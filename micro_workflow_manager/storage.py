@@ -1,6 +1,8 @@
 import json
 import os
 import threading
+import time
+from uuid import uuid4
 from pathlib import Path
 from shutil import copy2
 from threading import RLock
@@ -122,18 +124,35 @@ class FileStorage:
             ) from error
 
     def atomic_write_json(self, path: Path, data: Any):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        text = self.json_text(path, data)
-        temp = path.with_name(
-            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
+        with self.lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            text = self.json_text(path, data)
 
-        try:
-            temp.write_text(text, encoding="utf-8")
-            temp.replace(path)
-        finally:
-            if temp.exists():
-                temp.unlink()
+            temp = path.with_name(
+                f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
+            )
+
+            try:
+                temp.write_text(text, encoding="utf-8")
+
+                last_error = None
+
+                for attempt in range(20):
+                    try:
+                        os.replace(temp, path)
+                        return
+                    except PermissionError as error:
+                        last_error = error
+                        time.sleep(0.05 * (attempt + 1))
+
+                raise last_error
+
+            finally:
+                try:
+                    if temp.exists():
+                        temp.unlink()
+                except PermissionError:
+                    pass
 
     def read_json(self, path: Path, default: Any = None) -> Any:
         if not path.exists():
