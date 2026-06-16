@@ -6,6 +6,7 @@ import importlib.util
 import json
 import shutil
 import sys
+import textwrap
 from pathlib import Path
 
 import networkx as nx
@@ -15,28 +16,170 @@ from .system import MicroWorkflow
 
 MWF_FILE = ".mwf"
 RUNNER_CHOICES = ["threaded", "direct"]
+COMMAND_NAMES = ["init", "graph", "clean", "wipe", "run", "runfrom"]
+
+HELP_EPILOG = """
+Common help commands:
+  mwf --help
+  mwf init --help
+  mwf graph --help
+  mwf clean --help
+  mwf wipe --help
+  mwf run --help
+  mwf runfrom --help
+
+Command descriptions:
+  mwf --describe init
+  mwf --describe graph
+  mwf --describe clean
+  mwf --describe wipe
+  mwf --describe run
+  mwf --describe runfrom
+
+Typical flow:
+  mwf init
+  mwf graph src/graph.py
+  mwf run start_node
+  mwf runfrom start_node
+
+Cleaning:
+  mwf clean node_name   # clear output/files for one node, keep input files
+  mwf clean *           # clean every node in the graph
+  mwf wipe node_name    # clean one node and remove its input folder too
+  mwf wipe *            # wipe every node in the graph
+"""
+
+COMMAND_DESCRIPTIONS = {
+    "init": """
+init creates the project marker file .mwf in the current directory.
+
+Code context:
+  init does not import your graph.py or node_behavior files.
+
+File-system context:
+  writes .mwf with the default runner set to threaded
+  stores graph_path as null until you run mwf graph <path>
+  does not create node folders until a graph is loaded
+
+Use when:
+  starting a new micro-workflow project folder
+""",
+    "graph": """
+graph records the Python file that defines your DAG edges.
+
+Code context:
+  imports the supplied graph file
+  reads EDGES or edges from that module
+  imports sibling node_behavior/*.py files when loading the workflow
+  mounts NodeRouter objects found in those behavior files
+
+File-system context:
+  updates .mwf with graph_path, runner, and edges
+  creates node/<node-name>/ folders for graph nodes
+  each node folder contains input/, output/, jobs/, node_state.json, and schema.json when applicable
+
+Use when:
+  you add or change graph edges, or you want to change the stored default runner:
+    mwf graph src/graph.py --runner threaded
+    mwf graph src/graph.py --runner direct
+""",
+    "clean": """
+clean resets runnable state for one or more nodes while preserving node input files.
+
+Code context:
+  loads .mwf, graph.py, and node_behavior/*.py so it can validate node names
+  does not run your node task code
+
+File-system context for each selected node:
+  deletes node/<node>/output/
+  keeps node/<node>/input/
+  keeps each job's job.json and input.json
+  removes per-job files/status/output/debug artifacts
+  resets existing jobs to queued
+  resets node_state.json to queued
+
+Targets:
+  mwf clean node_name   cleans one node
+  mwf clean a b c       cleans several named nodes
+  mwf clean *           cleans every node in the graph
+
+Shell note:
+  in shells that expand *, quote it as mwf clean "*" if needed.
+""",
+    "wipe": """
+wipe is clean plus input removal.
+
+Code context:
+  loads .mwf, graph.py, and node_behavior/*.py so it can validate node names
+  does not run your node task code
+
+File-system context for each selected node:
+  does everything clean does
+  also deletes and recreates node/<node>/input/
+
+Targets:
+  mwf wipe node_name   wipes one node
+  mwf wipe a b c       wipes several named nodes
+  mwf wipe *           wipes every node in the graph
+
+Shell note:
+  in shells that expand *, quote it as mwf wipe "*" if needed.
+""",
+    "run": """
+run executes one node if that node is ready.
+
+Code context:
+  loads .mwf, graph.py, and node_behavior/*.py
+  validates the requested node exists in the graph
+  may inspect node_behavior source code for simple autostart calls
+  uses the stored runner from .mwf unless --runner is provided
+  honors per-node runner overrides such as runner="direct" or router.run_sequentially()
+
+File-system context:
+  if the node has no jobs, no predecessors, and no required params, run auto-queues one starter job
+  cleans the requested node before running it
+  if detected autostart nodes are included, clears those downstream nodes before running
+  reads jobs from node/<node>/jobs/
+  writes task artifacts under node/<node>/jobs/<job-id>/files/ and node/<node>/output/
+
+Use when:
+  you want to rerun a single ready node, or a node plus detected autostart chain.
+""",
+    "runfrom": """
+runfrom executes a node and its descendants in graph order, with threaded execution where possible.
+
+Code context:
+  loads .mwf, graph.py, and node_behavior/*.py
+  computes all descendants of the requested start node
+  may inspect node_behavior source code for simple autostart calls outside that descendant set
+  uses the stored runner from .mwf unless --runner is provided
+  honors per-node runner overrides such as runner="direct" or runner="threaded"
+
+File-system context:
+  cleans the starting node
+  clears descendant nodes selected for this run
+  queues autostart-created jobs instead of letting them escape the selected run set
+  reads and writes each selected node's node/<node>/jobs/, node/<node>/output/, and node_state.json
+  refuses to continue if direct upstream nodes outside the run set are incomplete, unless you confirm
+
+Use when:
+  you want a safe partial workflow rerun from one node onward.
+""",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="mwf")
-    parser.add_argument("--runner", choices=RUNNER_CHOICES)
-
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("init")
-
-    graph_cmd = commands.add_parser("graph")
-    graph_cmd.add_argument("path")
-    graph_cmd.add_argument("--runner", choices=RUNNER_CHOICES)
-
-    for name in ["clean", "wipe", "run", "runfrom"]:
-        cmd = commands.add_parser(name)
-        cmd.add_argument("node")
-        if name in {"run", "runfrom"}:
-            cmd.add_argument("--runner", choices=RUNNER_CHOICES)
-
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     try:
+        if args.describe is not None:
+            return describe_command(args.describe)
+
+        if args.command is None:
+            parser.print_help()
+            return 0
+
         if args.command == "init":
             return init_project()
 
@@ -46,18 +189,23 @@ def main(argv: list[str] | None = None) -> int:
             return setup_graph(root, args.path, args.runner)
 
         workflow = load_workflow(root, args.runner)
+
+        if args.command in {"clean", "wipe"}:
+            nodes = resolve_node_targets(workflow, args.nodes)
+            remove_input = args.command == "wipe"
+
+            for node in nodes:
+                clean_node(root, workflow, node, remove_input=remove_input)
+
+            verb = "Wiped" if remove_input else "Cleaned"
+            if is_all_nodes_request(args.nodes):
+                print(f"{verb} all nodes: {', '.join(nodes)}")
+            else:
+                print(f"{verb}: {', '.join(nodes)}")
+            return 0
+
         node = safe_node_name(args.node)
         require_node(workflow, node)
-
-        if args.command == "clean":
-            clean_node(root, workflow, node)
-            print(f"Cleaned {node}")
-            return 0
-
-        if args.command == "wipe":
-            clean_node(root, workflow, node, remove_input=True)
-            print(f"Wiped {node}")
-            return 0
 
         if args.command == "run":
             return run_node(root, workflow, node)
@@ -70,6 +218,155 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mwf",
+        description=(
+            "A small file-backed DAG workflow manager. Use 'mwf <command> --help' "
+            "for command-specific help, or 'mwf --describe <command>' for the "
+            "code and file-system context behind a command."
+        ),
+        epilog=textwrap.dedent(HELP_EPILOG).strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--runner",
+        choices=RUNNER_CHOICES,
+        help="Temporarily override the stored runner for commands that load the workflow.",
+    )
+    parser.add_argument(
+        "--describe",
+        metavar="COMMAND",
+        help="Describe the code and file-system context for a command.",
+    )
+
+    commands = parser.add_subparsers(dest="command", metavar="command")
+
+    commands.add_parser(
+        "init",
+        help="Create a .mwf project marker in the current directory.",
+        description=COMMAND_DESCRIPTIONS["init"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    graph_cmd = commands.add_parser(
+        "graph",
+        help="Set the graph.py file and initialize node folders.",
+        description=COMMAND_DESCRIPTIONS["graph"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    graph_cmd.add_argument("path", help="Path to the Python file defining EDGES or edges.")
+    graph_cmd.add_argument(
+        "--runner",
+        choices=RUNNER_CHOICES,
+        help="Store a default runner for future workflow commands.",
+    )
+
+    clean_cmd = commands.add_parser(
+        "clean",
+        help="Reset node output/job artifacts while keeping input files. Use '*' for all nodes.",
+        description=COMMAND_DESCRIPTIONS["clean"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    clean_cmd.add_argument(
+        "nodes",
+        nargs="+",
+        metavar="node",
+        help="One or more node names, or '*' to clean every graph node.",
+    )
+
+    wipe_cmd = commands.add_parser(
+        "wipe",
+        help="Like clean, but remove input files too. Use '*' for all nodes.",
+        description=COMMAND_DESCRIPTIONS["wipe"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    wipe_cmd.add_argument(
+        "nodes",
+        nargs="+",
+        metavar="node",
+        help="One or more node names, or '*' to wipe every graph node.",
+    )
+
+    run_cmd = commands.add_parser(
+        "run",
+        help="Run one ready node, optionally following detected autostarts.",
+        description=COMMAND_DESCRIPTIONS["run"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run_cmd.add_argument("node", help="Node name to run.")
+    run_cmd.add_argument(
+        "--runner",
+        choices=RUNNER_CHOICES,
+        help="Temporarily override the workflow runner for this run.",
+    )
+
+    runfrom_cmd = commands.add_parser(
+        "runfrom",
+        help="Run a node and its descendants safely.",
+        description=COMMAND_DESCRIPTIONS["runfrom"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    runfrom_cmd.add_argument("node", help="Start node for the partial workflow run.")
+    runfrom_cmd.add_argument(
+        "--runner",
+        choices=RUNNER_CHOICES,
+        help="Temporarily override the workflow runner for this runfrom.",
+    )
+
+    return parser
+
+
+def describe_command(command: str) -> int:
+    command = command.strip().lower()
+
+    if command not in COMMAND_DESCRIPTIONS:
+        valid = ", ".join(COMMAND_NAMES)
+        raise RuntimeError(f"Unknown command for --describe: {command}. Choose one of: {valid}")
+
+    print(f"mwf {command}")
+    print("=" * (4 + len(command)))
+    print(textwrap.dedent(COMMAND_DESCRIPTIONS[command]).strip())
+
+    context = current_project_context()
+    if context:
+        print("\nCurrent directory context:")
+        print(context)
+
+    print(f"\nMore syntax help: mwf {command} --help")
+    return 0
+
+
+def current_project_context() -> str:
+    try:
+        root = find_root()
+    except RuntimeError:
+        return "  No .mwf project found from the current directory."
+
+    lines = [f"  project root: {root}"]
+
+    try:
+        config = read_config(root)
+    except Exception as error:
+        lines.append(f"  could not read .mwf: {error}")
+        return "\n".join(lines)
+
+    graph_path = config.get("graph_path")
+    runner = config.get("runner", "threaded")
+    lines.append(f"  stored runner: {runner}")
+    lines.append(f"  graph path: {graph_path or 'not set'}")
+    lines.append(f"  node folder: {root / 'node'}")
+
+    node_root = root / "node"
+    if node_root.exists():
+        nodes = sorted(path.name for path in node_root.iterdir() if path.is_dir())
+        lines.append(f"  nodes on disk: {', '.join(nodes) if nodes else '(none)'}")
+    else:
+        lines.append("  nodes on disk: (node folder does not exist yet)")
+
+    return "\n".join(lines)
 
 
 def init_project() -> int:
@@ -314,6 +611,44 @@ def run_nodes(
     finally:
         workflow.allowed_run_nodes = previous_allowed_run_nodes
         workflow.autostart_mode = previous_autostart_mode
+
+
+def is_all_nodes_request(nodes: list[str]) -> bool:
+    if any(item == "*" for item in nodes):
+        return True
+
+    # On shells that expand '*' before Python sees it, mwf clean * may arrive
+    # as the visible names in the current directory. Treat that exact expansion
+    # as the same all-nodes request.
+    try:
+        visible_cwd_entries = sorted(
+            path.name for path in Path.cwd().iterdir()
+            if not path.name.startswith(".")
+        )
+    except OSError:
+        return False
+
+    return len(nodes) > 1 and sorted(nodes) == visible_cwd_entries
+
+
+def resolve_node_targets(workflow: MicroWorkflow, requested: list[str]) -> list[str]:
+    if not requested:
+        raise RuntimeError("No node specified")
+
+    if is_all_nodes_request(requested):
+        return list(nx.topological_sort(workflow.graph_obj))
+
+    seen: set[str] = set()
+    nodes: list[str] = []
+
+    for item in requested:
+        node = safe_node_name(item)
+        require_node(workflow, node)
+        if node not in seen:
+            seen.add(node)
+            nodes.append(node)
+
+    return nodes
 
 def clean_node(
     root: Path,
