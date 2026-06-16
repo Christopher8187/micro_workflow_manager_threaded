@@ -26,41 +26,80 @@ class NodeHandle:
             **params,
         )
 
-    def add_from_output_files(
-        self,
-        pattern: str = "*",
-        *,
-        file_param: str = "output_file",
-        autostart: bool = False,
-        recursive: bool = False,
-        files_only: bool = True,
-        path_mode: str = "absolute",
-        dedupe: bool = True,
-        **params,
-    ):
-        """Create downstream jobs from this node's output files after the node finishes.
+    @property
+    def input_dir(self) -> Path:
+        """The input folder for the downstream node."""
+        return self.system.storage.node_input_dir(self.to_node)
 
-        The jobs are intentionally deferred because the node-level output folder
-        may not contain every file until all jobs in the current node have
-        finished. Each matched file becomes one downstream job, with the file
-        path placed in ``file_param``.
-        """
-        return self.system.defer_output_file_jobs(
-            from_node=self.from_node,
-            to_node=self.to_node,
-            pattern=pattern,
-            file_param=file_param,
-            autostart=autostart,
-            recursive=recursive,
-            files_only=files_only,
-            path_mode=path_mode,
-            dedupe=dedupe,
-            _parent_job_id=self.from_job_id,
-            **params,
+    def input_path(self, *parts: str) -> Path:
+        """Build a safe path inside the downstream node's input folder."""
+        return self.system.storage.input_path(self.to_node, *parts)
+
+    def write_input(
+        self,
+        filename: str,
+        content: str,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        """Write text into the downstream node's input folder."""
+        return self.system.storage.write_node_input_text(
+            self.to_node,
+            filename,
+            content,
+            overwrite=overwrite,
         )
 
-    # Short alias for code that reads naturally in node behavior files.
-    add_from_outputs = add_from_output_files
+    def write_input_bytes(
+        self,
+        filename: str,
+        content: bytes,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        """Write bytes into the downstream node's input folder."""
+        return self.system.storage.write_node_input_bytes(
+            self.to_node,
+            filename,
+            content,
+            overwrite=overwrite,
+        )
+
+    def add_input_file(
+        self,
+        source: str | Path,
+        filename: str | None = None,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        """Copy one file into the downstream node's input folder.
+
+        This is the replacement for output-folder-triggered job creation. The
+        current job can place concrete files where a later node can read them
+        through ``ctx.input_files(...)`` or ``ctx.input_path(...)``.
+        """
+        return self.system.storage.copy_to_node_input(
+            self.to_node,
+            source,
+            filename=filename,
+            overwrite=overwrite,
+        )
+
+    def add_input_files(
+        self,
+        sources,
+        *,
+        overwrite: bool = False,
+    ) -> list[Path]:
+        """Copy several files into the downstream node's input folder."""
+        return [
+            self.add_input_file(source, overwrite=overwrite)
+            for source in sources
+        ]
+
+    # Short aliases for code that reads naturally in node behavior files.
+    add_file = add_input_file
+    add_files = add_input_files
 
 
 class JobContext:

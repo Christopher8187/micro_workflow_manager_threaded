@@ -54,11 +54,6 @@ class MicroWorkflow:
         self.allowed_run_nodes: set[str] | None = None
         self.autostart_mode = "immediate"
 
-        # Output-folder based job creation is deferred until the source node
-        # completes, because node/output may not contain all files while jobs
-        # inside that node are still running.
-        self._deferred_output_file_jobs: list[dict[str, Any]] = []
-
     def graph(self, edges: list[tuple[str, str]]):
         with self.lock:
             for start, end in edges:
@@ -263,6 +258,53 @@ class MicroWorkflow:
             **params,
         )
 
+    def create_jobs(
+        self,
+        node_name: str,
+        *,
+        number: int = 1,
+        params: dict[str, Any] | None = None,
+        start_job_id: int = 1,
+    ) -> list[Job]:
+        """Create deterministic default jobs for a node.
+
+        This is the workflow-level companion to ``NodeRouter.create_job``.
+        Existing default jobs with the same ids are refreshed in-place instead
+        of duplicated, so importing routers during CLI commands is idempotent.
+        """
+        number = validate_positive_int("number", number)
+        start_job_id = self.storage.validate_job_id(start_job_id)
+
+        if params is None:
+            params = {}
+
+        if not isinstance(params, dict):
+            raise ValueError("params must be a dict")
+
+        # Reject unserializable params before writing anything.
+        self.storage.json_text(Path("create_job_params.json"), params)
+
+        node = self.ensure_node(node_name)
+        created: list[Job] = []
+
+        with node.lock:
+            node.validate_params(params)
+
+            for offset in range(number):
+                job_id = start_job_id + offset
+                job = Job(
+                    job_id=job_id,
+                    node_name=node_name,
+                    params=dict(params),
+                    parent=None,
+                )
+                self.storage.ensure_job(job)
+                created.append(job)
+
+            self.storage.set_node_status(node_name, QUEUED)
+
+        return created
+
     def add_job(
         self,
         from_node: str | None,
@@ -324,173 +366,6 @@ class MicroWorkflow:
             )
 
         return job
-
-    def defer_output_file_jobs(
-        self,
-        from_node: str,
-        to_node: str,
-        pattern: str = "*",
-        *,
-        file_param: str = "output_file",
-        autostart: bool = False,
-        recursive: bool = False,
-        files_only: bool = True,
-        path_mode: str = "absolute",
-        dedupe: bool = True,
-        _parent_job_id: int | None = None,
-        **params,
-    ) -> dict[str, Any]:
-        """Queue output-folder based job creation until ``from_node`` completes."""
-        if _parent_job_id is not None:
-            self.storage.validate_job_id(_parent_job_id)
-
-        self.validate_edge(from_node, to_node)
-        self.storage.validate_relative_pattern(pattern)
-
-        if not isinstance(file_param, str) or not file_param:
-            raise ValueError("file_param must be a non-empty string")
-
-        if file_param in params:
-            raise ValueError(f"{file_param!r} is reserved for the matched output file")
-
-        if path_mode not in {"absolute", "relative", "name"}:
-            raise ValueError("path_mode must be 'absolute', 'relative', or 'name'")
-
-        if autostart and self.allowed_run_nodes is not None and to_node not in self.allowed_run_nodes:
-            parent = f"{from_node}/{_parent_job_id}" if _parent_job_id is not None else from_node
-            raise InvalidGraphError(
-                f"Autostart from {parent} to {to_node} was blocked because "
-                f"{to_node} is outside the approved run set. "
-                "Use mwf run/runfrom and approve detected autostarts, or include "
-                "the target node in the run set. Dynamic autostarts may not be "
-                "found by the static scanner."
-            )
-
-        # Match normal add_job behavior by rejecting unserializable params early.
-        self.storage.json_text(Path("deferred_output_file_params.json"), params)
-
-        target = self.ensure_node(to_node)
-        sample_params = {**params, file_param: ""}
-        with target.lock:
-            target.validate_params(sample_params)
-
-        operation = {
-            "from_node": from_node,
-            "from_job_id": _parent_job_id,
-            "to_node": to_node,
-            "pattern": pattern,
-            "file_param": file_param,
-            "autostart": autostart,
-            "recursive": recursive,
-            "files_only": files_only,
-            "path_mode": path_mode,
-            "params": dict(params),
-        }
-
-        with self.lock:
-            if dedupe:
-                key = self._deferred_output_file_key(operation)
-                for existing in self._deferred_output_file_jobs:
-                    if self._deferred_output_file_key(existing) == key:
-                        return {
-                            "deferred": True,
-                            "deduped": True,
-                            "from_node": from_node,
-                            "to_node": to_node,
-                            "pattern": pattern,
-                        }
-
-            self._deferred_output_file_jobs.append(operation)
-
-        return {
-            "deferred": True,
-            "deduped": False,
-            "from_node": from_node,
-            "to_node": to_node,
-            "pattern": pattern,
-        }
-
-    def _deferred_output_file_key(self, operation: dict[str, Any]) -> str:
-        return self.storage.json_text(
-            Path("deferred_output_file_key.json"),
-            {
-                key: operation[key]
-                for key in [
-                    "from_node",
-                    "to_node",
-                    "pattern",
-                    "file_param",
-                    "autostart",
-                    "recursive",
-                    "files_only",
-                    "path_mode",
-                    "params",
-                ]
-            },
-        )
-
-    def flush_deferred_output_file_jobs(self, node_name: str) -> list[Any]:
-        """Create any jobs that were waiting for ``node_name`` output files."""
-        with self.lock:
-            operations = [
-                operation
-                for operation in self._deferred_output_file_jobs
-                if operation["from_node"] == node_name
-            ]
-
-            if not operations:
-                return []
-
-            self._deferred_output_file_jobs = [
-                operation
-                for operation in self._deferred_output_file_jobs
-                if operation["from_node"] != node_name
-            ]
-
-        created: list[Any] = []
-        for operation in operations:
-            files = self.storage.output_files(
-                node_name,
-                pattern=operation["pattern"],
-                recursive=operation["recursive"],
-                files_only=operation["files_only"],
-            )
-
-            for file in files:
-                params = dict(operation["params"])
-                params[operation["file_param"]] = self._output_file_param_value(
-                    node_name,
-                    file,
-                    operation["path_mode"],
-                )
-                created.append(
-                    self.add_job(
-                        from_node=node_name,
-                        to_node=operation["to_node"],
-                        autostart=operation["autostart"],
-                        _parent_job_id=operation["from_job_id"],
-                        **params,
-                    )
-                )
-
-        return created
-
-    def _output_file_param_value(
-        self,
-        node_name: str,
-        path: Path,
-        path_mode: str,
-    ) -> str:
-        if path_mode == "absolute":
-            return str(path)
-
-        if path_mode == "relative":
-            return str(path.relative_to(self.storage.node_output_dir(node_name)))
-
-        if path_mode == "name":
-            return path.name
-
-        raise ValueError("path_mode must be 'absolute', 'relative', or 'name'")
 
     def node_complete(self, node_name: str) -> bool:
         return self.storage.get_node_status(node_name) in NODE_COMPLETE_STATUSES
@@ -689,9 +564,6 @@ class MicroWorkflow:
             raise
 
         self.refresh_node_status(node_name, allow_complete=True)
-
-        if self.node_complete(node_name):
-            self.flush_deferred_output_file_jobs(node_name)
 
         return result
 

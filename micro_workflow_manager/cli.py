@@ -136,7 +136,7 @@ Code context:
   honors per-node runner overrides such as runner="direct" or router.run_sequentially()
 
 File-system context:
-  if the node has no jobs, no predecessors, and no required params, run auto-queues one starter job
+  does not invent starter jobs; declare them with router.create_job(...) in node_behavior/<node>.py
   cleans the requested node before running it
   if detected autostart nodes are included, clears those downstream nodes before running
   reads jobs from node/<node>/jobs/
@@ -159,6 +159,7 @@ File-system context:
   cleans the starting node
   clears descendant nodes selected for this run
   queues autostart-created jobs instead of letting them escape the selected run set
+  does not invent starter jobs; declare them with router.create_job(...) in node_behavior/<node>.py
   reads and writes each selected node's node/<node>/jobs/, node/<node>/output/, and node_state.json
   refuses to continue if direct upstream nodes outside the run set are incomplete, unless you confirm
 
@@ -545,10 +546,12 @@ def run_nodes(
     workflow.autostart_mode = "queue"
 
     try:
-        ensure_auto_start_job(workflow, start_node)
-
         if not workflow.storage.queued_jobs(start_node):
-            print(f"No queued jobs for {start_node}")
+            print(
+                f"No queued jobs for {start_node}. "
+                f"Create default jobs in node_behavior/{start_node}.py with "
+                "router.create_job(number=..., params={...})."
+            )
             return 0
 
         if workflow.runner == "threaded":
@@ -687,19 +690,6 @@ def clear_node(root: Path, workflow: MicroWorkflow, node: str):
     remove_dir(node_dir / "jobs")
     workflow.storage.init_node_folders(node)
     workflow.storage.set_node_status(node, QUEUED)
-
-
-def ensure_auto_start_job(workflow: MicroWorkflow, node: str):
-    if workflow.storage.list_jobs(node):
-        return
-
-    if list(workflow.graph_obj.predecessors(node)):
-        return
-
-    task = workflow.nodes[node].main_task
-
-    if task is not None and not task.required_params:
-        workflow.start(node)
 
 
 def ready_for_run_set(
@@ -868,11 +858,7 @@ def autostart_target(node: ast.AST, node_handles: dict[str, str]) -> str | None:
     if not isinstance(node, ast.Call):
         return None
 
-    if not isinstance(node.func, ast.Attribute) or node.func.attr not in {
-        "add",
-        "add_from_output_files",
-        "add_from_outputs",
-    }:
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "add":
         return None
 
     if not any(keyword.arg == "autostart" and is_true(keyword.value) for keyword in node.keywords):

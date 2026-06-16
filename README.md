@@ -1,10 +1,40 @@
 # micro-workflow-manager
 
-A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, and APIRouter-style node modules.
+A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
 ## Important workflow rule
 
-A finished job is not the same thing as a finished node. This matters for autostarted jobs: a downstream node can receive and finish one job before all of its predecessor nodes have completed and before those predecessors have finished creating every downstream job. The library only marks a node `done` during node-level finalization after its predecessors are complete.
+A finished job is not the same thing as a finished node. This matters for dynamically-created jobs: a downstream node can receive and finish one job before all of its predecessor nodes have completed and before those predecessors have finished creating every downstream job. The library only marks a node `done` during node-level finalization after its predecessors are complete.
+
+## Explicit jobs
+
+`mwf run` and `mwf runfrom` no longer invent a default starter job. Declare default jobs in the respective node file:
+
+```python
+from micro_workflow_manager import NodeRouter
+
+router = NodeRouter("split", max_threads=2)
+router.create_job(number=2, params={"message": "hello"})
+
+@router.task
+def split(ctx, message):
+    print(message, ctx.job_id)
+```
+
+`number=2` creates jobs 1 and 2 with the same params. Multiple `router.create_job(...)` calls are allocated deterministic job ids in the order they appear. These declarations are idempotent when the CLI imports node files repeatedly.
+
+## Passing files forward
+
+Output-folder-triggered job creation has been removed. Instead, a task can add files directly to the input folder of a downstream node:
+
+```python
+@router.task
+def split(ctx):
+    page = ctx.write("page_001.txt", "page text")
+    ctx.node("tagify").add_input_file(page, filename="page_001.txt")
+```
+
+The downstream node can read those files with `ctx.input_files(...)` or `ctx.input_path(...)`. This keeps job creation explicit while still allowing upstream nodes to prepare the file inputs that later nodes consume.
 
 ## Runners
 

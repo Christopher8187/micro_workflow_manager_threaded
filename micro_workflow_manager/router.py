@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import sys
 from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 from types import ModuleType
 from typing import Callable
@@ -22,6 +23,12 @@ class RouterTask:
     retries: int = 0
     repeats: int = 1
     name: str | None = None
+
+
+@dataclass
+class RouterJobSpec:
+    number: int
+    params: dict[str, Any]
 
 
 class NodeRouter:
@@ -63,6 +70,7 @@ class NodeRouter:
             self.max_threads = 1
         self.main_task: RouterTask | None = None
         self.fallbacks: list[RouterTask] = []
+        self.initial_jobs: list[RouterJobSpec] = []
 
     @classmethod
     def from_file(
@@ -96,6 +104,33 @@ class NodeRouter:
         self.runner_override = validate_node_runner(runner)
         if self.runner_override == "direct":
             self.max_threads = 1
+        return self
+
+
+    def create_job(
+        self,
+        *,
+        number: int = 1,
+        params: dict[str, Any] | None = None,
+    ) -> "NodeRouter":
+        """Declare default jobs for this node.
+
+        The jobs are created deterministically when the router is mounted.
+        For example, ``router.create_job(number=2, params={"name": "demo"})``
+        creates jobs 1 and 2 for this node, both with the same params.
+
+        ``number`` is deliberately explicit: ``mwf run`` and ``mwf runfrom`` no
+        longer invent a default starter job.
+        """
+        number = validate_positive_int("number", number)
+
+        if params is None:
+            params = {}
+
+        if not isinstance(params, dict):
+            raise ValueError("params must be a dict")
+
+        self.initial_jobs.append(RouterJobSpec(number=number, params=dict(params)))
         return self
 
     def task(
@@ -193,6 +228,16 @@ class NodeRouter:
                 retries=fallback.retries,
                 repeats=fallback.repeats,
             )(fallback.handler)
+
+        next_job_id = 1
+        for spec in self.initial_jobs:
+            workflow.create_jobs(
+                self.name,
+                number=spec.number,
+                params=spec.params,
+                start_job_id=next_job_id,
+            )
+            next_job_id += spec.number
 
         return self
 

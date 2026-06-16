@@ -247,6 +247,60 @@ class FileStorage:
         path.write_bytes(content)
         return path
 
+    def write_node_input_text(
+        self,
+        node_name: str,
+        filename: str,
+        content: str,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        directory = self.node_input_dir(node_name)
+        path = self.safe_join(directory, filename)
+        if path.exists() and not overwrite:
+            path = self.unique_target(path.parent, path.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def write_node_input_bytes(
+        self,
+        node_name: str,
+        filename: str,
+        content: bytes,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        directory = self.node_input_dir(node_name)
+        path = self.safe_join(directory, filename)
+        if path.exists() and not overwrite:
+            path = self.unique_target(path.parent, path.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def copy_to_node_input(
+        self,
+        node_name: str,
+        source: str | Path,
+        filename: str | None = None,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        source_path = Path(source)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Input source file does not exist: {source_path}")
+        if not source_path.is_file():
+            raise ValueError(f"Input source path is not a file: {source_path}")
+
+        target_name = filename or source_path.name
+        target = self.safe_join(self.node_input_dir(node_name), target_name)
+        if target.exists() and not overwrite:
+            target = self.unique_target(target.parent, target.name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        copy2(source_path, target)
+        return target
+
     def write_node_schema(
         self,
         node_name: str,
@@ -350,6 +404,51 @@ class FileStorage:
             )
 
             self.set_job_status(job.node_name, job.job_id, QUEUED)
+
+    def ensure_job(self, job: Job) -> Job:
+        """Create or refresh a deterministic default job.
+
+        Unlike create_job, this method is idempotent. It is used for jobs
+        declared in node_behavior files, because those files are imported every
+        time the CLI loads the workflow.
+        """
+        self.validate_job_id(job.job_id)
+        self.json_text(Path("input.json"), job.params)
+
+        with self.lock:
+            if not self.job_exists(job.node_name, job.job_id):
+                self.create_job(job)
+                return job
+
+            existing_params = self.read_json(
+                self.input_file(job.node_name, job.job_id),
+                default={},
+            )
+
+            if existing_params != job.params:
+                self.atomic_write_json(
+                    self.input_file(job.node_name, job.job_id),
+                    job.params,
+                )
+                self.set_job_status(job.node_name, job.job_id, QUEUED)
+
+            job_data = self.read_json(
+                self.job_file(job.node_name, job.job_id),
+                default={},
+            )
+
+            if job_data.get("parent") is not None:
+                self.atomic_write_json(
+                    self.job_file(job.node_name, job.job_id),
+                    {
+                        "job_id": job.job_id,
+                        "node_name": job.node_name,
+                        "parent": None,
+                        "created_at": job_data.get("created_at", job.created_at),
+                    },
+                )
+
+            return job
 
     def load_job(self, node_name: str, job_id: int) -> Job:
         self.validate_job_id(job_id)
