@@ -187,3 +187,76 @@ def test_threaded_workflow_starts_newly_ready_nodes_while_other_nodes_are_still_
         assert elapsed < 0.45
         assert set(ran) == {"A", "B", "C"}
         assert workflow.node_complete("C")
+
+
+def test_router_can_force_one_node_to_run_jobs_sequentially_with_threaded_workflow():
+    import time
+
+    with tempfile.TemporaryDirectory() as project_dir:
+        workflow = MicroWorkflow(project_dir=project_dir, runner="threaded")
+        workflow.graph([("A", "B")])
+
+        router = NodeRouter("A", max_threads=2)
+        router.run_sequentially()
+
+        @router.task
+        def a(ctx):
+            time.sleep(0.12)
+            return ctx.job_id
+
+        workflow.include_router(router)
+
+        @workflow.task("B")
+        def b(ctx):
+            return "done"
+
+        workflow.start("A", job_id=1)
+        workflow.start("A", job_id=2)
+
+        started = time.perf_counter()
+        workflow.run_node("A")
+        elapsed = time.perf_counter() - started
+
+        assert elapsed >= 0.20
+        assert workflow.node_complete("A")
+        assert workflow.nodes["A"].runner_override == "direct"
+
+
+def test_output_file_autostarts_are_deferred_until_source_node_completes():
+    import json
+    import time
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as project_dir:
+        workflow = MicroWorkflow(project_dir=project_dir, runner="threaded")
+        workflow.graph([("A", "B")])
+
+        @workflow.task("A", max_threads=2)
+        def a(ctx, name, delay):
+            time.sleep(delay)
+            ctx.write_output(f"{name}.txt", name)
+            ctx.node("B").add_from_output_files(
+                "*.txt",
+                file_param="output_file",
+                autostart=True,
+            )
+
+        @workflow.task("B")
+        def b(ctx, output_file):
+            output_path = Path(output_file)
+            seen = sorted(path.name for path in output_path.parent.glob("*.txt"))
+            ctx.write(f"seen_{ctx.job_id}.json", json.dumps(seen))
+            return seen
+
+        workflow.start("A", job_id=1, name="first", delay=0.02)
+        workflow.start("A", job_id=2, name="second", delay=0.12)
+
+        workflow.run_node("A")
+
+        b_rows = workflow.storage.list_jobs("B")
+        assert len(b_rows) == 2
+        assert {row["status"] for row in b_rows} == {"done"}
+
+        for row in b_rows:
+            seen_path = workflow.storage.files_dir("B", row["job_id"]) / f"seen_{row['job_id']}.json"
+            assert json.loads(seen_path.read_text()) == ["first.txt", "second.txt"]

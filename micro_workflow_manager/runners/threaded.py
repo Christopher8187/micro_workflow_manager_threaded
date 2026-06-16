@@ -9,9 +9,8 @@ from .base import BaseRunner
 class ThreadedRunner(BaseRunner):
     """Dependency-free thread pool runner for jobs inside one node.
 
-    This is the local replacement for the Prefect ThreadPoolTaskRunner used by
-    PrefectThreadRunner. It runs multiple queued jobs for the same node in
-    parallel, capped by that node's max_threads setting.
+    It runs multiple queued jobs for the same node in parallel, capped by that
+    node's max_threads setting.
     """
 
     def __init__(self, max_threads: int):

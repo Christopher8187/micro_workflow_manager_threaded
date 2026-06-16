@@ -2,11 +2,11 @@ import json
 import os
 import threading
 import time
-from uuid import uuid4
 from pathlib import Path
 from shutil import copy2
 from threading import RLock
 from typing import Any
+from uuid import uuid4
 
 from .models import Job, QUEUED, VALID_STATUSES
 
@@ -203,6 +203,28 @@ class FileStorage:
 
         return result
 
+    def output_files(
+        self,
+        node_name: str,
+        pattern: str = "*",
+        recursive: bool = False,
+        files_only: bool = True,
+    ) -> list[Path]:
+        self.validate_relative_pattern(pattern)
+        root = self.node_output_dir(node_name)
+
+        paths = root.rglob(pattern) if recursive else root.glob(pattern)
+
+        result = sorted(
+            path for path in paths
+            if path.resolve().is_relative_to(root.resolve())
+        )
+
+        if files_only:
+            result = [path for path in result if path.is_file()]
+
+        return result
+
     def write_node_output_text(
         self,
         node_name: str,
@@ -233,6 +255,8 @@ class FileStorage:
         retries: int,
         repeats: int,
         fallbacks: list[str],
+        runner_override: str | None = None,
+        max_threads: int | None = None,
     ):
         self.atomic_write_json(
             self.node_schema_file(node_name),
@@ -243,6 +267,9 @@ class FileStorage:
                 "retries": retries,
                 "repeats": repeats,
                 "fallbacks": fallbacks,
+                "runner_override": runner_override,
+                "sequential": runner_override == "direct",
+                "max_threads": max_threads,
                 "input_dir": str(self.node_input_dir(node_name)),
                 "output_dir": str(self.node_output_dir(node_name)),
                 "jobs_dir": str(self.jobs_dir(node_name)),

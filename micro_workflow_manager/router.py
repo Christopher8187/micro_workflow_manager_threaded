@@ -6,9 +6,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Callable, Iterable
+from typing import Callable
 
-from .node import validate_non_negative_int, validate_positive_int
+from .node import (
+    sequential_runner_value,
+    validate_node_runner,
+    validate_non_negative_int,
+    validate_positive_int,
+)
 
 
 @dataclass
@@ -33,18 +38,65 @@ class NodeRouter:
         @router.fallback(name="plain")
         def plain(ctx, file_name, error=None):
             ...
+
+    To force one node to run its own jobs sequentially even when the CLI runner
+    is threaded, add one line in that node file:
+
+        router.run_sequentially()
     """
 
-    def __init__(self, name: str, max_threads: int = 5):
+    def __init__(
+        self,
+        name: str,
+        max_threads: int = 5,
+        *,
+        runner: str | None = None,
+        sequential: bool = False,
+    ):
         self.name = name
         self.max_threads = validate_positive_int("max_threads", max_threads)
+        self.runner_override = sequential_runner_value(
+            runner=runner,
+            sequential=sequential,
+        )
+        if self.runner_override == "direct":
+            self.max_threads = 1
         self.main_task: RouterTask | None = None
         self.fallbacks: list[RouterTask] = []
 
     @classmethod
-    def from_file(cls, file: str | Path, max_threads: int = 5) -> "NodeRouter":
+    def from_file(
+        cls,
+        file: str | Path,
+        max_threads: int = 5,
+        *,
+        runner: str | None = None,
+        sequential: bool = False,
+    ) -> "NodeRouter":
         """Create a router whose node name is the Python file stem."""
-        return cls(Path(file).stem, max_threads=max_threads)
+        return cls(
+            Path(file).stem,
+            max_threads=max_threads,
+            runner=runner,
+            sequential=sequential,
+        )
+
+    def run_sequentially(self) -> "NodeRouter":
+        """Force this node's jobs to run with the direct runner.
+
+        This is a per-node override. It still allows other independent nodes to
+        use the workflow's normal runner.
+        """
+        self.runner_override = "direct"
+        self.max_threads = 1
+        return self
+
+    def use_runner(self, runner: str) -> "NodeRouter":
+        """Force this node to use a specific runner: 'direct' or 'threaded'."""
+        self.runner_override = validate_node_runner(runner)
+        if self.runner_override == "direct":
+            self.max_threads = 1
+        return self
 
     def task(
         self,
@@ -53,6 +105,8 @@ class NodeRouter:
         retries: int = 0,
         repeats: int = 1,
         max_threads: int | None = None,
+        runner: str | None = None,
+        sequential: bool = False,
     ):
         """Register the main task for this node.
 
@@ -69,6 +123,13 @@ class NodeRouter:
 
         if max_threads is not None:
             self.max_threads = validate_positive_int("max_threads", max_threads)
+
+        override = sequential_runner_value(runner=runner, sequential=sequential)
+        if override is not None:
+            self.runner_override = override
+
+        if self.runner_override == "direct":
+            self.max_threads = 1
 
         def decorator(handler: Callable):
             self.main_task = RouterTask(
@@ -122,6 +183,7 @@ class NodeRouter:
             max_threads=self.max_threads,
             retries=self.main_task.retries,
             repeats=self.main_task.repeats,
+            runner=self.runner_override,
         )(self.main_task.handler)
 
         for fallback in self.fallbacks:

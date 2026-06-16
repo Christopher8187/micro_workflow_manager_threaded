@@ -14,7 +14,7 @@ from .models import QUEUED
 from .system import MicroWorkflow
 
 MWF_FILE = ".mwf"
-RUNNER_CHOICES = ["threaded", "direct", "prefect"]
+RUNNER_CHOICES = ["threaded", "direct"]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -533,7 +533,11 @@ def autostart_target(node: ast.AST, node_handles: dict[str, str]) -> str | None:
     if not isinstance(node, ast.Call):
         return None
 
-    if not isinstance(node.func, ast.Attribute) or node.func.attr != "add":
+    if not isinstance(node.func, ast.Attribute) or node.func.attr not in {
+        "add",
+        "add_from_output_files",
+        "add_from_outputs",
+    }:
         return None
 
     if not any(keyword.arg == "autostart" and is_true(keyword.value) for keyword in node.keywords):

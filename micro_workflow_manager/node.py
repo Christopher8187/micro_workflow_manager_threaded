@@ -5,6 +5,9 @@ from typing import Callable
 from .models import MountedTask
 
 
+NODE_RUNNER_CHOICES = {"direct", "threaded"}
+
+
 def validate_non_negative_int(name: str, value: int) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be an integer >= 0")
@@ -17,14 +20,60 @@ def validate_positive_int(name: str, value: int) -> int:
     return value
 
 
+def validate_node_runner(runner: str | None) -> str | None:
+    if runner is None:
+        return None
+
+    if runner == "thread":
+        runner = "threaded"
+
+    if runner not in NODE_RUNNER_CHOICES:
+        raise ValueError(f"runner must be one of {sorted(NODE_RUNNER_CHOICES)}")
+
+    return runner
+
+
+def sequential_runner_value(
+    runner: str | None = None,
+    sequential: bool = False,
+) -> str | None:
+    runner = validate_node_runner(runner)
+
+    if sequential:
+        if runner not in {None, "direct"}:
+            raise ValueError("sequential=True cannot be combined with runner='threaded'")
+        return "direct"
+
+    return runner
+
+
 class JobNode:
-    def __init__(self, name: str, max_threads: int = 5):
+    def __init__(
+        self,
+        name: str,
+        max_threads: int = 5,
+        runner: str | None = None,
+    ):
         self.name = name
         self.max_threads = validate_positive_int("max_threads", max_threads)
+        self.runner_override = validate_node_runner(runner)
         self.main_task: MountedTask | None = None
         self.fallbacks: dict[str, MountedTask] = {}
         self.fallback_order: list[str] = []
         self.lock = RLock()
+
+    @property
+    def sequential(self) -> bool:
+        return self.runner_override == "direct"
+
+    def set_runner(self, runner: str | None = None, sequential: bool = False):
+        override = sequential_runner_value(runner=runner, sequential=sequential)
+
+        if override is not None:
+            self.runner_override = override
+
+        if self.runner_override == "direct":
+            self.max_threads = 1
 
     def infer_params(self, handler: Callable) -> tuple[set[str], set[str]]:
         sig = signature(handler)

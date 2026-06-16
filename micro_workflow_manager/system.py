@@ -1,7 +1,7 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import RLock
-from typing import Callable
+from typing import Any, Callable
 
 import networkx as nx
 
@@ -18,7 +18,12 @@ from .models import (
     SKIPPED,
     SUCCESSFUL_JOB_TERMINAL_STATUSES,
 )
-from .node import JobNode, validate_non_negative_int, validate_positive_int
+from .node import (
+    JobNode,
+    sequential_runner_value,
+    validate_non_negative_int,
+    validate_positive_int,
+)
 from .router import NodeRouter, import_modules_from_dir, routers_from_module
 from .runners.direct import DirectRunner
 from .runners.threaded import ThreadedRunner
@@ -34,7 +39,7 @@ class MicroWorkflow:
         if runner == "thread":
             runner = "threaded"
 
-        if runner not in {"prefect", "direct", "threaded"}:
+        if runner not in {"direct", "threaded"}:
             raise ValueError(f"Unknown runner: {runner}")
 
         self.storage = FileStorage(project_dir)
@@ -48,6 +53,11 @@ class MicroWorkflow:
         # CLI safety controls. Normal library use keeps immediate autostarts.
         self.allowed_run_nodes: set[str] | None = None
         self.autostart_mode = "immediate"
+
+        # Output-folder based job creation is deferred until the source node
+        # completes, because node/output may not contain all files while jobs
+        # inside that node are still running.
+        self._deferred_output_file_jobs: list[dict[str, Any]] = []
 
     def graph(self, edges: list[tuple[str, str]]):
         with self.lock:
@@ -121,18 +131,36 @@ class MicroWorkflow:
     include_nodes = include_routers
     include_node_dir = include_router_dir
 
-    def ensure_node(self, name: str, max_threads: int = 5) -> JobNode:
+    def ensure_node(
+        self,
+        name: str,
+        max_threads: int = 5,
+        runner: str | None = None,
+        sequential: bool = False,
+    ) -> JobNode:
         name = self.storage.validate_node_name(name)
         max_threads = validate_positive_int("max_threads", max_threads)
+        runner_override = sequential_runner_value(runner=runner, sequential=sequential)
+
+        if runner_override == "direct":
+            max_threads = 1
 
         with self.lock:
             if name not in self.nodes:
-                self.nodes[name] = JobNode(name, max_threads=max_threads)
+                self.nodes[name] = JobNode(
+                    name,
+                    max_threads=max_threads,
+                    runner=runner_override,
+                )
                 self.graph_obj.add_node(name)
                 self.storage.init_node_folders(name)
 
                 if self.storage.get_node_status(name) is None:
                     self.storage.set_node_status(name, QUEUED)
+            else:
+                node = self.nodes[name]
+                if runner_override is not None:
+                    node.set_runner(runner=runner_override)
 
             return self.nodes[name]
 
@@ -142,14 +170,26 @@ class MicroWorkflow:
         max_threads: int = 5,
         retries: int = 0,
         repeats: int = 1,
+        runner: str | None = None,
+        sequential: bool = False,
     ):
         max_threads_checked = validate_positive_int("max_threads", max_threads)
         retries_checked = validate_non_negative_int("retries", retries)
         repeats_checked = validate_positive_int("repeats", repeats)
+        runner_override = sequential_runner_value(runner=runner, sequential=sequential)
+
+        if runner_override == "direct":
+            max_threads_checked = 1
 
         def decorator(fn: Callable):
-            node = self.ensure_node(node_name, max_threads=max_threads_checked)
+            node = self.ensure_node(
+                node_name,
+                max_threads=max_threads_checked,
+                runner=runner_override,
+            )
             node.max_threads = max_threads_checked
+            if runner_override is not None:
+                node.set_runner(runner=runner_override)
             node.mount_main(fn, retries=retries_checked, repeats=repeats_checked)
 
             assert node.main_task is not None
@@ -161,6 +201,8 @@ class MicroWorkflow:
                 retries=node.main_task.retries,
                 repeats=node.main_task.repeats,
                 fallbacks=node.fallback_order,
+                runner_override=node.runner_override,
+                max_threads=node.max_threads,
             )
 
             return fn
@@ -194,6 +236,8 @@ class MicroWorkflow:
                     retries=node.main_task.retries,
                     repeats=node.main_task.repeats,
                     fallbacks=node.fallback_order,
+                    runner_override=node.runner_override,
+                    max_threads=node.max_threads,
                 )
 
             return fn
@@ -281,6 +325,173 @@ class MicroWorkflow:
 
         return job
 
+    def defer_output_file_jobs(
+        self,
+        from_node: str,
+        to_node: str,
+        pattern: str = "*",
+        *,
+        file_param: str = "output_file",
+        autostart: bool = False,
+        recursive: bool = False,
+        files_only: bool = True,
+        path_mode: str = "absolute",
+        dedupe: bool = True,
+        _parent_job_id: int | None = None,
+        **params,
+    ) -> dict[str, Any]:
+        """Queue output-folder based job creation until ``from_node`` completes."""
+        if _parent_job_id is not None:
+            self.storage.validate_job_id(_parent_job_id)
+
+        self.validate_edge(from_node, to_node)
+        self.storage.validate_relative_pattern(pattern)
+
+        if not isinstance(file_param, str) or not file_param:
+            raise ValueError("file_param must be a non-empty string")
+
+        if file_param in params:
+            raise ValueError(f"{file_param!r} is reserved for the matched output file")
+
+        if path_mode not in {"absolute", "relative", "name"}:
+            raise ValueError("path_mode must be 'absolute', 'relative', or 'name'")
+
+        if autostart and self.allowed_run_nodes is not None and to_node not in self.allowed_run_nodes:
+            parent = f"{from_node}/{_parent_job_id}" if _parent_job_id is not None else from_node
+            raise InvalidGraphError(
+                f"Autostart from {parent} to {to_node} was blocked because "
+                f"{to_node} is outside the approved run set. "
+                "Use mwf run/runfrom and approve detected autostarts, or include "
+                "the target node in the run set. Dynamic autostarts may not be "
+                "found by the static scanner."
+            )
+
+        # Match normal add_job behavior by rejecting unserializable params early.
+        self.storage.json_text(Path("deferred_output_file_params.json"), params)
+
+        target = self.ensure_node(to_node)
+        sample_params = {**params, file_param: ""}
+        with target.lock:
+            target.validate_params(sample_params)
+
+        operation = {
+            "from_node": from_node,
+            "from_job_id": _parent_job_id,
+            "to_node": to_node,
+            "pattern": pattern,
+            "file_param": file_param,
+            "autostart": autostart,
+            "recursive": recursive,
+            "files_only": files_only,
+            "path_mode": path_mode,
+            "params": dict(params),
+        }
+
+        with self.lock:
+            if dedupe:
+                key = self._deferred_output_file_key(operation)
+                for existing in self._deferred_output_file_jobs:
+                    if self._deferred_output_file_key(existing) == key:
+                        return {
+                            "deferred": True,
+                            "deduped": True,
+                            "from_node": from_node,
+                            "to_node": to_node,
+                            "pattern": pattern,
+                        }
+
+            self._deferred_output_file_jobs.append(operation)
+
+        return {
+            "deferred": True,
+            "deduped": False,
+            "from_node": from_node,
+            "to_node": to_node,
+            "pattern": pattern,
+        }
+
+    def _deferred_output_file_key(self, operation: dict[str, Any]) -> str:
+        return self.storage.json_text(
+            Path("deferred_output_file_key.json"),
+            {
+                key: operation[key]
+                for key in [
+                    "from_node",
+                    "to_node",
+                    "pattern",
+                    "file_param",
+                    "autostart",
+                    "recursive",
+                    "files_only",
+                    "path_mode",
+                    "params",
+                ]
+            },
+        )
+
+    def flush_deferred_output_file_jobs(self, node_name: str) -> list[Any]:
+        """Create any jobs that were waiting for ``node_name`` output files."""
+        with self.lock:
+            operations = [
+                operation
+                for operation in self._deferred_output_file_jobs
+                if operation["from_node"] == node_name
+            ]
+
+            if not operations:
+                return []
+
+            self._deferred_output_file_jobs = [
+                operation
+                for operation in self._deferred_output_file_jobs
+                if operation["from_node"] != node_name
+            ]
+
+        created: list[Any] = []
+        for operation in operations:
+            files = self.storage.output_files(
+                node_name,
+                pattern=operation["pattern"],
+                recursive=operation["recursive"],
+                files_only=operation["files_only"],
+            )
+
+            for file in files:
+                params = dict(operation["params"])
+                params[operation["file_param"]] = self._output_file_param_value(
+                    node_name,
+                    file,
+                    operation["path_mode"],
+                )
+                created.append(
+                    self.add_job(
+                        from_node=node_name,
+                        to_node=operation["to_node"],
+                        autostart=operation["autostart"],
+                        _parent_job_id=operation["from_job_id"],
+                        **params,
+                    )
+                )
+
+        return created
+
+    def _output_file_param_value(
+        self,
+        node_name: str,
+        path: Path,
+        path_mode: str,
+    ) -> str:
+        if path_mode == "absolute":
+            return str(path)
+
+        if path_mode == "relative":
+            return str(path.relative_to(self.storage.node_output_dir(node_name)))
+
+        if path_mode == "name":
+            return path.name
+
+        raise ValueError("path_mode must be 'absolute', 'relative', or 'name'")
+
     def node_complete(self, node_name: str) -> bool:
         return self.storage.get_node_status(node_name) in NODE_COMPLETE_STATUSES
 
@@ -349,23 +560,15 @@ class MicroWorkflow:
         return ready
 
     def make_runner(self, node: JobNode):
-        if self.runner == "direct":
+        effective_runner = node.runner_override or self.runner
+
+        if effective_runner == "direct":
             return DirectRunner()
 
-        if self.runner == "threaded":
+        if effective_runner == "threaded":
             return ThreadedRunner(max_threads=node.max_threads)
 
-        if self.runner == "prefect":
-            try:
-                from .runners.prefect_thread import PrefectThreadRunner
-            except ModuleNotFoundError as error:
-                raise ModuleNotFoundError(
-                    "runner='prefect' needs Prefect. Install it with: pip install prefect"
-                ) from error
-
-            return PrefectThreadRunner(max_threads=node.max_threads)
-
-        raise ValueError(f"Unknown runner: {self.runner}")
+        raise ValueError(f"Unknown runner: {effective_runner}")
 
     def run(self):
         if self.runner == "threaded":
@@ -392,9 +595,8 @@ class MicroWorkflow:
     ) -> list[str]:
         """Run ready nodes concurrently, and jobs inside each node concurrently.
 
-        This is the dependency-free local equivalent of the Prefect-based mode,
-        but it also schedules multiple ready nodes at the same time. Each node
-        still uses its own max_threads value for jobs inside that node.
+        This schedules multiple ready nodes at the same time. Each node still
+        uses its own max_threads value for jobs inside that node.
         """
         selected = list(nodes) if nodes is not None else list(self.graph_obj.nodes)
         selected_set = set(selected)
@@ -487,6 +689,10 @@ class MicroWorkflow:
             raise
 
         self.refresh_node_status(node_name, allow_complete=True)
+
+        if self.node_complete(node_name):
+            self.flush_deferred_output_file_jobs(node_name)
+
         return result
 
     def run_job(

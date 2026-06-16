@@ -26,6 +26,42 @@ class NodeHandle:
             **params,
         )
 
+    def add_from_output_files(
+        self,
+        pattern: str = "*",
+        *,
+        file_param: str = "output_file",
+        autostart: bool = False,
+        recursive: bool = False,
+        files_only: bool = True,
+        path_mode: str = "absolute",
+        dedupe: bool = True,
+        **params,
+    ):
+        """Create downstream jobs from this node's output files after the node finishes.
+
+        The jobs are intentionally deferred because the node-level output folder
+        may not contain every file until all jobs in the current node have
+        finished. Each matched file becomes one downstream job, with the file
+        path placed in ``file_param``.
+        """
+        return self.system.defer_output_file_jobs(
+            from_node=self.from_node,
+            to_node=self.to_node,
+            pattern=pattern,
+            file_param=file_param,
+            autostart=autostart,
+            recursive=recursive,
+            files_only=files_only,
+            path_mode=path_mode,
+            dedupe=dedupe,
+            _parent_job_id=self.from_job_id,
+            **params,
+        )
+
+    # Short alias for code that reads naturally in node behavior files.
+    add_from_outputs = add_from_output_files
+
 
 class JobContext:
     def __init__(
@@ -83,6 +119,19 @@ class JobContext:
         files_only: bool = True,
     ) -> list[Path]:
         return self.system.storage.input_files(
+            self.current_node,
+            pattern=pattern,
+            recursive=recursive,
+            files_only=files_only,
+        )
+
+    def output_files(
+        self,
+        pattern: str = "*",
+        recursive: bool = False,
+        files_only: bool = True,
+    ) -> list[Path]:
+        return self.system.storage.output_files(
             self.current_node,
             pattern=pattern,
             recursive=recursive,
