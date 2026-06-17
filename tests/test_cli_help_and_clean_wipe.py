@@ -78,12 +78,10 @@ def test_clean_star_cleans_all_nodes_but_preserves_inputs(tmp_path, monkeypatch,
         node_dir = tmp_path / "node" / node
         assert (node_dir / "input" / "keep.txt").read_text(encoding="utf-8") == "input"
         assert not (node_dir / "output" / "remove.txt").exists()
-        assert (node_dir / "jobs" / "1" / "job.json").exists()
-        assert (node_dir / "jobs" / "1" / "input.json").exists()
-        assert not (node_dir / "jobs" / "1" / "output.json").exists()
-        assert not (node_dir / "jobs" / "1" / "files" / "debug.txt").exists()
-        status = json.loads((node_dir / "jobs" / "1" / "status.json").read_text(encoding="utf-8"))
-        assert status["status"] == "queued"
+        assert (node_dir / "jobs").is_dir()
+        assert not (node_dir / "jobs" / "1").exists()
+        node_status = json.loads((node_dir / "node_state.json").read_text(encoding="utf-8"))
+        assert node_status["status"] == "queued"
 
 
 def test_wipe_star_wipes_all_nodes_and_removes_inputs(tmp_path, monkeypatch, capsys):
@@ -101,10 +99,10 @@ def test_wipe_star_wipes_all_nodes_and_removes_inputs(tmp_path, monkeypatch, cap
         assert (node_dir / "input").is_dir()
         assert not (node_dir / "input" / "keep.txt").exists()
         assert not (node_dir / "output" / "remove.txt").exists()
-        assert (node_dir / "jobs" / "1" / "job.json").exists()
-        assert (node_dir / "jobs" / "1" / "input.json").exists()
-        status = json.loads((node_dir / "jobs" / "1" / "status.json").read_text(encoding="utf-8"))
-        assert status["status"] == "queued"
+        assert (node_dir / "jobs").is_dir()
+        assert not (node_dir / "jobs" / "1").exists()
+        node_status = json.loads((node_dir / "node_state.json").read_text(encoding="utf-8"))
+        assert node_status["status"] == "queued"
 
 
 def test_clean_star_also_works_when_shell_expands_star(tmp_path, monkeypatch, capsys):
@@ -118,3 +116,87 @@ def test_clean_star_also_works_when_shell_expands_star(tmp_path, monkeypatch, ca
 
     assert "Cleaned all nodes: alpha, beta, gamma" in out
     assert not (tmp_path / "node" / "alpha" / "output" / "remove.txt").exists()
+
+
+def make_chain_project(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    src = tmp_path / "src"
+    behavior = src / "node_behavior"
+    behavior.mkdir(parents=True)
+    (src / "graph.py").write_text(
+        "EDGES = [('A', 'B'), ('B', 'C')]\n",
+        encoding="utf-8",
+    )
+    (behavior / "A.py").write_text(
+        """
+from micro_workflow_manager import NodeRouter
+router = NodeRouter("A")
+router.create_job(params={"value": "from A"})
+@router.task
+def run(ctx, value):
+    ctx.node("B").add(value=value)
+    return value
+""".strip(),
+        encoding="utf-8",
+    )
+    (behavior / "B.py").write_text(
+        """
+from micro_workflow_manager import NodeRouter
+router = NodeRouter("B")
+@router.task
+def run(ctx, value):
+    ctx.node("C").add(value=value + " then B")
+    return value
+""".strip(),
+        encoding="utf-8",
+    )
+    (behavior / "C.py").write_text(
+        """
+from micro_workflow_manager import NodeRouter
+router = NodeRouter("C")
+@router.task
+def run(ctx, value):
+    return value
+""".strip(),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
+
+
+def test_run_b_after_run_a_keeps_a_finished_status(tmp_path, monkeypatch, capsys):
+    make_chain_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["run", "A", "--runner", "direct"]) == 0
+    capsys.readouterr()
+    assert json.loads((tmp_path / "node" / "A" / "node_state.json").read_text())["status"] == "done"
+
+    assert cli.main(["run", "B", "--runner", "direct"]) == 0
+    out = capsys.readouterr().out
+
+    assert "Ran:" in out
+    assert "  B" in out
+    assert json.loads((tmp_path / "node" / "A" / "node_state.json").read_text())["status"] == "done"
+    assert json.loads((tmp_path / "node" / "B" / "node_state.json").read_text())["status"] == "done"
+
+
+def test_cleaning_a_removes_finished_status_and_blocks_b(tmp_path, monkeypatch, capsys):
+    make_chain_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["run", "A", "--runner", "direct"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["clean", "A"]) == 0
+    capsys.readouterr()
+    assert json.loads((tmp_path / "node" / "A" / "node_state.json").read_text())["status"] == "queued"
+    assert not (tmp_path / "node" / "A" / "jobs" / "1").exists()
+
+    assert cli.main(["run", "B", "--runner", "direct"]) == 1
+    out = capsys.readouterr().out
+
+    assert "B is not ready yet." in out
+    assert "Previous nodes not finished:" in out
+    assert "A: queued" in out

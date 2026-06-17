@@ -16,7 +16,7 @@ from .system import MicroWorkflow
 
 MWF_FILE = ".mwf"
 RUNNER_CHOICES = ["threaded", "direct"]
-COMMAND_NAMES = ["init", "graph", "clean", "wipe", "run", "runfrom"]
+COMMAND_NAMES = ["init", "graph", "clean", "reset", "wipe", "run", "runfrom"]
 
 HELP_EPILOG = """
 Common help commands:
@@ -24,6 +24,7 @@ Common help commands:
   mwf init --help
   mwf graph --help
   mwf clean --help
+  mwf reset --help
   mwf wipe --help
   mwf run --help
   mwf runfrom --help
@@ -32,6 +33,7 @@ Command descriptions:
   mwf --describe init
   mwf --describe graph
   mwf --describe clean
+  mwf --describe reset
   mwf --describe wipe
   mwf --describe run
   mwf --describe runfrom
@@ -43,8 +45,10 @@ Typical flow:
   mwf runfrom start_node
 
 Cleaning:
-  mwf clean node_name   # clear output/files for one node, keep input files
+  mwf clean node_name   # clear output/files/jobs for one node, keep input files
   mwf clean *           # clean every node in the graph
+  mwf reset node_name   # clear outputs and rerun existing jobs, keep job definitions
+  mwf reset *           # reset every node in the graph
   mwf wipe node_name    # clean one node and remove its input folder too
   mwf wipe *            # wipe every node in the graph
 """
@@ -96,6 +100,7 @@ File-system context for each selected node:
   deletes node/<node>/jobs/ entirely
   resets node_state.json to queued
   the next CLI load will recreate router.create_job(...) defaults if declared
+  use reset instead when you want to keep existing job definitions and inputs
 
 Targets:
   mwf clean node_name   cleans one node
@@ -104,6 +109,29 @@ Targets:
 
 Shell note:
   in shells that expand *, quote it as mwf clean "*" if needed.
+""",
+    "reset": """
+reset reruns existing jobs for one or more nodes while preserving node input files and job definitions.
+
+Code context:
+  loads .mwf, graph.py, and node_behavior/*.py so it can validate node names
+  does not run your node task code
+
+File-system context for each selected node:
+  deletes node/<node>/output/
+  keeps node/<node>/input/
+  keeps node/<node>/jobs/<id>/job.json and input.json
+  removes per-job status/output/files so those jobs are queued again
+  resets node_state.json to queued
+  unlike clean, it does not delete the jobs folder or erase existing job inputs
+
+Targets:
+  mwf reset node_name   resets one node
+  mwf reset a b c       resets several named nodes
+  mwf reset *           resets every node in the graph
+
+Shell note:
+  in shells that expand *, quote it as mwf reset "*" if needed.
 """,
     "wipe": """
 wipe is clean plus input removal.
@@ -137,7 +165,7 @@ Code context:
 File-system context:
   does not invent starter jobs; declare them with router.create_job(...) in node_behavior/<node>.py
   resets the requested node's existing job artifacts before running it
-  if detected autostart nodes are included, clears those downstream nodes before running
+  if detected autostart nodes are included, resets those downstream nodes before running
   reads jobs from node/<node>/jobs/
   writes task artifacts under node/<node>/jobs/<job-id>/files/ and node/<node>/output/
 
@@ -156,7 +184,8 @@ Code context:
 
 File-system context:
   resets the starting node's existing job artifacts before running it
-  clears descendant nodes selected for this run
+  resets descendant nodes selected for this run while preserving router.create_job(...) jobs
+  removes stale parent-generated descendant jobs so upstream nodes can regenerate them
   queues autostart-created jobs instead of letting them escape the selected run set
   does not invent starter jobs; declare them with router.create_job(...) in node_behavior/<node>.py
   reads and writes each selected node's node/<node>/jobs/, node/<node>/output/, and node_state.json
@@ -190,14 +219,19 @@ def main(argv: list[str] | None = None) -> int:
 
         workflow = load_workflow(root, args.runner)
 
-        if args.command in {"clean", "wipe"}:
+        if args.command in {"clean", "reset", "wipe"}:
             nodes = resolve_node_targets(workflow, args.nodes)
-            remove_input = args.command == "wipe"
 
-            for node in nodes:
-                clean_node(root, workflow, node, remove_input=remove_input)
+            if args.command == "reset":
+                for node in nodes:
+                    reset_node_for_run(root, workflow, node)
+                verb = "Reset"
+            else:
+                remove_input = args.command == "wipe"
+                for node in nodes:
+                    clean_node(root, workflow, node, remove_input=remove_input)
+                verb = "Wiped" if remove_input else "Cleaned"
 
-            verb = "Wiped" if remove_input else "Cleaned"
             if is_all_nodes_request(args.nodes):
                 print(f"{verb} all nodes: {', '.join(nodes)}")
             else:
@@ -275,6 +309,19 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="node",
         help="One or more node names, or '*' to clean every graph node.",
+    )
+
+    reset_cmd = commands.add_parser(
+        "reset",
+        help="Reset node output/status artifacts while keeping input files and jobs. Use '*' for all nodes.",
+        description=COMMAND_DESCRIPTIONS["reset"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    reset_cmd.add_argument(
+        "nodes",
+        nargs="+",
+        metavar="node",
+        help="One or more node names, or '*' to reset every graph node.",
     )
 
     wipe_cmd = commands.add_parser(
@@ -494,7 +541,7 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str) -> int:
     reset_node_for_run(root, workflow, node)
     for item in nodes:
         if item != node:
-            clear_node(root, workflow, item)
+            reset_node_for_run(root, workflow, item, remove_parented_jobs=True)
 
     return run_nodes(workflow, nodes, node, ignore_external=ignore_external)
 
@@ -526,7 +573,7 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str) -> int:
     reset_node_for_run(root, workflow, node)
     for child in nodes:
         if child != node:
-            clear_node(root, workflow, child)
+            reset_node_for_run(root, workflow, child, remove_parented_jobs=True)
 
     return run_nodes(workflow, nodes, node, ignore_external=ignore_external)
 
@@ -677,12 +724,20 @@ def clean_node(
     workflow.storage.set_node_status(node, QUEUED)
 
 
-def reset_node_for_run(root: Path, workflow: MicroWorkflow, node: str):
-    """Reset existing jobs just before running a node.
+def reset_node_for_run(
+    root: Path,
+    workflow: MicroWorkflow,
+    node: str,
+    *,
+    remove_parented_jobs: bool = False,
+):
+    """Reset a node while preserving its job definitions.
 
-    `mwf run B` should rerun B's current jobs, including jobs created by A, so
-    this preserves job.json/input.json while deleting status/output/files. This
-    differs from user-facing `mwf clean B`, which removes the jobs entirely.
+    This keeps each job's job.json and input.json, but removes the generated
+    run artifacts so the job is queued again. When remove_parented_jobs=True,
+    jobs created by upstream runs are deleted instead of preserved; this lets
+    runfrom keep router.create_job(...) jobs on descendants while avoiding stale
+    dynamic jobs from earlier runs.
     """
     node_dir = safe_node_dir(root, node)
 
@@ -691,11 +746,16 @@ def reset_node_for_run(root: Path, workflow: MicroWorkflow, node: str):
     jobs_dir = node_dir / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
 
-    for job_dir in jobs_dir.iterdir():
+    for job_dir in list(jobs_dir.iterdir()):
         if not job_dir.is_dir() or not job_dir.name.isdigit():
             continue
 
-        for item in job_dir.iterdir():
+        job_data = workflow.storage.read_json(job_dir / "job.json", default={})
+        if remove_parented_jobs and job_data.get("parent") is not None:
+            remove_path(job_dir)
+            continue
+
+        for item in list(job_dir.iterdir()):
             if item.name in {"job.json", "input.json"}:
                 continue
             remove_path(item)
@@ -704,7 +764,6 @@ def reset_node_for_run(root: Path, workflow: MicroWorkflow, node: str):
 
     workflow.storage.init_node_folders(node)
     workflow.storage.set_node_status(node, QUEUED)
-
 
 def clear_node(root: Path, workflow: MicroWorkflow, node: str):
     node_dir = safe_node_dir(root, node)
