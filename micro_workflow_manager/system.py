@@ -286,12 +286,30 @@ class MicroWorkflow:
 
         node = self.ensure_node(node_name)
         created: list[Job] = []
+        changed_any_job = False
 
         with node.lock:
             node.validate_params(params)
 
             for offset in range(number):
                 job_id = start_job_id + offset
+                existed = self.storage.job_exists(node_name, job_id)
+                previous_params = None
+                previous_parent = None
+                previous_status = None
+
+                if existed:
+                    previous_params = self.storage.read_json(
+                        self.storage.input_file(node_name, job_id),
+                        default={},
+                    )
+                    previous_job_data = self.storage.read_json(
+                        self.storage.job_file(node_name, job_id),
+                        default={},
+                    )
+                    previous_parent = previous_job_data.get("parent")
+                    previous_status = self.storage.get_job_status(node_name, job_id)
+
                 job = Job(
                     job_id=job_id,
                     node_name=node_name,
@@ -301,7 +319,21 @@ class MicroWorkflow:
                 self.storage.ensure_job(job)
                 created.append(job)
 
-            self.storage.set_node_status(node_name, QUEUED)
+                if (
+                    not existed
+                    or previous_params != job.params
+                    or previous_parent is not None
+                    or previous_status is None
+                ):
+                    changed_any_job = True
+
+            # Router-declared jobs are mounted every time the CLI loads the
+            # workflow. Re-mounting an unchanged default job must not erase a
+            # previously completed node status, otherwise `mwf run A` followed by
+            # `mwf run B` would make B think A is unfinished. Only mark the node
+            # queued when a default job was actually created, refreshed, or fixed.
+            if changed_any_job:
+                self.storage.set_node_status(node_name, QUEUED)
 
         return created
 
