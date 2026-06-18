@@ -298,3 +298,93 @@ def test_runfrom_preserves_router_created_jobs_on_descendant_nodes(tmp_path, mon
     capsys.readouterr()
     assert len(list((tmp_path / "node" / "tagify" / "jobs").iterdir())) == 1
     assert (tmp_path / "node" / "disintegrate" / "jobs" / "1" / "files" / "combined.txt").read_text(encoding="utf-8") == "page 1"
+
+
+def make_job_selection_project(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    src = tmp_path / "src"
+    behavior = src / "node_behavior"
+    behavior.mkdir(parents=True)
+    (src / "graph.py").write_text(
+        "EDGES = [('work', 'after')]\n",
+        encoding="utf-8",
+    )
+    (behavior / "work.py").write_text(
+        """
+from micro_workflow_manager import NodeRouter
+router = NodeRouter("work")
+router.create_job(number=10)
+@router.task
+def run(ctx):
+    ctx.write("job.txt", f"job {ctx.job_id}")
+    return ctx.job_id
+""".strip(),
+        encoding="utf-8",
+    )
+    (behavior / "after.py").write_text(
+        """
+from micro_workflow_manager import NodeRouter
+router = NodeRouter("after")
+@router.task
+def run(ctx):
+    return "after"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
+
+
+def test_run_job_selection_runs_individual_jobs_and_ranges_only(tmp_path, monkeypatch, capsys):
+    make_job_selection_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["run", "work", "job", "1", "3", "8-10", "--runner", "direct"]) == 0
+    out = capsys.readouterr().out
+
+    assert "Ran jobs for work:" in out
+    for job_id in [1, 3, 8, 9, 10]:
+        assert f"  {job_id}" in out
+        assert (tmp_path / "node" / "work" / "jobs" / str(job_id) / "files" / "job.txt").read_text(encoding="utf-8") == f"job {job_id}"
+
+    for job_id in [2, 4, 5, 6, 7]:
+        assert not (tmp_path / "node" / "work" / "jobs" / str(job_id) / "files" / "job.txt").exists()
+        status = json.loads((tmp_path / "node" / "work" / "jobs" / str(job_id) / "status.json").read_text(encoding="utf-8"))
+        assert status["status"] == "queued"
+
+    node_status = json.loads((tmp_path / "node" / "work" / "node_state.json").read_text(encoding="utf-8"))
+    assert node_status["status"] == "queued"
+
+
+def test_run_job_selection_resets_only_selected_job_artifacts(tmp_path, monkeypatch, capsys):
+    make_job_selection_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["run", "work", "job", "2", "--runner", "direct"]) == 0
+    capsys.readouterr()
+
+    selected_file = tmp_path / "node" / "work" / "jobs" / "2" / "files" / "job.txt"
+    stale_file = tmp_path / "node" / "work" / "jobs" / "2" / "files" / "stale.txt"
+    other_status = tmp_path / "node" / "work" / "jobs" / "3" / "status.json"
+    stale_file.write_text("old", encoding="utf-8")
+
+    assert cli.main(["run", "work", "job", "2", "--runner", "direct"]) == 0
+    capsys.readouterr()
+
+    assert selected_file.read_text(encoding="utf-8") == "job 2"
+    assert not stale_file.exists()
+    assert json.loads(other_status.read_text(encoding="utf-8"))["status"] == "queued"
+
+
+def test_run_job_selection_rejects_bad_selectors(tmp_path, monkeypatch, capsys):
+    make_job_selection_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["run", "work", "job", "3-1", "--runner", "direct"]) == 1
+    err = capsys.readouterr().err
+    assert "Invalid job range: 3-1" in err
+
+    assert cli.main(["run", "work", "job", "999", "--runner", "direct"]) == 1
+    err = capsys.readouterr().err
+    assert "Job does not exist: work/999" in err

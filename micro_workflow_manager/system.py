@@ -566,11 +566,29 @@ class MicroWorkflow:
         return ran
 
     def run_node(self, node_name: str, ignore_readiness: bool = False):
+        jobs = self.storage.queued_jobs(node_name)
+        return self.run_node_jobs(
+            node_name=node_name,
+            jobs=jobs,
+            ignore_readiness=ignore_readiness,
+        )
+
+    def run_node_jobs(
+        self,
+        node_name: str,
+        jobs: list[Job],
+        ignore_readiness: bool = False,
+    ):
+        """Run a specific list of jobs from one node.
+
+        This is the shared implementation for normal node runs and the CLI's
+        job-selection mode. The supplied jobs are the only jobs executed; other
+        queued jobs on the same node are left untouched.
+        """
         if not ignore_readiness and not self.node_ready(node_name):
             raise InvalidGraphError(f"Node {node_name} is not ready yet")
 
         node = self.nodes[node_name]
-        jobs = self.storage.queued_jobs(node_name)
 
         if not jobs:
             self.refresh_node_status(node_name, allow_complete=True)
@@ -598,6 +616,27 @@ class MicroWorkflow:
         self.refresh_node_status(node_name, allow_complete=True)
 
         return result
+
+    def run_jobs(
+        self,
+        node_name: str,
+        job_ids: list[int],
+        ignore_readiness: bool = False,
+    ):
+        """Run selected job IDs from one node.
+
+        Unlike run_node(...), this does not gather every queued job. It loads the
+        exact job IDs requested by the caller and runs only those jobs.
+        """
+        if not job_ids:
+            return []
+
+        jobs = [self.storage.load_job(node_name, job_id) for job_id in job_ids]
+        return self.run_node_jobs(
+            node_name=node_name,
+            jobs=jobs,
+            ignore_readiness=ignore_readiness,
+        )
 
     def run_job(
         self,

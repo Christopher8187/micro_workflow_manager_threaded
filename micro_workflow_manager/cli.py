@@ -42,6 +42,7 @@ Typical flow:
   mwf init
   mwf graph src/graph.py
   mwf run start_node
+  mwf run start_node job 1 3 8-10
   mwf runfrom start_node
 
 Cleaning:
@@ -153,7 +154,15 @@ Shell note:
   in shells that expand *, quote it as mwf wipe "*" if needed.
 """,
     "run": """
-run executes one node if that node is ready.
+run executes one ready node, or selected jobs inside that node.
+
+Job-selection syntax:
+  mwf run node_name job 1
+  mwf run node_name job 1 3 8-10
+
+The job form reruns only the selected job IDs. Other jobs on the same node are
+left untouched. Selected jobs are reset before execution, so previously done or
+failed jobs can be rerun.
 
 Code context:
   loads .mwf, graph.py, and node_behavior/*.py
@@ -168,9 +177,12 @@ File-system context:
   if detected autostart nodes are included, resets those downstream nodes before running
   reads jobs from node/<node>/jobs/
   writes task artifacts under node/<node>/jobs/<job-id>/files/ and node/<node>/output/
+  in job-selection mode, clears only the selected job folders' status/output/files artifacts
 
 Use when:
-  you want to rerun a single ready node, or a node plus detected autostart chain.
+  you want to rerun a single ready node, or a node plus detected autostart chain
+  you want to rerun exact jobs without disturbing the rest of the node:
+    mwf run tagify job 1 3 8-10
 """,
     "runfrom": """
 runfrom executes a node and its descendants in graph order, with threaded execution where possible.
@@ -242,6 +254,9 @@ def main(argv: list[str] | None = None) -> int:
         require_node(workflow, node)
 
         if args.command == "run":
+            job_ids = selected_job_ids_from_args(args.job_mode, args.job_specs)
+            if job_ids is not None:
+                return run_selected_jobs(root, workflow, node, job_ids)
             return run_node(root, workflow, node)
 
         if args.command == "runfrom":
@@ -339,11 +354,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_cmd = commands.add_parser(
         "run",
-        help="Run one ready node, optionally following detected autostarts.",
+        help="Run one ready node, or selected jobs in that node.",
         description=COMMAND_DESCRIPTIONS["run"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     run_cmd.add_argument("node", help="Node name to run.")
+    run_cmd.add_argument(
+        "job_mode",
+        nargs="?",
+        metavar="job",
+        help="Optional literal 'job' or 'jobs' to run selected job IDs only.",
+    )
+    run_cmd.add_argument(
+        "job_specs",
+        nargs="*",
+        metavar="id|start-end",
+        help="Job IDs and ranges, for example: 1 3 8-10.",
+    )
     run_cmd.add_argument(
         "--runner",
         choices=RUNNER_CHOICES,
@@ -510,6 +537,98 @@ def read_edges(module) -> list[tuple[str, str]]:
 
     return result
 
+
+
+def selected_job_ids_from_args(job_mode: str | None, job_specs: list[str]) -> list[int] | None:
+    if job_mode is None:
+        if job_specs:
+            raise RuntimeError("Job selectors require the 'job' keyword, for example: mwf run node job 1 3 8-10")
+        return None
+
+    if job_mode not in {"job", "jobs"}:
+        raise RuntimeError(
+            f"Unexpected run argument: {job_mode}. Use: mwf run <node> job 1 3 8-10"
+        )
+
+    if not job_specs:
+        raise RuntimeError("No jobs selected. Use: mwf run <node> job 1 3 8-10")
+
+    return parse_job_selectors(job_specs)
+
+
+def parse_job_selectors(selectors: list[str]) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+
+    for selector in selectors:
+        if "-" in selector:
+            parts = selector.split("-")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise RuntimeError(f"Invalid job range: {selector}")
+
+            start = parse_positive_job_id(parts[0])
+            end = parse_positive_job_id(parts[1])
+
+            if end < start:
+                raise RuntimeError(f"Invalid job range: {selector}; end must be >= start")
+
+            values = range(start, end + 1)
+        else:
+            values = [parse_positive_job_id(selector)]
+
+        for job_id in values:
+            if job_id not in seen:
+                seen.add(job_id)
+                ids.append(job_id)
+
+    return ids
+
+
+def parse_positive_job_id(text: str) -> int:
+    if not text.isdigit():
+        raise RuntimeError(f"Invalid job id: {text}")
+
+    job_id = int(text)
+    if job_id < 1:
+        raise RuntimeError(f"Invalid job id: {text}; job IDs start at 1")
+
+    return job_id
+
+
+def run_selected_jobs(
+    root: Path,
+    workflow: MicroWorkflow,
+    node: str,
+    job_ids: list[int],
+) -> int:
+    if not is_ready(workflow, node):
+        print_not_ready(workflow, node)
+        return 1
+
+    for job_id in job_ids:
+        if not workflow.storage.job_exists(node, job_id):
+            raise RuntimeError(f"Job does not exist: {node}/{job_id}")
+
+    for job_id in job_ids:
+        reset_job_for_run(root, workflow, node, job_id)
+
+    previous_allowed_run_nodes = workflow.allowed_run_nodes
+    previous_autostart_mode = workflow.autostart_mode
+    workflow.allowed_run_nodes = {node}
+    workflow.autostart_mode = "queue"
+
+    try:
+        jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
+        workflow.run_node_jobs(node, jobs, ignore_readiness=True)
+    finally:
+        workflow.allowed_run_nodes = previous_allowed_run_nodes
+        workflow.autostart_mode = previous_autostart_mode
+
+    print(f"Ran jobs for {node}:")
+    for job_id in job_ids:
+        print(f"  {job_id}")
+
+    return 0
 
 def run_node(root: Path, workflow: MicroWorkflow, node: str) -> int:
     if not is_ready(workflow, node):
@@ -763,6 +882,28 @@ def reset_node_for_run(
         workflow.storage.set_job_status(node, int(job_dir.name), QUEUED)
 
     workflow.storage.init_node_folders(node)
+    workflow.storage.set_node_status(node, QUEUED)
+
+
+def reset_job_for_run(
+    root: Path,
+    workflow: MicroWorkflow,
+    node: str,
+    job_id: int,
+):
+    """Reset one job while preserving job.json and input.json."""
+    node_dir = safe_node_dir(root, node)
+    job_dir = node_dir / "jobs" / str(job_id)
+
+    if not job_dir.is_dir():
+        raise RuntimeError(f"Job does not exist: {node}/{job_id}")
+
+    for item in list(job_dir.iterdir()):
+        if item.name in {"job.json", "input.json"}:
+            continue
+        remove_path(item)
+
+    workflow.storage.set_job_status(node, job_id, QUEUED)
     workflow.storage.set_node_status(node, QUEUED)
 
 def clear_node(root: Path, workflow: MicroWorkflow, node: str):
