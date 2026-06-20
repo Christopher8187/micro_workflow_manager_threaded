@@ -618,18 +618,35 @@ class FileStorage:
 
         return self.read_json(status_path, default={}).get("status") == QUEUED
 
+    def iter_job_ids(self, node_name: str):
+        """Yield existing job IDs without building a full in-memory list first."""
+        jobs_root = self.jobs_dir(node_name)
+
+        with os.scandir(jobs_root) as entries:
+            for entry in entries:
+                if not entry.is_dir() or not entry.name.isdigit():
+                    continue
+
+                job_path = Path(entry.path) / "job.json"
+                if job_path.is_file():
+                    yield int(entry.name)
+
+    def iter_queued_job_ids(self, node_name: str):
+        """Yield queued job IDs lazily.
+
+        This lets runners start executing the first queued jobs while the rest of
+        a huge node is still being discovered. The older queued_job_ids() helper
+        still returns a sorted list for callers that need a stable display order.
+        """
+        for job_id in self.iter_job_ids(node_name):
+            if self.job_is_queued(node_name, job_id):
+                yield job_id
+
     def queued_job_ids(self, node_name: str) -> list[int]:
-        return [
-            job_id
-            for job_id in self.list_job_ids(node_name)
-            if self.job_is_queued(node_name, job_id)
-        ]
+        return sorted(self.iter_queued_job_ids(node_name))
 
     def has_queued_jobs(self, node_name: str) -> bool:
-        for job_id in self.list_job_ids(node_name):
-            if self.job_is_queued(node_name, job_id):
-                return True
-        return False
+        return next(self.iter_queued_job_ids(node_name), None) is not None
 
     def queued_jobs(self, node_name: str) -> list[Job]:
         return [

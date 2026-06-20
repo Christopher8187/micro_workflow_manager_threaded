@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from threading import Event, Lock
 from typing import Callable
 
 from .base import BaseRunner
@@ -61,3 +62,75 @@ class ThreadedRunner(BaseRunner):
                 results_by_index[index] = future.result()
 
         return results_by_index
+
+    def run_job_source(self, node_name: str, job_source, run_one: Callable):
+        """Run jobs from a lazy source without preloading every job.
+
+        Only max_threads worker loops are submitted. Each worker pulls the next
+        queued job ID/object when it is ready, so a node with thousands of jobs
+        can begin executing almost immediately instead of waiting for every job
+        JSON file to be loaded up front.
+        """
+        iterator = iter(job_source)
+        source_lock = Lock()
+        stop = Event()
+
+        def next_item():
+            if stop.is_set():
+                return None
+
+            with source_lock:
+                if stop.is_set():
+                    return None
+                try:
+                    return next(iterator)
+                except StopIteration:
+                    return None
+
+        def worker_loop():
+            results = []
+
+            while not stop.is_set():
+                item = next_item()
+                if item is None:
+                    break
+
+                try:
+                    results.append(run_one(item))
+                except Exception:
+                    stop.set()
+                    raise
+
+            return results
+
+        with ThreadPoolExecutor(
+            max_workers=self.max_threads,
+            thread_name_prefix=f"mwf-job-{node_name}",
+        ) as executor:
+            futures = [
+                executor.submit(worker_loop)
+                for _ in range(self.max_threads)
+            ]
+
+            done, not_done = wait(futures, return_when=FIRST_EXCEPTION)
+
+            first_error = None
+            for future in done:
+                try:
+                    future.result()
+                except Exception as error:  # keep original traceback via raise below
+                    first_error = error
+                    break
+
+            if first_error is not None:
+                stop.set()
+                for future in not_done:
+                    future.cancel()
+                wait(not_done)
+                raise first_error
+
+            results = []
+            for future in futures:
+                results.extend(future.result())
+
+        return results

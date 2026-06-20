@@ -222,7 +222,7 @@ def test_router_can_force_one_node_to_run_jobs_sequentially_with_threaded_workfl
         assert workflow.nodes["A"].runner_override == "direct"
 
 
-def test_run_node_marks_node_running_before_loading_queued_jobs(monkeypatch):
+def test_run_node_marks_node_running_before_streaming_queued_jobs(monkeypatch):
     with tempfile.TemporaryDirectory() as project_dir:
         workflow = MicroWorkflow(project_dir=project_dir, runner="direct")
         workflow.graph([("A", "B")])
@@ -236,14 +236,58 @@ def test_run_node_marks_node_running_before_loading_queued_jobs(monkeypatch):
             return "done"
 
         workflow.start("A")
-        original_queued_jobs = workflow.storage.queued_jobs
+        original_iter_queued_job_ids = workflow.storage.iter_queued_job_ids
         observed_status = {}
 
-        def queued_jobs_spy(node_name):
+        def iter_queued_job_ids_spy(node_name):
             observed_status[node_name] = workflow.storage.get_node_status(node_name)
-            return original_queued_jobs(node_name)
+            yield from original_iter_queued_job_ids(node_name)
 
-        monkeypatch.setattr(workflow.storage, "queued_jobs", queued_jobs_spy)
+        def queued_jobs_should_not_be_used(node_name):
+            raise AssertionError("run_node should stream queued job IDs instead")
+
+        monkeypatch.setattr(workflow.storage, "iter_queued_job_ids", iter_queued_job_ids_spy)
+        monkeypatch.setattr(workflow.storage, "queued_jobs", queued_jobs_should_not_be_used)
         workflow.run_node("A")
 
         assert observed_status["A"] == "running"
+
+
+def test_threaded_runner_starts_before_lazy_source_is_exhausted():
+    import threading
+    import time
+
+    from micro_workflow_manager.runners.threaded import ThreadedRunner
+
+    first_job_started = threading.Event()
+    allow_second_job = threading.Event()
+
+    def job_source():
+        yield 1
+        allow_second_job.wait(timeout=1)
+        yield 2
+
+    def run_one(job_id):
+        if job_id == 1:
+            first_job_started.set()
+        return job_id
+
+    result_holder = {}
+
+    def run_runner():
+        result_holder["result"] = ThreadedRunner(max_threads=2).run_job_source(
+            node_name="A",
+            job_source=job_source(),
+            run_one=run_one,
+        )
+
+    thread = threading.Thread(target=run_runner)
+    thread.start()
+
+    assert first_job_started.wait(timeout=0.5)
+    assert thread.is_alive()
+
+    allow_second_job.set()
+    thread.join(timeout=1)
+
+    assert sorted(result_holder["result"]) == [1, 2]

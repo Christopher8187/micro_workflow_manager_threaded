@@ -443,8 +443,10 @@ class MicroWorkflow:
         rows = self.storage.list_jobs(node_name)
 
         if not rows:
-            if self.storage.get_node_status(node_name) is None:
-                self.storage.set_node_status(node_name, QUEUED)
+            current_status = self.storage.get_node_status(node_name)
+            if current_status in {DONE, FAILED, CANCELLED, SKIPPED}:
+                return
+            self.storage.set_node_status(node_name, QUEUED)
             return
 
         statuses = {row.get("status") for row in rows}
@@ -590,17 +592,52 @@ class MicroWorkflow:
         if not ignore_readiness and not self.node_ready(node_name):
             raise InvalidGraphError(f"Node {node_name} is not ready yet")
 
-        # Make the node-level status flip immediately. With thousands of jobs,
-        # loading every queued job can take noticeable time; the user should not
-        # see the node stuck at queued while that bookkeeping happens.
+        # Make the node-level status flip immediately. Queued jobs are then
+        # streamed to the runner by ID, so execution can start before every job
+        # folder has been scanned and before every input.json has been loaded.
         self.storage.set_node_status(node_name, RUNNING)
 
-        jobs = self.storage.queued_jobs(node_name)
-        return self.run_node_jobs(
+        return self.run_queued_node_jobs(
             node_name=node_name,
-            jobs=jobs,
             ignore_readiness=True,
         )
+
+    def run_queued_node_jobs(
+        self,
+        node_name: str,
+        ignore_readiness: bool = False,
+    ):
+        """Run all currently queued jobs for one node using a lazy job source."""
+        if not ignore_readiness and not self.node_ready(node_name):
+            raise InvalidGraphError(f"Node {node_name} is not ready yet")
+
+        node = self.nodes[node_name]
+
+        if not self.storage.has_queued_jobs(node_name):
+            self.refresh_node_status(node_name, allow_complete=True)
+            return []
+
+        self.storage.set_node_status(node_name, RUNNING)
+        runner = self.make_runner(node)
+
+        try:
+            result = runner.run_job_source(
+                node_name=node_name,
+                job_source=self.storage.iter_queued_job_ids(node_name),
+                run_one=lambda job_id: self.run_job(
+                    node_name=node_name,
+                    job_id=job_id,
+                    ignore_readiness=True,
+                ),
+            )
+
+        except Exception:
+            self.storage.set_node_status(node_name, FAILED)
+            raise
+
+        self.refresh_node_status(node_name, allow_complete=True)
+
+        return result
 
     def run_node_jobs(
         self,

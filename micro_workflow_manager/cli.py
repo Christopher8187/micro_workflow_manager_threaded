@@ -776,7 +776,7 @@ def run_nodes(
             for node in unfinished:
                 status = workflow.storage.get_node_status(node) or "missing"
                 job_count = len(workflow.storage.list_jobs(node))
-                queued_count = len(workflow.storage.queued_jobs(node))
+                queued_count = len(workflow.storage.queued_job_ids(node))
                 print(f"  {node}: {status}, jobs={job_count}, queued={queued_count}")
             print("This usually means an upstream task did not create the expected downstream jobs.")
             return 1
