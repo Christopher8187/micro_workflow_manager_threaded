@@ -23,6 +23,12 @@ def write_json(path: Path, data: dict):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+def read_status_or_queued(path: Path) -> str:
+    if not path.exists():
+        return "queued"
+    return json.loads(path.read_text(encoding="utf-8"))["status"]
+
+
 def seed_dirty_node(tmp_path: Path, node: str):
     node_dir = tmp_path / "node" / node
     (node_dir / "input" / "keep.txt").write_text("input", encoding="utf-8")
@@ -102,7 +108,7 @@ def test_reset_star_preserves_job_definitions_and_requeues_jobs(tmp_path, monkey
         assert not (node_dir / "output" / "remove.txt").exists()
         assert (job_dir / "job.json").exists()
         assert json.loads((job_dir / "input.json").read_text(encoding="utf-8")) == {"value": node}
-        assert json.loads((job_dir / "status.json").read_text(encoding="utf-8"))["status"] == "queued"
+        assert read_status_or_queued(job_dir / "status.json") == "queued"
         assert not (job_dir / "output.json").exists()
         assert not (job_dir / "files" / "debug.txt").exists()
         node_status = json.loads((node_dir / "node_state.json").read_text(encoding="utf-8"))
@@ -350,8 +356,8 @@ def test_run_job_selection_runs_individual_jobs_and_ranges_only(tmp_path, monkey
 
     for job_id in [2, 4, 5, 6, 7]:
         assert not (tmp_path / "node" / "work" / "jobs" / str(job_id) / "files" / "job.txt").exists()
-        status = json.loads((tmp_path / "node" / "work" / "jobs" / str(job_id) / "status.json").read_text(encoding="utf-8"))
-        assert status["status"] == "queued"
+        status_path = tmp_path / "node" / "work" / "jobs" / str(job_id) / "status.json"
+        assert read_status_or_queued(status_path) == "queued"
 
     node_status = json.loads((tmp_path / "node" / "work" / "node_state.json").read_text(encoding="utf-8"))
     assert node_status["status"] == "queued"
@@ -374,7 +380,7 @@ def test_run_job_selection_resets_only_selected_job_artifacts(tmp_path, monkeypa
 
     assert selected_file.read_text(encoding="utf-8") == "job 2"
     assert not stale_file.exists()
-    assert json.loads(other_status.read_text(encoding="utf-8"))["status"] == "queued"
+    assert read_status_or_queued(other_status) == "queued"
 
 
 def test_run_job_selection_rejects_bad_selectors(tmp_path, monkeypatch, capsys):

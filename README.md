@@ -58,6 +58,11 @@ mwf graph src/graph.py --runner direct
 mwf runfrom start_node
 ```
 
+
+## Large-node performance note
+
+For large nodes, `queued` is the implicit per-job status. A job with `job.json` and `input.json` but no `status.json` is treated as queued by the storage API. This avoids thousands of small JSON writes during reset/requeue and lets `node_state.json` switch to `running` before the runner loads every queued job. Explicit `status.json` files are still written for `running`, `done`, `failed`, `cancelled`, and `skipped` jobs.
+
 ## Install for development
 
 ```bash

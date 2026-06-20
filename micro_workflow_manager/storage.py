@@ -89,6 +89,9 @@ class FileStorage:
     def node_schema_file(self, node_name: str) -> Path:
         return self.node_dir(node_name) / "schema.json"
 
+    def default_jobs_file(self, node_name: str) -> Path:
+        return self.node_dir(node_name) / "default_jobs.json"
+
     def job_base_dir(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
         return self.safe_join(self.jobs_dir(node_name), str(job_id))
@@ -122,6 +125,17 @@ class FileStorage:
             raise TypeError(
                 f"Data written to {path} must be JSON serializable: {error}"
             ) from error
+
+    def json_signature(self, data: Any) -> str:
+        try:
+            return json.dumps(
+                data,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except TypeError as error:
+            raise TypeError(f"Data must be JSON serializable: {error}") from error
 
     def atomic_write_json(self, path: Path, data: Any):
         with self.lock:
@@ -375,6 +389,59 @@ class FileStorage:
         job_id = self.validate_job_id(job_id)
         return self.job_file(node_name, job_id).exists()
 
+    def default_job_spec_key(self, start_job_id: int, number: int) -> str:
+        return f"{start_job_id}:{number}"
+
+    def default_job_spec_current(
+        self,
+        node_name: str,
+        *,
+        start_job_id: int,
+        number: int,
+        params: dict[str, Any],
+    ) -> bool:
+        manifest = self.read_json(self.default_jobs_file(node_name), default={})
+        if not isinstance(manifest, dict):
+            return False
+
+        key = self.default_job_spec_key(start_job_id, number)
+        expected = {
+            "start_job_id": start_job_id,
+            "number": number,
+            "params_signature": self.json_signature(params),
+        }
+
+        if manifest.get(key) != expected:
+            return False
+
+        jobs_root = self.jobs_dir(node_name)
+        return all(
+            (jobs_root / str(job_id) / "job.json").is_file()
+            for job_id in range(start_job_id, start_job_id + number)
+        )
+
+    def write_default_job_spec(
+        self,
+        node_name: str,
+        *,
+        start_job_id: int,
+        number: int,
+        params: dict[str, Any],
+    ):
+        with self.lock:
+            path = self.default_jobs_file(node_name)
+            manifest = self.read_json(path, default={})
+            if not isinstance(manifest, dict):
+                manifest = {}
+
+            key = self.default_job_spec_key(start_job_id, number)
+            manifest[key] = {
+                "start_job_id": start_job_id,
+                "number": number,
+                "params_signature": self.json_signature(params),
+            }
+            self.atomic_write_json(path, manifest)
+
     def create_job(self, job: Job):
         self.validate_job_id(job.job_id)
         # Validate before creating folders so bad params cannot leave partial jobs.
@@ -470,6 +537,20 @@ class FileStorage:
     def set_job_status(self, node_name: str, job_id: int, status: str, **extra):
         job_id = self.validate_job_id(job_id)
         status = self.validate_status(status)
+
+        # QUEUED is the default state for an existing job. Keeping it implicit
+        # avoids thousands of tiny JSON writes when a large node is reset before
+        # a run. Non-queued states still get an explicit status.json so existing
+        # tooling can inspect running/done/failed jobs on disk.
+        if status == QUEUED and not extra:
+            with self.lock:
+                path = self.status_file(node_name, job_id)
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            return
+
         data = {
             "job_id": job_id,
             "node_name": node_name,
@@ -484,10 +565,14 @@ class FileStorage:
 
     def get_job_status(self, node_name: str, job_id: int) -> str | None:
         self.validate_job_id(job_id)
+
+        if not self.job_exists(node_name, job_id):
+            return None
+
         data = self.read_json(self.status_file(node_name, job_id), default=None)
 
         if data is None:
-            return None
+            return QUEUED
 
         return data.get("status")
 
@@ -505,7 +590,14 @@ class FileStorage:
 
         for job_id in self.list_job_ids(node_name):
             job_data = self.read_json(self.job_file(node_name, job_id), default={})
-            status_data = self.read_json(self.status_file(node_name, job_id), default={})
+            status_data = self.read_json(
+                self.status_file(node_name, job_id),
+                default={
+                    "job_id": job_id,
+                    "node_name": node_name,
+                    "status": QUEUED,
+                },
+            )
 
             row = {
                 **job_data,
@@ -517,13 +609,33 @@ class FileStorage:
 
         return rows
 
+    def job_is_queued(self, node_name: str, job_id: int) -> bool:
+        self.validate_job_id(job_id)
+        status_path = self.status_file(node_name, job_id)
+
+        if not status_path.exists():
+            return self.job_exists(node_name, job_id)
+
+        return self.read_json(status_path, default={}).get("status") == QUEUED
+
+    def queued_job_ids(self, node_name: str) -> list[int]:
+        return [
+            job_id
+            for job_id in self.list_job_ids(node_name)
+            if self.job_is_queued(node_name, job_id)
+        ]
+
+    def has_queued_jobs(self, node_name: str) -> bool:
+        for job_id in self.list_job_ids(node_name):
+            if self.job_is_queued(node_name, job_id):
+                return True
+        return False
+
     def queued_jobs(self, node_name: str) -> list[Job]:
-        jobs = []
-
-        for row in self.list_jobs(node_name, status=QUEUED):
-            jobs.append(self.load_job(node_name, row["job_id"]))
-
-        return jobs
+        return [
+            self.load_job(node_name, job_id)
+            for job_id in self.queued_job_ids(node_name)
+        ]
 
     def write_output(self, node_name: str, job_id: int, data: dict):
         self.validate_job_id(job_id)

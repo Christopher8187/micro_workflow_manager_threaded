@@ -220,3 +220,30 @@ def test_router_can_force_one_node_to_run_jobs_sequentially_with_threaded_workfl
         assert elapsed >= 0.20
         assert workflow.node_complete("A")
         assert workflow.nodes["A"].runner_override == "direct"
+
+
+def test_run_node_marks_node_running_before_loading_queued_jobs(monkeypatch):
+    with tempfile.TemporaryDirectory() as project_dir:
+        workflow = MicroWorkflow(project_dir=project_dir, runner="direct")
+        workflow.graph([("A", "B")])
+
+        @workflow.task("A")
+        def a(ctx):
+            return "done"
+
+        @workflow.task("B")
+        def b(ctx):
+            return "done"
+
+        workflow.start("A")
+        original_queued_jobs = workflow.storage.queued_jobs
+        observed_status = {}
+
+        def queued_jobs_spy(node_name):
+            observed_status[node_name] = workflow.storage.get_node_status(node_name)
+            return original_queued_jobs(node_name)
+
+        monkeypatch.setattr(workflow.storage, "queued_jobs", queued_jobs_spy)
+        workflow.run_node("A")
+
+        assert observed_status["A"] == "running"

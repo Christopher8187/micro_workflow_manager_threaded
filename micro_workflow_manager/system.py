@@ -291,6 +291,22 @@ class MicroWorkflow:
         with node.lock:
             node.validate_params(params)
 
+            if self.storage.default_job_spec_current(
+                node_name,
+                start_job_id=start_job_id,
+                number=number,
+                params=params,
+            ):
+                return [
+                    Job(
+                        job_id=start_job_id + offset,
+                        node_name=node_name,
+                        params=dict(params),
+                        parent=None,
+                    )
+                    for offset in range(number)
+                ]
+
             for offset in range(number):
                 job_id = start_job_id + offset
                 existed = self.storage.job_exists(node_name, job_id)
@@ -326,6 +342,13 @@ class MicroWorkflow:
                     or previous_status is None
                 ):
                     changed_any_job = True
+
+            self.storage.write_default_job_spec(
+                node_name,
+                start_job_id=start_job_id,
+                number=number,
+                params=params,
+            )
 
             # Router-declared jobs are mounted every time the CLI loads the
             # workflow. Re-mounting an unchanged default job must not erase a
@@ -459,9 +482,7 @@ class MicroWorkflow:
         ready = []
 
         for node_name in self.graph_obj.nodes:
-            queued = self.storage.queued_jobs(node_name)
-
-            if queued and self.node_ready(node_name):
+            if self.storage.has_queued_jobs(node_name) and self.node_ready(node_name):
                 ready.append(node_name)
 
         return ready
@@ -530,7 +551,7 @@ class MicroWorkflow:
                     node_name
                     for node_name in selected
                     if node_name not in in_flight
-                    and self.storage.queued_jobs(node_name)
+                    and self.storage.has_queued_jobs(node_name)
                     and check(node_name)
                 ]
 
@@ -566,11 +587,19 @@ class MicroWorkflow:
         return ran
 
     def run_node(self, node_name: str, ignore_readiness: bool = False):
+        if not ignore_readiness and not self.node_ready(node_name):
+            raise InvalidGraphError(f"Node {node_name} is not ready yet")
+
+        # Make the node-level status flip immediately. With thousands of jobs,
+        # loading every queued job can take noticeable time; the user should not
+        # see the node stuck at queued while that bookkeeping happens.
+        self.storage.set_node_status(node_name, RUNNING)
+
         jobs = self.storage.queued_jobs(node_name)
         return self.run_node_jobs(
             node_name=node_name,
             jobs=jobs,
-            ignore_readiness=ignore_readiness,
+            ignore_readiness=True,
         )
 
     def run_node_jobs(

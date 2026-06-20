@@ -11,7 +11,7 @@ from pathlib import Path
 
 import networkx as nx
 
-from .models import QUEUED
+from .models import QUEUED, RUNNING
 from .system import MicroWorkflow
 
 MWF_FILE = ".mwf"
@@ -609,8 +609,12 @@ def run_selected_jobs(
         if not workflow.storage.job_exists(node, job_id):
             raise RuntimeError(f"Job does not exist: {node}/{job_id}")
 
+    # Flip the visible node status before reset bookkeeping, so a large selected
+    # run does not appear stuck at queued while stale artifacts are removed.
+    workflow.storage.set_node_status(node, RUNNING)
+
     for job_id in job_ids:
-        reset_job_for_run(root, workflow, node, job_id)
+        reset_job_for_run(root, workflow, node, job_id, mark_queued=False)
 
     previous_allowed_run_nodes = workflow.allowed_run_nodes
     previous_autostart_mode = workflow.autostart_mode
@@ -657,7 +661,11 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str) -> int:
             return 1
         ignore_external = True
 
-    reset_node_for_run(root, workflow, node)
+    # The requested node is now actively being prepared to run. Keep it marked
+    # running during reset/bookkeeping instead of flipping back to queued.
+    workflow.storage.set_node_status(node, RUNNING)
+
+    reset_node_for_run(root, workflow, node, mark_queued=False)
     for item in nodes:
         if item != node:
             reset_node_for_run(root, workflow, item, remove_parented_jobs=True)
@@ -689,7 +697,9 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str) -> int:
             return 1
         ignore_external = True
 
-    reset_node_for_run(root, workflow, node)
+    workflow.storage.set_node_status(node, RUNNING)
+
+    reset_node_for_run(root, workflow, node, mark_queued=False)
     for child in nodes:
         if child != node:
             reset_node_for_run(root, workflow, child, remove_parented_jobs=True)
@@ -711,7 +721,8 @@ def run_nodes(
     workflow.autostart_mode = "queue"
 
     try:
-        if not workflow.storage.queued_jobs(start_node):
+        if not workflow.storage.has_queued_jobs(start_node):
+            workflow.storage.set_node_status(start_node, QUEUED)
             print(
                 f"No queued jobs for {start_node}. "
                 f"Create default jobs in node_behavior/{start_node}.py with "
@@ -736,7 +747,7 @@ def run_nodes(
                 ready = [
                     node
                     for node in nodes
-                    if workflow.storage.queued_jobs(node)
+                    if workflow.storage.has_queued_jobs(node)
                     and ready_for_run_set(workflow, node, run_set, ignore_external)
                 ]
 
@@ -749,7 +760,7 @@ def run_nodes(
 
         workflow.finalize_ready_nodes()
 
-        blocked = [node for node in nodes if workflow.storage.queued_jobs(node)]
+        blocked = [node for node in nodes if workflow.storage.has_queued_jobs(node)]
 
         if blocked:
             print("Stopped before these queued nodes became ready:")
@@ -849,6 +860,7 @@ def reset_node_for_run(
     node: str,
     *,
     remove_parented_jobs: bool = False,
+    mark_queued: bool = True,
 ):
     """Reset a node while preserving its job definitions.
 
@@ -869,20 +881,23 @@ def reset_node_for_run(
         if not job_dir.is_dir() or not job_dir.name.isdigit():
             continue
 
-        job_data = workflow.storage.read_json(job_dir / "job.json", default={})
-        if remove_parented_jobs and job_data.get("parent") is not None:
-            remove_path(job_dir)
-            continue
-
-        for item in list(job_dir.iterdir()):
-            if item.name in {"job.json", "input.json"}:
+        if remove_parented_jobs:
+            job_data = workflow.storage.read_json(job_dir / "job.json", default={})
+            if job_data.get("parent") is not None:
+                remove_path(job_dir)
                 continue
-            remove_path(item)
 
-        workflow.storage.set_job_status(node, int(job_dir.name), QUEUED)
+        # Remove the known generated artifacts directly instead of scanning every
+        # child path. On nodes with thousands of jobs this removes a large amount
+        # of startup bookkeeping before the actual run begins. A missing
+        # status.json is now interpreted as queued by FileStorage.
+        remove_path(job_dir / "status.json")
+        remove_path(job_dir / "output.json")
+        remove_path(job_dir / "files")
 
     workflow.storage.init_node_folders(node)
-    workflow.storage.set_node_status(node, QUEUED)
+    if mark_queued:
+        workflow.storage.set_node_status(node, QUEUED)
 
 
 def reset_job_for_run(
@@ -890,6 +905,8 @@ def reset_job_for_run(
     workflow: MicroWorkflow,
     node: str,
     job_id: int,
+    *,
+    mark_queued: bool = True,
 ):
     """Reset one job while preserving job.json and input.json."""
     node_dir = safe_node_dir(root, node)
@@ -898,13 +915,12 @@ def reset_job_for_run(
     if not job_dir.is_dir():
         raise RuntimeError(f"Job does not exist: {node}/{job_id}")
 
-    for item in list(job_dir.iterdir()):
-        if item.name in {"job.json", "input.json"}:
-            continue
-        remove_path(item)
+    remove_path(job_dir / "status.json")
+    remove_path(job_dir / "output.json")
+    remove_path(job_dir / "files")
 
-    workflow.storage.set_job_status(node, job_id, QUEUED)
-    workflow.storage.set_node_status(node, QUEUED)
+    if mark_queued:
+        workflow.storage.set_node_status(node, QUEUED)
 
 def clear_node(root: Path, workflow: MicroWorkflow, node: str):
     node_dir = safe_node_dir(root, node)
