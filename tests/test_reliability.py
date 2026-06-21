@@ -291,3 +291,90 @@ def test_threaded_runner_starts_before_lazy_source_is_exhausted():
     thread.join(timeout=1)
 
     assert sorted(result_holder["result"]) == [1, 2]
+
+
+def test_process_runner_executes_jobs_in_child_processes_and_keeps_dynamic_job_ids_unique(tmp_path, monkeypatch):
+    import json
+    import os
+    import textwrap
+
+    from micro_workflow_manager import cli
+
+    monkeypatch.chdir(tmp_path)
+    behavior = tmp_path / "src" / "node_behavior"
+    behavior.mkdir(parents=True)
+    (tmp_path / "src" / "graph.py").write_text(
+        "EDGES = [('A', 'B')]\n",
+        encoding="utf-8",
+    )
+    (behavior / "A.py").write_text(
+        textwrap.dedent(
+            """
+            import os
+            import time
+            from micro_workflow_manager import NodeRouter
+
+            router = NodeRouter("A", max_threads=2)
+            router.create_job(number=6)
+
+            @router.task
+            def run(ctx):
+                time.sleep(0.05)
+                ctx.node("B").add(value=ctx.job_id)
+                return os.getpid()
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    (behavior / "B.py").write_text(
+        textwrap.dedent(
+            """
+            from micro_workflow_manager import NodeRouter
+
+            router = NodeRouter("B", max_threads=2)
+
+            @router.task
+            def run(ctx, value):
+                return value
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "process"]) == 0
+    assert cli.main(["runfrom", "A", "--runner", "process"]) == 0
+
+    parent_pid = os.getpid()
+    child_pids = set()
+    for job_id in range(1, 7):
+        data = json.loads((tmp_path / "node" / "A" / "jobs" / str(job_id) / "output.json").read_text())
+        child_pids.add(int(data["result_repr"]))
+
+    assert child_pids
+    assert parent_pid not in child_pids
+    assert sorted(path.name for path in (tmp_path / "node" / "B" / "jobs").iterdir()) == [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+    ]
+    assert json.loads((tmp_path / "node" / "A" / "node_state.json").read_text())["status"] == "done"
+    assert json.loads((tmp_path / "node" / "B" / "node_state.json").read_text())["status"] == "done"
+
+
+def test_process_runner_without_graph_path_explains_requirement(tmp_path):
+    import pytest
+
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="process")
+
+    @workflow.task("A")
+    def a(ctx):
+        return ctx.job_id
+
+    workflow.start("A")
+
+    with pytest.raises(RuntimeError, match="process runner needs a graph file"):
+        workflow.run_node("A")

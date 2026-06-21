@@ -51,6 +51,34 @@ mwf runfrom start_node
 - multiple ready nodes at the same time, while still respecting DAG predecessor completion
 - newly-ready downstream nodes while unrelated nodes are still running
 
+For CPU-heavy work, use the process-pool runner:
+
+```bash
+mwf graph src/graph.py --runner process
+mwf runfrom start_node
+```
+
+`process` mirrors the threaded runner's workflow behavior, but jobs run in child Python processes through `ProcessPoolExecutor`. It still runs multiple ready nodes at the same time, streams large job queues lazily, respects DAG readiness, and uses each node's `max_threads` value as the process-worker cap for that node. `processes`, `process_pool`, and `processpool` are accepted aliases.
+
+Process mode is meant for normal CLI/router projects where child processes can rebuild the workflow from `src/graph.py` and `src/node_behavior/*.py`. Keep process-run node code in importable files, and return pickleable values such as strings, numbers, lists, dicts, or `Path` objects. On Windows, use the CLI or put programmatic runs behind `if __name__ == "__main__":`.
+
+A node can override the global runner:
+
+```python
+from micro_workflow_manager import NodeRouter
+
+router = NodeRouter("ocr_pages", max_threads=4, runner="process")
+router.create_job(number=8)
+
+@router.task
+def ocr_pages(ctx):
+    # CPU-heavy page work here. With runner="process", up to 4 jobs for
+    # this node run in separate Python processes.
+    text = f"processed page job {ctx.job_id}"
+    ctx.write(f"page_{ctx.job_id}.txt", text)
+    return text
+```
+
 For step-by-step debugging, use the direct runner:
 
 ```bash

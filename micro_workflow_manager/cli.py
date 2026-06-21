@@ -12,10 +12,10 @@ from pathlib import Path
 import networkx as nx
 
 from .models import QUEUED, RUNNING
-from .system import MicroWorkflow
+from .system import MicroWorkflow, normalize_workflow_runner
 
 MWF_FILE = ".mwf"
-RUNNER_CHOICES = ["threaded", "direct"]
+RUNNER_CHOICES = ["threaded", "process", "direct", "thread", "processes", "process_pool", "processpool"]
 COMMAND_NAMES = ["init", "graph", "clean", "reset", "wipe", "run", "runfrom"]
 
 HELP_EPILOG = """
@@ -86,6 +86,7 @@ File-system context:
 Use when:
   you add or change graph edges, or you want to change the stored default runner:
     mwf graph src/graph.py --runner threaded
+    mwf graph src/graph.py --runner process
     mwf graph src/graph.py --runner direct
 """,
     "clean": """
@@ -192,7 +193,7 @@ Code context:
   computes all descendants of the requested start node
   may inspect node_behavior source code for simple autostart calls outside that descendant set
   uses the stored runner from .mwf unless --runner is provided
-  honors per-node runner overrides such as runner="direct" or runner="threaded"
+  honors per-node runner overrides such as runner="direct", runner="threaded", or runner="process"
 
 File-system context:
   resets the starting node's existing job artifacts before running it
@@ -473,7 +474,7 @@ def setup_graph(root: Path, graph_path: str, runner: str | None = None) -> int:
     config["graph_path"] = str(path.relative_to(root))
 
     if runner is not None:
-        config["runner"] = runner
+        config["runner"] = normalize_workflow_runner(runner)
 
     write_json(root / MWF_FILE, config)
     workflow = load_workflow(root, runner)
@@ -499,7 +500,11 @@ def load_workflow(root: Path, runner: str | None = None) -> MicroWorkflow:
     module = import_file(graph_file)
     edges = read_edges(module)
 
-    workflow = MicroWorkflow(project_dir=root, runner=runner or config.get("runner", "threaded"))
+    workflow = MicroWorkflow(
+        project_dir=root,
+        runner=runner or config.get("runner", "threaded"),
+        process_graph_path=graph_file,
+    )
     workflow.graph(edges)
     workflow.include_node_dir(graph_file.parent / "node_behavior")
     return workflow
@@ -730,7 +735,7 @@ def run_nodes(
             )
             return 0
 
-        if workflow.runner == "threaded":
+        if workflow.runner in {"threaded", "process"}:
             ran = workflow.run_concurrently(
                 nodes=nodes,
                 ready_check=lambda item: ready_for_run_set(

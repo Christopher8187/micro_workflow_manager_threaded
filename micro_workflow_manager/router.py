@@ -100,7 +100,7 @@ class NodeRouter:
         return self
 
     def use_runner(self, runner: str) -> "NodeRouter":
-        """Force this node to use a specific runner: 'direct' or 'threaded'."""
+        """Force this node to use 'direct', 'threaded', or 'process'."""
         self.runner_override = validate_node_runner(runner)
         if self.runner_override == "direct":
             self.max_threads = 1

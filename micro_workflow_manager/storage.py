@@ -1,7 +1,9 @@
 import json
 import os
+import re
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from shutil import copy2
 from threading import RLock
@@ -45,6 +47,48 @@ class FileStorage:
 
     def workflow_file(self) -> Path:
         return self.project_dir / ".mwf"
+
+    def lock_dir(self) -> Path:
+        path = self.project_dir / ".mwf_locks"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def lock_file(self, name: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "lock"
+        return self.lock_dir() / f"{safe}.lock"
+
+    @contextmanager
+    def interprocess_lock(self, name: str):
+        """Cross-process file lock for state that needs read/modify/write safety.
+
+        Thread locks protect one Python process. The process runner has several
+        Python interpreters writing the same file-backed workflow, so job ID
+        allocation and unique input-file naming also need a small OS file lock.
+        """
+        path = self.lock_file(name)
+
+        with path.open("a+b") as file:
+            if os.name == "nt":
+                import msvcrt
+
+                if file.tell() == 0 and file.read(1) == b"":
+                    file.write(b"0")
+                    file.flush()
+                file.seek(0)
+                msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    file.seek(0)
+                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
     def node_dir(self, node_name: str) -> Path:
         node_name = self.validate_node_name(node_name)
@@ -269,13 +313,14 @@ class FileStorage:
         *,
         overwrite: bool = False,
     ) -> Path:
-        directory = self.node_input_dir(node_name)
-        path = self.safe_join(directory, filename)
-        if path.exists() and not overwrite:
-            path = self.unique_target(path.parent, path.name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return path
+        with self.interprocess_lock(f"node-{node_name}-input"):
+            directory = self.node_input_dir(node_name)
+            path = self.safe_join(directory, filename)
+            if path.exists() and not overwrite:
+                path = self.unique_target(path.parent, path.name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            return path
 
     def write_node_input_bytes(
         self,
@@ -285,13 +330,14 @@ class FileStorage:
         *,
         overwrite: bool = False,
     ) -> Path:
-        directory = self.node_input_dir(node_name)
-        path = self.safe_join(directory, filename)
-        if path.exists() and not overwrite:
-            path = self.unique_target(path.parent, path.name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-        return path
+        with self.interprocess_lock(f"node-{node_name}-input"):
+            directory = self.node_input_dir(node_name)
+            path = self.safe_join(directory, filename)
+            if path.exists() and not overwrite:
+                path = self.unique_target(path.parent, path.name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            return path
 
     def copy_to_node_input(
         self,
@@ -307,13 +353,14 @@ class FileStorage:
         if not source_path.is_file():
             raise ValueError(f"Input source path is not a file: {source_path}")
 
-        target_name = filename or source_path.name
-        target = self.safe_join(self.node_input_dir(node_name), target_name)
-        if target.exists() and not overwrite:
-            target = self.unique_target(target.parent, target.name)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        copy2(source_path, target)
-        return target
+        with self.interprocess_lock(f"node-{node_name}-input"):
+            target_name = filename or source_path.name
+            target = self.safe_join(self.node_input_dir(node_name), target_name)
+            if target.exists() and not overwrite:
+                target = self.unique_target(target.parent, target.name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copy2(source_path, target)
+            return target
 
     def write_node_schema(
         self,
@@ -368,9 +415,10 @@ class FileStorage:
 
         timestamp = datetime.now().isoformat(timespec="seconds")
 
-        with self.lock:
-            with self.debug_file(node_name).open("a", encoding="utf-8") as file:
-                file.write(f"[{timestamp}] {message}\n")
+        with self.interprocess_lock(f"node-{node_name}-debug"):
+            with self.lock:
+                with self.debug_file(node_name).open("a", encoding="utf-8") as file:
+                    file.write(f"[{timestamp}] {message}\n")
 
     def next_job_id(self, node_name: str) -> int:
         with self.lock:

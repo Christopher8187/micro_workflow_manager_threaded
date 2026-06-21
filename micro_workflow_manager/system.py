@@ -26,8 +26,24 @@ from .node import (
 )
 from .router import NodeRouter, import_modules_from_dir, routers_from_module
 from .runners.direct import DirectRunner
+from .runners.process import ProcessPoolRunner
 from .runners.threaded import ThreadedRunner
 from .storage import FileStorage
+
+
+def normalize_workflow_runner(runner: str) -> str:
+    aliases = {
+        "thread": "threaded",
+        "processes": "process",
+        "process_pool": "process",
+        "processpool": "process",
+    }
+    runner = aliases.get(runner, runner)
+
+    if runner not in {"direct", "threaded", "process"}:
+        raise ValueError(f"Unknown runner: {runner}")
+
+    return runner
 
 
 class MicroWorkflow:
@@ -35,15 +51,17 @@ class MicroWorkflow:
         self,
         project_dir: str | Path = "project",
         runner: str = "threaded",
+        process_graph_path: str | Path | None = None,
     ):
-        if runner == "thread":
-            runner = "threaded"
-
-        if runner not in {"direct", "threaded"}:
-            raise ValueError(f"Unknown runner: {runner}")
+        runner = normalize_workflow_runner(runner)
 
         self.storage = FileStorage(project_dir)
         self.runner = runner
+        self.process_graph_path = (
+            Path(process_graph_path).resolve()
+            if process_graph_path is not None
+            else None
+        )
 
         self.graph_obj = nx.DiGraph()
         self.nodes: dict[str, JobNode] = {}
@@ -288,75 +306,76 @@ class MicroWorkflow:
         created: list[Job] = []
         changed_any_job = False
 
-        with node.lock:
-            node.validate_params(params)
+        with self.storage.interprocess_lock(f"node-{node_name}-jobs"):
+            with node.lock:
+                node.validate_params(params)
 
-            if self.storage.default_job_spec_current(
-                node_name,
-                start_job_id=start_job_id,
-                number=number,
-                params=params,
-            ):
-                return [
-                    Job(
-                        job_id=start_job_id + offset,
+                if self.storage.default_job_spec_current(
+                    node_name,
+                    start_job_id=start_job_id,
+                    number=number,
+                    params=params,
+                ):
+                    return [
+                        Job(
+                            job_id=start_job_id + offset,
+                            node_name=node_name,
+                            params=dict(params),
+                            parent=None,
+                        )
+                        for offset in range(number)
+                    ]
+
+                for offset in range(number):
+                    job_id = start_job_id + offset
+                    existed = self.storage.job_exists(node_name, job_id)
+                    previous_params = None
+                    previous_parent = None
+                    previous_status = None
+
+                    if existed:
+                        previous_params = self.storage.read_json(
+                            self.storage.input_file(node_name, job_id),
+                            default={},
+                        )
+                        previous_job_data = self.storage.read_json(
+                            self.storage.job_file(node_name, job_id),
+                            default={},
+                        )
+                        previous_parent = previous_job_data.get("parent")
+                        previous_status = self.storage.get_job_status(node_name, job_id)
+
+                    job = Job(
+                        job_id=job_id,
                         node_name=node_name,
                         params=dict(params),
                         parent=None,
                     )
-                    for offset in range(number)
-                ]
+                    self.storage.ensure_job(job)
+                    created.append(job)
 
-            for offset in range(number):
-                job_id = start_job_id + offset
-                existed = self.storage.job_exists(node_name, job_id)
-                previous_params = None
-                previous_parent = None
-                previous_status = None
+                    if (
+                        not existed
+                        or previous_params != job.params
+                        or previous_parent is not None
+                        or previous_status is None
+                    ):
+                        changed_any_job = True
 
-                if existed:
-                    previous_params = self.storage.read_json(
-                        self.storage.input_file(node_name, job_id),
-                        default={},
-                    )
-                    previous_job_data = self.storage.read_json(
-                        self.storage.job_file(node_name, job_id),
-                        default={},
-                    )
-                    previous_parent = previous_job_data.get("parent")
-                    previous_status = self.storage.get_job_status(node_name, job_id)
-
-                job = Job(
-                    job_id=job_id,
-                    node_name=node_name,
-                    params=dict(params),
-                    parent=None,
+                self.storage.write_default_job_spec(
+                    node_name,
+                    start_job_id=start_job_id,
+                    number=number,
+                    params=params,
                 )
-                self.storage.ensure_job(job)
-                created.append(job)
 
-                if (
-                    not existed
-                    or previous_params != job.params
-                    or previous_parent is not None
-                    or previous_status is None
-                ):
-                    changed_any_job = True
-
-            self.storage.write_default_job_spec(
-                node_name,
-                start_job_id=start_job_id,
-                number=number,
-                params=params,
-            )
-
-            # Router-declared jobs are mounted every time the CLI loads the
-            # workflow. Re-mounting an unchanged default job must not erase a
-            # previously completed node status, otherwise `mwf run A` followed by
-            # `mwf run B` would make B think A is unfinished. Only mark the node
-            # queued when a default job was actually created, refreshed, or fixed.
-            if changed_any_job:
-                self.storage.set_node_status(node_name, QUEUED)
+                # Router-declared jobs are mounted every time the CLI loads the
+                # workflow. Re-mounting an unchanged default job must not erase a
+                # previously completed node status, otherwise `mwf run A` followed by
+                # `mwf run B` would make B think A is unfinished. Only mark the node
+                # queued when a default job was actually created, refreshed, or fixed.
+                if changed_any_job:
+                    self.storage.set_node_status(node_name, QUEUED)
 
         return created
 
@@ -390,28 +409,29 @@ class MicroWorkflow:
 
         node = self.ensure_node(to_node)
 
-        with node.lock:
-            node.validate_params(params)
+        with self.storage.interprocess_lock(f"node-{to_node}-jobs"):
+            with node.lock:
+                node.validate_params(params)
 
-            if job_id is None:
-                job_id = self.storage.next_job_id(to_node)
+                if job_id is None:
+                    job_id = self.storage.next_job_id(to_node)
 
-            parent = None
-            if from_node is not None:
-                parent = {
-                    "from_node": from_node,
-                    "from_job_id": _parent_job_id,
-                }
+                parent = None
+                if from_node is not None:
+                    parent = {
+                        "from_node": from_node,
+                        "from_job_id": _parent_job_id,
+                    }
 
-            job = Job(
-                job_id=job_id,
-                node_name=to_node,
-                params=params,
-                parent=parent,
-            )
+                job = Job(
+                    job_id=job_id,
+                    node_name=to_node,
+                    params=params,
+                    parent=parent,
+                )
 
-            self.storage.create_job(job)
-            self.storage.set_node_status(to_node, QUEUED)
+                self.storage.create_job(job)
+                self.storage.set_node_status(to_node, QUEUED)
 
         if autostart and self.autostart_mode == "immediate":
             return self.run_job(
@@ -498,10 +518,19 @@ class MicroWorkflow:
         if effective_runner == "threaded":
             return ThreadedRunner(max_threads=node.max_threads)
 
+        if effective_runner == "process":
+            return ProcessPoolRunner(
+                max_processes=node.max_threads,
+                project_dir=self.storage.project_dir,
+                graph_path=self.process_graph_path,
+                allowed_run_nodes=self.allowed_run_nodes,
+                autostart_mode=self.autostart_mode,
+            )
+
         raise ValueError(f"Unknown runner: {effective_runner}")
 
     def run(self):
-        if self.runner == "threaded":
+        if self.runner in {"threaded", "process"}:
             return self.run_concurrently()
 
         ran = []

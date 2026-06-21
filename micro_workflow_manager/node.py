@@ -5,7 +5,7 @@ from typing import Callable
 from .models import MountedTask
 
 
-NODE_RUNNER_CHOICES = {"direct", "threaded"}
+NODE_RUNNER_CHOICES = {"direct", "threaded", "process"}
 
 
 def validate_non_negative_int(name: str, value: int) -> int:
@@ -24,8 +24,13 @@ def validate_node_runner(runner: str | None) -> str | None:
     if runner is None:
         return None
 
-    if runner == "thread":
-        runner = "threaded"
+    aliases = {
+        "thread": "threaded",
+        "processes": "process",
+        "process_pool": "process",
+        "processpool": "process",
+    }
+    runner = aliases.get(runner, runner)
 
     if runner not in NODE_RUNNER_CHOICES:
         raise ValueError(f"runner must be one of {sorted(NODE_RUNNER_CHOICES)}")
@@ -41,7 +46,7 @@ def sequential_runner_value(
 
     if sequential:
         if runner not in {None, "direct"}:
-            raise ValueError("sequential=True cannot be combined with runner='threaded'")
+            raise ValueError("sequential=True cannot be combined with a concurrent runner")
         return "direct"
 
     return runner
