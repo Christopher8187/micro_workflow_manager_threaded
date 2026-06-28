@@ -6,6 +6,17 @@ A small file-backed DAG workflow manager. Each node has inspectable `input/`, `o
 
 A finished job is not the same thing as a finished node. This matters for dynamically-created jobs: a downstream node can receive and finish one job before all of its predecessor nodes have completed and before those predecessors have finished creating every downstream job. The library only marks a node `done` during node-level finalization after its predecessors are complete.
 
+## Cyclic autostart components
+
+Graphs may contain self-loops and mutually reachable autostart nodes. The
+workflow manager treats each strongly connected component as one communicating
+class for readiness and completion. For example, if `A -> A`, `A -> B`,
+`B -> A`, and `A -> D`, then `D` is not ready merely because one A job
+finished. `D` waits until all queued/running jobs across the whole A/B
+component are done and the component is finalized together.
+
+See `examples/autostart_cycle_lab` for a runnable four-node experiment.
+
 ## Explicit jobs
 
 `mwf run` and `mwf runfrom` no longer invent a default starter job. Declare default jobs in the respective node file:

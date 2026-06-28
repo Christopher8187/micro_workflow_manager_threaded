@@ -79,9 +79,10 @@ class MicroWorkflow:
                 self.ensure_node(end)
                 self.graph_obj.add_edge(start, end)
 
-            if not nx.is_directed_acyclic_graph(self.graph_obj):
-                raise InvalidGraphError("Graph must be a DAG. Cycles are not allowed.")
-
+            # Cycles are allowed. A strongly connected component is treated as
+            # one communicating class for readiness and completion. This lets
+            # autostart loops such as A -> A or A -> B -> A keep generating
+            # jobs until the whole component becomes quiescent.
             self.storage.write_graph(edges)
 
     def include_router(self, router):
@@ -445,21 +446,108 @@ class MicroWorkflow:
     def node_complete(self, node_name: str) -> bool:
         return self.storage.get_node_status(node_name) in NODE_COMPLETE_STATUSES
 
+    def strongly_connected_components(self) -> list[set[str]]:
+        return [set(component) for component in nx.strongly_connected_components(self.graph_obj)]
+
+    def component_for(self, node_name: str) -> set[str]:
+        for component in self.strongly_connected_components():
+            if node_name in component:
+                return component
+        return {node_name}
+
+    def component_is_cyclic(self, component: set[str]) -> bool:
+        return len(component) > 1 or any(
+            self.graph_obj.has_edge(node_name, node_name)
+            for node_name in component
+        )
+
+    def component_predecessors(self, component: set[str]) -> set[str]:
+        predecessors: set[str] = set()
+
+        for node_name in component:
+            predecessors.update(self.graph_obj.predecessors(node_name))
+
+        return predecessors - component
+
+    def component_ready(self, component: set[str]) -> bool:
+        return all(self.node_complete(node) for node in self.component_predecessors(component))
+
+    def component_has_any_jobs(self, component: set[str]) -> bool:
+        return any(self.storage.list_jobs(node_name) for node_name in component)
+
+    def refresh_component_status(self, component: set[str], allow_complete: bool = False):
+        """Refresh a strongly connected component as one communicating class."""
+        component = set(component)
+        rows_by_node = {
+            node_name: self.storage.list_jobs(node_name)
+            for node_name in component
+        }
+        statuses_by_node = {
+            node_name: {row.get("status") for row in rows}
+            for node_name, rows in rows_by_node.items()
+        }
+        all_statuses = {
+            status
+            for statuses in statuses_by_node.values()
+            for status in statuses
+        }
+        has_jobs = any(rows_by_node.values())
+        cyclic = self.component_is_cyclic(component)
+
+        if not has_jobs:
+            for node_name in component:
+                current_status = self.storage.get_node_status(node_name)
+                if current_status in {DONE, FAILED, CANCELLED, SKIPPED}:
+                    continue
+                self.storage.set_node_status(node_name, QUEUED)
+            return
+
+        if FAILED in all_statuses:
+            for node_name in component:
+                self.storage.set_node_status(node_name, FAILED)
+            return
+
+        if RUNNING in all_statuses or QUEUED in all_statuses:
+            for node_name in component:
+                statuses = statuses_by_node[node_name]
+                if RUNNING in statuses:
+                    self.storage.set_node_status(node_name, RUNNING)
+                else:
+                    # A node with no current jobs inside a cyclic component is
+                    # still part of the active communicating class. Keep it
+                    # non-complete while sibling nodes are queued/running.
+                    self.storage.set_node_status(node_name, QUEUED)
+            return
+
+        if all_statuses and all_statuses.issubset(SUCCESSFUL_JOB_TERMINAL_STATUSES):
+            if allow_complete and self.component_ready(component):
+                for node_name in component:
+                    self.storage.set_node_status(node_name, DONE)
+            else:
+                for node_name in component:
+                    self.storage.set_node_status(node_name, QUEUED)
+            return
+
+        for node_name in component:
+            self.storage.set_node_status(node_name, QUEUED)
+
     def node_ready(self, node_name: str) -> bool:
-        predecessors = set(self.graph_obj.predecessors(node_name))
-        return all(self.node_complete(node) for node in predecessors)
+        return self.component_ready(self.component_for(node_name))
 
     def refresh_node_status(self, node_name: str, allow_complete: bool = False):
-        """Refresh a node's status from its jobs without unsafe early completion.
+        """Refresh a node or cyclic component without unsafe early completion.
 
-        A single job finishing does not mean the node is complete. This matters
-        for autostarted downstream jobs: a node can receive and finish one job
-        before all of its predecessor nodes have finished generating every job
-        that should flow into it.
-
-        Therefore DONE is only written when allow_complete=True and the node is
-        actually ready, meaning all predecessor nodes are complete.
+        In an acyclic graph this preserves the original per-node behavior. In a
+        strongly connected component, all nodes in the component are finalized
+        together, so an autostart loop cannot mark A done while B/C still have
+        queued work that can later create more A jobs.
         """
+        component = self.component_for(node_name)
+
+        if self.component_is_cyclic(component):
+            self.refresh_component_status(component, allow_complete=allow_complete)
+            return
+
         rows = self.storage.list_jobs(node_name)
 
         if not rows:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "micro-workflow-manager"
-version = "0.1.4"
+version = "0.1.5"
 description = "A small file-backed workflow manager for node-based Python jobs."
 requires-python = ">=3.10"
 dependencies = [

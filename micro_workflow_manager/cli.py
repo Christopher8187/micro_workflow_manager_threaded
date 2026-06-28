@@ -646,14 +646,14 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str) -> int:
 
     graph_file = (root / read_config(root)["graph_path"]).resolve()
     autostart_nodes = autostart_closure(workflow, graph_file, [node])
-    nodes = [node]
+    nodes = topo_subset(workflow, expand_to_components(workflow, {node}))
 
     if autostart_nodes:
         print("Detected autostarts to:", ", ".join(autostart_nodes))
         if not ask("Run all detected nodes sequentially?"):
             print("Stopped without running.")
             return 1
-        nodes = topo_subset(workflow, {node, *autostart_nodes})
+        nodes = topo_subset(workflow, expand_to_components(workflow, {node, *autostart_nodes}))
 
     blockers = direct_incomplete_inputs(workflow, set(nodes)) - set(workflow.graph_obj.predecessors(node))
     ignore_external = False
@@ -679,7 +679,10 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str) -> int:
 
 
 def run_from(root: Path, workflow: MicroWorkflow, node: str) -> int:
-    nodes = [node] + descendants_in_order(workflow, node)
+    nodes = component_topological_nodes(
+        workflow,
+        expand_to_components(workflow, {node, *descendants_in_order(workflow, node)}),
+    )
     graph_file = (root / read_config(root)["graph_path"]).resolve()
     autostart_nodes = autostart_closure(workflow, graph_file, nodes)
     extra_autostart_nodes = [item for item in autostart_nodes if item not in nodes]
@@ -689,7 +692,10 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str) -> int:
         if not ask("Include these nodes and run all selected nodes sequentially?"):
             print("Stopped without running.")
             return 1
-        nodes = topo_subset(workflow, {node, *nodes, *extra_autostart_nodes})
+        nodes = topo_subset(
+            workflow,
+            expand_to_components(workflow, {node, *nodes, *extra_autostart_nodes}),
+        )
 
     blockers = direct_incomplete_inputs(workflow, set(nodes))
     ignore_external = False
@@ -820,7 +826,7 @@ def resolve_node_targets(workflow: MicroWorkflow, requested: list[str]) -> list[
         raise RuntimeError("No node specified")
 
     if is_all_nodes_request(requested):
-        return list(nx.topological_sort(workflow.graph_obj))
+        return component_topological_nodes(workflow)
 
     seen: set[str] = set()
     nodes: list[str] = []
@@ -941,7 +947,9 @@ def ready_for_run_set(
     run_set: set[str],
     ignore_external: bool,
 ) -> bool:
-    for previous in workflow.graph_obj.predecessors(node):
+    component = workflow.component_for(node)
+
+    for previous in workflow.component_predecessors(component):
         if previous not in run_set and ignore_external:
             continue
 
@@ -964,11 +972,55 @@ def direct_incomplete_inputs(workflow: MicroWorkflow, nodes: set[str]) -> set[st
 
 def descendants_in_order(workflow: MicroWorkflow, node: str) -> list[str]:
     descendants = nx.descendants(workflow.graph_obj, node)
-    return [item for item in nx.topological_sort(workflow.graph_obj) if item in descendants]
+    descendants.discard(node)
+    return component_topological_nodes(workflow, descendants)
 
 
 def topo_subset(workflow: MicroWorkflow, nodes: set[str]) -> list[str]:
-    return [node for node in nx.topological_sort(workflow.graph_obj) if node in nodes]
+    return component_topological_nodes(workflow, nodes)
+
+
+def expand_to_components(workflow: MicroWorkflow, nodes: set[str]) -> set[str]:
+    expanded: set[str] = set()
+
+    for node in nodes:
+        expanded.update(workflow.component_for(node))
+
+    return expanded
+
+
+def component_topological_nodes(
+    workflow: MicroWorkflow,
+    nodes: set[str] | None = None,
+) -> list[str]:
+    """Return nodes ordered by the DAG of strongly connected components."""
+    graph = workflow.graph_obj
+    selected = set(graph.nodes) if nodes is None else set(nodes)
+    node_order = list(graph.nodes)
+    components = [set(component) for component in nx.strongly_connected_components(graph)]
+    component_by_node = {
+        node: index
+        for index, component in enumerate(components)
+        for node in component
+    }
+
+    component_graph = nx.DiGraph()
+    component_graph.add_nodes_from(range(len(components)))
+
+    for start, end in graph.edges:
+        start_component = component_by_node[start]
+        end_component = component_by_node[end]
+        if start_component != end_component:
+            component_graph.add_edge(start_component, end_component)
+
+    result: list[str] = []
+
+    for component_index in nx.topological_sort(component_graph):
+        for node in node_order:
+            if component_by_node[node] == component_index and node in selected:
+                result.append(node)
+
+    return result
 
 
 def autostart_closure(
