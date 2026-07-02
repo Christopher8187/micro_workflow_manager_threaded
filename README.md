@@ -98,6 +98,34 @@ mwf runfrom start_node
 ```
 
 
+## Monitoring and live statistics
+
+While a workflow is running, open a second terminal in the same project and run:
+
+```bash
+mwf monitor
+```
+
+`mwf monitor` reads the file-backed job and node state and prints a live dashboard with running nodes, queued/running/done/failed job counts, jobs left, progress, running job IDs, average completed job duration, and rough ETA. It does not run task code.
+
+Useful forms:
+
+```bash
+mwf monitor --once          # one snapshot
+mwf monitor A B             # monitor selected nodes only
+mwf monitor --json --once   # machine-readable snapshot
+```
+
+You can also print compact status lines in the same terminal as the run:
+
+```bash
+mwf runfrom start_node --stats
+mwf run start_node --stats --stats-interval 10
+```
+
+ETA is intentionally approximate. It is calculated from completed job durations and becomes more useful after at least one job in the relevant node has finished.
+
+
 ## Large-node performance note
 
 For large nodes, `queued` is the implicit per-job status. A job with `job.json` and `input.json` but no `status.json` is treated as queued by the storage API. This avoids thousands of small JSON writes during reset/requeue and lets `node_state.json` switch to `running` before the runner loads every queued job. Explicit `status.json` files are still written for `running`, `done`, `failed`, `cancelled`, and `skipped` jobs.

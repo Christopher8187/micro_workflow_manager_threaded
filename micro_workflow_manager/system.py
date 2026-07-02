@@ -1,5 +1,6 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+from time import perf_counter
 from threading import RLock
 from typing import Any, Callable
 
@@ -17,6 +18,7 @@ from .models import (
     RUNNING,
     SKIPPED,
     SUCCESSFUL_JOB_TERMINAL_STATUSES,
+    now,
 )
 from .node import (
     JobNode,
@@ -836,7 +838,9 @@ class MicroWorkflow:
         if node.main_task is None:
             raise InvalidJobError(f"Node {node_name} has no mounted task")
 
-        self.storage.set_job_status(node_name, job_id, RUNNING)
+        started_at = now()
+        started_perf = perf_counter()
+        self.storage.set_job_status(node_name, job_id, RUNNING, started_at=started_at)
 
         try:
             result = self.execute_with_fallbacks(job)
@@ -853,7 +857,14 @@ class MicroWorkflow:
                 },
             )
 
-            self.storage.set_job_status(node_name, job_id, DONE)
+            self.storage.set_job_status(
+                node_name,
+                job_id,
+                DONE,
+                started_at=started_at,
+                finished_at=now(),
+                duration_seconds=round(perf_counter() - started_perf, 6),
+            )
 
             if self.storage.get_node_status(node_name) != RUNNING:
                 self.refresh_node_status(node_name, allow_complete=False)
@@ -875,7 +886,14 @@ class MicroWorkflow:
                 },
             )
 
-            self.storage.set_job_status(node_name, job_id, FAILED)
+            self.storage.set_job_status(
+                node_name,
+                job_id,
+                FAILED,
+                started_at=started_at,
+                finished_at=now(),
+                duration_seconds=round(perf_counter() - started_perf, 6),
+            )
 
             if self.storage.get_node_status(node_name) != RUNNING:
                 self.refresh_node_status(node_name, allow_complete=False)

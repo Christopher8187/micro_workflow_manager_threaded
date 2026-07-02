@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import argparse
 import ast
+import os
 import importlib.util
 import json
 import shutil
 import sys
 import textwrap
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import networkx as nx
 
 from .models import QUEUED, RUNNING
+from .monitor import InlineStatsReporter, monitor_loop, now_iso
 from .system import MicroWorkflow, normalize_workflow_runner
 
 MWF_FILE = ".mwf"
 RUNNER_CHOICES = ["threaded", "process", "direct", "thread", "processes", "process_pool", "processpool"]
-COMMAND_NAMES = ["init", "graph", "clean", "reset", "wipe", "run", "runfrom"]
+COMMAND_NAMES = ["init", "graph", "clean", "reset", "wipe", "run", "runfrom", "monitor"]
 
 HELP_EPILOG = """
 Common help commands:
@@ -28,6 +32,7 @@ Common help commands:
   mwf wipe --help
   mwf run --help
   mwf runfrom --help
+  mwf monitor --help
 
 Command descriptions:
   mwf --describe init
@@ -37,6 +42,7 @@ Command descriptions:
   mwf --describe wipe
   mwf --describe run
   mwf --describe runfrom
+  mwf --describe monitor
 
 Typical flow:
   mwf init
@@ -44,6 +50,9 @@ Typical flow:
   mwf run start_node
   mwf run start_node job 1 3 8-10
   mwf runfrom start_node
+  mwf runfrom start_node --stats
+  mwf monitor              # live workflow statistics in a second terminal
+  mwf monitor --once       # one status snapshot
 
 Cleaning:
   mwf clean node_name   # clear output/files/jobs for one node, keep input files
@@ -184,6 +193,33 @@ Use when:
   you want to rerun a single ready node, or a node plus detected autostart chain
   you want to rerun exact jobs without disturbing the rest of the node:
     mwf run tagify job 1 3 8-10
+  you want compact inline status while it runs:
+    mwf run tagify --stats
+""",
+
+    "monitor": """
+monitor prints workflow statistics from the file-backed node/job folders.
+
+Code context:
+  loads .mwf, graph.py, and node_behavior/*.py so it knows graph nodes,
+  component order, node max_threads, and runner overrides
+  does not run your task code
+
+File-system context:
+  reads node/<node>/node_state.json
+  reads node/<node>/jobs/<id>/job.json and status.json
+  reads .mwf_run.json when a run or runfrom command is active or recently finished
+  estimates ETA from duration_seconds written to completed job status files
+
+Use when:
+  you want a second terminal dashboard while another terminal runs work:
+    mwf runfrom start_node
+    mwf monitor
+
+Options:
+  mwf monitor --once       print one snapshot and exit
+  mwf monitor A B          monitor only selected nodes
+  mwf monitor --json       output machine-readable JSON
 """,
     "runfrom": """
 runfrom executes a node and its descendants in graph order, with threaded execution where possible.
@@ -205,7 +241,11 @@ File-system context:
   refuses to continue if direct upstream nodes outside the run set are incomplete, unless you confirm
 
 Use when:
-  you want a safe partial workflow rerun from one node onward.
+  you want a safe partial workflow rerun from one node onward
+  you want compact inline status while it runs:
+    mwf runfrom split --stats
+  for a full dashboard in another terminal, use:
+    mwf monitor
 """,
 }
 
@@ -232,6 +272,17 @@ def main(argv: list[str] | None = None) -> int:
 
         workflow = load_workflow(root, args.runner)
 
+        if args.command == "monitor":
+            nodes = resolve_node_targets(workflow, args.nodes) if args.nodes else component_topological_nodes(workflow)
+            return monitor_command(
+                workflow,
+                nodes,
+                interval=args.interval,
+                once=args.once,
+                json_output=args.json,
+                no_clear=args.no_clear,
+            )
+
         if args.command in {"clean", "reset", "wipe"}:
             nodes = resolve_node_targets(workflow, args.nodes)
 
@@ -257,11 +308,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run":
             job_ids = selected_job_ids_from_args(args.job_mode, args.job_specs)
             if job_ids is not None:
-                return run_selected_jobs(root, workflow, node, job_ids)
-            return run_node(root, workflow, node)
+                return run_selected_jobs(
+                    root,
+                    workflow,
+                    node,
+                    job_ids,
+                    stats=args.stats,
+                    stats_interval=args.stats_interval,
+                )
+            return run_node(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval)
 
         if args.command == "runfrom":
-            return run_from(root, workflow, node)
+            return run_from(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval)
 
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
@@ -390,8 +448,90 @@ def build_parser() -> argparse.ArgumentParser:
         choices=RUNNER_CHOICES,
         help="Temporarily override the workflow runner for this runfrom.",
     )
+    add_stats_arguments(run_cmd)
+    add_stats_arguments(runfrom_cmd)
+
+    monitor_cmd = commands.add_parser(
+        "monitor",
+        help="Show live workflow/node/job statistics. Use from a second terminal during run/runfrom.",
+        description=COMMAND_DESCRIPTIONS["monitor"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    monitor_cmd.add_argument(
+        "nodes",
+        nargs="*",
+        metavar="node",
+        help="Optional nodes to monitor. Omit to monitor every graph node.",
+    )
+    monitor_cmd.add_argument(
+        "--interval",
+        type=positive_float,
+        default=2.0,
+        help="Seconds between refreshes in watch mode. Default: 2.",
+    )
+    monitor_cmd.add_argument(
+        "--once",
+        action="store_true",
+        help="Print one snapshot and exit instead of watching continuously.",
+    )
+    monitor_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON instead of a table.",
+    )
+    monitor_cmd.add_argument(
+        "--no-clear",
+        action="store_true",
+        help="Do not clear the terminal between watch snapshots.",
+    )
 
     return parser
+
+
+def positive_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"expected a positive number, got {text!r}") from error
+
+    if value <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+
+    return value
+
+
+def add_stats_arguments(command: argparse.ArgumentParser):
+    command.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print compact live statistics while this command runs. For a cleaner dashboard, use mwf monitor in another terminal.",
+    )
+    command.add_argument(
+        "--stats-interval",
+        type=positive_float,
+        default=5.0,
+        help="Seconds between --stats lines. Default: 5.",
+    )
+
+
+def monitor_command(
+    workflow: MicroWorkflow,
+    nodes: list[str],
+    *,
+    interval: float,
+    once: bool,
+    json_output: bool,
+    no_clear: bool,
+) -> int:
+    monitor_loop(
+        workflow,
+        nodes=nodes,
+        interval=interval,
+        once=once,
+        json_output=json_output,
+        no_clear=no_clear,
+    )
+    return 0
 
 
 def describe_command(command: str) -> int:
@@ -600,11 +740,60 @@ def parse_positive_job_id(text: str) -> int:
     return job_id
 
 
+@contextmanager
+def active_workflow_run(
+    workflow: MicroWorkflow,
+    *,
+    command: str,
+    start_node: str,
+    nodes: list[str],
+    selected_jobs: list[int] | None = None,
+):
+    run_id = f"{int(time.time())}-{os.getpid()}"
+    data = {
+        "run_id": run_id,
+        "status": "running",
+        "command": command,
+        "start_node": start_node,
+        "nodes": list(nodes),
+        "selected_jobs": list(selected_jobs or []),
+        "started_at": now_iso(),
+        "pid": os.getpid(),
+    }
+    workflow.storage.write_run_state(data)
+    finished = False
+
+    def finish(status: str, error: str | None = None):
+        nonlocal finished
+        if finished:
+            return
+        updates = {
+            "status": status,
+            "finished_at": now_iso(),
+        }
+        if error is not None:
+            updates["error"] = error
+        workflow.storage.update_run_state(**updates)
+        finished = True
+
+    try:
+        yield finish
+    except Exception as error:
+        finish("failed", repr(error))
+        raise
+    finally:
+        if not finished:
+            finish("done")
+
+
 def run_selected_jobs(
     root: Path,
     workflow: MicroWorkflow,
     node: str,
     job_ids: list[int],
+    *,
+    stats: bool = False,
+    stats_interval: float = 5.0,
 ) -> int:
     if not is_ready(workflow, node):
         print_not_ready(workflow, node)
@@ -627,8 +816,22 @@ def run_selected_jobs(
     workflow.autostart_mode = "queue"
 
     try:
-        jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
-        workflow.run_node_jobs(node, jobs, ignore_readiness=True)
+        with active_workflow_run(
+            workflow,
+            command="run jobs",
+            start_node=node,
+            nodes=[node],
+            selected_jobs=job_ids,
+        ) as finish_run:
+            with InlineStatsReporter(
+                workflow,
+                nodes=[node],
+                enabled=stats,
+                interval=stats_interval,
+            ):
+                jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
+                workflow.run_node_jobs(node, jobs, ignore_readiness=True)
+            finish_run("done")
     finally:
         workflow.allowed_run_nodes = previous_allowed_run_nodes
         workflow.autostart_mode = previous_autostart_mode
@@ -639,7 +842,7 @@ def run_selected_jobs(
 
     return 0
 
-def run_node(root: Path, workflow: MicroWorkflow, node: str) -> int:
+def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0) -> int:
     if not is_ready(workflow, node):
         print_not_ready(workflow, node)
         return 1
@@ -675,10 +878,10 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str) -> int:
         if item != node:
             reset_node_for_run(root, workflow, item, remove_parented_jobs=True)
 
-    return run_nodes(workflow, nodes, node, ignore_external=ignore_external)
+    return run_nodes(workflow, nodes, node, ignore_external=ignore_external, command="run", stats=stats, stats_interval=stats_interval)
 
 
-def run_from(root: Path, workflow: MicroWorkflow, node: str) -> int:
+def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0) -> int:
     nodes = component_topological_nodes(
         workflow,
         expand_to_components(workflow, {node, *descendants_in_order(workflow, node)}),
@@ -715,7 +918,7 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str) -> int:
         if child != node:
             reset_node_for_run(root, workflow, child, remove_parented_jobs=True)
 
-    return run_nodes(workflow, nodes, node, ignore_external=ignore_external)
+    return run_nodes(workflow, nodes, node, ignore_external=ignore_external, command="runfrom", stats=stats, stats_interval=stats_interval)
 
 
 def run_nodes(
@@ -723,6 +926,10 @@ def run_nodes(
     nodes: list[str],
     start_node: str,
     ignore_external: bool = False,
+    *,
+    command: str = "run",
+    stats: bool = False,
+    stats_interval: float = 5.0,
 ) -> int:
     run_set = set(nodes)
     previous_allowed_run_nodes = workflow.allowed_run_nodes
@@ -741,62 +948,77 @@ def run_nodes(
             )
             return 0
 
-        if workflow.runner in {"threaded", "process"}:
-            ran = workflow.run_concurrently(
+        with active_workflow_run(
+            workflow,
+            command=command,
+            start_node=start_node,
+            nodes=nodes,
+        ) as finish_run:
+            with InlineStatsReporter(
+                workflow,
                 nodes=nodes,
-                ready_check=lambda item: ready_for_run_set(
-                    workflow,
-                    item,
-                    run_set,
-                    ignore_external,
-                ),
-            )
-        else:
-            ran = []
+                enabled=stats,
+                interval=stats_interval,
+            ):
+                if workflow.runner in {"threaded", "process"}:
+                    ran = workflow.run_concurrently(
+                        nodes=nodes,
+                        ready_check=lambda item: ready_for_run_set(
+                            workflow,
+                            item,
+                            run_set,
+                            ignore_external,
+                        ),
+                    )
+                else:
+                    ran = []
 
-            while True:
-                ready = [
-                    node
-                    for node in nodes
-                    if workflow.storage.has_queued_jobs(node)
-                    and ready_for_run_set(workflow, node, run_set, ignore_external)
-                ]
+                    while True:
+                        ready = [
+                            node
+                            for node in nodes
+                            if workflow.storage.has_queued_jobs(node)
+                            and ready_for_run_set(workflow, node, run_set, ignore_external)
+                        ]
 
-                if not ready:
-                    break
+                        if not ready:
+                            break
 
-                for node in ready:
-                    workflow.run_node(node, ignore_readiness=True)
-                    ran.append(node)
+                        for node in ready:
+                            workflow.run_node(node, ignore_readiness=True)
+                            ran.append(node)
 
-        workflow.finalize_ready_nodes()
+            workflow.finalize_ready_nodes()
 
-        blocked = [node for node in nodes if workflow.storage.has_queued_jobs(node)]
+            blocked = [node for node in nodes if workflow.storage.has_queued_jobs(node)]
 
-        if blocked:
-            print("Stopped before these queued nodes became ready:")
-            for node in blocked:
-                status = workflow.storage.get_node_status(node) or "missing"
-                print(f"  {node}: {status}")
-            return 1
+            if blocked:
+                finish_run("blocked")
+                print("Stopped before these queued nodes became ready:")
+                for node in blocked:
+                    status = workflow.storage.get_node_status(node) or "missing"
+                    print(f"  {node}: {status}")
+                return 1
 
-        unfinished = [node for node in nodes if not workflow.node_complete(node)]
+            unfinished = [node for node in nodes if not workflow.node_complete(node)]
 
-        if unfinished:
-            print("These nodes did not complete:")
-            for node in unfinished:
-                status = workflow.storage.get_node_status(node) or "missing"
-                job_count = len(workflow.storage.list_jobs(node))
-                queued_count = len(workflow.storage.queued_job_ids(node))
-                print(f"  {node}: {status}, jobs={job_count}, queued={queued_count}")
-            print("This usually means an upstream task did not create the expected downstream jobs.")
-            return 1
+            if unfinished:
+                finish_run("incomplete")
+                print("These nodes did not complete:")
+                for node in unfinished:
+                    status = workflow.storage.get_node_status(node) or "missing"
+                    job_count = len(workflow.storage.list_jobs(node))
+                    queued_count = len(workflow.storage.queued_job_ids(node))
+                    print(f"  {node}: {status}, jobs={job_count}, queued={queued_count}")
+                print("This usually means an upstream task did not create the expected downstream jobs.")
+                return 1
 
-        print("Ran:")
-        for node in ran:
-            print(f"  {node}")
+            finish_run("done")
+            print("Ran:")
+            for node in ran:
+                print(f"  {node}")
 
-        return 0
+            return 0
 
     finally:
         workflow.allowed_run_nodes = previous_allowed_run_nodes

@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import re
@@ -6,7 +7,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from shutil import copy2
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 from uuid import uuid4
 
@@ -14,10 +15,119 @@ from .models import Job, QUEUED, VALID_STATUSES
 
 
 class FileStorage:
+    _thread_locks: dict[Path, RLock] = {}
+    _thread_locks_guard = Lock()
+
     def __init__(self, project_dir: str | Path):
         self.project_dir = Path(project_dir).resolve()
         self.lock = RLock()
         self.project_dir.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def thread_lock_for(cls, path: Path) -> RLock:
+        path = Path(path).resolve()
+        with cls._thread_locks_guard:
+            lock = cls._thread_locks.get(path)
+            if lock is None:
+                lock = RLock()
+                cls._thread_locks[path] = lock
+            return lock
+
+    def retryable_errno(self, error: OSError) -> bool:
+        retryable = {
+            getattr(errno, "EACCES", 13),
+            getattr(errno, "EAGAIN", 11),
+            getattr(errno, "EBUSY", 16),
+            getattr(errno, "EDEADLK", 35),
+            getattr(errno, "ENOLCK", 37),
+            getattr(errno, "EPERM", 1),
+            36,  # Some platforms report "Resource deadlock avoided" as errno 36.
+        }
+        return getattr(error, "errno", None) in retryable
+
+    def retry_fs(self, action, *, attempts: int = 60, base_delay: float = 0.02):
+        last_error = None
+
+        for attempt in range(attempts):
+            try:
+                return action()
+            except OSError as error:
+                if not self.retryable_errno(error):
+                    raise
+                last_error = error
+                time.sleep(min(1.0, base_delay * (attempt + 1)))
+
+        raise last_error
+
+    def remove_if_exists(self, path: Path):
+        def action():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+        self.retry_fs(action)
+
+    def atomic_write_text(self, path: Path, content: str, encoding: str = "utf-8") -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
+        )
+
+        try:
+            def action():
+                temp.write_text(content, encoding=encoding)
+                os.replace(temp, path)
+
+            self.retry_fs(action)
+            return path
+        finally:
+            if temp.exists():
+                self.remove_if_exists(temp)
+
+    def atomic_write_bytes(self, path: Path, content: bytes) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
+        )
+
+        try:
+            def action():
+                temp.write_bytes(content)
+                os.replace(temp, path)
+
+            self.retry_fs(action)
+            return path
+        finally:
+            if temp.exists():
+                self.remove_if_exists(temp)
+
+    def atomic_copy_file(self, source: Path, target: Path) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_name(
+            f".{target.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
+        )
+
+        try:
+            def action():
+                copy2(source, temp)
+                os.replace(temp, target)
+
+            self.retry_fs(action)
+            return target
+        finally:
+            if temp.exists():
+                self.remove_if_exists(temp)
+
+    def append_text(self, path: Path, content: str, encoding: str = "utf-8") -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        def action():
+            with path.open("a", encoding=encoding) as file:
+                file.write(content)
+
+        self.retry_fs(action)
+        return path
 
     def validate_node_name(self, node_name: str) -> str:
         if not isinstance(node_name, str) or not node_name or node_name in {".", ".."}:
@@ -48,6 +158,21 @@ class FileStorage:
     def workflow_file(self) -> Path:
         return self.project_dir / ".mwf"
 
+    def run_state_file(self) -> Path:
+        return self.project_dir / ".mwf_run.json"
+
+    def write_run_state(self, data: dict):
+        self.atomic_write_json(self.run_state_file(), data)
+
+    def get_run_state(self) -> dict:
+        data = self.read_json(self.run_state_file(), default={})
+        return data if isinstance(data, dict) else {}
+
+    def update_run_state(self, **updates):
+        data = self.get_run_state()
+        data.update(updates)
+        self.write_run_state(data)
+
     def lock_dir(self) -> Path:
         path = self.project_dir / ".mwf_locks"
         path.mkdir(parents=True, exist_ok=True)
@@ -59,36 +184,42 @@ class FileStorage:
 
     @contextmanager
     def interprocess_lock(self, name: str):
-        """Cross-process file lock for state that needs read/modify/write safety.
+        """Cross-process lock with same-process thread serialization.
 
-        Thread locks protect one Python process. The process runner has several
-        Python interpreters writing the same file-backed workflow, so job ID
-        allocation and unique input-file naming also need a small OS file lock.
+        On Linux/macOS, fcntl/flock locks are process-level and can behave badly
+        when many threads in the same process try to acquire the same lock file
+        at once. The per-lock RLock serializes threads before taking the OS lock.
+        The OS lock still protects process-pool workers and separate CLI commands.
         """
         path = self.lock_file(name)
+        thread_lock = self.thread_lock_for(path)
 
-        with path.open("a+b") as file:
-            if os.name == "nt":
-                import msvcrt
+        with thread_lock:
+            file = self.retry_fs(lambda: path.open("a+b"), attempts=60)
+            try:
+                if os.name == "nt":
+                    import msvcrt
 
-                if file.tell() == 0 and file.read(1) == b"":
-                    file.write(b"0")
-                    file.flush()
-                file.seek(0)
-                msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
-                try:
-                    yield
-                finally:
+                    if file.tell() == 0 and file.read(1) == b"":
+                        file.write(b"0")
+                        file.flush()
                     file.seek(0)
-                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                    self.retry_fs(lambda: msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1), attempts=120)
+                    try:
+                        yield
+                    finally:
+                        file.seek(0)
+                        self.retry_fs(lambda: msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1), attempts=20)
+                else:
+                    import fcntl
 
-                fcntl.flock(file.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+                    self.retry_fs(lambda: fcntl.flock(file.fileno(), fcntl.LOCK_EX), attempts=120)
+                    try:
+                        yield
+                    finally:
+                        self.retry_fs(lambda: fcntl.flock(file.fileno(), fcntl.LOCK_UN), attempts=20)
+            finally:
+                file.close()
 
     def node_dir(self, node_name: str) -> Path:
         node_name = self.validate_node_name(node_name)
@@ -183,34 +314,7 @@ class FileStorage:
 
     def atomic_write_json(self, path: Path, data: Any):
         with self.lock:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            text = self.json_text(path, data)
-
-            temp = path.with_name(
-                f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
-            )
-
-            try:
-                temp.write_text(text, encoding="utf-8")
-
-                last_error = None
-
-                for attempt in range(20):
-                    try:
-                        os.replace(temp, path)
-                        return
-                    except PermissionError as error:
-                        last_error = error
-                        time.sleep(0.05 * (attempt + 1))
-
-                raise last_error
-
-            finally:
-                try:
-                    if temp.exists():
-                        temp.unlink()
-                except PermissionError:
-                    pass
+            self.atomic_write_text(path, self.json_text(path, data))
 
     def read_json(self, path: Path, default: Any = None) -> Any:
         if not path.exists():
@@ -290,8 +394,7 @@ class FileStorage:
         content: str,
     ) -> Path:
         path = self.safe_join(self.node_output_dir(node_name), filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        self.atomic_write_text(path, content)
         return path
 
     def write_node_output_bytes(
@@ -301,8 +404,7 @@ class FileStorage:
         content: bytes,
     ) -> Path:
         path = self.safe_join(self.node_output_dir(node_name), filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        self.atomic_write_bytes(path, content)
         return path
 
     def write_node_input_text(
@@ -318,8 +420,7 @@ class FileStorage:
             path = self.safe_join(directory, filename)
             if path.exists() and not overwrite:
                 path = self.unique_target(path.parent, path.name)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            self.atomic_write_text(path, content)
             return path
 
     def write_node_input_bytes(
@@ -335,8 +436,7 @@ class FileStorage:
             path = self.safe_join(directory, filename)
             if path.exists() and not overwrite:
                 path = self.unique_target(path.parent, path.name)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
+            self.atomic_write_bytes(path, content)
             return path
 
     def copy_to_node_input(
@@ -358,8 +458,7 @@ class FileStorage:
             target = self.safe_join(self.node_input_dir(node_name), target_name)
             if target.exists() and not overwrite:
                 target = self.unique_target(target.parent, target.name)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            copy2(source_path, target)
+            self.atomic_copy_file(source_path, target)
             return target
 
     def write_node_schema(
@@ -416,9 +515,7 @@ class FileStorage:
         timestamp = datetime.now().isoformat(timespec="seconds")
 
         with self.interprocess_lock(f"node-{node_name}-debug"):
-            with self.lock:
-                with self.debug_file(node_name).open("a", encoding="utf-8") as file:
-                    file.write(f"[{timestamp}] {message}\n")
+            self.append_text(self.debug_file(node_name), f"[{timestamp}] {message}\n")
 
     def next_job_id(self, node_name: str) -> int:
         with self.lock:
@@ -593,10 +690,7 @@ class FileStorage:
         if status == QUEUED and not extra:
             with self.lock:
                 path = self.status_file(node_name, job_id)
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+                self.remove_if_exists(path)
             return
 
         data = {
@@ -711,14 +805,12 @@ class FileStorage:
 
     def write_text(self, node_name: str, job_id: int, filename: str, content: str) -> Path:
         path = self.safe_join(self.files_dir(node_name, job_id), filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        self.atomic_write_text(path, content)
         return path
 
     def write_bytes(self, node_name: str, job_id: int, filename: str, content: bytes) -> Path:
         path = self.safe_join(self.files_dir(node_name, job_id), filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        self.atomic_write_bytes(path, content)
         return path
 
     def unique_target(self, directory: Path, filename: str) -> Path:
@@ -790,7 +882,7 @@ class FileStorage:
                 continue
 
             target = self.unique_target(destination, source.name)
-            copy2(source, target)
+            self.atomic_copy_file(source, target)
             stored.append(str(target))
 
         return stored
