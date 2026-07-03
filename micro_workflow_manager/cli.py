@@ -975,21 +975,24 @@ def run_nodes(
                     )
                 else:
                     ran = []
+                    units = workflow.execution_components(nodes)
 
                     while True:
-                        ready = [
-                            node
-                            for node in nodes
-                            if workflow.storage.has_queued_jobs(node)
-                            and ready_for_run_set(workflow, node, run_set, ignore_external)
+                        ready_units = [
+                            unit
+                            for unit in units
+                            if any(workflow.storage.has_queued_jobs(node) for node in unit)
+                            and all(
+                                ready_for_run_set(workflow, node, run_set, ignore_external)
+                                for node in unit
+                            )
                         ]
 
-                        if not ready:
+                        if not ready_units:
                             break
 
-                        for node in ready:
-                            workflow.run_node(node, ignore_readiness=True)
-                            ran.append(node)
+                        for unit in ready_units:
+                            ran.extend(workflow.run_component(set(unit), ignore_readiness=True))
 
             workflow.finalize_ready_nodes()
 

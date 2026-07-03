@@ -140,6 +140,10 @@ class ProcessPoolRunner(BaseRunner):
 
     def _executor(self):
         self._require_project_loader()
+        # Python 3.13 warns when forking from a multi-threaded parent. The
+        # workflow manager normally has node/job scheduler threads, so use
+        # spawn explicitly for the process runner. This also matches Windows
+        # semantics and avoids fork-with-threads deadlock hazards.
         return ProcessPoolExecutor(
             max_workers=self.max_processes,
             mp_context=mp.get_context("spawn"),
