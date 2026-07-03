@@ -136,6 +136,24 @@ ETA is intentionally approximate. It is calculated from completed job durations 
 
 For large nodes, `queued` is the implicit per-job status. A job with `job.json` and `input.json` but no `status.json` is treated as queued by the storage API. This avoids thousands of small JSON writes during reset/requeue and lets `node_state.json` switch to `running` before the runner loads every queued job. Explicit `status.json` files are still written for `running`, `done`, `failed`, `cancelled`, and `skipped` jobs.
 
+### Job index design
+
+`job_index.json` is a rebuildable per-node summary cache, not the source of truth.
+The source of truth is still the file-backed job state:
+
+- `jobs/<id>/job.json` and `input.json` prove that a job exists
+- missing `status.json` means the job is queued
+- explicit `status.json` stores running/done/failed/cancelled/skipped
+- `queued/<id>.queued` is the cheap scheduler queue marker
+
+The index stores fast monitor/scheduler summaries such as status counts,
+`last_job_id`, running job IDs, and completed-duration totals. It is maintained
+incrementally during normal runs, but if Windows or another process temporarily
+blocks `job_index.json`, the workflow marks the index dirty and continues. The
+next reader rebuilds it from the authoritative job folders/status files. This
+keeps high-fan-in spawn nodes such as `zoning` from failing just because many
+workers touched the same summary file at once.
+
 ## Install for development
 
 ```bash

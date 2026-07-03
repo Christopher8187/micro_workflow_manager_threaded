@@ -3,6 +3,7 @@ import tempfile
 import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeRouter
+from micro_workflow_manager.models import DONE
 
 
 def test_router_rejects_bad_thread_and_retry_values():
@@ -378,3 +379,80 @@ def test_process_runner_without_graph_path_explains_requirement(tmp_path):
 
     with pytest.raises(RuntimeError, match="process runner needs a graph file"):
         workflow.run_node("A")
+
+
+def test_dirty_job_index_does_not_fail_dynamic_spawn(monkeypatch):
+    """A transient Windows-style index write failure must not kill job creation."""
+    with tempfile.TemporaryDirectory() as project_dir:
+        workflow = MicroWorkflow(project_dir=project_dir, runner="direct")
+        workflow.graph([("A", "B")])
+
+        @workflow.task("A")
+        def a(ctx):
+            ctx.node("B").add(value=123)
+            return "a"
+
+        @workflow.task("B")
+        def b(ctx, value):
+            return value
+
+        original_write_job_index = workflow.storage.write_job_index
+        failed_once = {"B": False}
+
+        def flaky_write_job_index(node_name, index):
+            if node_name == "B" and not failed_once["B"]:
+                failed_once["B"] = True
+                raise PermissionError(13, "Permission denied", str(workflow.storage.job_index_file(node_name)))
+            return original_write_job_index(node_name, index)
+
+        monkeypatch.setattr(workflow.storage, "write_job_index", flaky_write_job_index)
+
+        workflow.start("A")
+        workflow.run()
+
+        assert failed_once["B"] is True
+        assert workflow.node_complete("A")
+        assert workflow.node_complete("B")
+        assert workflow.storage.node_job_summary("B")["counts"][DONE] == 1
+
+
+def test_threaded_high_fan_in_to_one_node_survives_index_contention(monkeypatch):
+    """Many workers spawning into one convergence node should not rely on a fragile index file."""
+    import time
+
+    with tempfile.TemporaryDirectory() as project_dir:
+        workflow = MicroWorkflow(project_dir=project_dir, runner="threaded")
+        workflow.graph([("A", "Z")])
+
+        @workflow.task("A", max_threads=16)
+        def a(ctx):
+            time.sleep(0.001)
+            ctx.node("Z").add(value=ctx.job_id)
+            return ctx.job_id
+
+        @workflow.task("Z", max_threads=16)
+        def z(ctx, value):
+            time.sleep(0.001)
+            return value
+
+        original_write_job_index = workflow.storage.write_job_index
+        failures_left = {"Z": 5}
+
+        def flaky_write_job_index(node_name, index):
+            if node_name == "Z" and failures_left["Z"] > 0:
+                failures_left["Z"] -= 1
+                raise PermissionError(13, "Permission denied", str(workflow.storage.job_index_file(node_name)))
+            return original_write_job_index(node_name, index)
+
+        monkeypatch.setattr(workflow.storage, "write_job_index", flaky_write_job_index)
+
+        for job_id in range(1, 81):
+            workflow.start("A", job_id=job_id)
+
+        workflow.run()
+
+        assert failures_left["Z"] == 0
+        assert workflow.node_complete("A")
+        assert workflow.node_complete("Z")
+        assert workflow.storage.node_job_summary("Z")["total"] == 80
+        assert workflow.storage.node_job_summary("Z")["counts"][DONE] == 80

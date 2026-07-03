@@ -73,13 +73,15 @@ class FileStorage:
         temp = path.with_name(
             f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
         )
+        thread_lock = self.thread_lock_for(path)
 
         try:
             def action():
                 temp.write_text(content, encoding=encoding)
                 os.replace(temp, path)
 
-            self.retry_fs(action)
+            with thread_lock:
+                self.retry_fs(action)
             return path
         finally:
             if temp.exists():
@@ -90,13 +92,15 @@ class FileStorage:
         temp = path.with_name(
             f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
         )
+        thread_lock = self.thread_lock_for(path)
 
         try:
             def action():
                 temp.write_bytes(content)
                 os.replace(temp, path)
 
-            self.retry_fs(action)
+            with thread_lock:
+                self.retry_fs(action)
             return path
         finally:
             if temp.exists():
@@ -279,6 +283,30 @@ class FileStorage:
         job_id = self.validate_job_id(job_id)
         return self.queued_dir(node_name) / f"{job_id}.queued"
 
+    def job_index_dirty_file(self, node_name: str) -> Path:
+        return self.node_dir(node_name) / "job_index.dirty"
+
+    def job_index_dirty(self, node_name: str) -> bool:
+        return self.job_index_dirty_file(node_name).exists()
+
+    def mark_job_index_dirty(self, node_name: str, reason: str | None = None):
+        # The index is a rebuildable cache. If a high-contention index update
+        # fails after retries, do not fail the job spawn/status transition. Mark
+        # the node dirty so the next reader rebuilds from per-job truth.
+        try:
+            self.atomic_write_text(
+                self.job_index_dirty_file(node_name),
+                (reason or "dirty") + "\n",
+            )
+        except OSError:
+            # If even the dirty marker is temporarily blocked, leave recovery to
+            # normal index validation/rebuild on the next read. The underlying
+            # job/status files have already been written by the caller.
+            pass
+
+    def clear_job_index_dirty(self, node_name: str):
+        self.remove_if_exists(self.job_index_dirty_file(node_name))
+
     def job_base_dir(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
         return self.safe_join(self.jobs_dir(node_name), str(job_id))
@@ -325,14 +353,40 @@ class FileStorage:
             raise TypeError(f"Data must be JSON serializable: {error}") from error
 
     def atomic_write_json(self, path: Path, data: Any):
-        with self.lock:
-            self.atomic_write_text(path, self.json_text(path, data))
+        # Atomic writes are serialized per target path by atomic_write_text.
+        # Do not take the global storage lock here: high-fan-in workflows such
+        # as many typed explode nodes writing to zoning should not make every
+        # unrelated JSON write wait behind one global lock. Multi-file updates
+        # still take their own node/job interprocess locks at the call site.
+        self.atomic_write_text(path, self.json_text(path, data))
 
     def read_json(self, path: Path, default: Any = None) -> Any:
-        if not path.exists():
-            return default
+        path = Path(path)
 
-        return json.loads(path.read_text(encoding="utf-8"))
+        def read_text_or_none():
+            try:
+                return path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+
+        # Windows can briefly deny reading a file that another process is
+        # replacing. Treat that like a transient filesystem condition. Also
+        # retry JSON decoding a few times in case a third-party tool has the
+        # file open while it is being swapped.
+        last_decode_error = None
+        thread_lock = self.thread_lock_for(path)
+        for attempt in range(20):
+            with thread_lock:
+                text = self.retry_fs(read_text_or_none, attempts=8, base_delay=0.01)
+            if text is None:
+                return default
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as error:
+                last_decode_error = error
+                time.sleep(min(0.25, 0.01 * (attempt + 1)))
+
+        raise last_decode_error
 
     def empty_job_index(self, node_name: str) -> dict[str, Any]:
         return {
@@ -366,11 +420,23 @@ class FileStorage:
         return index
 
     def read_job_index(self, node_name: str) -> dict[str, Any]:
+        # Fast path: a valid clean index is returned without taking the OS lock.
+        # If the file is missing/corrupt/dirty/temporarily unreadable, rebuild
+        # under the node index lock from the authoritative job folders and
+        # status files.
         path = self.job_index_file(node_name)
-        index = self.normalize_job_index(node_name, self.read_json(path, default=None))
-        if index is None:
-            index = self.rebuild_job_index(node_name)
-        return index
+        if not self.job_index_dirty(node_name):
+            try:
+                index = self.normalize_job_index(node_name, self.read_json(path, default=None))
+                if index is not None:
+                    return index
+            except OSError as error:
+                if not self.retryable_errno(error):
+                    raise
+            except json.JSONDecodeError:
+                pass
+
+        return self.rebuild_job_index(node_name)
 
     def write_job_index(self, node_name: str, index: dict[str, Any]):
         self.atomic_write_json(self.job_index_file(node_name), index)
@@ -423,6 +489,7 @@ class FileStorage:
                     index["duration_count"] += 1
 
         self.write_job_index(node_name, index)
+        self.clear_job_index_dirty(node_name)
         return index
 
     def rebuild_job_index(self, node_name: str) -> dict[str, Any]:
@@ -459,18 +526,28 @@ class FileStorage:
         job_id = self.validate_job_id(job_id)
         status = self.validate_status(status)
 
-        with self.interprocess_lock(f"node-{node_name}-index"):
-            index = self.normalize_job_index(node_name, self.read_json(self.job_index_file(node_name), default=None))
-            if index is None:
-                # The job was already written before registration, so rebuilding
-                # will include it. Do not increment a second time.
-                self.rebuild_job_index_unlocked(node_name)
-                return
-            index["last_job_id"] = max(index["last_job_id"], job_id)
-            index["counts"][status] += 1
-            if status == QUEUED:
-                self.atomic_write_text(self.queued_marker_file(node_name, job_id), "")
-            self.write_job_index(node_name, index)
+        # The job folder/job.json/input.json are the source of truth. The queued
+        # marker is the scheduler's cheap queue source. job_index.json is only a
+        # rebuildable summary cache; if its update fails under Windows file
+        # contention, mark it dirty and let the job spawn succeed.
+        if status == QUEUED:
+            self.atomic_write_text(self.queued_marker_file(node_name, job_id), "")
+
+        try:
+            with self.interprocess_lock(f"node-{node_name}-index"):
+                index = self.normalize_job_index(node_name, self.read_json(self.job_index_file(node_name), default=None))
+                if index is None:
+                    # The job was already written before registration, so rebuilding
+                    # will include it. Do not increment a second time.
+                    self.rebuild_job_index_unlocked(node_name)
+                    return
+                index["last_job_id"] = max(index["last_job_id"], job_id)
+                index["counts"][status] += 1
+                self.write_job_index(node_name, index)
+        except OSError as error:
+            if not self.retryable_errno(error):
+                raise
+            self.mark_job_index_dirty(node_name, f"create {job_id}: {error}")
 
     def update_job_index_status(
         self,
@@ -484,43 +561,51 @@ class FileStorage:
         job_id = self.validate_job_id(job_id)
         new_status = self.validate_status(new_status)
 
-        with self.interprocess_lock(f"node-{node_name}-index"):
-            index = self.normalize_job_index(node_name, self.read_json(self.job_index_file(node_name), default=None))
-            if index is None:
-                # The status file has already been written/removed, so rebuilding
-                # now captures the new state exactly.
-                self.rebuild_job_index_unlocked(node_name)
-                return
-            index["last_job_id"] = max(index["last_job_id"], job_id)
+        # Keep the queued marker correct before touching the summary cache. The
+        # scheduler can still see queued work even if the index update is later
+        # marked dirty and rebuilt.
+        marker = self.queued_marker_file(node_name, job_id)
+        if new_status == QUEUED:
+            self.atomic_write_text(marker, "")
+        else:
+            self.remove_if_exists(marker)
 
-            if old_status in VALID_STATUSES and index["counts"].get(old_status, 0) > 0:
-                index["counts"][old_status] -= 1
+        try:
+            with self.interprocess_lock(f"node-{node_name}-index"):
+                index = self.normalize_job_index(node_name, self.read_json(self.job_index_file(node_name), default=None))
+                if index is None:
+                    # The status file has already been written/removed, so rebuilding
+                    # now captures the new state exactly.
+                    self.rebuild_job_index_unlocked(node_name)
+                    return
+                index["last_job_id"] = max(index["last_job_id"], job_id)
 
-            index["counts"][new_status] += 1
+                if old_status in VALID_STATUSES and index["counts"].get(old_status, 0) > 0:
+                    index["counts"][old_status] -= 1
 
-            marker = self.queued_marker_file(node_name, job_id)
-            if new_status == QUEUED:
-                self.atomic_write_text(marker, "")
-            else:
-                self.remove_if_exists(marker)
+                index["counts"][new_status] += 1
 
-            running = index.setdefault("running_jobs", {})
-            running.pop(str(job_id), None)
-            if new_status == RUNNING:
-                running[str(job_id)] = {
-                    "started_at": (new_data or {}).get("started_at"),
-                }
+                running = index.setdefault("running_jobs", {})
+                running.pop(str(job_id), None)
+                if new_status == RUNNING:
+                    running[str(job_id)] = {
+                        "started_at": (new_data or {}).get("started_at"),
+                    }
 
-            terminal = {DONE, FAILED, SKIPPED, CANCELLED}
-            if old_status in terminal and isinstance((old_data or {}).get("duration_seconds"), int | float):
-                index["duration_total"] = max(0.0, index["duration_total"] - float(old_data["duration_seconds"]))
-                index["duration_count"] = max(0, int(index["duration_count"]) - 1)
+                terminal = {DONE, FAILED, SKIPPED, CANCELLED}
+                if old_status in terminal and isinstance((old_data or {}).get("duration_seconds"), int | float):
+                    index["duration_total"] = max(0.0, index["duration_total"] - float(old_data["duration_seconds"]))
+                    index["duration_count"] = max(0, int(index["duration_count"]) - 1)
 
-            if new_status in terminal and isinstance((new_data or {}).get("duration_seconds"), int | float):
-                index["duration_total"] += float(new_data["duration_seconds"])
-                index["duration_count"] = int(index["duration_count"]) + 1
+                if new_status in terminal and isinstance((new_data or {}).get("duration_seconds"), int | float):
+                    index["duration_total"] += float(new_data["duration_seconds"])
+                    index["duration_count"] = int(index["duration_count"]) + 1
 
-            self.write_job_index(node_name, index)
+                self.write_job_index(node_name, index)
+        except OSError as error:
+            if not self.retryable_errno(error):
+                raise
+            self.mark_job_index_dirty(node_name, f"status {job_id}: {error}")
 
     def write_graph(self, edges: list[tuple[str, str]]):
         data = self.read_json(self.workflow_file(), default={})
@@ -729,7 +814,16 @@ class FileStorage:
     def next_job_id(self, node_name: str) -> int:
         # Fast path: use the per-node index instead of scanning every job folder.
         # add_job/create_job already hold the node jobs lock while allocating.
-        return int(self.read_job_index(node_name).get("last_job_id") or 0) + 1
+        try:
+            return int(self.read_job_index(node_name).get("last_job_id") or 0) + 1
+        except OSError as error:
+            if not self.retryable_errno(error):
+                raise
+            # If the index file itself is temporarily inaccessible, job-id
+            # allocation must still work. The jobs folder is authoritative and
+            # this call is made while the node jobs lock is held.
+            self.mark_job_index_dirty(node_name, f"next_job_id: {error}")
+            return max(self.iter_job_ids(node_name), default=0) + 1
 
     def job_exists(self, node_name: str, job_id: int) -> bool:
         job_id = self.validate_job_id(job_id)
@@ -1010,7 +1104,16 @@ class FileStorage:
         return list(self.iter_queued_job_ids(node_name))
 
     def has_queued_jobs(self, node_name: str) -> bool:
-        return self.read_job_index(node_name)["counts"].get(QUEUED, 0) > 0
+        # Queue markers are the cheap scheduler source of truth. This avoids
+        # missing newly-spawned jobs if the summary index is temporarily dirty,
+        # and avoids reading the hot job_index.json file just to answer yes/no.
+        queued = self.queued_dir(node_name)
+
+        def action():
+            with os.scandir(queued) as entries:
+                return any(entry.is_file() and entry.name.endswith(".queued") for entry in entries)
+
+        return bool(self.retry_fs(action, attempts=20, base_delay=0.01))
 
     def queued_jobs(self, node_name: str) -> list[Job]:
         return [
