@@ -16,3 +16,12 @@ test = ["pytest>=7.0"]
 
 [project.scripts]
 mwf = "micro_workflow_manager.cli:main"
+
+[tool.pytest.ini_options]
+addopts = "-m 'not stress' -p no:ddtrace"
+markers = [
+    "stress: long-running cyclic autostart scheduler tests",
+]
+filterwarnings = [
+    "error",
+]

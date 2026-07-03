@@ -437,6 +437,18 @@ class MicroWorkflow:
                 self.storage.set_node_status(to_node, QUEUED)
 
         if autostart and self.autostart_mode == "immediate":
+            # Immediate autostart is safe across DAG edges, but inside a cyclic
+            # strongly connected component it can recursively run a child job
+            # from inside its parent job. With many concurrent jobs this can
+            # saturate every worker with parents waiting for children from the
+            # same component. Same-component autostarts therefore mean
+            # "enqueue and wake the component scheduler", not "run nested now".
+            if (
+                from_node is not None
+                and self.same_cyclic_component(from_node, to_node)
+            ):
+                return job
+
             return self.run_job(
                 node_name=to_node,
                 job_id=job_id,
@@ -462,6 +474,50 @@ class MicroWorkflow:
             self.graph_obj.has_edge(node_name, node_name)
             for node_name in component
         )
+
+    def same_cyclic_component(self, first_node: str, second_node: str) -> bool:
+        first_component = self.component_for(first_node)
+        return second_node in first_component and self.component_is_cyclic(first_component)
+
+    def component_topological_units(
+        self,
+        nodes: list[str] | None = None,
+    ) -> list[list[str]]:
+        """Return selected nodes grouped by strongly connected component.
+
+        Each cyclic component is scheduled as one unit. This prevents several
+        node-level schedulers from simultaneously owning the same communicating
+        class while still preserving topological order between components.
+        """
+        selected = set(self.graph_obj.nodes if nodes is None else nodes)
+        node_order = list(self.graph_obj.nodes)
+        components = [set(component) for component in nx.strongly_connected_components(self.graph_obj)]
+        component_by_node = {
+            node_name: index
+            for index, component in enumerate(components)
+            for node_name in component
+        }
+
+        component_graph = nx.DiGraph()
+        component_graph.add_nodes_from(range(len(components)))
+
+        for start, end in self.graph_obj.edges:
+            start_component = component_by_node[start]
+            end_component = component_by_node[end]
+            if start_component != end_component:
+                component_graph.add_edge(start_component, end_component)
+
+        units: list[list[str]] = []
+        for component_index in nx.topological_sort(component_graph):
+            unit = [
+                node_name
+                for node_name in node_order
+                if component_by_node[node_name] == component_index and node_name in selected
+            ]
+            if unit:
+                units.append(unit)
+
+        return units
 
     def component_predecessors(self, component: set[str]) -> set[str]:
         predecessors: set[str] = set()
@@ -645,12 +701,104 @@ class MicroWorkflow:
         nodes: list[str] | None = None,
         ready_check: Callable[[str], bool] | None = None,
     ) -> list[str]:
-        """Run ready nodes concurrently, and jobs inside each node concurrently.
+        """Run ready workflow units concurrently.
 
-        This schedules multiple ready nodes at the same time. Each node still
-        uses its own max_threads value for jobs inside that node.
+        Acyclic singleton components are scheduled as ordinary nodes. Cyclic
+        strongly connected components are scheduled as one component-owned pump:
+        jobs inside the component may create more jobs inside the same component,
+        but no second node scheduler is allowed to take ownership of that same
+        communicating class. This keeps autostart=True intuitive for cycles
+        without recursive/nested execution deadlocks.
         """
         selected = list(nodes) if nodes is not None else list(self.graph_obj.nodes)
+        if not selected:
+            return []
+
+        def default_ready_check(node_name: str) -> bool:
+            return self.node_ready(node_name)
+
+        check = ready_check or default_ready_check
+        units = self.component_topological_units(selected)
+        max_workers = max(1, len(units))
+        ran: list[str] = []
+        in_flight: set[tuple[str, ...]] = set()
+        futures = {}
+
+        def unit_key(unit: list[str]) -> tuple[str, ...]:
+            return tuple(sorted(unit))
+
+        def unit_has_queued_jobs(unit: list[str]) -> bool:
+            return any(self.storage.has_queued_jobs(node_name) for node_name in unit)
+
+        def unit_ready(unit: list[str]) -> bool:
+            return all(check(node_name) for node_name in unit)
+
+        def run_unit(unit: list[str]):
+            if len(unit) == 1 and not self.component_is_cyclic(set(unit)):
+                return self.run_node(unit[0], True)
+            return self.run_component(unit, ready_check=check)
+
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="mwf-unit",
+        ) as executor:
+            while True:
+                self.finalize_ready_nodes()
+
+                ready_units = [
+                    unit
+                    for unit in units
+                    if unit_key(unit) not in in_flight
+                    and unit_has_queued_jobs(unit)
+                    and unit_ready(unit)
+                ]
+
+                for unit in ready_units:
+                    key = unit_key(unit)
+                    future = executor.submit(run_unit, list(unit))
+                    futures[future] = key
+                    in_flight.add(key)
+
+                if not futures:
+                    break
+
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+
+                for future in done:
+                    key = futures.pop(future)
+                    in_flight.remove(key)
+
+                    try:
+                        result = future.result()
+                    except Exception:
+                        for pending in futures:
+                            pending.cancel()
+                        wait(futures)
+                        raise
+
+                    if isinstance(result, list):
+                        ran.extend(str(item) for item in result)
+                    else:
+                        ran.extend(key)
+
+        self.finalize_ready_nodes()
+        return ran
+
+    def run_component(
+        self,
+        nodes: list[str],
+        ready_check: Callable[[str], bool] | None = None,
+    ) -> list[str]:
+        """Pump one cyclic component until it becomes quiescent.
+
+        This is the core cyclic-autostart scheduler. It owns the component while
+        it is active, starts node runners as queued jobs appear, and only returns
+        after every queued/running job in the selected component has settled.
+        New same-component jobs created with autostart=True are simply queued;
+        this pump notices them and schedules them without nesting child jobs
+        inside parent job threads.
+        """
+        selected = list(nodes)
         selected_set = set(selected)
         if not selected:
             return []
@@ -664,14 +812,17 @@ class MicroWorkflow:
         in_flight: set[str] = set()
         futures = {}
 
+        def any_queued() -> bool:
+            return any(self.storage.has_queued_jobs(node_name) for node_name in selected)
+
         with ThreadPoolExecutor(
             max_workers=max_workers,
-            thread_name_prefix="mwf-node",
+            thread_name_prefix="mwf-component",
         ) as executor:
             while True:
-                self.finalize_ready_nodes()
+                self.refresh_component_status(selected_set, allow_complete=False)
 
-                ready = [
+                ready_nodes = [
                     node_name
                     for node_name in selected
                     if node_name not in in_flight
@@ -679,19 +830,24 @@ class MicroWorkflow:
                     and check(node_name)
                 ]
 
-                for node_name in ready:
-                    future = executor.submit(
-                        self.run_node,
-                        node_name,
-                        True,
-                    )
+                for node_name in ready_nodes:
+                    future = executor.submit(self.run_node, node_name, True)
                     futures[future] = node_name
                     in_flight.add(node_name)
 
                 if not futures:
+                    if any_queued():
+                        # The component still has queued work, but it is not
+                        # ready under the caller's run-set policy. Let the outer
+                        # workflow loop report the blocked nodes instead of
+                        # spinning forever.
+                        break
                     break
 
-                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                done, _ = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
+
+                if not done:
+                    continue
 
                 for future in done:
                     node_name = futures.pop(future)
@@ -707,7 +863,7 @@ class MicroWorkflow:
 
                     ran.append(node_name)
 
-        self.finalize_ready_nodes()
+        self.refresh_component_status(selected_set, allow_complete=True)
         return ran
 
     def run_node(self, node_name: str, ignore_readiness: bool = False):

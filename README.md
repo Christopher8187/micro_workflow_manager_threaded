@@ -17,6 +17,12 @@ component are done and the component is finalized together.
 
 See `examples/autostart_cycle_lab` for a runnable four-node experiment.
 
+### Same-component autostart scheduling
+
+Inside a cyclic strongly connected component, `autostart=True` means "enqueue the child job and wake the component scheduler". It does not recursively run the child job inside the parent job thread. This avoids cyclic autostart deadlocks where every worker slot is held by parent jobs trying to synchronously run children from the same communicating class.
+
+For acyclic edges, normal autostart behavior is preserved. For CLI `mwf run` / `mwf runfrom`, the selected run set is still protected: dynamic autostarts outside the approved nodes are blocked, while jobs created inside the selected cyclic component are pumped until the whole component is quiescent.
+
 ## Explicit jobs
 
 `mwf run` and `mwf runfrom` no longer invent a default starter job. Declare default jobs in the respective node file:

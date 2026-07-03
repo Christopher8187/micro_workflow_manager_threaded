@@ -122,3 +122,48 @@ def test_runfrom_supports_self_and_mutual_autostart_cycles_before_downstream(tmp
     assert sorted(path.name for path in (tmp_path / "node" / "B" / "jobs").iterdir()) == ["1"]
     assert sorted(path.name for path in (tmp_path / "node" / "C" / "jobs").iterdir()) == ["1"]
     assert sorted(path.name for path in (tmp_path / "node" / "D" / "jobs").iterdir()) == ["1", "2", "3", "4"]
+
+
+def test_same_component_immediate_autostart_is_deferred_not_nested(tmp_path):
+    from micro_workflow_manager import MicroWorkflow
+
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B"), ("B", "A")])
+    events = []
+
+    @workflow.task("A")
+    def run_a(ctx):
+        events.append("A-start")
+        ctx.node("B").add(autostart=True)
+        events.append("A-end")
+        return "A"
+
+    @workflow.task("B")
+    def run_b(ctx):
+        events.append("B")
+        return "B"
+
+    workflow.start("A")
+    workflow.run()
+
+    assert events == ["A-start", "A-end", "B"]
+    assert workflow.node_complete("A")
+    assert workflow.node_complete("B")
+
+
+def test_threaded_runfrom_pumps_cyclic_autostart_component_before_downstream(tmp_path, monkeypatch, capsys):
+    make_cycle_project(tmp_path, monkeypatch)
+    assert cli.main(["graph", "src/graph.py", "--runner", "threaded"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["runfrom", "A", "--runner", "threaded"]) == 0
+    out = capsys.readouterr().out
+
+    assert "Ran:" in out
+    assert node_status(tmp_path, "A") == "done"
+    assert node_status(tmp_path, "B") == "done"
+    assert node_status(tmp_path, "C") == "done"
+    assert node_status(tmp_path, "D") == "done"
+
+    assert sorted(path.name for path in (tmp_path / "node" / "A" / "jobs").iterdir()) == ["1", "2", "3", "4"]
+    assert sorted(path.name for path in (tmp_path / "node" / "D" / "jobs").iterdir()) == ["1", "2", "3", "4"]

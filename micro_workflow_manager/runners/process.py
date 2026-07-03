@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import multiprocessing as mp
 import pickle
 import sys
 from concurrent.futures import FIRST_COMPLETED, FIRST_EXCEPTION, ProcessPoolExecutor, wait
@@ -141,6 +142,7 @@ class ProcessPoolRunner(BaseRunner):
         self._require_project_loader()
         return ProcessPoolExecutor(
             max_workers=self.max_processes,
+            mp_context=mp.get_context("spawn"),
             initializer=_init_process_worker,
             initargs=(
                 str(self.project_dir),
