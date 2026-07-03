@@ -11,7 +11,7 @@ from threading import Lock, RLock
 from typing import Any
 from uuid import uuid4
 
-from .models import Job, QUEUED, VALID_STATUSES
+from .models import CANCELLED, DONE, FAILED, Job, QUEUED, RUNNING, SKIPPED, VALID_STATUSES
 
 
 class FileStorage:
@@ -267,6 +267,18 @@ class FileStorage:
     def default_jobs_file(self, node_name: str) -> Path:
         return self.node_dir(node_name) / "default_jobs.json"
 
+    def job_index_file(self, node_name: str) -> Path:
+        return self.node_dir(node_name) / "job_index.json"
+
+    def queued_dir(self, node_name: str) -> Path:
+        path = self.node_dir(node_name) / "queued"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def queued_marker_file(self, node_name: str, job_id: int) -> Path:
+        job_id = self.validate_job_id(job_id)
+        return self.queued_dir(node_name) / f"{job_id}.queued"
+
     def job_base_dir(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
         return self.safe_join(self.jobs_dir(node_name), str(job_id))
@@ -322,6 +334,194 @@ class FileStorage:
 
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def empty_job_index(self, node_name: str) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "node": node_name,
+            "last_job_id": 0,
+            "counts": {status: 0 for status in VALID_STATUSES},
+            "running_jobs": {},
+            "duration_total": 0.0,
+            "duration_count": 0,
+        }
+
+    def normalize_job_index(self, node_name: str, data: Any) -> dict[str, Any] | None:
+        if not isinstance(data, dict) or data.get("version") != 1:
+            return None
+
+        index = self.empty_job_index(node_name)
+        index.update(data)
+        counts = index.get("counts")
+        if not isinstance(counts, dict):
+            counts = {}
+        index["counts"] = {
+            status: int(counts.get(status, 0) or 0)
+            for status in VALID_STATUSES
+        }
+        running_jobs = index.get("running_jobs")
+        index["running_jobs"] = running_jobs if isinstance(running_jobs, dict) else {}
+        index["last_job_id"] = int(index.get("last_job_id") or 0)
+        index["duration_total"] = float(index.get("duration_total") or 0.0)
+        index["duration_count"] = int(index.get("duration_count") or 0)
+        return index
+
+    def read_job_index(self, node_name: str) -> dict[str, Any]:
+        path = self.job_index_file(node_name)
+        index = self.normalize_job_index(node_name, self.read_json(path, default=None))
+        if index is None:
+            index = self.rebuild_job_index(node_name)
+        return index
+
+    def write_job_index(self, node_name: str, index: dict[str, Any]):
+        self.atomic_write_json(self.job_index_file(node_name), index)
+
+    def rebuild_job_index_unlocked(self, node_name: str) -> dict[str, Any]:
+        """Rebuild the per-node job index. Caller must hold node index lock."""
+        index = self.empty_job_index(node_name)
+        queued = self.queued_dir(node_name)
+
+        for marker in list(queued.glob("*.queued")):
+            self.remove_if_exists(marker)
+
+        jobs_root = self.jobs_dir(node_name)
+        with os.scandir(jobs_root) as entries:
+            for entry in entries:
+                if not entry.is_dir() or not entry.name.isdigit():
+                    continue
+
+                job_id = int(entry.name)
+                job_file = Path(entry.path) / "job.json"
+                if not job_file.is_file():
+                    continue
+
+                index["last_job_id"] = max(index["last_job_id"], job_id)
+                status_path = Path(entry.path) / "status.json"
+                status_data = self.read_json(status_path, default=None)
+                if isinstance(status_data, dict):
+                    status = status_data.get("status") or QUEUED
+                else:
+                    status = QUEUED
+
+                if status not in VALID_STATUSES:
+                    status = QUEUED
+
+                index["counts"][status] += 1
+
+                if status == QUEUED:
+                    self.atomic_write_text(self.queued_marker_file(node_name, job_id), "")
+
+                if status == RUNNING:
+                    index["running_jobs"][str(job_id)] = {
+                        "started_at": status_data.get("started_at") if isinstance(status_data, dict) else None,
+                    }
+
+                duration = None
+                if isinstance(status_data, dict):
+                    duration = status_data.get("duration_seconds")
+                if status in {DONE, FAILED, SKIPPED, CANCELLED} and isinstance(duration, int | float):
+                    index["duration_total"] += float(duration)
+                    index["duration_count"] += 1
+
+        self.write_job_index(node_name, index)
+        return index
+
+    def rebuild_job_index(self, node_name: str) -> dict[str, Any]:
+        """Rebuild the per-node job index from existing job folders.
+
+        This is the compatibility path for projects created before job_index.json
+        existed. It is intentionally the only place that scans every job in a
+        node for scheduler bookkeeping. Normal runs maintain this index
+        incrementally as jobs are created and statuses change.
+        """
+        with self.interprocess_lock(f"node-{node_name}-index"):
+            return self.rebuild_job_index_unlocked(node_name)
+
+    def job_status_counts(self, node_name: str) -> dict[str, int]:
+        return dict(self.read_job_index(node_name)["counts"])
+
+    def node_job_summary(self, node_name: str) -> dict[str, Any]:
+        index = self.read_job_index(node_name)
+        counts = dict(index["counts"])
+        total = sum(counts.values())
+        duration_count = int(index.get("duration_count") or 0)
+        avg_duration = None
+        if duration_count:
+            avg_duration = float(index.get("duration_total") or 0.0) / duration_count
+
+        return {
+            "total": total,
+            "counts": counts,
+            "running_jobs": dict(index.get("running_jobs") or {}),
+            "avg_duration_seconds": avg_duration,
+        }
+
+    def register_job_created(self, node_name: str, job_id: int, status: str = QUEUED):
+        job_id = self.validate_job_id(job_id)
+        status = self.validate_status(status)
+
+        with self.interprocess_lock(f"node-{node_name}-index"):
+            index = self.normalize_job_index(node_name, self.read_json(self.job_index_file(node_name), default=None))
+            if index is None:
+                # The job was already written before registration, so rebuilding
+                # will include it. Do not increment a second time.
+                self.rebuild_job_index_unlocked(node_name)
+                return
+            index["last_job_id"] = max(index["last_job_id"], job_id)
+            index["counts"][status] += 1
+            if status == QUEUED:
+                self.atomic_write_text(self.queued_marker_file(node_name, job_id), "")
+            self.write_job_index(node_name, index)
+
+    def update_job_index_status(
+        self,
+        node_name: str,
+        job_id: int,
+        old_status: str | None,
+        new_status: str,
+        old_data: dict[str, Any] | None = None,
+        new_data: dict[str, Any] | None = None,
+    ):
+        job_id = self.validate_job_id(job_id)
+        new_status = self.validate_status(new_status)
+
+        with self.interprocess_lock(f"node-{node_name}-index"):
+            index = self.normalize_job_index(node_name, self.read_json(self.job_index_file(node_name), default=None))
+            if index is None:
+                # The status file has already been written/removed, so rebuilding
+                # now captures the new state exactly.
+                self.rebuild_job_index_unlocked(node_name)
+                return
+            index["last_job_id"] = max(index["last_job_id"], job_id)
+
+            if old_status in VALID_STATUSES and index["counts"].get(old_status, 0) > 0:
+                index["counts"][old_status] -= 1
+
+            index["counts"][new_status] += 1
+
+            marker = self.queued_marker_file(node_name, job_id)
+            if new_status == QUEUED:
+                self.atomic_write_text(marker, "")
+            else:
+                self.remove_if_exists(marker)
+
+            running = index.setdefault("running_jobs", {})
+            running.pop(str(job_id), None)
+            if new_status == RUNNING:
+                running[str(job_id)] = {
+                    "started_at": (new_data or {}).get("started_at"),
+                }
+
+            terminal = {DONE, FAILED, SKIPPED, CANCELLED}
+            if old_status in terminal and isinstance((old_data or {}).get("duration_seconds"), int | float):
+                index["duration_total"] = max(0.0, index["duration_total"] - float(old_data["duration_seconds"]))
+                index["duration_count"] = max(0, int(index["duration_count"]) - 1)
+
+            if new_status in terminal and isinstance((new_data or {}).get("duration_seconds"), int | float):
+                index["duration_total"] += float(new_data["duration_seconds"])
+                index["duration_count"] = int(index["duration_count"]) + 1
+
+            self.write_job_index(node_name, index)
+
     def write_graph(self, edges: list[tuple[str, str]]):
         data = self.read_json(self.workflow_file(), default={})
 
@@ -336,6 +536,7 @@ class FileStorage:
         self.node_input_dir(node_name)
         self.node_output_dir(node_name)
         self.jobs_dir(node_name)
+        self.queued_dir(node_name)
 
     def input_path(self, node_name: str, *parts: str) -> Path:
         return self.safe_join(self.node_input_dir(node_name), *parts)
@@ -492,9 +693,17 @@ class FileStorage:
 
     def set_node_status(self, node_name: str, status: str):
         status = self.validate_status(status)
+        path = self.node_state_file(node_name)
+        current = self.read_json(path, default=None)
+        if isinstance(current, dict) and current.get("status") == status:
+            return
+
         with self.lock:
+            current = self.read_json(path, default=None)
+            if isinstance(current, dict) and current.get("status") == status:
+                return
             self.atomic_write_json(
-                self.node_state_file(node_name),
+                path,
                 {
                     "node": node_name,
                     "status": status,
@@ -518,17 +727,9 @@ class FileStorage:
             self.append_text(self.debug_file(node_name), f"[{timestamp}] {message}\n")
 
     def next_job_id(self, node_name: str) -> int:
-        with self.lock:
-            existing = []
-
-            for path in self.jobs_dir(node_name).iterdir():
-                if path.is_dir() and path.name.isdigit() and (path / "job.json").is_file():
-                    existing.append(int(path.name))
-
-            if not existing:
-                return 1
-
-            return max(existing) + 1
+        # Fast path: use the per-node index instead of scanning every job folder.
+        # add_job/create_job already hold the node jobs lock while allocating.
+        return int(self.read_job_index(node_name).get("last_job_id") or 0) + 1
 
     def job_exists(self, node_name: str, job_id: int) -> bool:
         job_id = self.validate_job_id(job_id)
@@ -615,7 +816,8 @@ class FileStorage:
                 job.params,
             )
 
-            self.set_job_status(job.node_name, job.job_id, QUEUED)
+            self.remove_if_exists(self.status_file(job.node_name, job.job_id))
+            self.register_job_created(job.node_name, job.job_id, QUEUED)
 
     def ensure_job(self, job: Job) -> Job:
         """Create or refresh a deterministic default job.
@@ -682,27 +884,39 @@ class FileStorage:
     def set_job_status(self, node_name: str, job_id: int, status: str, **extra):
         job_id = self.validate_job_id(job_id)
         status = self.validate_status(status)
+        status_path = self.status_file(node_name, job_id)
+        old_data = self.read_json(status_path, default=None)
+
+        if isinstance(old_data, dict):
+            old_status = old_data.get("status") or QUEUED
+        elif self.job_exists(node_name, job_id):
+            old_status = QUEUED
+        else:
+            old_status = None
 
         # QUEUED is the default state for an existing job. Keeping it implicit
         # avoids thousands of tiny JSON writes when a large node is reset before
         # a run. Non-queued states still get an explicit status.json so existing
         # tooling can inspect running/done/failed jobs on disk.
         if status == QUEUED and not extra:
-            with self.lock:
-                path = self.status_file(node_name, job_id)
-                self.remove_if_exists(path)
-            return
+            self.remove_if_exists(status_path)
+            new_data = None
+        else:
+            new_data = {
+                "job_id": job_id,
+                "node_name": node_name,
+                "status": status,
+                **extra,
+            }
+            self.atomic_write_json(status_path, new_data)
 
-        data = {
-            "job_id": job_id,
-            "node_name": node_name,
-            "status": status,
-            **extra,
-        }
-
-        self.atomic_write_json(
-            self.status_file(node_name, job_id),
-            data,
+        self.update_job_index_status(
+            node_name=node_name,
+            job_id=job_id,
+            old_status=old_status,
+            new_status=status,
+            old_data=old_data if isinstance(old_data, dict) else None,
+            new_data=new_data,
         )
 
     def get_job_status(self, node_name: str, job_id: int) -> str | None:
@@ -774,21 +988,29 @@ class FileStorage:
                     yield int(entry.name)
 
     def iter_queued_job_ids(self, node_name: str):
-        """Yield queued job IDs lazily.
+        """Yield queued job IDs from the queue marker directory.
 
-        This lets runners start executing the first queued jobs while the rest of
-        a huge node is still being discovered. The older queued_job_ids() helper
-        still returns a sorted list for callers that need a stable display order.
+        This avoids scanning every job/status file whenever the scheduler wants
+        to know what can run next. The marker directory is maintained
+        incrementally by set_job_status/create_job and rebuilt once for older
+        projects that do not yet have job_index.json.
         """
-        for job_id in self.iter_job_ids(node_name):
-            if self.job_is_queued(node_name, job_id):
-                yield job_id
+        self.read_job_index(node_name)
+        queued = self.queued_dir(node_name)
+        ids = []
+        with os.scandir(queued) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.endswith(".queued"):
+                    raw = entry.name[:-7]
+                    if raw.isdigit():
+                        ids.append(int(raw))
+        yield from sorted(ids)
 
     def queued_job_ids(self, node_name: str) -> list[int]:
-        return sorted(self.iter_queued_job_ids(node_name))
+        return list(self.iter_queued_job_ids(node_name))
 
     def has_queued_jobs(self, node_name: str) -> bool:
-        return next(self.iter_queued_job_ids(node_name), None) is not None
+        return self.read_job_index(node_name)["counts"].get(QUEUED, 0) > 0
 
     def queued_jobs(self, node_name: str) -> list[Job]:
         return [

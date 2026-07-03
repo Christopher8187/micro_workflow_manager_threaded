@@ -73,33 +73,31 @@ def _max_parallel_jobs(workflow, node_name: str) -> int:
 
 
 def node_stats(workflow, node_name: str) -> dict[str, Any]:
-    rows = workflow.storage.list_jobs(node_name)
+    # Fast path: use FileStorage's per-node job index. This makes monitor
+    # snapshots O(number of nodes + running jobs), not O(all job folders/status
+    # files). On large cyclic autostart runs, the old monitor could itself
+    # compete with the runner by rereading 10k+ status files every refresh.
+    summary = workflow.storage.node_job_summary(node_name)
     counts = {status: 0 for status in STATUSES}
-    running_jobs: list[int] = []
-    running_elapsed: list[float] = []
-    durations: list[float] = []
+    counts.update(summary.get("counts") or {})
 
-    for row in rows:
-        status = row.get("status") or QUEUED
-        counts[status] = counts.get(status, 0) + 1
-
-        if status == RUNNING:
-            job_id = row.get("job_id")
-            if isinstance(job_id, int):
-                running_jobs.append(job_id)
-            elapsed = seconds_since(row.get("started_at"))
+    running_jobs = []
+    running_elapsed = []
+    for raw_job_id, data in (summary.get("running_jobs") or {}).items():
+        try:
+            running_jobs.append(int(raw_job_id))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            elapsed = seconds_since(data.get("started_at"))
             if elapsed is not None:
                 running_elapsed.append(elapsed)
 
-        duration = _duration(row)
-        if duration is not None and status in TERMINAL:
-            durations.append(duration)
-
-    total = len(rows)
+    total = int(summary.get("total") or 0)
     completed = counts.get(DONE, 0) + counts.get(SKIPPED, 0)
     remaining = counts.get(QUEUED, 0) + counts.get(RUNNING, 0)
     failed = counts.get(FAILED, 0)
-    avg_duration = sum(durations) / len(durations) if durations else None
+    avg_duration = summary.get("avg_duration_seconds")
     max_parallel = _max_parallel_jobs(workflow, node_name)
     eta_seconds = None
 

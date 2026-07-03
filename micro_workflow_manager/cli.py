@@ -858,7 +858,10 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
             return 1
         nodes = topo_subset(workflow, expand_to_components(workflow, {node, *autostart_nodes}))
 
-    blockers = direct_incomplete_inputs(workflow, set(nodes)) - set(workflow.graph_obj.predecessors(node))
+    blockers = (
+        direct_incomplete_inputs(workflow, set(nodes))
+        - workflow.component_predecessors(workflow.component_for(node))
+    )
     ignore_external = False
 
     if blockers:
@@ -1084,6 +1087,7 @@ def clean_node(
         remove_dir(node_dir / "input")
 
     workflow.storage.init_node_folders(node)
+    workflow.storage.rebuild_job_index(node)
     workflow.storage.set_node_status(node, QUEUED)
 
 
@@ -1129,6 +1133,7 @@ def reset_node_for_run(
         remove_path(job_dir / "files")
 
     workflow.storage.init_node_folders(node)
+    workflow.storage.rebuild_job_index(node)
     if mark_queued:
         workflow.storage.set_node_status(node, QUEUED)
 
@@ -1148,9 +1153,9 @@ def reset_job_for_run(
     if not job_dir.is_dir():
         raise RuntimeError(f"Job does not exist: {node}/{job_id}")
 
-    remove_path(job_dir / "status.json")
     remove_path(job_dir / "output.json")
     remove_path(job_dir / "files")
+    workflow.storage.set_job_status(node, job_id, QUEUED)
 
     if mark_queued:
         workflow.storage.set_node_status(node, QUEUED)
@@ -1160,6 +1165,7 @@ def clear_node(root: Path, workflow: MicroWorkflow, node: str):
     remove_dir(node_dir / "output")
     remove_dir(node_dir / "jobs")
     workflow.storage.init_node_folders(node)
+    workflow.storage.rebuild_job_index(node)
     workflow.storage.set_node_status(node, QUEUED)
 
 

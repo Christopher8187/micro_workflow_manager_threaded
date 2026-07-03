@@ -478,25 +478,24 @@ class MicroWorkflow:
         return any(self.storage.list_jobs(node_name) for node_name in component)
 
     def refresh_component_status(self, component: set[str], allow_complete: bool = False):
-        """Refresh a strongly connected component as one communicating class."""
+        """Refresh a strongly connected component as one communicating class.
+
+        This uses the per-node job index instead of list_jobs(), so refreshing a
+        cyclic autostart component is O(number of nodes) rather than repeatedly
+        scanning thousands of job folders after every small routing update.
+        """
         component = set(component)
-        rows_by_node = {
-            node_name: self.storage.list_jobs(node_name)
+        counts_by_node = {
+            node_name: self.storage.job_status_counts(node_name)
             for node_name in component
         }
-        statuses_by_node = {
-            node_name: {row.get("status") for row in rows}
-            for node_name, rows in rows_by_node.items()
+        totals_by_node = {
+            node_name: sum(counts.values())
+            for node_name, counts in counts_by_node.items()
         }
-        all_statuses = {
-            status
-            for statuses in statuses_by_node.values()
-            for status in statuses
-        }
-        has_jobs = any(rows_by_node.values())
-        cyclic = self.component_is_cyclic(component)
+        total_jobs = sum(totals_by_node.values())
 
-        if not has_jobs:
+        if total_jobs == 0:
             for node_name in component:
                 current_status = self.storage.get_node_status(node_name)
                 if current_status in {DONE, FAILED, CANCELLED, SKIPPED}:
@@ -504,24 +503,31 @@ class MicroWorkflow:
                 self.storage.set_node_status(node_name, QUEUED)
             return
 
-        if FAILED in all_statuses:
+        if any(counts.get(FAILED, 0) for counts in counts_by_node.values()):
             for node_name in component:
                 self.storage.set_node_status(node_name, FAILED)
             return
 
-        if RUNNING in all_statuses or QUEUED in all_statuses:
-            for node_name in component:
-                statuses = statuses_by_node[node_name]
-                if RUNNING in statuses:
+        has_running_or_queued = any(
+            counts.get(RUNNING, 0) or counts.get(QUEUED, 0)
+            for counts in counts_by_node.values()
+        )
+        if has_running_or_queued:
+            for node_name, counts in counts_by_node.items():
+                if counts.get(RUNNING, 0):
                     self.storage.set_node_status(node_name, RUNNING)
                 else:
-                    # A node with no current jobs inside a cyclic component is
-                    # still part of the active communicating class. Keep it
-                    # non-complete while sibling nodes are queued/running.
                     self.storage.set_node_status(node_name, QUEUED)
             return
 
-        if all_statuses and all_statuses.issubset(SUCCESSFUL_JOB_TERMINAL_STATUSES):
+        successful_terminal = {DONE, SKIPPED}
+        all_terminal_success = all(
+            totals_by_node[node_name] > 0
+            and sum(counts_by_node[node_name].get(status, 0) for status in successful_terminal) == totals_by_node[node_name]
+            for node_name in component
+        )
+
+        if all_terminal_success:
             if allow_complete and self.component_ready(component):
                 for node_name in component:
                     self.storage.set_node_status(node_name, DONE)
@@ -539,10 +545,9 @@ class MicroWorkflow:
     def refresh_node_status(self, node_name: str, allow_complete: bool = False):
         """Refresh a node or cyclic component without unsafe early completion.
 
-        In an acyclic graph this preserves the original per-node behavior. In a
-        strongly connected component, all nodes in the component are finalized
-        together, so an autostart loop cannot mark A done while B/C still have
-        queued work that can later create more A jobs.
+        Uses the per-node job index rather than list_jobs(), avoiding a full
+        status-file scan every time a node or component is considered for
+        readiness/finalization.
         """
         component = self.component_for(node_name)
 
@@ -550,35 +555,33 @@ class MicroWorkflow:
             self.refresh_component_status(component, allow_complete=allow_complete)
             return
 
-        rows = self.storage.list_jobs(node_name)
+        counts = self.storage.job_status_counts(node_name)
+        total = sum(counts.values())
 
-        if not rows:
+        if total == 0:
             current_status = self.storage.get_node_status(node_name)
             if current_status in {DONE, FAILED, CANCELLED, SKIPPED}:
                 return
             self.storage.set_node_status(node_name, QUEUED)
             return
 
-        statuses = {row.get("status") for row in rows}
-
-        if FAILED in statuses:
+        if counts.get(FAILED, 0):
             self.storage.set_node_status(node_name, FAILED)
             return
 
-        if RUNNING in statuses:
+        if counts.get(RUNNING, 0):
             self.storage.set_node_status(node_name, RUNNING)
             return
 
-        if QUEUED in statuses:
+        if counts.get(QUEUED, 0):
             self.storage.set_node_status(node_name, QUEUED)
             return
 
-        if statuses and statuses.issubset(SUCCESSFUL_JOB_TERMINAL_STATUSES):
+        successful = counts.get(DONE, 0) + counts.get(SKIPPED, 0)
+        if successful == total:
             if allow_complete and self.node_ready(node_name):
                 self.storage.set_node_status(node_name, DONE)
             else:
-                # Finished jobs are not enough to complete the node if earlier
-                # predecessor nodes may still create more jobs for this node.
                 self.storage.set_node_status(node_name, QUEUED)
             return
 
