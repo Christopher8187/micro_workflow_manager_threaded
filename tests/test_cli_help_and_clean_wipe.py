@@ -1,5 +1,9 @@
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from micro_workflow_manager import cli
 
@@ -414,9 +418,9 @@ def test_init_creates_vscode_settings_and_gitignore(tmp_path, monkeypatch, capsy
     for entry in [
         ".mwf_locks/",
         ".mwf_run.json",
-        "node/*/input/**",
+        "node/*/input/*/",
         "node/*/jobs/**",
-        "node/*/output/**",
+        "node/*/output/*/",
         "node/*/queued/**",
         "node/*/node_state.json",
         "node/*/job_index.json",
@@ -427,6 +431,50 @@ def test_init_creates_vscode_settings_and_gitignore(tmp_path, monkeypatch, capsy
         ".pytest_cache/",
     ]:
         assert entry in gitignore
+
+    assert "node/*/input/**" not in gitignore
+    assert "node/*/output/**" not in gitignore
+
+
+def test_init_gitignore_keeps_direct_input_output_files_but_ignores_nested(tmp_path, monkeypatch, capsys):
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git executable is required to verify .gitignore matching semantics")
+
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["init"]) == 0
+    capsys.readouterr()
+
+    paths = [
+        "node/work/input/root.txt",
+        "node/work/input/nested/page.txt",
+        "node/work/output/result.txt",
+        "node/work/output/images/page.png",
+        "node/work/jobs/1/job.json",
+        "node/work/queued/1.queued",
+    ]
+    for rel in paths:
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+
+    subprocess.run([git, "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def is_ignored(rel: str) -> bool:
+        return subprocess.run(
+            [git, "check-ignore", "-q", rel],
+            cwd=tmp_path,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+
+    assert not is_ignored("node/work/input/root.txt")
+    assert is_ignored("node/work/input/nested/page.txt")
+    assert not is_ignored("node/work/output/result.txt")
+    assert is_ignored("node/work/output/images/page.png")
+    assert is_ignored("node/work/jobs/1/job.json")
+    assert is_ignored("node/work/queued/1.queued")
 
 
 def test_reinit_updates_sidecars_without_duplicating_gitignore_section(tmp_path, monkeypatch, capsys):
