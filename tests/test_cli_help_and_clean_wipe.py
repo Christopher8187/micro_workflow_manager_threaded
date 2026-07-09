@@ -394,3 +394,48 @@ def test_run_job_selection_rejects_bad_selectors(tmp_path, monkeypatch, capsys):
     assert cli.main(["run", "work", "job", "999", "--runner", "direct"]) == 1
     err = capsys.readouterr().err
     assert "Job does not exist: work/999" in err
+
+
+def test_init_creates_vscode_settings_and_gitignore(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["init"]) == 0
+    capsys.readouterr()
+
+    settings = json.loads((tmp_path / ".vscode" / "settings.json").read_text(encoding="utf-8"))
+    for key in ["files.exclude", "search.exclude"]:
+        assert settings[key]["**/*.egg-info"] is True
+        assert settings[key]["**/__pycache__"] is True
+        assert settings[key]["**/.pytest_cache"] is True
+        assert settings[key]["**/.mwf_locks"] is True
+        assert settings[key]["**/.mwf_run.json"] is True
+
+    gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    for entry in [
+        ".mwf_locks/",
+        ".mwf_run.json",
+        "node/*/input/**",
+        "node/*/jobs/**",
+        "node/*/output/**",
+        "node/*/queued/**",
+        "node/*/node_state.json",
+        "node/*/job_index.json",
+        "node/*/default_jobs.json",
+        "node/*/schema.json",
+        "*.egg-info/",
+        "__pycache__/",
+        ".pytest_cache/",
+    ]:
+        assert entry in gitignore
+
+
+def test_reinit_updates_sidecars_without_duplicating_gitignore_section(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["init"]) == 0
+    assert cli.main(["init"]) == 0
+    capsys.readouterr()
+
+    gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert gitignore.count("# >>> micro-workflow-manager generated state >>>") == 1
+    assert gitignore.count("# <<< micro-workflow-manager generated state <<<") == 1

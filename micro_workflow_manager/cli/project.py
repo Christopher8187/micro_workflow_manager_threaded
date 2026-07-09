@@ -7,10 +7,13 @@ from pathlib import Path
 from micro_workflow_manager.system import MicroWorkflow, normalize_workflow_runner
 
 from .constants import MWF_FILE
+from .extras.scaffold import ensure_project_sidecars
 from .files import find_root, read_config, safe_node_name, write_json
 
 def init_project() -> int:
-    path = Path.cwd() / MWF_FILE
+    root = Path.cwd()
+    path = root / MWF_FILE
+    ensure_project_sidecars(root)
 
     if path.exists():
         print(f"Already initialized: {path}")
