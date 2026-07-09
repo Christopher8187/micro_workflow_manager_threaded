@@ -1,6 +1,6 @@
 import networkx as nx
 
-from .models import (
+from ..models import (
     CANCELLED,
     DONE,
     FAILED,

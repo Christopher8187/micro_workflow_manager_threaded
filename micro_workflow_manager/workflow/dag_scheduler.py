@@ -1,9 +1,9 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable
 
-from .errors import InvalidGraphError
-from .models import FAILED, RUNNING
-from .models import Job
+from ..errors import InvalidGraphError
+from ..models import FAILED, RUNNING
+from ..models import Job
 
 
 class DagSchedulerMixin:

@@ -2,8 +2,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import networkx as nx
 
-from .errors import InvalidGraphError
-from .models import RUNNING
+from ..errors import InvalidGraphError
+from ..models import RUNNING
 
 
 class ComponentSchedulerMixin:

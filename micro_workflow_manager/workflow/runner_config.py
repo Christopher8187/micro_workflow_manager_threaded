@@ -1,7 +1,7 @@
-from .node import JobNode
-from .runners.direct import DirectRunner
-from .runners.process import ProcessPoolRunner
-from .runners.threaded import ThreadedRunner
+from ..node import JobNode
+from ..runners.direct import DirectRunner
+from ..runners.process import ProcessPoolRunner
+from ..runners.threaded import ThreadedRunner
 
 
 def normalize_workflow_runner(runner: str) -> str:

@@ -3,15 +3,15 @@ from threading import RLock, local
 
 import networkx as nx
 
-from .component_scheduler import ComponentSchedulerMixin
-from .component_state import ComponentStateMixin
-from .dag_scheduler import DagSchedulerMixin
-from .job_creation import JobCreationMixin
-from .job_execution import JobExecutionMixin
+from .workflow.component_scheduler import ComponentSchedulerMixin
+from .workflow.component_state import ComponentStateMixin
+from .workflow.dag_scheduler import DagSchedulerMixin
+from .workflow.job_creation import JobCreationMixin
+from .workflow.job_execution import JobExecutionMixin
 from .node import JobNode
-from .runner_config import RunnerFactoryMixin, normalize_workflow_runner
+from .workflow.runner_config import RunnerFactoryMixin, normalize_workflow_runner
 from .storage import FileStorage
-from .workflow_registration import WorkflowRegistrationMixin
+from .workflow.workflow_registration import WorkflowRegistrationMixin
 
 
 class MicroWorkflow(
