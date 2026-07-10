@@ -2,6 +2,65 @@
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
+## Explicit graph synchronization
+
+The graph definition and the top-level `node/` folders are synchronized only by
+the `graph` command. Ordinary commands such as `run`, `runfrom`, `clean`, and
+`monitor` do not silently add or remove node folders.
+
+Set the graph the first time:
+
+```bash
+mwf graph src/graph.py
+```
+
+After editing edges or renaming, adding, or removing nodes, explicitly apply the
+new graph state:
+
+```bash
+mwf graph --update
+```
+
+`mwf graph --update` uses the graph path already stored in `.mwf`. It creates
+folders for new nodes and permanently deletes folders for nodes no longer in the
+graph, including their inputs, outputs, jobs, and state. Back up or move any data
+you need before updating. If an ordinary command detects changed edges, missing
+new folders, or stale renamed folders, it exits with an instruction to run the
+update and leaves the disk unchanged.
+
+A leftover `node_behavior/*.py` file whose router name is no longer in the graph
+is ignored; importing the project will not recreate that old node folder.
+
+## Compact directed fans in `graph.py`
+
+A lowercase name can represent one node and an uppercase variable can represent
+a group. Put a collection on one side of an edge to express an `a-B` fan-out or
+an `A-b` fan-in:
+
+```python
+A = ["extract_text", "extract_images"]
+B = ["jsonify", "index"]
+
+EDGES = [
+    ("split", B),   # split -> jsonify, split -> index
+    (A, "merge"),   # extract_text -> merge, extract_images -> merge
+]
+```
+
+The explicit helper form is also supported:
+
+```python
+from micro_workflow_manager import fan
+
+EDGES = [
+    fan("split", ["jsonify", "index"]),
+    fan(["extract_text", "extract_images"], "merge"),
+]
+```
+
+A collection on both sides is rejected because that would describe a complete
+bipartite graph rather than one directed fan.
+
 ## Important workflow rule
 
 A finished job is not the same thing as a finished node. This matters for dynamically-created jobs: a downstream node can receive and finish one job before all of its predecessor nodes have completed and before those predecessors have finished creating every downstream job. The library only marks a node `done` during node-level finalization after its predecessors are complete.
@@ -154,14 +213,54 @@ next reader rebuilds it from the authoritative job folders/status files. This
 keeps high-fan-in spawn nodes such as `zoning` from failing just because many
 workers touched the same summary file at once.
 
-## Install for development
+## Install, uninstall, and persistence
 
-```bash
-pip install -e .[test]
+Use a project-local virtual environment so the package can be removed without
+changing the system Python installation:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[test]"
+```
+
+The package installs no Windows service, daemon, scheduled task, registry entry,
+or background process. Runtime state stays in the project (`.mwf`, `node/`,
+`.mwf_locks/`, and `.mwf_run.json`). Stop any active `mwf run`, `mwf runfrom`,
+or `mwf monitor` process before uninstalling, especially on Windows where an
+active `mwf.exe` launcher can be locked.
+
+```powershell
+python -m pip uninstall micro-workflow-manager
+```
+
+Deleting the project-local `.venv` removes the entire isolated installation as
+an alternative. Deleting the Python package does not delete workflow project
+data; remove `.mwf`, `node/`, `.mwf_locks/`, and `.mwf_run.json` separately only
+when you intentionally want to remove that data.
+
+If an older interrupted pip operation reports an invalid distribution such as
+`~icro-workflow-manager`, close all Python/MWF processes and remove only the
+stale temporary entries from that virtual environment, then reinstall or
+uninstall normally:
+
+```powershell
+Get-ChildItem .\.venv\Lib\site-packages -Force |
+  Where-Object { $_.Name -like "~icro*" } |
+  Remove-Item -Recurse -Force
+Remove-Item .\.venv\Scripts\mwf.exe -Force -ErrorAction SilentlyContinue
+python -m pip install --force-reinstall .
+python -m pip uninstall micro-workflow-manager
 ```
 
 ## Run tests
 
 ```bash
 pytest
+```
+
+Run the marked long stress test explicitly:
+
+```bash
+pytest -m stress tests/test_markov_chain_stress.py
 ```

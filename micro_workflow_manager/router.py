@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -293,13 +292,15 @@ def import_modules_from_dir(
             continue
 
         module_name = "micro_workflow_node_" + file.stem
-        spec = importlib.util.spec_from_file_location(module_name, file)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Could not import {file}")
-
-        module = importlib.util.module_from_spec(spec)
+        # Execute current source directly. Generated node files are often
+        # rewritten several times within one second and may keep the same file
+        # size, which can make timestamp-based .pyc validation reuse obsolete
+        # task code across graph reloads or test projects.
+        module = ModuleType(module_name)
+        module.__file__ = str(file)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        source = file.read_text(encoding="utf-8")
+        exec(compile(source, str(file), "exec"), module.__dict__)
         modules.append(module)
 
     return modules

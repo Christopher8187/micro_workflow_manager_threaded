@@ -28,6 +28,9 @@ class MicroWorkflow(
         project_dir: str | Path = "project",
         runner: str = "threaded",
         process_graph_path: str | Path | None = None,
+        *,
+        persist_graph: bool = True,
+        initialize_node_folders: bool = True,
     ):
         runner = normalize_workflow_runner(runner)
 
@@ -38,6 +41,9 @@ class MicroWorkflow(
             if process_graph_path is not None
             else None
         )
+
+        self.persist_graph = bool(persist_graph)
+        self.initialize_node_folders = bool(initialize_node_folders)
 
         self.graph_obj = nx.DiGraph()
         self.nodes: dict[str, JobNode] = {}

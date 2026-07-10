@@ -88,9 +88,13 @@ class ComponentStateMixin:
             return
 
         successful_terminal = {DONE, SKIPPED}
-        all_terminal_success = all(
-            totals_by_node[node_name] > 0
-            and sum(counts_by_node[node_name].get(status, 0) for status in successful_terminal) == totals_by_node[node_name]
+        # A node in a cyclic routing component may legitimately receive no
+        # jobs (for example, a document may contain no notation objects). Such
+        # an unused branch is vacuously complete; requiring one job in every
+        # node would keep the whole SCC queued forever.
+        all_terminal_success = total_jobs > 0 and all(
+            sum(counts_by_node[node_name].get(status, 0) for status in successful_terminal)
+            == totals_by_node[node_name]
             for node_name in component
         )
 

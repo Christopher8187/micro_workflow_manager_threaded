@@ -23,6 +23,7 @@ Command descriptions:
 Typical flow:
   mwf init
   mwf graph src/graph.py
+  mwf graph --update       # after changing or renaming graph nodes/edges
   mwf run start_node
   mwf run start_node job 1 3 8-10
   mwf runfrom start_node
@@ -55,24 +56,33 @@ Use when:
   starting a new micro-workflow project folder
 """,
     "graph": """
-graph records the Python file that defines your DAG edges.
+graph records or explicitly synchronizes the Python file that defines your DAG.
 
 Code context:
-  imports the supplied graph file
+  imports the supplied graph file, or the stored graph when --update is used
   reads EDGES or edges from that module
-  imports sibling node_behavior/*.py files when loading the workflow
-  mounts NodeRouter objects found in those behavior files
+  supports ordinary edges plus a-B / A-b directed fans such as ("a", B) and (A, "b")
+  imports sibling node_behavior/*.py files
+  mounts only NodeRouter objects whose names are present in the graph
 
 File-system context:
-  updates .mwf with graph_path, runner, and edges
-  creates node/<node-name>/ folders for graph nodes
-  each node folder contains input/, output/, jobs/, node_state.json, and schema.json when applicable
+  updates .mwf with graph_path, runner, and fully expanded edges
+  creates folders for newly-added graph nodes
+  permanently deletes stale folders for removed or renamed nodes
+  normal commands never perform this top-level node-folder synchronization
 
 Use when:
-  you add or change graph edges, or you want to change the stored default runner:
-    mwf graph src/graph.py --runner threaded
-    mwf graph src/graph.py --runner process
-    mwf graph src/graph.py --runner direct
+  setting a graph for the first time:
+    mwf graph src/graph.py
+  applying later graph edits or node renames:
+    mwf graph --update
+  changing the stored default runner while synchronizing:
+    mwf graph --update --runner threaded
+    mwf graph --update --runner process
+    mwf graph --update --runner direct
+
+Warning:
+  removed/renamed node folders are deleted with their inputs, outputs, jobs, and state.
 """,
     "clean": """
 clean resets runnable state for one or more nodes while preserving node input files.

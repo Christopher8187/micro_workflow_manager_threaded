@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         root = find_root()
 
         if args.command == "graph":
-            return setup_graph(root, args.path, args.runner)
+            return setup_graph(root, args.path, args.runner, update=args.update)
 
         workflow = load_workflow(root, args.runner)
 

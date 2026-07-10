@@ -265,7 +265,7 @@ class FileStorageBase:
     def atomic_write_json(self, path: Path, data: Any):
         # Atomic writes are serialized per target path by atomic_write_text.
         # Do not take the global storage lock here: high-fan-in workflows such
-        # as many typed explode nodes writing to zoning should not make every
+        # as many typed explode nodes writing to attachfragment should not make every
         # unrelated JSON write wait behind one global lock. Multi-file updates
         # still take their own node/job interprocess locks at the call site.
         self.atomic_write_text(path, self.json_text(path, data))

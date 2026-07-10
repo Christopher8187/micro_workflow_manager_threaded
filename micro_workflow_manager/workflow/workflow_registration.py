@@ -23,7 +23,8 @@ class WorkflowRegistrationMixin:
             # one communicating class for readiness and completion. This lets
             # autostart loops such as A -> A or A -> B -> A keep generating
             # jobs until the whole component becomes quiescent.
-            self.storage.write_graph(edges)
+            if self.persist_graph:
+                self.storage.write_graph(edges)
 
     def include_router(self, router):
         """Mount a NodeRouter or a module that exports router/routers.
@@ -59,6 +60,7 @@ class WorkflowRegistrationMixin:
         directory: str | Path,
         package: str | None = None,
         recursive: bool = False,
+        allowed_node_names: set[str] | None = None,
     ):
         """Import every node file in a folder and mount its router.
 
@@ -76,6 +78,8 @@ class WorkflowRegistrationMixin:
 
         for module in modules:
             for router in routers_from_module(module):
+                if allowed_node_names is not None and router.name not in allowed_node_names:
+                    continue
                 self.include_router(router)
 
         return modules
@@ -102,10 +106,12 @@ class WorkflowRegistrationMixin:
                     runner=runner_override,
                 )
                 self.graph_obj.add_node(name)
-                self.storage.init_node_folders(name)
 
-                if self.storage.get_node_status(name) is None:
-                    self.storage.set_node_status(name, QUEUED)
+                if self.initialize_node_folders:
+                    self.storage.init_node_folders(name)
+
+                    if self.storage.get_node_status(name) is None:
+                        self.storage.set_node_status(name, QUEUED)
             else:
                 node = self.nodes[name]
                 if runner_override is not None:

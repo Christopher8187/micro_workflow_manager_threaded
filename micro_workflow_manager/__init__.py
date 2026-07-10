@@ -1,4 +1,5 @@
 from .context import JobContext
+from .graph import DirectedFan, fan
 from .node import JobNode
 from .router import NodeRouter
 from .system import MicroWorkflow
@@ -11,4 +12,6 @@ __all__ = [
     "JobNode",
     "JobContext",
     "NodeRouter",
+    "DirectedFan",
+    "fan",
 ]

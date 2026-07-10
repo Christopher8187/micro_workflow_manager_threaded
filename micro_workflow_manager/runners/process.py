@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import multiprocessing as mp
 import pickle
 import sys
@@ -8,6 +7,8 @@ from concurrent.futures import FIRST_COMPLETED, FIRST_EXCEPTION, ProcessPoolExec
 from pathlib import Path
 from types import ModuleType
 from typing import Callable, Iterable
+
+from micro_workflow_manager.graph import normalize_edges
 
 from .base import BaseRunner
 
@@ -23,27 +24,20 @@ def _import_graph_file(path: Path) -> ModuleType:
         if text not in sys.path:
             sys.path.insert(0, text)
 
-    module_name = "mwf_process_graph"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-
-    if spec is None or spec.loader is None:
-        raise ImportError(path)
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    module = ModuleType("mwf_process_graph")
+    module.__file__ = str(path)
+    source = path.read_text(encoding="utf-8")
+    exec(compile(source, str(path), "exec"), module.__dict__)
     return module
 
 
 def _read_edges(module: ModuleType) -> list[tuple[str, str]]:
-    if hasattr(module, "EDGES"):
-        return list(module.EDGES)
-
-    if hasattr(module, "edges"):
-        value = module.edges
-        return list(value() if callable(value) else value)
-
-    raise RuntimeError("Graph file must define EDGES or edges()")
+    value = getattr(module, "EDGES", None)
+    if value is None:
+        value = getattr(module, "edges", None)
+    if callable(value):
+        value = value()
+    return normalize_edges(value)
 
 
 def _init_process_worker(
@@ -70,9 +64,16 @@ def _init_process_worker(
         project_dir=project,
         runner="direct",
         process_graph_path=graph_file,
+        persist_graph=False,
+        initialize_node_folders=False,
     )
-    workflow.graph(_read_edges(module))
-    workflow.include_node_dir(graph_file.parent / "node_behavior")
+    edges = _read_edges(module)
+    graph_nodes = {node for edge in edges for node in edge}
+    workflow.graph(edges)
+    workflow.include_node_dir(
+        graph_file.parent / "node_behavior",
+        allowed_node_names=graph_nodes,
+    )
     workflow.allowed_run_nodes = None if allowed_run_nodes is None else set(allowed_run_nodes)
     workflow.autostart_mode = autostart_mode
 

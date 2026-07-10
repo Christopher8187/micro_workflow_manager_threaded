@@ -39,11 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     graph_cmd = commands.add_parser(
         "graph",
-        help="Set the graph.py file and initialize node folders.",
+        help="Set or explicitly synchronize graph.py and node folders.",
         description=COMMAND_DESCRIPTIONS["graph"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    graph_cmd.add_argument("path", help="Path to the Python file defining EDGES or edges.")
+    graph_cmd.add_argument("path", nargs="?", help="Path to the Python file defining EDGES or edges. Omit when using --update.")
+    graph_cmd.add_argument(
+        "--update",
+        action="store_true",
+        help="Synchronize edges and node folders using the configured graph file; stale node folders are deleted.",
+    )
     graph_cmd.add_argument(
         "--runner",
         choices=RUNNER_CHOICES,
