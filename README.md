@@ -190,6 +190,54 @@ mwf run start_node --stats --stats-interval 10
 
 ETA is intentionally approximate. It is calculated from completed job durations and becomes more useful after at least one job in the relevant node has finished.
 
+## Restart one running job from a second terminal
+
+When an individual job is hung inside an active `mwf run` or `mwf runfrom`
+sequence, keep the original terminal running and use the dedicated restart
+command from a second terminal in the same project:
+
+```bash
+mwf restart explode job 42
+```
+
+Several currently running jobs may be selected with IDs and ranges:
+
+```bash
+mwf restart explode jobs 42 57 80-82
+```
+
+`mwf restart` does not start another scheduler and does not replace the active
+`.mwf_run.json` record. It atomically advances the selected job's execution
+generation before clearing job-local `output.json` and `files/`. The scheduler
+that already owns the larger run sees the new generation and immediately starts
+the replacement attempt. The node remains active throughout this handoff, so it
+cannot be finalized merely because the abandoned attempt stopped being current.
+The original `job.json` and `input.json` are preserved.
+
+An older generation is fenced from committing its final status, returned files,
+`ctx.write(...)`, `ctx.write_output(...)`, and `ctx.node(...).add(...)` effects.
+If it finishes while the restart command is preparing the replacement, its stale
+completion is discarded. The command only accepts a job that is still `running`,
+belongs to a live active run, and has a live execution lease; it refuses rather
+than creating an orphan queued job when the old attempt has already completed.
+Ordinary `mwf run` and `mwf runfrom` commands also refuse to start a competing
+sequence while another one owns the project.
+
+Python cannot safely force-kill an arbitrary thread that is blocked inside a
+third-party HTTP request or native library. From MWF's point of view the old
+generation is invalid immediately and the replacement begins, but the underlying
+old call may continue until its own timeout or return. External side effects and
+direct filesystem writes performed outside MWF's context helpers cannot be
+rolled back. Long custom loops may call `ctx.checkpoint()` between expensive
+operations to exit promptly after a restart. Process-runner attempts are fenced
+in the same way; an abandoned daemon thread disappears when its worker process
+returns.
+
+Use ordinary selected-job rerun syntax after the larger workflow has ended:
+
+```bash
+mwf run explode job 42
+```
 
 ## Large-node performance note
 
