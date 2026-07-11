@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from .base import FileStorageBase
+from .execution import JobExecutionStorageMixin
 from .job_index import JobIndexStorageMixin
 from .jobs import JobFileStorageMixin
 from .nodes import NodeFileStorageMixin
 
 
 class FileStorage(
+    JobExecutionStorageMixin,
     JobFileStorageMixin,
     JobIndexStorageMixin,
     NodeFileStorageMixin,

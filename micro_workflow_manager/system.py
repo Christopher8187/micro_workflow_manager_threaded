@@ -53,6 +53,11 @@ class MicroWorkflow(
         # CLI safety controls. Normal library use keeps immediate autostarts.
         self.allowed_run_nodes: set[str] | None = None
         self.autostart_mode = "immediate"
+        # The CLI enables generation-fenced job restarts for active run/runfrom
+        # sessions. Programmatic workflows keep the original direct execution
+        # path unless they explicitly opt in, avoiding supervisory thread and
+        # filesystem-polling overhead.
+        self.active_job_restart_enabled = False
 
         # Job-spawn context. A task may create more jobs with autostart=True,
         # but those spawned jobs must be treated like newly-created entities in

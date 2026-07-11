@@ -56,6 +56,7 @@ def test_top_level_help_points_to_command_help_and_describe(capsys):
     assert "mwf clean *" in out
     assert "mwf reset *" in out
     assert "mwf wipe *" in out
+    assert "mwf restart explode job 42" in out
 
 
 def test_describe_explains_command_context_and_current_project(tmp_path, monkeypatch, capsys):

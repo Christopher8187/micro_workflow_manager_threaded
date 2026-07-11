@@ -76,6 +76,10 @@ def _init_process_worker(
     )
     workflow.allowed_run_nodes = None if allowed_run_nodes is None else set(allowed_run_nodes)
     workflow.autostart_mode = autostart_mode
+    # CLI runs pass an allowed run set and must honor second-terminal restart
+    # requests inside each worker. Programmatic process runs retain the original
+    # low-overhead execution path.
+    workflow.active_job_restart_enabled = allowed_run_nodes is not None
 
     _PROCESS_WORKFLOW = workflow
 

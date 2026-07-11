@@ -7,6 +7,7 @@ Common help commands:
   mwf reset --help
   mwf wipe --help
   mwf run --help
+  mwf restart --help
   mwf runfrom --help
   mwf monitor --help
 
@@ -17,6 +18,7 @@ Command descriptions:
   mwf --describe reset
   mwf --describe wipe
   mwf --describe run
+  mwf --describe restart
   mwf --describe runfrom
   mwf --describe monitor
 
@@ -26,6 +28,7 @@ Typical flow:
   mwf graph --update       # after changing or renaming graph nodes/edges
   mwf run start_node
   mwf run start_node job 1 3 8-10
+  mwf restart explode job 42  # from a second terminal during an active run
   mwf runfrom start_node
   mwf runfrom start_node --stats
   mwf monitor              # live workflow statistics in a second terminal
@@ -181,6 +184,51 @@ Use when:
     mwf run tagify job 1 3 8-10
   you want compact inline status while it runs:
     mwf run tagify --stats
+
+Concurrency:
+  if another run/runfrom sequence is active, this command refuses to start a
+  competing scheduler. Use mwf restart <node> job <id> for one running job.
+""",
+
+    "restart": """
+restart replaces one or more currently running jobs inside an existing run or
+runfrom sequence. It is designed for a second terminal when a sensitive job is
+hung or should be attempted again without discarding the surrounding workflow.
+
+Syntax:
+  mwf restart node_name job 42
+  mwf restart node_name jobs 42 57 80-82
+
+Code context:
+  does not import graph.py or node_behavior files
+  does not launch a second workflow runner
+  reads the live .mwf_run.json record and verifies the node belongs to that run
+  only accepts jobs that are still in running state and owned by a live execution
+
+Safety behavior:
+  atomically increments the job execution generation before cleanup
+  the old generation immediately loses permission to commit status, returned
+  files, ctx.write/ctx.write_output output, or ctx.node(...) side effects
+  the existing scheduler notices the generation change and starts the replacement
+  the node remains running, so downstream finalization cannot happen between the
+  abandoned attempt and the replacement attempt
+  job.json and input.json are preserved; job-local output.json and files/ are reset
+
+Important limitation:
+  Python cannot safely force-kill an arbitrary thread inside a third-party HTTP or
+  native call. The old attempt is stopped immediately from the workflow's point
+  of view and fenced from MWF-managed side effects, but its underlying call may
+  continue until that library returns or times out. Long custom loops can call
+  ctx.checkpoint() to exit promptly after a restart.
+
+Use when:
+  another terminal is already running mwf run or mwf runfrom and one job is hung
+  you need to preserve the larger active sequence:
+    mwf restart explode job 42
+
+Do not use as a normal rerun command after the workflow has ended; use
+  mwf run node_name job 42
+instead.
 """,
 
     "monitor": """
@@ -232,5 +280,9 @@ Use when:
     mwf runfrom split --stats
   for a full dashboard in another terminal, use:
     mwf monitor
+
+Concurrency:
+  if another run/runfrom sequence is active, this command refuses to replace it.
+  Use mwf restart <node> job <id> for one currently running job.
 """,
 }

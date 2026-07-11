@@ -157,6 +157,7 @@ def test_threaded_workflow_starts_newly_ready_nodes_while_other_nodes_are_still_
     with tempfile.TemporaryDirectory() as project_dir:
         workflow = MicroWorkflow(project_dir=project_dir, runner="threaded")
         workflow.graph([("A", "C"), ("B", "D")])
+        timeline = {}
 
         @workflow.task("A", max_threads=1)
         def a(ctx):
@@ -167,10 +168,12 @@ def test_threaded_workflow_starts_newly_ready_nodes_while_other_nodes_are_still_
         @workflow.task("B", max_threads=1)
         def b(ctx):
             time.sleep(0.30)
+            timeline["b_finished"] = time.perf_counter()
             return "B"
 
         @workflow.task("C", max_threads=1)
         def c(ctx):
+            timeline["c_started"] = time.perf_counter()
             time.sleep(0.20)
             return "C"
 
@@ -181,11 +184,11 @@ def test_threaded_workflow_starts_newly_ready_nodes_while_other_nodes_are_still_
         workflow.start("A")
         workflow.start("B")
 
-        started = time.perf_counter()
         ran = workflow.run()
-        elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.45
+        # Check the actual scheduling property instead of relying on a tight
+        # wall-clock threshold that is flaky on busy or slow filesystems.
+        assert timeline["c_started"] < timeline["b_finished"]
         assert set(ran) == {"A", "B", "C"}
         assert workflow.node_complete("C")
 

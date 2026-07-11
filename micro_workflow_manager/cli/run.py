@@ -4,11 +4,14 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
+from uuid import uuid4
 
 from micro_workflow_manager.models import QUEUED, RUNNING
 from micro_workflow_manager.monitor import InlineStatsReporter, now_iso
 from micro_workflow_manager.system import MicroWorkflow
 
+from .active_run import refuse_competing_run
 from .autostart_scan import autostart_closure
 from .cleanup import reset_job_for_run, reset_node_for_run
 from .files import read_config
@@ -31,7 +34,7 @@ def active_workflow_run(
     nodes: list[str],
     selected_jobs: list[int] | None = None,
 ):
-    run_id = f"{int(time.time())}-{os.getpid()}"
+    run_id = f"{int(time.time())}-{os.getpid()}-{uuid4().hex[:8]}"
     data = {
         "run_id": run_id,
         "status": "running",
@@ -42,20 +45,32 @@ def active_workflow_run(
         "started_at": now_iso(),
         "pid": os.getpid(),
     }
-    workflow.storage.write_run_state(data)
+
+    # Claim the project run slot atomically. This prevents two terminals from
+    # replacing .mwf_run.json at the same time. The restart command does not
+    # claim this slot; it only controls a job already owned by this run.
+    with workflow.storage.interprocess_lock("active-run-state"):
+        refuse_competing_run(workflow)
+        workflow.storage.write_run_state(data)
+
     finished = False
 
     def finish(status: str, error: str | None = None):
         nonlocal finished
         if finished:
             return
-        updates = {
-            "status": status,
-            "finished_at": now_iso(),
-        }
-        if error is not None:
-            updates["error"] = error
-        workflow.storage.update_run_state(**updates)
+
+        with workflow.storage.interprocess_lock("active-run-state"):
+            current = workflow.storage.get_run_state()
+            # Never let a stale process overwrite a newer run record.
+            if current.get("run_id") == run_id:
+                updates = {
+                    "status": status,
+                    "finished_at": now_iso(),
+                }
+                if error is not None:
+                    updates["error"] = error
+                workflow.storage.update_run_state(**updates)
         finished = True
 
     try:
@@ -76,6 +91,8 @@ def run_selected_jobs(
     stats: bool = False,
     stats_interval: float = 5.0,
 ) -> int:
+    refuse_competing_run(workflow)
+
     if not is_ready(workflow, node):
         print_not_ready(workflow, node)
         return 1
@@ -84,17 +101,12 @@ def run_selected_jobs(
         if not workflow.storage.job_exists(node, job_id):
             raise RuntimeError(f"Job does not exist: {node}/{job_id}")
 
-    # Flip the visible node status before reset bookkeeping, so a large selected
-    # run does not appear stuck at queued while stale artifacts are removed.
-    workflow.storage.set_node_status(node, RUNNING)
-
-    for job_id in job_ids:
-        reset_job_for_run(root, workflow, node, job_id, mark_queued=False)
-
     previous_allowed_run_nodes = workflow.allowed_run_nodes
     previous_autostart_mode = workflow.autostart_mode
+    previous_restart_enabled = workflow.active_job_restart_enabled
     workflow.allowed_run_nodes = {node}
     workflow.autostart_mode = "queue"
+    workflow.active_job_restart_enabled = True
 
     try:
         with active_workflow_run(
@@ -104,6 +116,12 @@ def run_selected_jobs(
             nodes=[node],
             selected_jobs=job_ids,
         ) as finish_run:
+            # The run slot is claimed before any selected-job artifacts are
+            # reset, so a second run command cannot race with preparation.
+            workflow.storage.set_node_status(node, RUNNING)
+            for job_id in job_ids:
+                reset_job_for_run(root, workflow, node, job_id, mark_queued=False)
+
             with InlineStatsReporter(
                 workflow,
                 nodes=[node],
@@ -116,6 +134,7 @@ def run_selected_jobs(
     finally:
         workflow.allowed_run_nodes = previous_allowed_run_nodes
         workflow.autostart_mode = previous_autostart_mode
+        workflow.active_job_restart_enabled = previous_restart_enabled
 
     print(f"Ran jobs for {node}:")
     for job_id in job_ids:
@@ -124,6 +143,8 @@ def run_selected_jobs(
     return 0
 
 def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0) -> int:
+    refuse_competing_run(workflow)
+
     if not is_ready(workflow, node):
         print_not_ready(workflow, node)
         return 1
@@ -153,18 +174,28 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
             return 1
         ignore_external = True
 
-    # The requested node is now actively being prepared to run. Keep it marked
-    # running during reset/bookkeeping instead of flipping back to queued.
-    workflow.storage.set_node_status(node, RUNNING)
+    def prepare():
+        # The active run slot is claimed before this destructive preparation.
+        workflow.storage.set_node_status(node, RUNNING)
+        reset_node_for_run(root, workflow, node, mark_queued=False)
+        for item in nodes:
+            if item != node:
+                reset_node_for_run(root, workflow, item, remove_parented_jobs=True)
 
-    reset_node_for_run(root, workflow, node, mark_queued=False)
-    for item in nodes:
-        if item != node:
-            reset_node_for_run(root, workflow, item, remove_parented_jobs=True)
-
-    return run_nodes(workflow, nodes, node, ignore_external=ignore_external, command="run", stats=stats, stats_interval=stats_interval)
+    return run_nodes(
+        workflow,
+        nodes,
+        node,
+        ignore_external=ignore_external,
+        command="run",
+        stats=stats,
+        stats_interval=stats_interval,
+        prepare=prepare,
+    )
 
 def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0) -> int:
+    refuse_competing_run(workflow)
+
     nodes = component_topological_nodes(
         workflow,
         expand_to_components(workflow, {node, *descendants_in_order(workflow, node)}),
@@ -194,14 +225,23 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
             return 1
         ignore_external = True
 
-    workflow.storage.set_node_status(node, RUNNING)
+    def prepare():
+        workflow.storage.set_node_status(node, RUNNING)
+        reset_node_for_run(root, workflow, node, mark_queued=False)
+        for child in nodes:
+            if child != node:
+                reset_node_for_run(root, workflow, child, remove_parented_jobs=True)
 
-    reset_node_for_run(root, workflow, node, mark_queued=False)
-    for child in nodes:
-        if child != node:
-            reset_node_for_run(root, workflow, child, remove_parented_jobs=True)
-
-    return run_nodes(workflow, nodes, node, ignore_external=ignore_external, command="runfrom", stats=stats, stats_interval=stats_interval)
+    return run_nodes(
+        workflow,
+        nodes,
+        node,
+        ignore_external=ignore_external,
+        command="runfrom",
+        stats=stats,
+        stats_interval=stats_interval,
+        prepare=prepare,
+    )
 
 def run_nodes(
     workflow: MicroWorkflow,
@@ -212,30 +252,37 @@ def run_nodes(
     command: str = "run",
     stats: bool = False,
     stats_interval: float = 5.0,
+    prepare: Callable[[], None] | None = None,
 ) -> int:
     run_set = set(nodes)
     previous_allowed_run_nodes = workflow.allowed_run_nodes
     previous_autostart_mode = workflow.autostart_mode
+    previous_restart_enabled = workflow.active_job_restart_enabled
 
     workflow.allowed_run_nodes = run_set
     workflow.autostart_mode = "queue"
+    workflow.active_job_restart_enabled = True
 
     try:
-        if not workflow.storage.has_queued_jobs(start_node):
-            workflow.storage.set_node_status(start_node, QUEUED)
-            print(
-                f"No queued jobs for {start_node}. "
-                f"Create default jobs in node_behavior/{start_node}.py with "
-                "router.create_job(number=..., params={...})."
-            )
-            return 0
-
         with active_workflow_run(
             workflow,
             command=command,
             start_node=start_node,
             nodes=nodes,
         ) as finish_run:
+            if prepare is not None:
+                prepare()
+
+            if not workflow.storage.has_queued_jobs(start_node):
+                workflow.storage.set_node_status(start_node, QUEUED)
+                print(
+                    f"No queued jobs for {start_node}. "
+                    f"Create default jobs in node_behavior/{start_node}.py with "
+                    "router.create_job(number=..., params={...})."
+                )
+                finish_run("done")
+                return 0
+
             with InlineStatsReporter(
                 workflow,
                 nodes=nodes,
@@ -308,3 +355,4 @@ def run_nodes(
     finally:
         workflow.allowed_run_nodes = previous_allowed_run_nodes
         workflow.autostart_mode = previous_autostart_mode
+        workflow.active_job_restart_enabled = previous_restart_enabled

@@ -10,6 +10,7 @@ from .jobs import selected_job_ids_from_args
 from .monitoring import monitor_command
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
+from .restart import restart_active_jobs
 from .run import run_from, run_node, run_selected_jobs
 from .validation import require_node
 
@@ -33,6 +34,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "graph":
             return setup_graph(root, args.path, args.runner, update=args.update)
+
+        # Restart is intentionally handled before graph/router loading. The
+        # generation fence reaches the running job as early as possible and the
+        # command never starts or replaces a workflow scheduler.
+        if args.command == "restart":
+            node = safe_node_name(args.node)
+            job_ids = selected_job_ids_from_args(
+                args.job_mode,
+                args.job_specs,
+                command="restart",
+            )
+            assert job_ids is not None
+            return restart_active_jobs(root, node, job_ids)
 
         workflow = load_workflow(root, args.runner)
 

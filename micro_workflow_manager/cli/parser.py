@@ -119,6 +119,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Temporarily override the workflow runner for this run.",
     )
 
+
+    restart_cmd = commands.add_parser(
+        "restart",
+        help="Safely restart running jobs inside an active run/runfrom sequence.",
+        description=COMMAND_DESCRIPTIONS["restart"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    restart_cmd.add_argument("node", help="Node containing the currently running job.")
+    restart_cmd.add_argument(
+        "job_mode",
+        metavar="job",
+        help="Literal 'job' or 'jobs'.",
+    )
+    restart_cmd.add_argument(
+        "job_specs",
+        nargs="+",
+        metavar="id|start-end",
+        help="Running job IDs and ranges, for example: 1 3 8-10.",
+    )
+
     runfrom_cmd = commands.add_parser(
         "runfrom",
         help="Run a node and its descendants safely.",
