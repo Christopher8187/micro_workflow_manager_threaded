@@ -4,6 +4,7 @@ from pathlib import Path
 from shutil import copy2
 
 from micro_workflow_manager.models import QUEUED
+from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 
 
 class NodeFileStorageMixin:
@@ -70,6 +71,14 @@ class NodeFileStorageMixin:
     def job_index_dirty_file(self, node_name: str) -> Path:
         return self.node_dir(node_name) / "job_index.dirty"
 
+    def idempotency_dir(self, node_name: str) -> Path:
+        path = self.node_dir(node_name) / "idempotency"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def idempotency_file(self, node_name: str, key_hash: str) -> Path:
+        return self.idempotency_dir(node_name) / f"{key_hash}.json"
+
     def job_base_dir(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
         return self.safe_join(self.jobs_dir(node_name), str(job_id))
@@ -92,6 +101,7 @@ class NodeFileStorageMixin:
         if not isinstance(data, dict):
             data = {}
 
+        data["schema_version"] = CURRENT_STATE_SCHEMA_VERSION
         data["edges"] = edges
         self.atomic_write_json(self.workflow_file(), data)
 
@@ -236,10 +246,12 @@ class NodeFileStorageMixin:
         fallbacks: list[str],
         runner_override: str | None = None,
         max_threads: int | None = None,
+        timeout: float | None = None,
     ):
         self.atomic_write_json(
             self.node_schema_file(node_name),
             {
+                "schema_version": CURRENT_STATE_SCHEMA_VERSION,
                 "node": node_name,
                 "allowed_params": sorted(allowed_params),
                 "required_params": sorted(required_params),
@@ -249,6 +261,7 @@ class NodeFileStorageMixin:
                 "runner_override": runner_override,
                 "sequential": runner_override == "direct",
                 "max_threads": max_threads,
+                "timeout": timeout,
                 "input_dir": str(self.node_input_dir(node_name)),
                 "output_dir": str(self.node_output_dir(node_name)),
                 "jobs_dir": str(self.jobs_dir(node_name)),
@@ -269,6 +282,7 @@ class NodeFileStorageMixin:
             self.atomic_write_json(
                 path,
                 {
+                    "schema_version": CURRENT_STATE_SCHEMA_VERSION,
                     "node": node_name,
                     "status": status,
                 },

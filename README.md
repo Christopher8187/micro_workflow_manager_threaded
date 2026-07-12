@@ -1,4 +1,4 @@
-# micro-workflow-manager
+# micro-workflow-manager 0.2.2
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -14,16 +14,20 @@ Set the graph the first time:
 mwf graph src/graph.py
 ```
 
-After editing edges or renaming, adding, or removing nodes, explicitly apply the
-new graph state:
+After editing edges or renaming, adding, or removing nodes, preview and then
+explicitly apply the new graph state:
 
 ```bash
+mwf graph --update --dry-run
 mwf graph --update
 ```
 
-`mwf graph --update` uses the graph path already stored in `.mwf`. It creates
-folders for new nodes and permanently deletes folders for nodes no longer in the
-graph, including their inputs, outputs, jobs, and state. Back up or move any data
+`mwf graph --update` uses the graph path already stored in `.mwf`. Relative graph
+paths are stored with `/`, even on Windows. When reading an older or manually
+edited project, MWF accepts both `src/graph.py` and `src\graph.py`, resolves the
+path inside the project root, and rewrites it to the portable `/` form on the
+next update. It creates folders for new nodes and permanently deletes folders
+for nodes no longer in the graph, including their inputs, outputs, jobs, and state. Back up or move any data
 you need before updating. If an ordinary command detects changed edges, missing
 new folders, or stale renamed folders, it exits with an instruction to run the
 update and leaves the disk unchanged.
@@ -163,6 +167,186 @@ mwf runfrom start_node
 ```
 
 
+## Health checks, inspection, and job history
+
+Run a read-only project check before a long workflow or after changing files:
+
+```bash
+mwf doctor
+```
+
+`mwf doctor` compares the graph, node folders, and router files; checks important
+JSON state; reports stale active-run records and abandoned running jobs; and warns
+about simple literal `ctx.node("B")` calls without a declared edge. It also warns
+when MWF-owned metadata should be upgraded with `mwf migrate`. It does not repair
+or modify the project. Errors produce a nonzero exit status.
+
+Use `inspect` when you need an explanation rather than a raw directory listing:
+
+```bash
+mwf inspect A
+mwf inspect A job 3
+```
+
+Node inspection explains readiness, blockers, status counts, strongly connected
+component membership, runner, timeout, and fallbacks. Job inspection shows input,
+output, execution generation, child jobs, and chronological lifecycle events.
+Each job has an append-only `events.jsonl` file containing small records such as
+`created`, `started`, `fallback_started`, `timeout`, `restart_requested`, and
+`done`. This history is diagnostic only: it is not scheduler state and it is not
+a provenance manifest. `output.json` and job-local output files remain the
+actual task result.
+
+## State schema migration and read-only previews
+
+MWF-owned metadata includes an explicit `schema_version`. This applies to files
+such as `.mwf`, `.mwf_run.json`, `node_state.json`, `schema.json`, `job.json`,
+`status.json`, `execution.json`, and the rebuildable job index. It does not apply
+to `input.json`, `output.json`, returned files, or `events.jsonl`.
+
+Preview and apply an upgrade from an older project:
+
+```bash
+mwf migrate --dry-run
+mwf migrate
+```
+
+Migration is additive and atomic per metadata file. MWF remains able to read
+older unversioned state long enough to migrate it, but refuses state that claims
+a newer schema than the installed package supports.
+
+Several destructive commands support a read-only preview:
+
+```bash
+mwf graph --update --dry-run
+mwf clean A --dry-run
+mwf reset A --dry-run
+mwf wipe A --dry-run
+mwf recover --dry-run
+mwf restart wait job 4 --dry-run
+```
+
+Execution commands provide `--plan` instead of pretending to run:
+
+```bash
+mwf run A --plan
+mwf runfrom A --plan
+mwf resume A --plan
+mwf resumefrom A --plan
+```
+
+A plan prints the selected nodes and jobs, reset-versus-resume semantics, detected
+static autostarts, external blockers, and current status counts. It does not claim
+the active-run slot or change state. Dynamic jobs created by task functions are
+reported as runtime-dependent rather than guessed.
+
+## Resume and crash recovery
+
+A CLI-owned run records its process ID, hostname, command, selected nodes, MWF
+version, and a lightweight heartbeat in `.mwf_run.json`. One small daemon thread
+updates the heartbeat while the sequence is active; normal job scheduling does
+not scan the project for liveness.
+
+If the owning process has crashed, recover abandoned `running` jobs without
+resetting completed work:
+
+```bash
+mwf recover --dry-run
+mwf recover
+```
+
+Recovery refuses to compete with a demonstrably live owner. For each abandoned
+job it advances the execution generation before requeueing it, so a late stale
+process cannot commit afterward. Jobs already marked `done`, `skipped`, or
+`failed` are not reset by recovery.
+
+Continue a failed partial run while preserving successful jobs:
+
+```bash
+mwf resume B
+mwf resumefrom A
+```
+
+`resume` continues one node. `resumefrom` continues that node and its descendants.
+Both preserve `done` and `skipped` jobs and their outputs, leave queued jobs
+available, and requeue only failed, cancelled, or abandoned-running jobs. By
+contrast, `run` and `runfrom` retain their fresh-reset behavior.
+
+## Cooperative cancellation and timeouts
+
+A node or individual handler can set an optional timeout:
+
+```python
+from micro_workflow_manager import NodeRouter
+
+router = NodeRouter("wait", timeout=30)
+
+@router.task
+def wait(ctx):
+    ctx.sleep(2)
+    return "finished"
+```
+
+Or set a handler-specific value:
+
+```python
+@router.task(timeout=10)
+def make_number(ctx):
+    ctx.checkpoint()
+    return 7
+```
+
+`ctx.checkpoint()` (also available as `ctx.raise_if_cancelled()`) raises when the
+attempt has been restarted or timed out. `ctx.sleep(seconds)` sleeps in short
+intervals and checks automatically. After timeout, MWF fences the attempt from
+MWF-managed writes, returned files, output updates, and downstream job creation,
+then follows the normal fallback chain. Python cannot safely force-kill every
+thread blocked inside an external library, and direct external side effects made
+outside `ctx` helpers cannot be rolled back. Nodes without a configured timeout
+stay on the original direct execution path and do not pay timeout-supervision
+cost.
+
+## Idempotent and transactional downstream jobs
+
+For a single downstream creation that may be retried, provide an idempotency key:
+
+```python
+@router.task
+def A(ctx):
+    return ctx.node("B").add(value=4, idempotency_key=f"A:{ctx.job_id}:B")
+```
+
+The same target node and key return the existing job instead of creating a
+duplicate. For several downstream jobs, stage them until a block succeeds:
+
+```python
+@router.task
+def A(ctx):
+    with ctx.transaction():
+        first = ctx.node("B").add(value=1)
+        second = ctx.node("B").add(value=2)
+    return [first.job_id, second.job_id]
+```
+
+Only `ctx.node(...).add(...)` operations are staged. If the block raises, none are
+created. Successful commits use deterministic per-parent-and-operation keys, so retries,
+resume, and manual restart generations complete a partially committed transaction
+without duplicate jobs. This is
+opt-in; ordinary downstream creation retains its existing fast path.
+
+## Cleanup previews
+
+The cleanup commands support `--dry-run` and preserve their existing semantics:
+
+```bash
+mwf clean A --dry-run   # would remove jobs/output, keep input
+mwf reset A --dry-run   # would keep jobs/input and requeue all jobs
+mwf wipe A --dry-run    # would remove jobs/output/input
+```
+
+The preview resolves `*` and validates node names but does not remove files or
+change statuses.
+
 ## Monitoring and live statistics
 
 While a workflow is running, open a second terminal in the same project and run:
@@ -197,13 +381,13 @@ sequence, keep the original terminal running and use the dedicated restart
 command from a second terminal in the same project:
 
 ```bash
-mwf restart explode job 42
+mwf restart wait job 42
 ```
 
 Several currently running jobs may be selected with IDs and ranges:
 
 ```bash
-mwf restart explode jobs 42 57 80-82
+mwf restart wait jobs 42 57 80-82
 ```
 
 `mwf restart` does not start another scheduler and does not replace the active
@@ -236,7 +420,7 @@ returns.
 Use ordinary selected-job rerun syntax after the larger workflow has ended:
 
 ```bash
-mwf run explode job 42
+mwf run wait job 42
 ```
 
 ## Large-node performance note
@@ -258,7 +442,7 @@ The index stores fast monitor/scheduler summaries such as status counts,
 incrementally during normal runs, but if Windows or another process temporarily
 blocks `job_index.json`, the workflow marks the index dirty and continues. The
 next reader rebuilds it from the authoritative job folders/status files. This
-keeps high-fan-in spawn nodes such as `zoning` from failing just because many
+keeps high-fan-in spawn nodes such as `combine` from failing just because many
 workers touched the same summary file at once.
 
 ## Install, uninstall, and persistence
@@ -274,7 +458,7 @@ python -m pip install -e ".[test]"
 
 The package installs no Windows service, daemon, scheduled task, registry entry,
 or background process. Runtime state stays in the project (`.mwf`, `node/`,
-`.mwf_locks/`, and `.mwf_run.json`). Stop any active `mwf run`, `mwf runfrom`,
+`.mwf_locks/`, and `.mwf_run.json`). Stop any active `mwf run`, `mwf runfrom`, `mwf resume`, `mwf resumefrom`,
 or `mwf monitor` process before uninstalling, especially on Windows where an
 active `mwf.exe` launcher can be locked.
 
@@ -303,12 +487,23 @@ python -m pip uninstall micro-workflow-manager
 
 ## Run tests
 
+Run the ordinary suite without combining the timing-sensitive cyclic tests:
+
 ```bash
-pytest
+python -m pytest -q --ignore=tests/test_autostart_cycles.py
+```
+
+Run every cyclic-autostart test in its own process with an extended outer timeout:
+
+```bash
+python -m pytest -q tests/test_autostart_cycles.py::test_runfrom_supports_self_and_mutual_autostart_cycles_before_downstream
+python -m pytest -q tests/test_autostart_cycles.py::test_threaded_diamond_cycle_spawns_100_seed_jobs_without_deadlock
+python -m pytest -q tests/test_autostart_cycles.py::test_threaded_ring_cycle_spawns_100_seed_jobs_without_deadlock
+python -m pytest -q tests/test_autostart_cycles.py::test_threaded_stochastic_game_engine_spawn_cycle_finishes
 ```
 
 Run the marked long stress test explicitly:
 
 ```bash
-pytest -m stress tests/test_markov_chain_stress.py
+python -m pytest -q -m stress tests/test_markov_chain_stress.py
 ```

@@ -136,6 +136,7 @@ class JobCreationMixin:
         job_id: int | None = None,
         autostart: bool = False,
         _parent_job_id: int | None = None,
+        idempotency_key: str | None = None,
         **params,
     ):
         if job_id is not None:
@@ -163,6 +164,11 @@ class JobCreationMixin:
             with node.lock:
                 node.validate_params(params)
 
+                if idempotency_key is not None:
+                    existing = self.storage.lookup_idempotent_job(to_node, idempotency_key)
+                    if existing is not None:
+                        return existing
+
                 if job_id is None:
                     job_id = self.storage.next_job_id(to_node)
 
@@ -181,6 +187,8 @@ class JobCreationMixin:
                 )
 
                 self.storage.create_job(job)
+                if idempotency_key is not None:
+                    self.storage.record_idempotent_job(to_node, idempotency_key, job_id)
                 self.storage.set_node_status(to_node, QUEUED)
 
         if autostart and self.autostart_mode == "immediate":

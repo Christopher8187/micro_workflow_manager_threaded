@@ -7,6 +7,7 @@ from types import ModuleType
 
 from micro_workflow_manager.graph import normalize_edges
 from micro_workflow_manager.models import QUEUED
+from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.system import MicroWorkflow, normalize_workflow_runner
 
@@ -28,6 +29,7 @@ def init_project() -> int:
         path,
         {
             "version": 2,
+            "schema_version": CURRENT_STATE_SCHEMA_VERSION,
             "graph_path": None,
             "runner": "threaded",
             "edges": [],
@@ -43,6 +45,7 @@ def setup_graph(
     runner: str | None = None,
     *,
     update: bool = False,
+    dry_run: bool = False,
 ) -> int:
     """Record or explicitly synchronize the graph and node folders.
 
@@ -60,8 +63,22 @@ def setup_graph(
     stale_nodes = sorted(old_nodes - expected_nodes)
     new_nodes = sorted(expected_nodes - old_nodes)
 
+    if dry_run:
+        stored_edges = _stored_edges(config)
+        target_runner = normalize_workflow_runner(runner or config.get("runner", "threaded"))
+        print("Graph synchronization dry run")
+        print(f"  graph path: {path.relative_to(root).as_posix()}")
+        print(f"  runner: {target_runner}")
+        print(f"  edges: {len(stored_edges)} stored -> {len(edges)} defined")
+        print("  nodes to add: " + (", ".join(new_nodes) if new_nodes else "(none)"))
+        print("  nodes to delete: " + (", ".join(stale_nodes) if stale_nodes else "(none)"))
+        print("  edge list changed: " + ("yes" if stored_edges != edges else "no"))
+        print("  no configuration or node folders were changed")
+        return 0
+
     config["version"] = 2
-    config["graph_path"] = str(path.relative_to(root))
+    config["schema_version"] = CURRENT_STATE_SCHEMA_VERSION
+    config["graph_path"] = path.relative_to(root).as_posix()
     config["edges"] = edges
 
     if runner is not None:
@@ -101,12 +118,18 @@ def load_workflow(
     require_synced: bool = True,
 ) -> MicroWorkflow:
     config = read_config(root)
+    config_schema = config.get("schema_version")
+    if type(config_schema) is int and config_schema > CURRENT_STATE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Project state schema {config_schema} is newer than this MWF supports "
+            f"({CURRENT_STATE_SCHEMA_VERSION}). Install a compatible newer version."
+        )
     graph_path = config.get("graph_path")
 
     if not graph_path:
         raise RuntimeError("No graph set. Run: mwf graph src/graph.py")
 
-    graph_file = (root / graph_path).resolve()
+    graph_file = resolve_stored_graph_path(root, graph_path)
     module = import_file(graph_file)
     edges = read_edges(module)
 
@@ -185,6 +208,26 @@ def read_edges(module) -> list[tuple[str, str]]:
     return result
 
 
+
+def resolve_stored_graph_path(root: Path, stored: str) -> Path:
+    """Resolve a graph path written with either POSIX or Windows separators."""
+    if not isinstance(stored, str) or not stored.strip():
+        raise RuntimeError("No graph set. Run: mwf graph src/graph.py")
+    normalized = stored.replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        raise ValueError(f"Unsafe stored graph path: {stored}")
+    path = root.joinpath(*parts).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as error:
+        raise ValueError(f"Graph file must be inside the mwf project: {path}") from error
+    return path
+
+
+def resolve_configured_graph_path(root: Path, config: dict) -> Path:
+    return resolve_stored_graph_path(root, config.get("graph_path"))
+
 def _resolve_graph_path(
     root: Path,
     config: dict,
@@ -198,9 +241,13 @@ def _resolve_graph_path(
             raise RuntimeError("Provide a graph path, or use: mwf graph --update")
         if not stored:
             raise RuntimeError("No graph set. Run: mwf graph src/graph.py")
-        path = (root / stored).resolve()
+        path = resolve_stored_graph_path(root, stored)
     else:
-        path = (Path.cwd() / graph_path).resolve()
+        # Accept either separator on either host. This matters when a command
+        # copied from PowerShell is run under Linux/WSL, or vice versa.
+        portable_input = graph_path.replace("\\", "/")
+        candidate = Path(portable_input)
+        path = (candidate if candidate.is_absolute() else Path.cwd() / candidate).resolve()
 
     if not path.exists():
         raise FileNotFoundError(path)

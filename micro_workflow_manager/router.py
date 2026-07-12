@@ -13,6 +13,7 @@ from .node import (
     validate_node_runner,
     validate_non_negative_int,
     validate_positive_int,
+    validate_positive_float,
 )
 
 
@@ -22,6 +23,7 @@ class RouterTask:
     retries: int = 0
     repeats: int = 1
     name: str | None = None
+    timeout: float | None = None
 
 
 @dataclass
@@ -58,9 +60,11 @@ class NodeRouter:
         *,
         runner: str | None = None,
         sequential: bool = False,
+        timeout: float | None = None,
     ):
         self.name = name
         self.max_threads = validate_positive_int("max_threads", max_threads)
+        self.timeout = validate_positive_float("timeout", timeout)
         self.runner_override = sequential_runner_value(
             runner=runner,
             sequential=sequential,
@@ -79,6 +83,7 @@ class NodeRouter:
         *,
         runner: str | None = None,
         sequential: bool = False,
+        timeout: float | None = None,
     ) -> "NodeRouter":
         """Create a router whose node name is the Python file stem."""
         return cls(
@@ -86,6 +91,7 @@ class NodeRouter:
             max_threads=max_threads,
             runner=runner,
             sequential=sequential,
+            timeout=timeout,
         )
 
     def run_sequentially(self) -> "NodeRouter":
@@ -141,6 +147,7 @@ class NodeRouter:
         max_threads: int | None = None,
         runner: str | None = None,
         sequential: bool = False,
+        timeout: float | None = None,
     ):
         """Register the main task for this node.
 
@@ -154,6 +161,7 @@ class NodeRouter:
         """
         retries = validate_non_negative_int("retries", retries)
         repeats = validate_positive_int("repeats", repeats)
+        effective_timeout = self.timeout if timeout is None else validate_positive_float("timeout", timeout)
 
         if max_threads is not None:
             self.max_threads = validate_positive_int("max_threads", max_threads)
@@ -170,6 +178,7 @@ class NodeRouter:
                 handler=handler,
                 retries=retries,
                 repeats=repeats,
+                timeout=effective_timeout,
             )
             return handler
 
@@ -185,11 +194,13 @@ class NodeRouter:
         name: str | None = None,
         retries: int = 0,
         repeats: int = 1,
+        timeout: float | None = None,
     ):
         """Register one fallback for this node."""
 
         retries = validate_non_negative_int("retries", retries)
         repeats = validate_positive_int("repeats", repeats)
+        effective_timeout = self.timeout if timeout is None else validate_positive_float("timeout", timeout)
 
         def decorator(handler: Callable):
             self.fallbacks.append(
@@ -198,6 +209,7 @@ class NodeRouter:
                     name=name or handler.__name__,
                     retries=retries,
                     repeats=repeats,
+                    timeout=effective_timeout,
                 )
             )
             return handler
@@ -217,6 +229,7 @@ class NodeRouter:
             max_threads=self.max_threads,
             retries=self.main_task.retries,
             repeats=self.main_task.repeats,
+            timeout=self.main_task.timeout,
             runner=self.runner_override,
         )(self.main_task.handler)
 
@@ -226,6 +239,7 @@ class NodeRouter:
                 name=fallback.name,
                 retries=fallback.retries,
                 repeats=fallback.repeats,
+                timeout=fallback.timeout,
             )(fallback.handler)
 
         next_job_id = 1

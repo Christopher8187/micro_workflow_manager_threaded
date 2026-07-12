@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from micro_workflow_manager.models import VALID_STATUSES
+from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 
 
 class FileStorageBase:
@@ -174,7 +175,10 @@ class FileStorageBase:
         return self.project_dir / ".mwf_run.json"
 
     def write_run_state(self, data: dict):
-        self.atomic_write_json(self.run_state_file(), data)
+        self.atomic_write_json(
+            self.run_state_file(),
+            {**data, "schema_version": CURRENT_STATE_SCHEMA_VERSION},
+        )
 
     def get_run_state(self) -> dict:
         data = self.read_json(self.run_state_file(), default={})

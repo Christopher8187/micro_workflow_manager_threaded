@@ -12,7 +12,7 @@ from .files import find_root, safe_node_name
 from .jobs import selected_job_ids_from_args
 
 
-def restart_active_jobs(root: Path, node: str, job_ids: list[int]) -> int:
+def restart_active_jobs(root: Path, node: str, job_ids: list[int], *, dry_run: bool = False) -> int:
     """Restart running jobs without creating a second workflow scheduler.
 
     This command deliberately uses FileStorage directly instead of importing the
@@ -34,6 +34,22 @@ def restart_active_jobs(root: Path, node: str, job_ids: list[int]) -> int:
             f"Node {node} is not part of active {active.get('command', 'workflow')} "
             f"run {active.get('run_id', '?')}."
         )
+
+    if dry_run:
+        print(
+            f"Restart dry run inside active {active.get('command', 'workflow')} "
+            f"run {active.get('run_id', '?')}:"
+        )
+        for job_id in job_ids:
+            if not storage.job_exists(node, job_id):
+                raise RuntimeError(f"Job does not exist: {node}/{job_id}")
+            status = storage.get_job_status(node, job_id)
+            control = storage.read_job_control(node, job_id)
+            if status != "running" or not control.get("active_execution_id"):
+                raise RuntimeError(f"Job {node}/{job_id} is not currently running with an active execution lease")
+            print(f"  would restart {node}/{job_id} generation {control.get('generation', 0)}")
+        print("  no execution generation, status, output, or files were changed")
+        return 0
 
     restarted = []
     for job_id in job_ids:
@@ -78,6 +94,11 @@ def restart_cli(argv: list[str]) -> int:
         metavar="id|start-end",
         help="Running job IDs and ranges, for example: 1 3 8-10.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and show restart targets without fencing them.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -90,7 +111,7 @@ def restart_cli(argv: list[str]) -> int:
             command="restart",
         )
         assert job_ids is not None
-        return restart_active_jobs(root, node, job_ids)
+        return restart_active_jobs(root, node, job_ids, dry_run=args.dry_run)
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

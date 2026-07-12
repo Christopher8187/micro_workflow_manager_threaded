@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from micro_workflow_manager.errors import JobRestartedError
 from micro_workflow_manager.models import QUEUED, RUNNING
+from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 
 
 T = TypeVar("T")
@@ -44,6 +45,7 @@ class JobExecutionStorageMixin:
             generation = 0
         return {
             **data,
+            "schema_version": CURRENT_STATE_SCHEMA_VERSION,
             "version": 1,
             "generation": generation,
         }
@@ -204,6 +206,15 @@ class JobExecutionStorageMixin:
         )
 
         self.set_job_status(node_name, job_id, QUEUED)
+        self.append_job_event(
+            node_name,
+            job_id,
+            "restart_requested",
+            previous_generation=previous_generation,
+            generation=generation,
+            reason=reason,
+            requested_by_pid=requested_by_pid or os.getpid(),
+        )
 
         # Cleanup happens only after the old generation is invalid. This
         # ordering prevents an old fast-finishing attempt from recreating a

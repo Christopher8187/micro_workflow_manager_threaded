@@ -20,6 +20,15 @@ def validate_positive_int(name: str, value: int) -> int:
     return value
 
 
+
+def validate_positive_float(name: str, value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"{name} must be a positive number or None")
+    return float(value)
+
+
 def validate_node_runner(runner: str | None) -> str | None:
     if runner is None:
         return None
@@ -118,9 +127,11 @@ class JobNode:
         handler: Callable,
         retries: int = 0,
         repeats: int = 1,
+        timeout: float | None = None,
     ):
         retries = validate_non_negative_int("retries", retries)
         repeats = validate_positive_int("repeats", repeats)
+        timeout = validate_positive_float("timeout", timeout)
 
         allowed, required = self.infer_params(handler)
 
@@ -131,6 +142,7 @@ class JobNode:
             required_params=required,
             retries=retries,
             repeats=repeats,
+            timeout=timeout,
         )
 
     def mount_fallback(
@@ -139,9 +151,11 @@ class JobNode:
         name: str | None = None,
         retries: int = 0,
         repeats: int = 1,
+        timeout: float | None = None,
     ):
         retries = validate_non_negative_int("retries", retries)
         repeats = validate_positive_int("repeats", repeats)
+        timeout = validate_positive_float("timeout", timeout)
 
         fallback_name = name or handler.__name__
         allowed, required = self.infer_params(handler)
@@ -153,6 +167,7 @@ class JobNode:
             required_params=required,
             retries=retries,
             repeats=repeats,
+            timeout=timeout,
         )
 
         if fallback_name not in self.fallback_order:

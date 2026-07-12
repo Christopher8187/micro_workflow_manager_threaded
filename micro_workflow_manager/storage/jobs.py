@@ -1,14 +1,39 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
 
 from micro_workflow_manager.models import Job, QUEUED
+from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 
 
 class JobFileStorageMixin:
     """Job lifecycle, job status, and returned-file storage operations."""
+
+    def idempotency_key_hash(self, key: str) -> str:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("idempotency_key must be a non-empty string")
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def lookup_idempotent_job(self, node_name: str, key: str) -> Job | None:
+        key_hash = self.idempotency_key_hash(key)
+        data = self.read_json(self.idempotency_file(node_name, key_hash), default=None)
+        if not isinstance(data, dict):
+            return None
+        job_id = data.get("job_id")
+        if type(job_id) is not int or not self.job_exists(node_name, job_id):
+            return None
+        return self.load_job(node_name, job_id)
+
+    def record_idempotent_job(self, node_name: str, key: str, job_id: int):
+        key_hash = self.idempotency_key_hash(key)
+        self.atomic_write_json(
+            self.idempotency_file(node_name, key_hash),
+            {"schema_version": CURRENT_STATE_SCHEMA_VERSION, "key": key, "job_id": self.validate_job_id(job_id)},
+        )
+
 
     def next_job_id(self, node_name: str) -> int:
         # Fast path: use the per-node index instead of scanning every job folder.
@@ -74,6 +99,7 @@ class JobFileStorageMixin:
                 manifest = {}
 
             key = self.default_job_spec_key(start_job_id, number)
+            manifest["schema_version"] = CURRENT_STATE_SCHEMA_VERSION
             manifest[key] = {
                 "start_job_id": start_job_id,
                 "number": number,
@@ -97,6 +123,7 @@ class JobFileStorageMixin:
             self.atomic_write_json(
                 self.job_file(job.node_name, job.job_id),
                 {
+                    "schema_version": CURRENT_STATE_SCHEMA_VERSION,
                     "job_id": job.job_id,
                     "node_name": job.node_name,
                     "parent": job.parent,
@@ -111,6 +138,13 @@ class JobFileStorageMixin:
 
             self.remove_if_exists(self.status_file(job.node_name, job.job_id))
             self.register_job_created(job.node_name, job.job_id, QUEUED)
+            self.append_job_event(
+                job.node_name,
+                job.job_id,
+                "created",
+                status=QUEUED,
+                parent=job.parent,
+            )
 
     def ensure_job(self, job: Job) -> Job:
         """Create or refresh a deterministic default job.
@@ -148,6 +182,7 @@ class JobFileStorageMixin:
                 self.atomic_write_json(
                     self.job_file(job.node_name, job.job_id),
                     {
+                        "schema_version": CURRENT_STATE_SCHEMA_VERSION,
                         "job_id": job.job_id,
                         "node_name": job.node_name,
                         "parent": None,
@@ -196,6 +231,7 @@ class JobFileStorageMixin:
             new_data = None
         else:
             new_data = {
+                "schema_version": CURRENT_STATE_SCHEMA_VERSION,
                 "job_id": job_id,
                 "node_name": node_name,
                 "status": status,
@@ -211,6 +247,24 @@ class JobFileStorageMixin:
             old_data=old_data if isinstance(old_data, dict) else None,
             new_data=new_data,
         )
+
+        if old_status != status or extra:
+            event_name = {
+                "queued": "queued",
+                "running": "started",
+                "done": "done",
+                "failed": "failed",
+                "cancelled": "cancelled",
+                "skipped": "skipped",
+            }.get(status, "status_changed")
+            self.append_job_event(
+                node_name,
+                job_id,
+                event_name,
+                previous_status=old_status,
+                status=status,
+                **extra,
+            )
 
     def get_job_status(self, node_name: str, job_id: int) -> str | None:
         self.validate_job_id(job_id)

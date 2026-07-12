@@ -24,6 +24,7 @@ class MountedTask:
     required_params: set[str]
     retries: int = 0
     repeats: int = 1
+    timeout: float | None = None
 
 
 QUEUED = "queued"

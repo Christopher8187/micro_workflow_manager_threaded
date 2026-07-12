@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import os
+import socket
 import time
 from contextlib import contextmanager
+from threading import Event, Thread
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
-from micro_workflow_manager.models import QUEUED, RUNNING
+from micro_workflow_manager import __version__
+from micro_workflow_manager.models import CANCELLED, FAILED, QUEUED, RUNNING
 from micro_workflow_manager.monitor import InlineStatsReporter, now_iso
 from micro_workflow_manager.system import MicroWorkflow
 
@@ -15,6 +18,7 @@ from .active_run import refuse_competing_run
 from .autostart_scan import autostart_closure
 from .cleanup import reset_job_for_run, reset_node_for_run
 from .files import read_config
+from .project import resolve_configured_graph_path
 from .graph_utils import (
     component_topological_nodes,
     descendants_in_order,
@@ -43,7 +47,10 @@ def active_workflow_run(
         "nodes": list(nodes),
         "selected_jobs": list(selected_jobs or []),
         "started_at": now_iso(),
+        "heartbeat_at": now_iso(),
         "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "mwf_version": __version__,
     }
 
     # Claim the project run slot atomically. This prevents two terminals from
@@ -53,6 +60,23 @@ def active_workflow_run(
         refuse_competing_run(workflow)
         workflow.storage.write_run_state(data)
 
+    heartbeat_stop = Event()
+
+    def heartbeat_loop():
+        while not heartbeat_stop.wait(2.0):
+            with workflow.storage.interprocess_lock("active-run-state"):
+                current = workflow.storage.get_run_state()
+                if current.get("run_id") != run_id or current.get("status") != "running":
+                    return
+                workflow.storage.update_run_state(heartbeat_at=now_iso())
+
+    heartbeat_thread = Thread(
+        target=heartbeat_loop,
+        name=f"mwf-heartbeat-{run_id}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
     finished = False
 
     def finish(status: str, error: str | None = None):
@@ -60,6 +84,7 @@ def active_workflow_run(
         if finished:
             return
 
+        heartbeat_stop.set()
         with workflow.storage.interprocess_lock("active-run-state"):
             current = workflow.storage.get_run_state()
             # Never let a stale process overwrite a newer run record.
@@ -149,7 +174,7 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
         print_not_ready(workflow, node)
         return 1
 
-    graph_file = (root / read_config(root)["graph_path"]).resolve()
+    graph_file = resolve_configured_graph_path(root, read_config(root))
     autostart_nodes = autostart_closure(workflow, graph_file, [node])
     nodes = topo_subset(workflow, expand_to_components(workflow, {node}))
 
@@ -200,7 +225,7 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
         workflow,
         expand_to_components(workflow, {node, *descendants_in_order(workflow, node)}),
     )
-    graph_file = (root / read_config(root)["graph_path"]).resolve()
+    graph_file = resolve_configured_graph_path(root, read_config(root))
     autostart_nodes = autostart_closure(workflow, graph_file, nodes)
     extra_autostart_nodes = [item for item in autostart_nodes if item not in nodes]
 
@@ -243,6 +268,100 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
         prepare=prepare,
     )
 
+def _prepare_node_for_resume(workflow: MicroWorkflow, node: str) -> int:
+    """Requeue only unsuccessful work, preserving done/skipped jobs and output."""
+    changed = 0
+    for job_id in workflow.storage.list_job_ids(node):
+        status = workflow.storage.get_job_status(node, job_id)
+        if status in {FAILED, CANCELLED, RUNNING}:
+            workflow.storage.request_job_restart(
+                node,
+                job_id,
+                reason="resume unsuccessful job",
+            )
+            changed += 1
+    if workflow.storage.has_queued_jobs(node):
+        workflow.storage.set_node_status(node, QUEUED)
+    return changed
+
+
+def resume_node(
+    root: Path,
+    workflow: MicroWorkflow,
+    node: str,
+    *,
+    stats: bool = False,
+    stats_interval: float = 5.0,
+) -> int:
+    refuse_competing_run(workflow)
+    graph_file = resolve_configured_graph_path(root, read_config(root))
+    autostart_nodes = autostart_closure(workflow, graph_file, [node])
+    nodes = topo_subset(workflow, expand_to_components(workflow, {node, *autostart_nodes}))
+
+    blockers = direct_incomplete_inputs(workflow, set(nodes)) - workflow.component_predecessors(
+        workflow.component_for(node)
+    )
+    ignore_external = not not blockers
+    if blockers:
+        print("Resuming with incomplete external inputs:", ", ".join(sorted(blockers)))
+
+    def prepare():
+        for item in nodes:
+            _prepare_node_for_resume(workflow, item)
+
+    return run_nodes(
+        workflow,
+        nodes,
+        node,
+        ignore_external=ignore_external,
+        command="resume",
+        stats=stats,
+        stats_interval=stats_interval,
+        prepare=prepare,
+        require_start_queued=False,
+    )
+
+
+def resume_from(
+    root: Path,
+    workflow: MicroWorkflow,
+    node: str,
+    *,
+    stats: bool = False,
+    stats_interval: float = 5.0,
+) -> int:
+    refuse_competing_run(workflow)
+    nodes = component_topological_nodes(
+        workflow,
+        expand_to_components(workflow, {node, *descendants_in_order(workflow, node)}),
+    )
+    graph_file = resolve_configured_graph_path(root, read_config(root))
+    extra = [item for item in autostart_closure(workflow, graph_file, nodes) if item not in nodes]
+    if extra:
+        nodes = topo_subset(workflow, expand_to_components(workflow, {*nodes, *extra}))
+
+    blockers = direct_incomplete_inputs(workflow, set(nodes))
+    ignore_external = not not blockers
+    if blockers:
+        print("Resuming with incomplete external inputs:", ", ".join(sorted(blockers)))
+
+    def prepare():
+        for item in nodes:
+            _prepare_node_for_resume(workflow, item)
+
+    return run_nodes(
+        workflow,
+        nodes,
+        node,
+        ignore_external=ignore_external,
+        command="resumefrom",
+        stats=stats,
+        stats_interval=stats_interval,
+        prepare=prepare,
+        require_start_queued=False,
+    )
+
+
 def run_nodes(
     workflow: MicroWorkflow,
     nodes: list[str],
@@ -253,6 +372,7 @@ def run_nodes(
     stats: bool = False,
     stats_interval: float = 5.0,
     prepare: Callable[[], None] | None = None,
+    require_start_queued: bool = True,
 ) -> int:
     run_set = set(nodes)
     previous_allowed_run_nodes = workflow.allowed_run_nodes
@@ -273,13 +393,17 @@ def run_nodes(
             if prepare is not None:
                 prepare()
 
-            if not workflow.storage.has_queued_jobs(start_node):
-                workflow.storage.set_node_status(start_node, QUEUED)
-                print(
-                    f"No queued jobs for {start_node}. "
-                    f"Create default jobs in node_behavior/{start_node}.py with "
-                    "router.create_job(number=..., params={...})."
-                )
+            has_any_queued = any(workflow.storage.has_queued_jobs(item) for item in nodes)
+            if (require_start_queued and not workflow.storage.has_queued_jobs(start_node)) or not has_any_queued:
+                if require_start_queued:
+                    workflow.storage.set_node_status(start_node, QUEUED)
+                    print(
+                        f"No queued jobs for {start_node}. "
+                        f"Create default jobs in node_behavior/{start_node}.py with "
+                        "router.create_job(number=..., params={...})."
+                    )
+                else:
+                    print("No failed, cancelled, stale-running, or queued jobs remain in the resume set.")
                 finish_run("done")
                 return 0
 

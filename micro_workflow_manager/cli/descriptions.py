@@ -1,288 +1,290 @@
 HELP_EPILOG = """
-Common help commands:
-  mwf --help
-  mwf init --help
-  mwf graph --help
+Command help:
   mwf clean --help
-  mwf reset --help
-  mwf wipe --help
   mwf run --help
-  mwf restart --help
-  mwf runfrom --help
-  mwf monitor --help
+  mwf resumefrom --help
 
-Command descriptions:
-  mwf --describe init
-  mwf --describe graph
-  mwf --describe clean
-  mwf --describe reset
-  mwf --describe wipe
+Extended command descriptions:
   mwf --describe run
-  mwf --describe restart
   mwf --describe runfrom
-  mwf --describe monitor
+  mwf --describe resumefrom
 
-Typical flow:
+Common flow:
   mwf init
   mwf graph src/graph.py
-  mwf graph --update       # after changing or renaming graph nodes/edges
-  mwf run start_node
-  mwf run start_node job 1 3 8-10
-  mwf restart explode job 42  # from a second terminal during an active run
-  mwf runfrom start_node
-  mwf runfrom start_node --stats
-  mwf monitor              # live workflow statistics in a second terminal
-  mwf monitor --once       # one status snapshot
+  mwf doctor
+  mwf migrate --dry-run
+  mwf run A --plan
+  mwf run A
+  mwf restart wait job 42
+  mwf resumefrom A
+  mwf monitor
 
-Cleaning:
-  mwf clean node_name   # clear output/files/jobs for one node, keep input files
-  mwf clean *           # clean every node in the graph
-  mwf reset node_name   # clear outputs and rerun existing jobs, keep job definitions
-  mwf reset *           # reset every node in the graph
-  mwf wipe node_name    # clean one node and remove its input folder too
-  mwf wipe *            # wipe every node in the graph
+Cleaning all nodes:
+  mwf clean *
+  mwf reset *
+  mwf wipe *
+
+Use 'mwf <command> --help' for syntax. Use 'mwf --describe <command>'
+for a longer essay explaining behavior, file effects, and abstract examples.
 """
+
+COMMAND_HELP_DESCRIPTIONS = {
+    "init": "Initialize the current folder as an MWF project. This creates .mwf and lightweight editor/git sidecars but does not load task code.",
+    "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
+    "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
+    "migrate": "Upgrade only MWF-owned metadata to the current state schema. User inputs, outputs, returned files, and event logs are never rewritten.",
+    "inspect": "Explain one node or one job, including readiness, status counts, execution generation, input/output, and append-only job events.",
+    "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
+    "clean": "Delete jobs and output for selected nodes while keeping node input files.",
+    "reset": "Requeue every existing job for selected nodes while keeping job definitions and node input files.",
+    "wipe": "Like clean, but remove selected nodes' input files as well.",
+    "run": "Reset and run one ready node, or reset and run explicitly selected job IDs.",
+    "restart": "From a second terminal, safely replace running jobs inside an active run/runfrom/resume sequence without starting another scheduler.",
+    "resume": "Continue unsuccessful or queued work for one node without resetting jobs that are already done or skipped.",
+    "runfrom": "Reset and run one node and its descendants while respecting dependency readiness.",
+    "resumefrom": "Continue unsuccessful or queued work from one node through its descendants without resetting completed jobs.",
+    "monitor": "Show live or one-shot node/job statistics without running task code.",
+}
 
 COMMAND_DESCRIPTIONS = {
     "init": """
-init creates the project marker file .mwf in the current directory.
+The help text tells you that init creates an MWF project. In practical terms,
+this command places a small .mwf marker in the current folder so later commands
+can find the project root from any subfolder. It does not import graph.py, create
+workflow nodes, or execute functions. That separation is useful because you can
+prepare a clean project shell before deciding what the graph should contain.
 
-Code context:
-  init does not import your graph.py or node_behavior files.
+A minimal beginning is:
+  mkdir simple_flow
+  cd simple_flow
+  mwf init
 
-File-system context:
-  writes .mwf with the default runner set to threaded
-  stores graph_path as null until you run mwf graph <path>
-  does not create node folders until a graph is loaded
-
-Use when:
-  starting a new micro-workflow project folder
+Afterward, create a graph file and register it with mwf graph. If .mwf already
+exists, init leaves the existing project configuration intact.
 """,
     "graph": """
-graph records or explicitly synchronizes the Python file that defines your DAG.
+The help text describes graph as the explicit synchronization point. This means
+ordinary run, monitor, inspect, and cleanup commands will not silently add or
+remove top-level node folders. Only graph changes the stored edge list and makes
+the node directory match the Python graph definition.
 
-Code context:
-  imports the supplied graph file, or the stored graph when --update is used
-  reads EDGES or edges from that module
-  supports ordinary edges plus a-B / A-b directed fans such as ("a", B) and (A, "b")
-  imports sibling node_behavior/*.py files
-  mounts only NodeRouter objects whose names are present in the graph
+For a very small graph, src/graph.py could contain:
+  EDGES = [("make_number", "double_number")]
 
-File-system context:
-  updates .mwf with graph_path, runner, and fully expanded edges
-  creates folders for newly-added graph nodes
-  permanently deletes stale folders for removed or renamed nodes
-  normal commands never perform this top-level node-folder synchronization
+Register it with:
+  mwf graph src/graph.py
 
-Use when:
-  setting a graph for the first time:
-    mwf graph src/graph.py
-  applying later graph edits or node renames:
-    mwf graph --update
-  changing the stored default runner while synchronizing:
-    mwf graph --update --runner threaded
-    mwf graph --update --runner process
-    mwf graph --update --runner direct
+After renaming a node or changing an edge, preview and then apply the change deliberately:
+  mwf graph --update --dry-run
+  mwf graph --update
 
-Warning:
-  removed/renamed node folders are deleted with their inputs, outputs, jobs, and state.
+MWF stores the relative path as src/graph.py even on Windows. Older or manually
+edited configurations containing src\\graph.py are also accepted, so the same
+project folder can move between Linux and Windows without rewriting .mwf first.
+Deleting or renaming a graph node during --update deletes that node's folder, so
+copy any data you still need before synchronizing.
+""",
+    "doctor": """
+Doctor is a read-only diagnostic pass. It builds on ordinary help by explaining
+why a project may fail before you spend time running it. It compares graph nodes,
+node folders, and node_behavior filenames; parses important JSON state files;
+checks whether a recorded run is live or stale; and warns about literal
+ctx.node("B") calls whose A -> B edge is absent.
+
+Run it after editing the graph or moving the project between machines:
+  mwf doctor
+
+For example, if graph.py contains A -> B but src/node_behavior/B.py is missing,
+doctor reports that mismatch without creating the file or changing any status.
+A warning does not necessarily make the project unusable, while an ERROR causes
+a nonzero exit status suitable for a simple test script.
+""",
+    "migrate": """
+Migrate updates the schema_version field on framework-owned metadata so a project
+created by an older MWF release has an explicit, supported state format. It does
+not change input.json, output.json, returned files, or events.jsonl, because those
+contain user data or task results rather than scheduler metadata.
+
+Preview the exact files first:
+  mwf migrate --dry-run
+
+Then apply the migration:
+  mwf migrate
+
+For a simple A -> B workflow, this may update .mwf, node_state.json, schema.json,
+job.json, status.json, execution.json, and the rebuildable job index. If a file
+claims a newer schema than the installed package supports, MWF refuses to
+downgrade it and asks you to use a compatible newer package.
+""",
+    "inspect": """
+Inspect turns the file-backed state into a readable explanation. Node inspection
+shows predecessors, successors, component membership, status counts, runner,
+timeout, and a sentence explaining why the node is complete, ready, blocked, or
+failed. Job inspection additionally shows its input, output, execution generation,
+and chronological events.jsonl history.
+
+Examples:
+  mwf inspect wait
+  mwf inspect wait job 3
+
+Imagine node wait has one failed job. The node view explains that the failure is
+preventing completion and suggests mwf resume wait. The job view then shows when
+it started, which fallback ran, whether it timed out, and the final error. Inspect
+only reads state and never retries work.
+""",
+    "recover": """
+Recover is for an interrupted command whose owning process is definitely gone.
+Active runs write a hostname, process ID, and heartbeat to .mwf_run.json. Recover
+uses that ownership information and each running job's execution record before it
+acts. It increments the execution generation first, then requeues only abandoned
+running jobs, which prevents a late stale process from committing afterward.
+
+Preview or apply recovery:
+  mwf recover --dry-run
+  mwf recover
+
+Suppose A finished, B was running a short wait, and the terminal process crashed.
+Recover leaves A done, requeues B, and records that the old run was recovered.
+You can then use mwf resume B or mwf resumefrom B. Recover refuses to operate
+while the recorded owner is still live.
 """,
     "clean": """
-clean resets runnable state for one or more nodes while preserving node input files.
-
 Code context:
-  loads .mwf, graph.py, and node_behavior/*.py so it can validate node names
-  does not run your node task code
+Clean loads the configured graph and routers only to validate node names; it does
+not execute a task function. It removes the selected nodes' job folders and output
+while preserving their input folders.
 
-File-system context for each selected node:
-  deletes node/<node>/output/
-  keeps node/<node>/input/
-  deletes node/<node>/jobs/ entirely
-  resets node_state.json to queued
-  the next CLI load will recreate router.create_job(...) defaults if declared
-  use reset instead when you want to keep existing job definitions and inputs
+File-system context:
+The jobs and output directories are recreated empty, while input remains in place. It is the broad reset to use when existing job definitions are no
+longer useful and should be recreated from router.create_job(...) or by an
+upstream node on the next run.
 
-Targets:
-  mwf clean node_name   cleans one node
-  mwf clean a b c       cleans several named nodes
-  mwf clean *           cleans every node in the graph
+Examples:
+  mwf clean make_number --dry-run
+  mwf clean make_number
+  mwf clean A B
+  mwf clean "*"
 
-Shell note:
-  in shells that expand *, quote it as mwf clean "*" if needed.
+If make_number previously created five random-number jobs, clean removes those
+five job records. It does not run the function and does not delete files you put
+in node/make_number/input/. Use reset when you want to keep the same jobs.
 """,
     "reset": """
-reset reruns existing jobs for one or more nodes while preserving node input files and job definitions.
+Reset preserves job.json and input.json but removes each selected job's status,
+result metadata, and job-local files so every existing job becomes queued again.
+It also clears node output. This is useful when the inputs are correct and you
+simply want all jobs to execute again.
 
-Code context:
-  loads .mwf, graph.py, and node_behavior/*.py so it can validate node names
-  does not run your node task code
+Examples:
+  mwf reset double_number --dry-run
+  mwf reset double_number
+  mwf reset A B
 
-File-system context for each selected node:
-  deletes node/<node>/output/
-  keeps node/<node>/input/
-  keeps node/<node>/jobs/<id>/job.json and input.json
-  removes per-job status/output/files so those jobs are queued again
-  resets node_state.json to queued
-  unlike clean, it does not delete the jobs folder or erase existing job inputs
-
-Targets:
-  mwf reset node_name   resets one node
-  mwf reset a b c       resets several named nodes
-  mwf reset *           resets every node in the graph
-
-Shell note:
-  in shells that expand *, quote it as mwf reset "*" if needed.
+If jobs 1 and 2 were done, both are requeued. If you only want to continue the
+failed job while preserving the done one, use mwf resume double_number instead.
 """,
     "wipe": """
-wipe is clean plus input removal.
+Wipe performs the same cleanup as clean and also recreates the selected input
+folders empty. It is intended for a complete local restart of a node's stored
+material, not for ordinary failure recovery.
 
-Code context:
-  loads .mwf, graph.py, and node_behavior/*.py so it can validate node names
-  does not run your node task code
+Examples:
+  mwf wipe wait --dry-run
+  mwf wipe wait
+  mwf wipe "*"
 
-File-system context for each selected node:
-  does everything clean does
-  also deletes and recreates node/<node>/input/
-
-Targets:
-  mwf wipe node_name   wipes one node
-  mwf wipe a b c       wipes several named nodes
-  mwf wipe *           wipes every node in the graph
-
-Shell note:
-  in shells that expand *, quote it as mwf wipe "*" if needed.
+A node function is not executed by wipe. Because input files are removed, use
+this command only when those files can be recreated or are no longer needed.
 """,
     "run": """
-run executes one ready node, or selected jobs inside that node.
+Run deliberately starts fresh work for one node. In normal node mode it resets
+the selected run set before scheduling it. In job-selection mode it resets only
+the named job IDs, leaving the other jobs in that node untouched.
 
-Job-selection syntax:
-  mwf run node_name job 1
-  mwf run node_name job 1 3 8-10
+Examples:
+  mwf run make_number --plan
+  mwf run make_number
+  mwf run double_number job 2
+  mwf run wait jobs 1 3-5
 
-The job form reruns only the selected job IDs. Other jobs on the same node are
-left untouched. Selected jobs are reset before execution, so previously done or
-failed jobs can be rerun.
-
-Code context:
-  loads .mwf, graph.py, and node_behavior/*.py
-  validates the requested node exists in the graph
-  may inspect node_behavior source code for simple autostart calls
-  uses the stored runner from .mwf unless --runner is provided
-  honors per-node runner overrides such as runner="direct" or router.run_sequentially()
-
-File-system context:
-  does not invent starter jobs; declare them with router.create_job(...) in node_behavior/<node>.py
-  resets the requested node's existing job artifacts before running it
-  if detected autostart nodes are included, resets those downstream nodes before running
-  reads jobs from node/<node>/jobs/
-  writes task artifacts under node/<node>/jobs/<job-id>/files/ and node/<node>/output/
-  in job-selection mode, clears only the selected job folders' status/output/files artifacts
-
-Use when:
-  you want to rerun a single ready node, or a node plus detected autostart chain
-  you want to rerun exact jobs without disturbing the rest of the node:
-    mwf run tagify job 1 3 8-10
-  you want compact inline status while it runs:
-    mwf run tagify --stats
-
-Concurrency:
-  if another run/runfrom sequence is active, this command refuses to start a
-  competing scheduler. Use mwf restart <node> job <id> for one running job.
+A basic task might choose a random integer, double it, or call ctx.sleep(1). Run
+uses the configured threaded, process, or direct runner and refuses to start if
+another CLI sequence already owns the project. To preserve completed work after
+a failure, use resume rather than run.
 """,
-
     "restart": """
-restart replaces one or more currently running jobs inside an existing run or
-runfrom sequence. It is designed for a second terminal when a sensitive job is
-hung or should be attempted again without discarding the surrounding workflow.
+Restart is the second-terminal control for one job that is currently running
+inside a live sequence. It does not import graph.py and does not launch another
+scheduler. Instead, it atomically advances the job's execution generation, clears
+that job's local result/files, and lets the existing scheduler start the new
+generation while the surrounding run remains intact.
 
-Syntax:
-  mwf restart node_name job 42
-  mwf restart node_name jobs 42 57 80-82
+Examples:
+  mwf restart wait job 4 --dry-run
+  mwf restart wait job 4
+  mwf restart wait jobs 4 7-8
 
-Code context:
-  does not import graph.py or node_behavior files
-  does not launch a second workflow runner
-  reads the live .mwf_run.json record and verifies the node belongs to that run
-  only accepts jobs that are still in running state and owned by a live execution
-
-Safety behavior:
-  atomically increments the job execution generation before cleanup
-  the old generation immediately loses permission to commit status, returned
-  files, ctx.write/ctx.write_output output, or ctx.node(...) side effects
-  the existing scheduler notices the generation change and starts the replacement
-  the node remains running, so downstream finalization cannot happen between the
-  abandoned attempt and the replacement attempt
-  job.json and input.json are preserved; job-local output.json and files/ are reset
-
-Important limitation:
-  Python cannot safely force-kill an arbitrary thread inside a third-party HTTP or
-  native call. The old attempt is stopped immediately from the workflow's point
-  of view and fenced from MWF-managed side effects, but its underlying call may
-  continue until that library returns or times out. Long custom loops can call
-  ctx.checkpoint() to exit promptly after a restart.
-
-Use when:
-  another terminal is already running mwf run or mwf runfrom and one job is hung
-  you need to preserve the larger active sequence:
-    mwf restart explode job 42
-
-Do not use as a normal rerun command after the workflow has ended; use
-  mwf run node_name job 42
-instead.
+A Python thread blocked in an outside library cannot always be force-killed, but
+its old generation immediately loses permission to commit MWF-managed status,
+files, or downstream jobs. Cooperative code can call ctx.checkpoint() or use
+ctx.sleep(...) so it notices replacement quickly.
 """,
+    "resume": """
+Resume continues one node without erasing successful work. Failed, cancelled,
+and stale-running jobs are fenced and requeued; already queued jobs remain queued;
+done and skipped jobs, their output records, and their files remain untouched.
+The command then schedules whatever work is still needed.
 
-    "monitor": """
-monitor prints workflow statistics from the file-backed node/job folders.
+Examples:
+  mwf resume double_number --plan
+  mwf resume double_number
 
-Code context:
-  loads .mwf, graph.py, and node_behavior/*.py so it knows graph nodes,
-  component order, node max_threads, and runner overrides
-  does not run your task code
-
-File-system context:
-  reads node/<node>/node_state.json
-  reads node/<node>/jobs/<id>/job.json and status.json
-  reads .mwf_run.json when a run or runfrom command is active or recently finished
-  estimates ETA from duration_seconds written to completed job status files
-
-Use when:
-  you want a second terminal dashboard while another terminal runs work:
-    mwf runfrom start_node
-    mwf monitor
-
-Options:
-  mwf monitor --once       print one snapshot and exit
-  mwf monitor A B          monitor only selected nodes
-  mwf monitor --json       output machine-readable JSON
+Suppose double_number has jobs 1 and 2 done and job 3 failed. Resume runs job 3
+only. This differs from mwf run double_number, which is a fresh node rerun. The
+append-only event history records the resume transition so inspect can explain
+what happened later.
 """,
     "runfrom": """
-runfrom executes a node and its descendants in graph order, with threaded execution where possible.
+Runfrom is the fresh-run form for a node and all of its descendants. It resets
+the selected path, checks external predecessors, and then schedules ready nodes
+in dependency order while allowing independent work to overlap under a concurrent
+runner.
 
-Code context:
-  loads .mwf, graph.py, and node_behavior/*.py
-  computes all descendants of the requested start node
-  may inspect node_behavior source code for simple autostart calls outside that descendant set
-  uses the stored runner from .mwf unless --runner is provided
-  honors per-node runner overrides such as runner="direct", runner="threaded", or runner="process"
+For A -> B -> C:
+  mwf runfrom A --plan
+  mwf runfrom A
 
-File-system context:
-  resets the starting node's existing job artifacts before running it
-  resets descendant nodes selected for this run while preserving router.create_job(...) jobs
-  removes stale parent-generated descendant jobs so upstream nodes can regenerate them
-  queues autostart-created jobs instead of letting them escape the selected run set
-  does not invent starter jobs; declare them with router.create_job(...) in node_behavior/<node>.py
-  reads and writes each selected node's node/<node>/jobs/, node/<node>/output/, and node_state.json
-  refuses to continue if direct upstream nodes outside the run set are incomplete, unless you confirm
+A simple A task might generate a number, B might add one, and C might wait briefly
+before writing the answer. Runfrom resets that selected sequence. Use resumefrom
+when some jobs are already done and should stay done.
+""",
+    "resumefrom": """
+Resumefrom mirrors runfrom's graph selection but uses resume semantics. It keeps
+done and skipped jobs throughout the descendant set, requeues only unsuccessful
+or abandoned work, and leaves existing queued jobs available. This makes it the
+normal command after a partial runfrom failure.
 
-Use when:
-  you want a safe partial workflow rerun from one node onward
-  you want compact inline status while it runs:
-    mwf runfrom split --stats
-  for a full dashboard in another terminal, use:
-    mwf monitor
+For A -> B -> C:
+  mwf resumefrom A --plan
+  mwf resumefrom A
 
-Concurrency:
-  if another run/runfrom sequence is active, this command refuses to replace it.
-  Use mwf restart <node> job <id> for one currently running job.
+If A is done, one B job failed, and C has not run yet, resumefrom preserves A,
+reruns the failed B job, and then allows C to continue when B completes. It does
+not delete parent-created jobs merely because they belong to a descendant node.
+""",
+    "monitor": """
+Monitor is a read-only live view over node_state.json, job_index.json, and job
+status files. It is safe to run in another terminal because it never claims the
+run slot or calls node functions.
+
+Examples:
+  mwf monitor
+  mwf monitor A B --once
+  mwf monitor --json --once
+
+During a task that waits for several seconds, monitor shows the running job ID,
+queued and completed counts, average duration, and approximate remaining time.
+Use inspect when you need the detailed history of one specific node or job.
 """,
 }

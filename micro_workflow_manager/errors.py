@@ -18,3 +18,9 @@ class JobRestartedError(MicroWorkflowError):
     """Raised when an execution lease is superseded by a manual restart."""
 
     pass
+
+
+class JobTimeoutError(MicroWorkflowError):
+    """Raised when a task exceeds its configured timeout."""
+
+    pass

@@ -3,7 +3,7 @@ from __future__ import annotations
 import textwrap
 
 from .constants import COMMAND_NAMES
-from .descriptions import COMMAND_DESCRIPTIONS
+from .descriptions import COMMAND_DESCRIPTIONS, COMMAND_HELP_DESCRIPTIONS
 from .files import find_root, read_config
 
 def describe_command(command: str) -> int:
@@ -15,6 +15,9 @@ def describe_command(command: str) -> int:
 
     print(f"mwf {command}")
     print("=" * (4 + len(command)))
+    print("Help summary:")
+    print(textwrap.fill(COMMAND_HELP_DESCRIPTIONS[command].strip(), width=88, initial_indent="  ", subsequent_indent="  "))
+    print("\nExtended explanation:")
     print(textwrap.dedent(COMMAND_DESCRIPTIONS[command]).strip())
 
     context = current_project_context()

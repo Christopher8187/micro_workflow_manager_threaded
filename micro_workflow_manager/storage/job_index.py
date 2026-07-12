@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, VALID_STATUSES
 
 
@@ -34,6 +35,7 @@ class JobIndexStorageMixin:
 
     def empty_job_index(self, node_name: str) -> dict[str, Any]:
         return {
+            "schema_version": CURRENT_STATE_SCHEMA_VERSION,
             "version": 1,
             "node": node_name,
             "last_job_id": 0,

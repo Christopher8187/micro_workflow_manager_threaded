@@ -1,7 +1,7 @@
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Callable, TypeVar
 
 from ..context import JobContext
@@ -10,6 +10,7 @@ from ..errors import (
     InvalidJobError,
     JobFailedError,
     JobRestartedError,
+    JobTimeoutError,
 )
 from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
 
@@ -326,6 +327,72 @@ class JobExecutionMixin:
                 raise error
             raise JobFailedError(f"Job {node_name}/{job_id} failed") from error
 
+
+    def _invoke_handler_with_timeout(
+        self,
+        mounted,
+        ctx: JobContext,
+        params: dict,
+        cancellation_event: Event,
+    ):
+        """Call a handler directly unless it has an explicit timeout.
+
+        Timed handlers run in an abandonable daemon thread. On expiry, the
+        local cancellation event immediately blocks future JobContext-managed
+        mutations from the stale handler while the normal fallback chain can
+        continue. This adds no thread or polling overhead to tasks without a
+        timeout.
+        """
+        timeout = mounted.timeout
+        if timeout is None:
+            return mounted.handler(ctx, **params)
+
+        outcomes: Queue = Queue(maxsize=1)
+        done = Event()
+
+        def target():
+            try:
+                outcomes.put(("result", mounted.handler(ctx, **params)))
+            except BaseException as error:
+                outcomes.put(("error", error))
+            finally:
+                done.set()
+
+        Thread(
+            target=target,
+            name=f"mwf-timeout-{ctx.current_node}-{ctx.job_id}-{mounted.name}",
+            daemon=True,
+        ).start()
+
+        if not done.wait(timeout):
+            cancellation_event.set()
+            self.storage.append_job_event(
+                ctx.current_node,
+                ctx.job_id,
+                "timeout",
+                task=mounted.name,
+                timeout_seconds=timeout,
+                attempt=ctx.attempt,
+            )
+            raise JobTimeoutError(
+                f"{ctx.current_node}.{mounted.name} exceeded timeout={timeout:g}s"
+            )
+
+        kind, payload = outcomes.get()
+        if kind == "error":
+            if isinstance(payload, JobTimeoutError):
+                cancellation_event.set()
+                self.storage.append_job_event(
+                    ctx.current_node,
+                    ctx.job_id,
+                    "timeout",
+                    task=mounted.name,
+                    timeout_seconds=timeout,
+                    attempt=ctx.attempt,
+                )
+            raise payload
+        return payload
+
     def execute_with_fallbacks(
         self,
         job: Job,
@@ -364,6 +431,13 @@ class JobExecutionMixin:
                 self.storage.write_debug(
                     job.node_name,
                     f"job {job.job_id} trying fallback {fallback_name}",
+                )
+                self.storage.append_job_event(
+                    job.node_name,
+                    job.job_id,
+                    "fallback_started",
+                    fallback=fallback_name,
+                    previous_error=repr(main_error),
                 )
 
                 try:
@@ -408,6 +482,12 @@ class JobExecutionMixin:
                 repeat_results = []
 
                 for repeat_index in range(1, mounted.repeats + 1):
+                    cancellation_event = Event()
+                    deadline = (
+                        monotonic() + mounted.timeout
+                        if mounted.timeout is not None
+                        else None
+                    )
                     ctx = JobContext(
                         system=self,
                         current_node=job.node_name,
@@ -418,6 +498,8 @@ class JobExecutionMixin:
                         error=previous_error,
                         execution_generation=execution_generation,
                         execution_id=execution_id,
+                        cancellation_event=cancellation_event,
+                        deadline=deadline,
                     )
 
                     params = {
@@ -435,7 +517,13 @@ class JobExecutionMixin:
                             f"Missing params for {job.node_name}.{mounted.name}: {missing}"
                         )
 
-                    result = mounted.handler(ctx, **params)
+                    result = self._invoke_handler_with_timeout(
+                        mounted,
+                        ctx,
+                        params,
+                        cancellation_event,
+                    )
+                    ctx.checkpoint()
                     repeat_results.append(result)
 
                 all_results.extend(repeat_results)
@@ -455,6 +543,15 @@ class JobExecutionMixin:
                         job.node_name,
                         f"job {job.job_id} retrying {mounted.name} "
                         f"attempt {attempt + 1}/{attempts}: {error}",
+                    )
+                    self.storage.append_job_event(
+                        job.node_name,
+                        job.job_id,
+                        "retry_started",
+                        task=mounted.name,
+                        attempt=attempt + 1,
+                        attempts=attempts,
+                        previous_error=repr(error),
                     )
                     continue
 
