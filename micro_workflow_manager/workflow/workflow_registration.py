@@ -129,11 +129,13 @@ class WorkflowRegistrationMixin:
         runner: str | None = None,
         sequential: bool = False,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ):
         max_threads_checked = validate_positive_int("max_threads", max_threads)
         retries_checked = validate_non_negative_int("retries", retries)
         repeats_checked = validate_positive_int("repeats", repeats)
         timeout_checked = validate_positive_float("timeout", timeout)
+        checkpoint_timeout_checked = validate_positive_float("checkpoint_timeout", checkpoint_timeout)
         runner_override = sequential_runner_value(runner=runner, sequential=sequential)
 
         if runner_override == "direct":
@@ -153,6 +155,7 @@ class WorkflowRegistrationMixin:
                 retries=retries_checked,
                 repeats=repeats_checked,
                 timeout=timeout_checked,
+                checkpoint_timeout=checkpoint_timeout_checked,
             )
 
             assert node.main_task is not None
@@ -167,6 +170,7 @@ class WorkflowRegistrationMixin:
                 runner_override=node.runner_override,
                 max_threads=node.max_threads,
                 timeout=node.main_task.timeout,
+                checkpoint_timeout=node.main_task.checkpoint_timeout,
             )
 
             return fn
@@ -180,10 +184,12 @@ class WorkflowRegistrationMixin:
         retries: int = 0,
         repeats: int = 1,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ):
         retries_checked = validate_non_negative_int("retries", retries)
         repeats_checked = validate_positive_int("repeats", repeats)
         timeout_checked = validate_positive_float("timeout", timeout)
+        checkpoint_timeout_checked = validate_positive_float("checkpoint_timeout", checkpoint_timeout)
 
         def decorator(fn: Callable):
             node = self.ensure_node(node_name)
@@ -193,6 +199,7 @@ class WorkflowRegistrationMixin:
                 retries=retries_checked,
                 repeats=repeats_checked,
                 timeout=timeout_checked,
+                checkpoint_timeout=checkpoint_timeout_checked,
             )
 
             if node.main_task is not None:
@@ -206,6 +213,7 @@ class WorkflowRegistrationMixin:
                     runner_override=node.runner_override,
                     max_threads=node.max_threads,
                     timeout=node.main_task.timeout,
+                    checkpoint_timeout=node.main_task.checkpoint_timeout,
                 )
 
             return fn

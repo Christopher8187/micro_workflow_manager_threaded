@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+from datetime import datetime
 from pathlib import Path
 
 from .active_run import process_is_alive, run_state_liveness
@@ -104,7 +105,7 @@ def doctor_command(root: Path) -> int:
 
     json_files: list[Path] = []
     if disk_root.is_dir():
-        for pattern in ("*/node_state.json", "*/schema.json", "*/job_index.json", "*/jobs/*/job.json", "*/jobs/*/input.json", "*/jobs/*/status.json", "*/jobs/*/execution.json"):
+        for pattern in ("*/node_state.json", "*/schema.json", "*/job_index.json", "*/jobs/*/job.json", "*/jobs/*/input.json", "*/jobs/*/status.json", "*/jobs/*/execution.json", "*/jobs/*/runtime.json"):
             json_files.extend(disk_root.glob(pattern))
     malformed = [problem for path in json_files if (problem := _json_problem(path))]
     errors.extend(f"malformed JSON: {item}" for item in malformed)
@@ -134,6 +135,34 @@ def doctor_command(root: Path) -> int:
     if abandoned_running:
         warnings.append(
             "running jobs have no live owner: " + ", ".join(abandoned_running) + "; run mwf recover"
+        )
+
+    overdue_checkpoints: list[str] = []
+    now_value = datetime.now().astimezone()
+    for runtime_path in disk_root.glob("*/jobs/*/runtime.json") if disk_root.is_dir() else []:
+        try:
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if runtime.get("state") != "running":
+            continue
+        deadline_text = runtime.get("checkpoint_deadline_at")
+        if not isinstance(deadline_text, str):
+            continue
+        try:
+            deadline = datetime.fromisoformat(deadline_text)
+        except ValueError:
+            continue
+        comparison_now = now_value if deadline.tzinfo is not None else datetime.now()
+        if deadline < comparison_now:
+            node = runtime_path.parents[2].name
+            job_id = runtime_path.parent.name
+            overdue_checkpoints.append(f"{node}/{job_id}")
+    if overdue_checkpoints:
+        warnings.append(
+            "checkpoint deadlines are overdue: "
+            + ", ".join(overdue_checkpoints)
+            + "; inspect the job and verify the active scheduler heartbeat"
         )
 
     state_path = root / ".mwf_run.json"

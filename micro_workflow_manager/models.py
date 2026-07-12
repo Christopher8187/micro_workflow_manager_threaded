@@ -25,6 +25,7 @@ class MountedTask:
     retries: int = 0
     repeats: int = 1
     timeout: float | None = None
+    checkpoint_timeout: float | None = None
 
 
 QUEUED = "queued"

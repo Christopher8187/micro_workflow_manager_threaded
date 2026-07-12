@@ -74,13 +74,24 @@ def recover_stale_jobs(
                     "generation": int(control.get("generation", 0)) + 1,
                 })
             else:
-                recovered.append(
-                    storage.request_job_restart(
+                item = storage.request_job_restart(
+                    node,
+                    job_id,
+                    reason="recover stale running job",
+                )
+                recovered.append(item)
+                runtime = storage.read_job_runtime(node, job_id)
+                if runtime:
+                    storage.write_job_runtime(
                         node,
                         job_id,
-                        reason="recover stale running job",
+                        {
+                            **runtime,
+                            "state": "recovered",
+                            "recovered_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                            "recovery_reason": liveness["reason"],
+                        },
                     )
-                )
                 storage.set_node_status(node, QUEUED)
 
     if not dry_run and state.get("status") == "running" and not liveness["live"]:

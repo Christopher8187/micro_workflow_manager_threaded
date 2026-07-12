@@ -369,7 +369,7 @@ def test_active_run_state_contains_ownership_and_heartbeat(tmp_path, monkeypatch
     assert state["hostname"]
     assert state["pid"] > 0
     assert state["heartbeat_at"]
-    assert state["mwf_version"] == "0.2.2"
+    assert state["mwf_version"] == "0.2.3"
     assert state["status"] == "done"
 
 
@@ -487,3 +487,264 @@ def test_every_describe_page_extends_help_with_abstract_examples(capsys):
         lowered = text.lower()
         for term in forbidden:
             assert term not in lowered
+
+
+def test_checkpoint_watchdog_refreshes_at_each_progress_checkpoint(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+
+    @workflow.task("A", checkpoint_timeout=0.05)
+    def a(ctx):
+        started = time.monotonic()
+        time.sleep(0.03)
+        ctx.checkpoint("halfway", progress=0.5, detail="first section complete")
+        time.sleep(0.03)
+        return time.monotonic() - started
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    elapsed = workflow.run_one("A")
+    assert elapsed > 0.05
+    runtime = workflow.storage.read_job_runtime("A", 1)
+    assert runtime["state"] == "completed"
+    assert runtime["checkpoint_name"] == "halfway"
+    assert runtime["progress"] == 0.5
+    assert runtime["progress_detail"] == "first section complete"
+    assert not any(
+        event.get("event") == "timeout"
+        for event in workflow.storage.read_job_events("A", 1)
+    )
+
+
+def test_checkpoint_watchdog_fails_stalled_section_and_blocks_late_write(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+
+    @workflow.task("A", checkpoint_timeout=0.03)
+    def a(ctx):
+        ctx.checkpoint("waiting for service", progress=0.25)
+        time.sleep(0.08)
+        ctx.write("late.txt", "must be fenced")
+        return "late"
+
+    @workflow.fallback("A", name="quick")
+    def quick(ctx, error=None):
+        return "fallback"
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    assert workflow.run_one("A") == "fallback"
+    time.sleep(0.1)
+    assert not (workflow.storage.files_dir("A", 1) / "late.txt").exists()
+    runtime = workflow.storage.read_job_runtime("A", 1)
+    assert runtime["state"] == "timed_out"
+    assert runtime["timeout_kind"] == "checkpoint"
+    assert runtime["checkpoint_name"] == "waiting for service"
+    events = workflow.storage.read_job_events("A", 1)
+    timeout_events = [event for event in events if event.get("event") == "timeout"]
+    assert len(timeout_events) == 1
+    assert timeout_events[0]["timeout_kind"] == "checkpoint"
+
+
+def test_inspect_reports_live_checkpoint_progress(tmp_path, capsys):
+    from threading import Event, Thread
+    from micro_workflow_manager.cli.inspect import inspect_job
+
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+    checkpoint_written = Event()
+    release = Event()
+
+    @workflow.task("A", checkpoint_timeout=1.0)
+    def a(ctx):
+        ctx.checkpoint("download", progress=0.4, detail="2 of 5 files")
+        checkpoint_written.set()
+        assert release.wait(0.5)
+        ctx.checkpoint("complete", progress=1.0)
+        return "ok"
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    job = workflow.start("A")
+    result: list[object] = []
+    worker = Thread(
+        target=lambda: result.append(
+            workflow.run_job("A", job.job_id, ignore_readiness=True)
+        ),
+        daemon=True,
+    )
+    worker.start()
+    assert checkpoint_written.wait(0.5)
+
+    assert inspect_job(workflow, "A", job.job_id) == 0
+    output = capsys.readouterr().out
+    assert "checkpoint: download" in output
+    assert "progress: 40.0%" in output
+    assert "progress detail: 2 of 5 files" in output
+    assert "checkpoint deadline:" in output
+
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert result == ["ok"]
+
+
+def test_scheduler_uses_one_central_watchdog_for_multiple_attempts(tmp_path):
+    from threading import Event, Thread, enumerate as enumerate_threads
+
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="threaded")
+    workflow.graph([("A", "B")])
+    workflow.nodes["A"].max_threads = 4
+    all_started = Event()
+    release = Event()
+    started_count = {"value": 0}
+    from threading import Lock
+    count_lock = Lock()
+
+    @workflow.task("A", max_threads=4, checkpoint_timeout=1.0)
+    def a(ctx):
+        with count_lock:
+            started_count["value"] += 1
+            if started_count["value"] == 4:
+                all_started.set()
+        ctx.checkpoint("waiting", progress=0.5)
+        assert release.wait(0.5)
+        return ctx.job_id
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    jobs = [workflow.start("A") for _ in range(4)]
+    runner = Thread(
+        target=lambda: workflow.run_node_jobs("A", jobs, ignore_readiness=True),
+        daemon=True,
+    )
+    runner.start()
+    assert all_started.wait(0.5)
+    assert len(workflow.scheduler_supervisor._watches) == 4
+    assert workflow.scheduler_supervisor._thread is not None
+    assert workflow.scheduler_supervisor._thread.name == "mwf-scheduler-supervisor"
+    assert not any(thread.name.startswith("mwf-timeout-") for thread in enumerate_threads())
+    release.set()
+    runner.join(timeout=3)
+    assert not runner.is_alive()
+
+
+def test_untimed_task_without_checkpoints_keeps_original_direct_fast_path(tmp_path):
+    from threading import get_ident
+
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+    caller = get_ident()
+    observed: list[int] = []
+
+    @workflow.task("A")
+    def a(ctx):
+        observed.append(get_ident())
+        return "ok"
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    assert workflow.run_one("A") == "ok"
+    assert observed == [caller]
+    assert not workflow.storage.job_runtime_file("A", 1).exists()
+    thread = workflow.scheduler_supervisor._thread
+    assert thread is None or not thread.is_alive()
+
+
+def test_dynamic_checkpoint_timeout_requires_supervised_handler(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+
+    @workflow.task("A")
+    def a(ctx):
+        ctx.checkpoint("section", timeout=0.1)
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    job = workflow.start("A")
+    with pytest.raises(Exception) as error:
+        workflow.run_job("A", job.job_id, ignore_readiness=True)
+    assert "checkpoint_timeout" in str(error.value.__cause__ or error.value)
+
+
+def test_router_checkpoint_timeout_is_written_to_schema(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+    router = NodeRouter("A", checkpoint_timeout=2.5)
+
+    @router.task
+    def a(ctx):
+        return 1
+
+    workflow.include_router(router)
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    schema = workflow.storage.read_json(workflow.storage.node_schema_file("A"))
+    assert schema["checkpoint_timeout"] == 2.5
+    assert workflow.nodes["A"].main_task.checkpoint_timeout == 2.5
+
+
+def test_checkpoint_watchdog_works_inside_process_runner(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    behavior = tmp_path / "src" / "node_behavior"
+    behavior.mkdir(parents=True)
+    (tmp_path / "src" / "graph.py").write_text("EDGES = [('A', 'B')]\n", encoding="utf-8")
+    (behavior / "A.py").write_text(
+        '''import time
+from micro_workflow_manager import NodeRouter
+router = NodeRouter("A", runner="process", checkpoint_timeout=0.05)
+router.create_job(number=1)
+@router.task
+def run(ctx):
+    ctx.checkpoint("remote wait", progress=0.2)
+    time.sleep(0.15)
+    ctx.write("late.txt", "bad")
+    return "late"
+@router.fallback(name="quick")
+def quick(ctx, error=None):
+    return "fallback"
+''',
+        encoding="utf-8",
+    )
+    (behavior / "B.py").write_text(
+        '''from micro_workflow_manager import NodeRouter
+router = NodeRouter("B")
+@router.task
+def run(ctx):
+    return None
+''',
+        encoding="utf-8",
+    )
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "process"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["run", "A", "--runner", "process"]) == 0
+    capsys.readouterr()
+    output = json.loads((tmp_path / "node" / "A" / "jobs" / "1" / "output.json").read_text())
+    assert output["result_repr"] == "'fallback'"
+    assert not (tmp_path / "node" / "A" / "jobs" / "1" / "files" / "late.txt").exists()
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "node" / "A" / "jobs" / "1" / "events.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        event.get("event") == "timeout" and event.get("timeout_kind") == "checkpoint"
+        for event in events
+    )
+

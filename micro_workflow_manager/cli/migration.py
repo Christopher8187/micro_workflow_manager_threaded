@@ -18,6 +18,7 @@ _METADATA_PATTERNS = (
     "node/*/jobs/*/job.json",
     "node/*/jobs/*/status.json",
     "node/*/jobs/*/execution.json",
+    "node/*/jobs/*/runtime.json",
     "node/*/idempotency/*.json",
 )
 

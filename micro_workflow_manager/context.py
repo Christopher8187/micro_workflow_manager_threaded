@@ -85,18 +85,12 @@ class _ExecutionChecks:
         self,
         *,
         cancellation_event: Event | None,
-        deadline: float | None,
     ):
         self._cancellation_event = cancellation_event
-        self._deadline = deadline
 
     def _check_local_execution(self):
         if self._cancellation_event is not None and self._cancellation_event.is_set():
-            raise JobTimeoutError("The task attempt was cancelled after exceeding its timeout")
-        if self._deadline is not None and monotonic() >= self._deadline:
-            if self._cancellation_event is not None:
-                self._cancellation_event.set()
-            raise JobTimeoutError("The task attempt exceeded its configured timeout")
+            raise JobTimeoutError("The task attempt was cancelled by the scheduler watchdog")
 
     def is_cancelled(self) -> bool:
         try:
@@ -117,10 +111,9 @@ class NodeHandle(_ExecutionChecks):
         execution_id: str | None,
         *,
         cancellation_event: Event | None = None,
-        deadline: float | None = None,
         transaction_getter: Callable[[], JobTransaction | None] | None = None,
     ):
-        super().__init__(cancellation_event=cancellation_event, deadline=deadline)
+        super().__init__(cancellation_event=cancellation_event)
         self.system = system
         self.from_node = from_node
         self.from_job_id = from_job_id
@@ -234,9 +227,9 @@ class JobContext(_ExecutionChecks):
         execution_generation: int,
         execution_id: str | None,
         cancellation_event: Event | None = None,
-        deadline: float | None = None,
+        attempt_watch=None,
     ):
-        super().__init__(cancellation_event=cancellation_event, deadline=deadline)
+        super().__init__(cancellation_event=cancellation_event)
         self.system = system
         self.current_node = current_node
         self.current_job = current_job
@@ -246,10 +239,22 @@ class JobContext(_ExecutionChecks):
         self.error = error
         self.execution_generation = execution_generation
         self.execution_id = execution_id
+        self._attempt_watch = attempt_watch
         self._transaction: JobTransaction | None = None
 
+    def _check_execution(self):
+        """Validate cancellation/restart without reporting progress."""
+        self._check_local_execution()
+        if self.execution_id is not None:
+            self.system.check_job_execution(
+                self.current_node,
+                self.job_id,
+                self.execution_generation,
+                self.execution_id,
+            )
+
     def _guarded(self, action: Callable[[], T]) -> T:
-        self.checkpoint()
+        self._check_execution()
         if self.execution_id is None:
             return action()
         return self.system.run_job_side_effect(
@@ -260,18 +265,41 @@ class JobContext(_ExecutionChecks):
             action,
         )
 
-    def checkpoint(self):
-        """Raise if this job was restarted or the current task timed out."""
-        self._check_local_execution()
-        if self.execution_id is not None:
-            self.system.check_job_execution(
-                self.current_node,
-                self.job_id,
-                self.execution_generation,
-                self.execution_id,
-            )
+    def checkpoint(
+        self,
+        name: str | None = None,
+        *,
+        progress: float | int | None = None,
+        detail: str | None = None,
+        timeout: float | int | None = None,
+    ):
+        """Report progress and refresh the scheduler-owned checkpoint deadline.
 
-    raise_if_cancelled = checkpoint
+        ``progress`` is a fraction from 0 to 1. ``timeout`` overrides the next
+        checkpoint interval for this section. A dynamic timeout requires the
+        task/router to enable centralized supervision with ``checkpoint_timeout``
+        (or a total ``timeout``).
+        """
+        self._check_execution()
+        if self._attempt_watch is not None:
+            self.system.scheduler_supervisor.report_checkpoint(
+                self._attempt_watch,
+                name=name,
+                progress=progress,
+                detail=detail,
+                timeout=timeout,
+            )
+        self._check_execution()
+
+    def raise_if_cancelled(self):
+        self._check_execution()
+
+    def is_cancelled(self) -> bool:
+        try:
+            self._check_execution()
+        except (JobTimeoutError, JobRestartedError):
+            return True
+        return False
 
     def sleep(self, seconds: float, *, check_interval: float = 0.1):
         """Sleep cooperatively, waking promptly for restart or timeout."""
@@ -281,7 +309,7 @@ class JobContext(_ExecutionChecks):
             raise ValueError("check_interval must be positive")
         end = monotonic() + seconds
         while True:
-            self.checkpoint()
+            self._check_execution()
             remaining = end - monotonic()
             if remaining <= 0:
                 return
@@ -306,7 +334,7 @@ class JobContext(_ExecutionChecks):
 
     @property
     def input_dir(self) -> Path:
-        self.checkpoint()
+        self._check_execution()
         return self.system.storage.node_input_dir(self.current_node)
 
     @property
@@ -322,14 +350,14 @@ class JobContext(_ExecutionChecks):
         return self._guarded(lambda: self.system.storage.files_dir(self.current_node, self.job_id))
 
     def input_path(self, *parts: str) -> Path:
-        self.checkpoint()
+        self._check_execution()
         return self.system.storage.input_path(self.current_node, *parts)
 
     def output_path(self, *parts: str) -> Path:
         return self._guarded(lambda: self.system.storage.output_path(self.current_node, *parts))
 
     def input_files(self, pattern: str = "*", recursive: bool = False, files_only: bool = True) -> list[Path]:
-        self.checkpoint()
+        self._check_execution()
         return self.system.storage.input_files(
             self.current_node, pattern=pattern, recursive=recursive, files_only=files_only
         )
@@ -365,7 +393,7 @@ class JobContext(_ExecutionChecks):
         self._guarded(lambda: self.system.storage.write_debug(self.current_node, message))
 
     def node(self, node_name: str) -> NodeHandle:
-        self.checkpoint()
+        self._check_execution()
         self.system.validate_edge(self.current_node, node_name)
         return NodeHandle(
             system=self.system,
@@ -375,6 +403,5 @@ class JobContext(_ExecutionChecks):
             execution_generation=self.execution_generation,
             execution_id=self.execution_id,
             cancellation_event=self._cancellation_event,
-            deadline=self._deadline,
             transaction_getter=lambda: self._transaction,
         )

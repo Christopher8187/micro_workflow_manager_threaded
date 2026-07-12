@@ -247,6 +247,7 @@ class NodeFileStorageMixin:
         runner_override: str | None = None,
         max_threads: int | None = None,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ):
         self.atomic_write_json(
             self.node_schema_file(node_name),
@@ -262,6 +263,7 @@ class NodeFileStorageMixin:
                 "sequential": runner_override == "direct",
                 "max_threads": max_threads,
                 "timeout": timeout,
+                "checkpoint_timeout": checkpoint_timeout,
                 "input_dir": str(self.node_input_dir(node_name)),
                 "output_dir": str(self.node_output_dir(node_name)),
                 "jobs_dir": str(self.jobs_dir(node_name)),

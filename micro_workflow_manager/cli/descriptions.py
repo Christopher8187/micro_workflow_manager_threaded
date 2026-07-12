@@ -34,7 +34,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
     "migrate": "Upgrade only MWF-owned metadata to the current state schema. User inputs, outputs, returned files, and event logs are never rewritten.",
-    "inspect": "Explain one node or one job, including readiness, status counts, execution generation, input/output, and append-only job events.",
+    "inspect": "Explain one node or one job, including readiness, checkpoint progress/deadlines, execution generation, input/output, and append-only job events.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
     "clean": "Delete jobs and output for selected nodes while keeping node input files.",
     "reset": "Requeue every existing job for selected nodes while keeping job definitions and node input files.",
@@ -120,25 +120,30 @@ downgrade it and asks you to use a compatible newer package.
     "inspect": """
 Inspect turns the file-backed state into a readable explanation. Node inspection
 shows predecessors, successors, component membership, status counts, runner,
-timeout, and a sentence explaining why the node is complete, ready, blocked, or
-failed. Job inspection additionally shows its input, output, execution generation,
-and chronological events.jsonl history.
+total timeout, checkpoint timeout, and why the node is ready, blocked, complete,
+or failed. Job inspection additionally shows the active or last task, named
+checkpoint, checkpoint deadline, progress percentage/detail, input, output,
+execution generation, and chronological events.jsonl history.
 
 Examples:
   mwf inspect wait
   mwf inspect wait job 3
 
-Imagine node wait has one failed job. The node view explains that the failure is
-preventing completion and suggests mwf resume wait. The job view then shows when
-it started, which fallback ran, whether it timed out, and the final error. Inspect
-only reads state and never retries work.
+A simple wait task might report checkpoint "number chosen" with progress 50%,
+then sleep before doubling the number. The job view displays that live progress
+from runtime.json without executing or retrying anything. If the checkpoint
+deadline expires, inspect shows the timeout reason and the event history shows
+which fallback ran afterward.
 """,
     "recover": """
 Recover is for an interrupted command whose owning process is definitely gone.
-Active runs write a hostname, process ID, and heartbeat to .mwf_run.json. Recover
-uses that ownership information and each running job's execution record before it
-acts. It increments the execution generation first, then requeues only abandoned
-running jobs, which prevents a late stale process from committing afterward.
+Active runs write a hostname, process ID, and scheduler heartbeat to
+.mwf_run.json. The scheduler supervisor also manages job checkpoint deadlines,
+but the two signals remain separate: a fresh run heartbeat proves the scheduler
+is alive, while runtime.json describes one job's latest progress. Recover uses
+run ownership and each running job's execution record before it acts. It advances
+the execution generation first, then requeues only abandoned running jobs, which
+prevents a late stale process from committing afterward.
 
 Preview or apply recovery:
   mwf recover --dry-run
@@ -227,8 +232,9 @@ Examples:
 
 A Python thread blocked in an outside library cannot always be force-killed, but
 its old generation immediately loses permission to commit MWF-managed status,
-files, or downstream jobs. Cooperative code can call ctx.checkpoint() or use
-ctx.sleep(...) so it notices replacement quickly.
+files, or downstream jobs. Cooperative code can call ctx.raise_if_cancelled();
+progress-aware code can call ctx.checkpoint("section", progress=0.5). Configured
+checkpoint deadlines are watched by the same centralized scheduler supervisor.
 """,
     "resume": """
 Resume continues one node without erasing successful work. Failed, cancelled,

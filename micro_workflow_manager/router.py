@@ -24,6 +24,7 @@ class RouterTask:
     repeats: int = 1
     name: str | None = None
     timeout: float | None = None
+    checkpoint_timeout: float | None = None
 
 
 @dataclass
@@ -61,10 +62,12 @@ class NodeRouter:
         runner: str | None = None,
         sequential: bool = False,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ):
         self.name = name
         self.max_threads = validate_positive_int("max_threads", max_threads)
         self.timeout = validate_positive_float("timeout", timeout)
+        self.checkpoint_timeout = validate_positive_float("checkpoint_timeout", checkpoint_timeout)
         self.runner_override = sequential_runner_value(
             runner=runner,
             sequential=sequential,
@@ -84,6 +87,7 @@ class NodeRouter:
         runner: str | None = None,
         sequential: bool = False,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ) -> "NodeRouter":
         """Create a router whose node name is the Python file stem."""
         return cls(
@@ -92,6 +96,7 @@ class NodeRouter:
             runner=runner,
             sequential=sequential,
             timeout=timeout,
+            checkpoint_timeout=checkpoint_timeout,
         )
 
     def run_sequentially(self) -> "NodeRouter":
@@ -148,6 +153,7 @@ class NodeRouter:
         runner: str | None = None,
         sequential: bool = False,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ):
         """Register the main task for this node.
 
@@ -162,6 +168,11 @@ class NodeRouter:
         retries = validate_non_negative_int("retries", retries)
         repeats = validate_positive_int("repeats", repeats)
         effective_timeout = self.timeout if timeout is None else validate_positive_float("timeout", timeout)
+        effective_checkpoint_timeout = (
+            self.checkpoint_timeout
+            if checkpoint_timeout is None
+            else validate_positive_float("checkpoint_timeout", checkpoint_timeout)
+        )
 
         if max_threads is not None:
             self.max_threads = validate_positive_int("max_threads", max_threads)
@@ -179,6 +190,7 @@ class NodeRouter:
                 retries=retries,
                 repeats=repeats,
                 timeout=effective_timeout,
+                checkpoint_timeout=effective_checkpoint_timeout,
             )
             return handler
 
@@ -195,12 +207,18 @@ class NodeRouter:
         retries: int = 0,
         repeats: int = 1,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ):
         """Register one fallback for this node."""
 
         retries = validate_non_negative_int("retries", retries)
         repeats = validate_positive_int("repeats", repeats)
         effective_timeout = self.timeout if timeout is None else validate_positive_float("timeout", timeout)
+        effective_checkpoint_timeout = (
+            self.checkpoint_timeout
+            if checkpoint_timeout is None
+            else validate_positive_float("checkpoint_timeout", checkpoint_timeout)
+        )
 
         def decorator(handler: Callable):
             self.fallbacks.append(
@@ -210,6 +228,7 @@ class NodeRouter:
                     retries=retries,
                     repeats=repeats,
                     timeout=effective_timeout,
+                    checkpoint_timeout=effective_checkpoint_timeout,
                 )
             )
             return handler
@@ -230,6 +249,7 @@ class NodeRouter:
             retries=self.main_task.retries,
             repeats=self.main_task.repeats,
             timeout=self.main_task.timeout,
+            checkpoint_timeout=self.main_task.checkpoint_timeout,
             runner=self.runner_override,
         )(self.main_task.handler)
 
@@ -240,6 +260,7 @@ class NodeRouter:
                 retries=fallback.retries,
                 repeats=fallback.repeats,
                 timeout=fallback.timeout,
+                checkpoint_timeout=fallback.checkpoint_timeout,
             )(fallback.handler)
 
         next_job_id = 1

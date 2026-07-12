@@ -29,6 +29,34 @@ class JobExecutionStorageMixin:
     def job_control_file(self, node_name: str, job_id: int) -> Path:
         return self.job_base_dir(node_name, job_id) / "execution.json"
 
+    def job_runtime_file(self, node_name: str, job_id: int) -> Path:
+        return self.job_base_dir(node_name, job_id) / "runtime.json"
+
+    def read_job_runtime(self, node_name: str, job_id: int) -> dict[str, Any]:
+        data = self.read_json(self.job_runtime_file(node_name, job_id), default={})
+        return data if isinstance(data, dict) else {}
+
+    def write_job_runtime(self, node_name: str, job_id: int, data: dict[str, Any]):
+        path = self.job_runtime_file(node_name, job_id)
+        with self.interprocess_lock(f"job-{node_name}-{job_id}-runtime"):
+            current = self.read_json(path, default={})
+            current = current if isinstance(current, dict) else {}
+            same_watch = current.get("watch_id") == data.get("watch_id")
+            terminal = {"timed_out", "completed", "failed", "restarted", "recovered"}
+            # A checkpoint write prepared just before a timeout must not race
+            # behind the timeout write and make inspect report the attempt as
+            # running again. New watch IDs are allowed to replace old attempts.
+            if (
+                same_watch
+                and current.get("state") in terminal
+                and data.get("state") == "running"
+            ):
+                return
+            self.atomic_write_json(
+                path,
+                {**data, "schema_version": CURRENT_STATE_SCHEMA_VERSION},
+            )
+
     def job_execution_lock_name(self, node_name: str, job_id: int) -> str:
         self.validate_node_name(node_name)
         self.validate_job_id(job_id)
@@ -215,6 +243,20 @@ class JobExecutionStorageMixin:
             reason=reason,
             requested_by_pid=requested_by_pid or os.getpid(),
         )
+        runtime = self.read_job_runtime(node_name, job_id)
+        if runtime:
+            self.write_job_runtime(
+                node_name,
+                job_id,
+                {
+                    **runtime,
+                    "state": "restarted",
+                    "updated_at": requested_at,
+                    "restart_reason": reason,
+                    "previous_generation": previous_generation,
+                    "generation": generation,
+                },
+            )
 
         # Cleanup happens only after the old generation is invalid. This
         # ordering prevents an old fast-finishing attempt from recreating a

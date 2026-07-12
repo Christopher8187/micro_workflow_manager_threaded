@@ -128,10 +128,12 @@ class JobNode:
         retries: int = 0,
         repeats: int = 1,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ):
         retries = validate_non_negative_int("retries", retries)
         repeats = validate_positive_int("repeats", repeats)
         timeout = validate_positive_float("timeout", timeout)
+        checkpoint_timeout = validate_positive_float("checkpoint_timeout", checkpoint_timeout)
 
         allowed, required = self.infer_params(handler)
 
@@ -143,6 +145,7 @@ class JobNode:
             retries=retries,
             repeats=repeats,
             timeout=timeout,
+            checkpoint_timeout=checkpoint_timeout,
         )
 
     def mount_fallback(
@@ -152,10 +155,12 @@ class JobNode:
         retries: int = 0,
         repeats: int = 1,
         timeout: float | None = None,
+        checkpoint_timeout: float | None = None,
     ):
         retries = validate_non_negative_int("retries", retries)
         repeats = validate_positive_int("repeats", repeats)
         timeout = validate_positive_float("timeout", timeout)
+        checkpoint_timeout = validate_positive_float("checkpoint_timeout", checkpoint_timeout)
 
         fallback_name = name or handler.__name__
         allowed, required = self.infer_params(handler)
@@ -168,6 +173,7 @@ class JobNode:
             retries=retries,
             repeats=repeats,
             timeout=timeout,
+            checkpoint_timeout=checkpoint_timeout,
         )
 
         if fallback_name not in self.fallback_order:

@@ -10,6 +10,7 @@ from .workflow.job_creation import JobCreationMixin
 from .workflow.job_execution import JobExecutionMixin
 from .node import JobNode
 from .workflow.runner_config import RunnerFactoryMixin, normalize_workflow_runner
+from .workflow.supervisor import SchedulerSupervisor
 from .storage import FileStorage
 from .workflow.workflow_registration import WorkflowRegistrationMixin
 
@@ -49,6 +50,7 @@ class MicroWorkflow(
         self.nodes: dict[str, JobNode] = {}
         self.lock = RLock()
         self._included_router_ids: set[int] = set()
+        self.scheduler_supervisor = SchedulerSupervisor(self)
 
         # CLI safety controls. Normal library use keeps immediate autostarts.
         self.allowed_run_nodes: set[str] | None = None

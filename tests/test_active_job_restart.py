@@ -297,3 +297,77 @@ def test_restart_command_replaces_running_generation_in_process_runner(
         if active.poll() is None:
             active.kill()
             active.communicate(timeout=5)
+
+
+def test_restart_cancels_old_checkpoint_watch_without_overwriting_replacement_runtime(
+    tmp_path,
+    monkeypatch,
+):
+    make_restart_project(tmp_path, monkeypatch)
+    behavior_file = tmp_path / "src" / "node_behavior" / "A.py"
+    behavior_file.write_text(
+        r'''
+import time
+from micro_workflow_manager import NodeRouter
+
+router = NodeRouter("A", checkpoint_timeout=0.4)
+router.create_job(number=1)
+
+@router.task
+def run(ctx):
+    if ctx.execution_generation == 0:
+        ctx.input_path("old_started.flag").write_text("started", encoding="utf-8")
+        ctx.checkpoint("old generation waiting", progress=0.2)
+        time.sleep(0.8)
+        ctx.write("stale.txt", "stale")
+        return "stale"
+
+    ctx.checkpoint("replacement generation", progress=1.0)
+    ctx.write("fresh.txt", "fresh")
+    ctx.node("B").add(value="fresh")
+    return "fresh"
+'''.strip(),
+        encoding="utf-8",
+    )
+
+    run_result: dict[str, int] = {}
+    active_thread = threading.Thread(
+        target=lambda: run_result.setdefault(
+            "code", cli.main(["runfrom", "A", "--runner", "threaded"])
+        ),
+        daemon=True,
+    )
+    active_thread.start()
+
+    runtime_file = tmp_path / "node" / "A" / "jobs" / "1" / "runtime.json"
+    wait_until(
+        lambda: runtime_file.exists()
+        and json.loads(runtime_file.read_text(encoding="utf-8")).get("checkpoint_name")
+        == "old generation waiting"
+    )
+
+    # Invoke the same command implementation directly so this regression test
+    # exercises the generation/watch race rather than subprocess startup time.
+    # Separate-terminal CLI behavior is covered by the integration tests above.
+    from micro_workflow_manager.cli.restart import restart_active_jobs
+
+    assert restart_active_jobs(tmp_path, "A", [1]) == 0
+
+    active_thread.join(timeout=8)
+    assert not active_thread.is_alive()
+    assert run_result == {"code": 0}
+
+    # Wait beyond the abandoned generation's checkpoint deadline. Its old
+    # watch must have been removed rather than emitting a late timeout or
+    # replacing the new generation's runtime state.
+    time.sleep(0.55)
+    runtime = json.loads(runtime_file.read_text(encoding="utf-8"))
+    assert runtime["generation"] == 1
+    assert runtime["state"] == "completed"
+    assert runtime["checkpoint_name"] == "replacement generation"
+    assert runtime["progress"] == 1.0
+
+    events_file = tmp_path / "node" / "A" / "jobs" / "1" / "events.jsonl"
+    events = [json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()]
+    assert not any(event.get("event") == "timeout" for event in events)
+    assert not (tmp_path / "node" / "A" / "jobs" / "1" / "files" / "stale.txt").exists()

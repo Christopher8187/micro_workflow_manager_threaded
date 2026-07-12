@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.2.2
+# micro-workflow-manager 0.2.3
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -189,19 +189,23 @@ mwf inspect A job 3
 ```
 
 Node inspection explains readiness, blockers, status counts, strongly connected
-component membership, runner, timeout, and fallbacks. Job inspection shows input,
-output, execution generation, child jobs, and chronological lifecycle events.
-Each job has an append-only `events.jsonl` file containing small records such as
-`created`, `started`, `fallback_started`, `timeout`, `restart_requested`, and
-`done`. This history is diagnostic only: it is not scheduler state and it is not
-a provenance manifest. `output.json` and job-local output files remain the
-actual task result.
+component membership, runner, total timeout, checkpoint timeout, and fallbacks.
+Job inspection additionally shows the current/last handler, named checkpoint,
+checkpoint deadline, progress percentage, progress detail, execution generation,
+child jobs, and chronological lifecycle events. Explicit checkpoints and
+supervised handlers use a small job-local `runtime.json`; this is scheduler
+diagnostic state, not task output or a provenance manifest.
+
+Each job also has an append-only `events.jsonl` file containing small records
+such as `created`, `started`, `fallback_started`, `timeout`, `restart_requested`,
+and `done`. `output.json` and job-local output files remain the actual task
+result.
 
 ## State schema migration and read-only previews
 
 MWF-owned metadata includes an explicit `schema_version`. This applies to files
 such as `.mwf`, `.mwf_run.json`, `node_state.json`, `schema.json`, `job.json`,
-`status.json`, `execution.json`, and the rebuildable job index. It does not apply
+`status.json`, `execution.json`, `runtime.json`, and the rebuildable job index. It does not apply
 to `input.json`, `output.json`, returned files, or `events.jsonl`.
 
 Preview and apply an upgrade from an older project:
@@ -243,9 +247,12 @@ reported as runtime-dependent rather than guessed.
 ## Resume and crash recovery
 
 A CLI-owned run records its process ID, hostname, command, selected nodes, MWF
-version, and a lightweight heartbeat in `.mwf_run.json`. One small daemon thread
-updates the heartbeat while the sequence is active; normal job scheduling does
-not scan the project for liveness.
+version, and a lightweight heartbeat in `.mwf_run.json`. The same single
+scheduler-supervisor thread that manages timeout deadlines updates this run
+heartbeat. Run liveness and job progress remain separate signals: the run
+heartbeat proves the scheduler process is alive, while a job checkpoint proves
+that one handler reached a progress boundary. Normal scheduling does not scan
+the project for liveness.
 
 If the owning process has crashed, recover abandoned `running` jobs without
 resetting completed work:
@@ -272,39 +279,70 @@ Both preserve `done` and `skipped` jobs and their outputs, leave queued jobs
 available, and requeue only failed, cancelled, or abandoned-running jobs. By
 contrast, `run` and `runfrom` retain their fresh-reset behavior.
 
-## Cooperative cancellation and timeouts
+## Centralized checkpoint watchdog, progress, and total timeouts
 
-A node or individual handler can set an optional timeout:
+MWF has two opt-in timeout types. `timeout` limits the complete handler attempt.
+`checkpoint_timeout` limits the silence between task start, explicit checkpoints,
+and handler completion:
 
 ```python
 from micro_workflow_manager import NodeRouter
 
-router = NodeRouter("wait", timeout=30)
+router = NodeRouter(
+    "wait",
+    timeout=300,
+    checkpoint_timeout=30,
+)
 
 @router.task
 def wait(ctx):
-    ctx.sleep(2)
+    prepare()
+    ctx.checkpoint(
+        "prepared",
+        progress=0.25,
+        detail="one of four sections complete",
+    )
+
+    call_service()
+    ctx.checkpoint("service complete", progress=0.75)
+
+    save_result()
     return "finished"
 ```
 
-Or set a handler-specific value:
+Task start is an implicit checkpoint. With `checkpoint_timeout=30`, the current
+attempt times out when 30 seconds pass without handler completion or another
+checkpoint. A checkpoint refreshes the next deadline. A section may override its
+next interval when the handler already has timeout supervision enabled:
 
 ```python
-@router.task(timeout=10)
-def make_number(ctx):
-    ctx.checkpoint()
-    return 7
+ctx.checkpoint("before slow request", timeout=90, progress=0.4)
 ```
 
-`ctx.checkpoint()` (also available as `ctx.raise_if_cancelled()`) raises when the
-attempt has been restarted or timed out. `ctx.sleep(seconds)` sleeps in short
-intervals and checks automatically. After timeout, MWF fences the attempt from
-MWF-managed writes, returned files, output updates, and downstream job creation,
-then follows the normal fallback chain. Python cannot safely force-kill every
-thread blocked inside an external library, and direct external side effects made
-outside `ctx` helpers cannot be rolled back. Nodes without a configured timeout
-stay on the original direct execution path and do not pay timeout-supervision
-cost.
+`progress` is a fraction from `0` to `1`. `detail` and the checkpoint name are
+optional human-readable values displayed by:
+
+```bash
+mwf inspect wait job 3
+```
+
+All configured total/checkpoint deadlines are managed by one workflow-owned
+scheduler supervisor using a deadline heap. There is no timer thread per job and
+no repeated scan of every job folder. Untimed handlers without checkpoints keep
+the original direct invocation path. An explicit progress checkpoint on an
+untimed handler writes only that job's `runtime.json` on demand.
+
+When a watchdog deadline expires, MWF sets the attempt's cancellation fence,
+records one timeout event, wakes the normal fallback/retry path, and prevents the
+abandoned handler from using MWF-managed writes or downstream-job creation.
+Python still cannot force-kill an arbitrary thread blocked inside an external
+library, so external request timeouts remain useful and direct side effects made
+outside `ctx` helpers cannot be rolled back. The process runner can isolate such
+code more strongly.
+
+`ctx.raise_if_cancelled()` checks restart/timeout state without reporting
+progress. `ctx.sleep(seconds)` checks cancellation in short intervals but does
+not fabricate progress checkpoints.
 
 ## Idempotent and transactional downstream jobs
 

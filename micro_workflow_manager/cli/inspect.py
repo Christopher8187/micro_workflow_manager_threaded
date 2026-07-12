@@ -14,6 +14,36 @@ def _print_json(label: str, value: Any):
         print(f"  {line}")
 
 
+def _format_progress(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{float(value) * 100:.1f}%"
+    return "(not reported)"
+
+
+def _print_runtime(runtime: dict[str, Any]):
+    if not runtime:
+        print("Runtime:")
+        print("  (no checkpoint or supervised timeout data recorded)")
+        return
+    print("Runtime:")
+    print(f"  state: {runtime.get('state', '?')}")
+    print(f"  task: {runtime.get('task', '?')}")
+    print(f"  attempt: {runtime.get('attempt', '?')} repeat: {runtime.get('repeat_index', '?')}")
+    print(f"  started_at: {runtime.get('started_at') or '(unknown)'}")
+    print(f"  updated_at: {runtime.get('updated_at') or '(unknown)'}")
+    print(f"  total timeout: {runtime.get('total_timeout_seconds')}")
+    print(f"  total deadline: {runtime.get('total_deadline_at') or '(none)'}")
+    print(f"  checkpoint: {runtime.get('checkpoint_name') or '(none)'}")
+    print(f"  checkpoint_at: {runtime.get('checkpoint_at') or '(none)'}")
+    print(f"  checkpoint timeout: {runtime.get('checkpoint_timeout_seconds')}")
+    print(f"  checkpoint deadline: {runtime.get('checkpoint_deadline_at') or '(none)'}")
+    print(f"  progress: {_format_progress(runtime.get('progress'))}")
+    if runtime.get("progress_detail"):
+        print(f"  progress detail: {runtime['progress_detail']}")
+    if runtime.get("timeout_message"):
+        print(f"  timeout: {runtime['timeout_message']}")
+
+
 def _node_explanation(workflow, node: str) -> str:
     status = workflow.storage.get_node_status(node) or "missing"
     summary = workflow.storage.node_job_summary(node)
@@ -48,6 +78,7 @@ def inspect_node(workflow, node: str) -> int:
         print(f"  runner: {schema.get('runner_override') or workflow.runner}")
         print(f"  max_threads: {schema.get('max_threads')}")
         print(f"  timeout: {schema.get('timeout')}")
+        print(f"  checkpoint_timeout: {schema.get('checkpoint_timeout')}")
         print(f"  fallbacks: {', '.join(schema.get('fallbacks') or []) or '(none)'}")
     print(f"  explanation: {_node_explanation(workflow, node)}")
     return 0
@@ -61,6 +92,7 @@ def inspect_job(workflow, node: str, job_id: int) -> int:
     status = storage.read_json(storage.status_file(node, job_id), default={"status": QUEUED})
     control = storage.read_job_control(node, job_id)
     output = storage.read_json(storage.output_file(node, job_id), default=None)
+    runtime = storage.read_job_runtime(node, job_id)
     events = storage.read_job_events(node, job_id)
     print(f"Job {node}/{job_id}")
     print(f"  status: {status.get('status', QUEUED)}")
@@ -69,6 +101,7 @@ def inspect_job(workflow, node: str, job_id: int) -> int:
     if control.get("active_execution_id"):
         print(f"  active process: {control.get('active_pid')}")
         print(f"  active since: {control.get('active_started_at')}")
+    _print_runtime(runtime)
     _print_json("Input", job.params)
     if output is not None:
         _print_json("Output", output)

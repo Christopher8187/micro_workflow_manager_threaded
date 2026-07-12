@@ -4,7 +4,6 @@ import os
 import socket
 import time
 from contextlib import contextmanager
-from threading import Event, Thread
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
@@ -60,22 +59,9 @@ def active_workflow_run(
         refuse_competing_run(workflow)
         workflow.storage.write_run_state(data)
 
-    heartbeat_stop = Event()
-
-    def heartbeat_loop():
-        while not heartbeat_stop.wait(2.0):
-            with workflow.storage.interprocess_lock("active-run-state"):
-                current = workflow.storage.get_run_state()
-                if current.get("run_id") != run_id or current.get("status") != "running":
-                    return
-                workflow.storage.update_run_state(heartbeat_at=now_iso())
-
-    heartbeat_thread = Thread(
-        target=heartbeat_loop,
-        name=f"mwf-heartbeat-{run_id}",
-        daemon=True,
-    )
-    heartbeat_thread.start()
+    # The scheduler supervisor owns both project-run heartbeats and handler
+    # checkpoint deadlines. One thread services the whole workflow sequence.
+    workflow.scheduler_supervisor.start_run_heartbeat(run_id, interval=2.0)
 
     finished = False
 
@@ -84,7 +70,7 @@ def active_workflow_run(
         if finished:
             return
 
-        heartbeat_stop.set()
+        workflow.scheduler_supervisor.stop_run_heartbeat(run_id)
         with workflow.storage.interprocess_lock("active-run-state"):
             current = workflow.storage.get_run_state()
             # Never let a stale process overwrite a newer run record.

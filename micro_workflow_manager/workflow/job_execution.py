@@ -1,7 +1,7 @@
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
-from time import monotonic, perf_counter
+from time import perf_counter
 from typing import Callable, TypeVar
 
 from ..context import JobContext
@@ -239,6 +239,13 @@ class JobExecutionMixin:
                     break
 
             if superseded:
+                self.scheduler_supervisor.cancel_execution(
+                    node_name,
+                    job_id,
+                    generation,
+                    execution_id,
+                    reason=f"Job {node_name}/{job_id} generation {generation} was restarted",
+                )
                 self.storage.write_debug(
                     node_name,
                     f"job {job_id} generation {generation} superseded; "
@@ -333,22 +340,27 @@ class JobExecutionMixin:
         mounted,
         ctx: JobContext,
         params: dict,
-        cancellation_event: Event,
+        watch,
     ):
-        """Call a handler directly unless it has an explicit timeout.
+        """Invoke one handler under the centralized scheduler supervisor.
 
-        Timed handlers run in an abandonable daemon thread. On expiry, the
-        local cancellation event immediately blocks future JobContext-managed
-        mutations from the stale handler while the normal fallback chain can
-        continue. This adds no thread or polling overhead to tasks without a
-        timeout.
+        Untimed handlers still execute directly. A total timeout or checkpoint
+        timeout opts the handler into one abandonable daemon thread, while the
+        single scheduler supervisor owns every deadline and the CLI heartbeat.
         """
-        timeout = mounted.timeout
-        if timeout is None:
-            return mounted.handler(ctx, **params)
+        supervisor = self.scheduler_supervisor
+
+        if not watch.supervised:
+            try:
+                result = mounted.handler(ctx, **params)
+            except BaseException as error:
+                supervisor.finish_attempt(watch, state="failed", error=error)
+                raise
+            else:
+                supervisor.finish_attempt(watch, state="completed")
+                return result
 
         outcomes: Queue = Queue(maxsize=1)
-        done = Event()
 
         def target():
             try:
@@ -356,41 +368,33 @@ class JobExecutionMixin:
             except BaseException as error:
                 outcomes.put(("error", error))
             finally:
-                done.set()
+                supervisor.signal_handler_complete(watch)
 
         Thread(
             target=target,
-            name=f"mwf-timeout-{ctx.current_node}-{ctx.job_id}-{mounted.name}",
+            name=f"mwf-handler-{ctx.current_node}-{ctx.job_id}-{mounted.name}",
             daemon=True,
         ).start()
 
-        if not done.wait(timeout):
-            cancellation_event.set()
-            self.storage.append_job_event(
-                ctx.current_node,
-                ctx.job_id,
-                "timeout",
-                task=mounted.name,
-                timeout_seconds=timeout,
-                attempt=ctx.attempt,
-            )
-            raise JobTimeoutError(
-                f"{ctx.current_node}.{mounted.name} exceeded timeout={timeout:g}s"
-            )
+        # The wake event is set by either handler completion or the one central
+        # scheduler watchdog. No per-attempt timeout polling/thread is needed.
+        watch.wake_event.wait()
+        restart_error = supervisor.execution_cancel_error(watch)
+        if restart_error is not None:
+            supervisor.finish_attempt(watch, state="superseded", error=restart_error)
+            raise restart_error
+
+        timeout_error = supervisor.timeout_error(watch)
+        if timeout_error is not None:
+            supervisor.finish_attempt(watch, state="timed_out", error=timeout_error)
+            raise timeout_error
 
         kind, payload = outcomes.get()
         if kind == "error":
-            if isinstance(payload, JobTimeoutError):
-                cancellation_event.set()
-                self.storage.append_job_event(
-                    ctx.current_node,
-                    ctx.job_id,
-                    "timeout",
-                    task=mounted.name,
-                    timeout_seconds=timeout,
-                    attempt=ctx.attempt,
-                )
+            supervisor.finish_attempt(watch, state="failed", error=payload)
             raise payload
+
+        supervisor.finish_attempt(watch, state="completed")
         return payload
 
     def execute_with_fallbacks(
@@ -482,26 +486,10 @@ class JobExecutionMixin:
                 repeat_results = []
 
                 for repeat_index in range(1, mounted.repeats + 1):
-                    cancellation_event = Event()
-                    deadline = (
-                        monotonic() + mounted.timeout
-                        if mounted.timeout is not None
-                        else None
-                    )
-                    ctx = JobContext(
-                        system=self,
-                        current_node=job.node_name,
-                        current_job=job,
-                        current_task=mounted.name,
-                        attempt=attempt,
-                        repeat_index=repeat_index,
-                        error=previous_error,
-                        execution_generation=execution_generation,
-                        execution_id=execution_id,
-                        cancellation_event=cancellation_event,
-                        deadline=deadline,
-                    )
-
+                    # Validate invocation inputs before registering a scheduler
+                    # watch. A malformed job must not leave an orphan deadline
+                    # that can fire after the validation error is already being
+                    # handled by retry/fallback logic.
                     params = {
                         key: value
                         for key, value in job.params.items()
@@ -517,13 +505,40 @@ class JobExecutionMixin:
                             f"Missing params for {job.node_name}.{mounted.name}: {missing}"
                         )
 
+                    cancellation_event = Event()
+                    watch = self.scheduler_supervisor.create_attempt(
+                        node_name=job.node_name,
+                        job_id=job.job_id,
+                        task_name=mounted.name,
+                        attempt=attempt,
+                        repeat_index=repeat_index,
+                        generation=execution_generation,
+                        execution_id=execution_id,
+                        cancellation_event=cancellation_event,
+                        total_timeout=mounted.timeout,
+                        checkpoint_timeout=mounted.checkpoint_timeout,
+                    )
+                    ctx = JobContext(
+                        system=self,
+                        current_node=job.node_name,
+                        current_job=job,
+                        current_task=mounted.name,
+                        attempt=attempt,
+                        repeat_index=repeat_index,
+                        error=previous_error,
+                        execution_generation=execution_generation,
+                        execution_id=execution_id,
+                        cancellation_event=cancellation_event,
+                        attempt_watch=watch,
+                    )
+
                     result = self._invoke_handler_with_timeout(
                         mounted,
                         ctx,
                         params,
-                        cancellation_event,
+                        watch,
                     )
-                    ctx.checkpoint()
+                    ctx.raise_if_cancelled()
                     repeat_results.append(result)
 
                 all_results.extend(repeat_results)
