@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-__version__ = "0.2.3"
+__version__ = "0.2.5"
 
 
 __all__ = [
@@ -21,6 +21,12 @@ __all__ = [
     "NodeRouter",
     "DirectedFan",
     "fan",
+    "FileSystem",
+    "FileSystemEntry",
+    "InputFileSystem",
+    "OutputFileSystem",
+    "JobFileSystem",
+    "NodeInputFileSystem",
 ]
 
 
@@ -31,6 +37,12 @@ _EXPORTS = {
     "NodeRouter": (".router", "NodeRouter"),
     "DirectedFan": (".graph", "DirectedFan"),
     "fan": (".graph", "fan"),
+    "FileSystem": (".files", "FileSystem"),
+    "FileSystemEntry": (".files", "FileSystemEntry"),
+    "InputFileSystem": (".files", "InputFileSystem"),
+    "OutputFileSystem": (".files", "OutputFileSystem"),
+    "JobFileSystem": (".files", "JobFileSystem"),
+    "NodeInputFileSystem": (".files", "NodeInputFileSystem"),
 }
 
 

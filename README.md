@@ -1,6 +1,145 @@
-# micro-workflow-manager 0.2.3
+# micro-workflow-manager 0.2.5
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
+
+
+## Client-facing filesystem architecture
+
+MWF 0.2.5 encourages node behavior files to describe their filesystem contract
+next to the router. A task should read like workflow logic, while reusable
+filesystem objects hold the stable information about where data comes from,
+where it is written, and which downstream node receives it.
+
+The four standard objects are:
+
+- `InputFileSystem`: the current node's read-only `input/` folder.
+- `OutputFileSystem`: the current node's persistent `output/` folder.
+- `JobFileSystem`: files returned by one job in `jobs/<id>/files/`.
+- `NodeInputFileSystem`: another node's `input/` folder and job-creation route.
+
+Each declaration has a human-readable label, an optional portable base-path
+template, and an encoding. `NodeInputFileSystem` also records the destination
+node. The object is only a declaration at import time; it resolves paths lazily
+when bound to a `JobContext`, so the same node file works on Windows and Linux.
+
+A representative node behavior file is:
+
+```python
+from micro_workflow_manager import (
+    InputFileSystem,
+    NodeInputFileSystem,
+    NodeRouter,
+    OutputFileSystem,
+)
+
+router = NodeRouter("add_numbers", max_threads=2)
+
+INPUT = InputFileSystem("number input")
+OUTPUT = OutputFileSystem("sum output", base="{batch}")
+REVIEW_INPUT = NodeInputFileSystem(
+    "review",
+    "review input",
+    base="{batch}",
+)
+
+
+@router.task(timeout=60)
+def add_numbers(ctx, batch, source_file):
+    # Load input through the declared filesystem contract.
+    numbers = INPUT.file(ctx, source_file).read_json()
+
+    ctx.checkpoint("numbers loaded", timeout=20, progress=0.25)
+
+    total = sum(numbers)
+
+    ctx.checkpoint("sum calculated", timeout=20, progress=0.75)
+
+    # Write output and carry it forward through filesystem objects.
+    result = OUTPUT.file(ctx, "sum.json", batch=batch)
+    result.write_json({"total": total})
+
+    review_copy = REVIEW_INPUT.file(ctx, "sum.json", batch=batch)
+    review_copy.copy_from(result, overwrite=True)
+    REVIEW_INPUT.add_job(
+        ctx,
+        batch=batch,
+        result_file=review_copy.relative_path,
+    )
+
+    return {"total": total}
+```
+
+This structure is deliberate:
+
+1. Imports state the external tools and MWF concepts used by the node.
+2. The router and filesystem declarations state the node's execution and data
+   contract before any task code.
+3. The task loads named inputs, performs domain subtasks, reports optional
+   checkpoints, then writes and routes named outputs.
+4. Helper functions can accept `FileSystemEntry` objects instead of rebuilding
+   project paths or calling low-level context methods repeatedly.
+
+### Binding and templates
+
+A filesystem object's `base` may use simple `str.format` placeholders:
+
+```python
+PAGES = OutputFileSystem("rendered pages", base="{book_name}")
+page = PAGES.file(ctx, "page_001.png", book_name=book_name)
+```
+
+`page` is a `FileSystemEntry`. It is path-like, so it can be passed to most
+libraries that accept `str`, `Path`, or `os.PathLike`, while also providing
+workflow-aware methods:
+
+```python
+page.exists()
+page.read_bytes()
+page.write_bytes(data)
+page.copy_to(destination, overwrite=True)
+page.parent.mkdir()
+PAGES.files(ctx, "*.png", book_name=book_name)
+```
+
+All relative paths are normalized to portable `/` form and reject absolute paths
+and `..`. Managed writes through `write_text`, `write_bytes`, `write_json`,
+`append_text`, `copy_from`, and `delete` use MWF's execution-generation guards.
+This prevents a restarted or timed-out stale attempt from committing through the
+framework.
+
+The `.path` property and writable `.open()` are available for third-party
+libraries that require an ordinary filesystem path. Direct writes made by such
+a library cannot be rolled back or fenced for the full duration of the open
+handle, so prefer the managed methods when possible and use checkpoints around
+long external operations.
+
+### Naming downstream filesystem types
+
+For a frequently used destination, a project may give its route a domain name:
+
+```python
+class ReviewInputFileSystem(NodeInputFileSystem):
+    def __init__(self):
+        super().__init__("review", "review input")
+
+REVIEW_INPUT = ReviewInputFileSystem()
+```
+
+This is optional. A plainly named instance such as
+`REVIEW_INPUT = NodeInputFileSystem("review", "review input")` is usually the
+smallest and clearest form.
+
+A complete runnable version of the simple addition example is included in
+`examples/filesystem_objects`.
+
+### Compatibility and philosophy
+
+The original `ctx.input_path()`, `ctx.write_output()`, `ctx.write()`, and
+`ctx.node()` methods remain supported. Filesystem objects are the recommended
+client-facing architecture, not a forced migration or a second storage system.
+They are thin declarations over the same file-backed storage, scheduler guards,
+transactions, and downstream job APIs, so they do not add project scans or
+per-file background work.
 
 ## Explicit graph synchronization
 
@@ -105,16 +244,31 @@ def split(ctx, message):
 
 ## Passing files forward
 
-Output-folder-triggered job creation has been removed. Instead, a task can add files directly to the input folder of a downstream node:
+Use a `NodeInputFileSystem` to make the destination visible at the top of the
+node file and to route both files and job parameters:
 
 ```python
+from micro_workflow_manager import NodeInputFileSystem, OutputFileSystem
+
+OUTPUT = OutputFileSystem("split pages")
+TAGIFY_INPUT = NodeInputFileSystem("tagify", "tagify page input")
+
+
 @router.task
 def split(ctx):
-    page = ctx.write("page_001.txt", "page text")
-    ctx.node("tagify").add_input_file(page, filename="page_001.txt")
+    page = OUTPUT.file(ctx, "page_001.txt")
+    page.write_text("page text")
+
+    incoming = TAGIFY_INPUT.file(ctx, page.name)
+    incoming.copy_from(page, overwrite=True)
+    TAGIFY_INPUT.add_job(ctx, page_file=incoming.relative_path)
 ```
 
-The downstream node can read those files with `ctx.input_files(...)` or `ctx.input_path(...)`. This keeps job creation explicit while still allowing upstream nodes to prepare the file inputs that later nodes consume.
+The downstream node reads `page_file` with its own `InputFileSystem`. Job
+creation remains explicit, so preparing a file never silently invents work.
+`ctx.transaction()` and idempotency keys continue to work because
+`NodeInputFileSystem.add_job()` delegates to the same guarded `NodeHandle.add()`
+operation.
 
 ## Runners
 
@@ -281,43 +435,47 @@ contrast, `run` and `runfrom` retain their fresh-reset behavior.
 
 ## Centralized checkpoint watchdog, progress, and total timeouts
 
-MWF has two opt-in timeout types. `timeout` limits the complete handler attempt.
-`checkpoint_timeout` limits the silence between task start, explicit checkpoints,
-and handler completion:
+MWF has a total handler timeout and dynamic checkpoint deadlines. Declare the
+hard upper bound with `timeout=` on the task or fallback, then choose the maximum
+allowed silence for each section in task code:
 
 ```python
 from micro_workflow_manager import NodeRouter
 
-router = NodeRouter(
-    "wait",
-    timeout=300,
-    checkpoint_timeout=30,
-)
+router = NodeRouter("wait")
 
-@router.task
+@router.task(timeout=300)
 def wait(ctx):
-    prepare()
     ctx.checkpoint(
-        "prepared",
-        progress=0.25,
-        detail="one of four sections complete",
+        "preparing request",
+        timeout=20,
+        progress=0.1,
+        detail="building parameters",
     )
+    prepare()
 
+    ctx.checkpoint(
+        "waiting for service",
+        timeout=90,
+        progress=0.25,
+    )
     call_service()
-    ctx.checkpoint("service complete", progress=0.75)
 
+    ctx.checkpoint(
+        "saving result",
+        timeout=15,
+        progress=0.8,
+    )
     save_result()
     return "finished"
 ```
 
-Task start is an implicit checkpoint. With `checkpoint_timeout=30`, the current
-attempt times out when 30 seconds pass without handler completion or another
-checkpoint. A checkpoint refreshes the next deadline. A section may override its
-next interval when the handler already has timeout supervision enabled:
-
-```python
-ctx.checkpoint("before slow request", timeout=90, progress=0.4)
-```
+Each `timeout=` passed to `ctx.checkpoint()` means the handler must either finish
+or reach another checkpoint before that many seconds pass. Reaching a checkpoint
+refreshes the scheduler-owned deadline. The task/fallback `timeout=` is still the
+hard upper bound for the whole attempt. The older router/task
+`checkpoint_timeout=` default remains accepted for compatibility, but dynamic
+checkpoint deadlines in task code are preferred.
 
 `progress` is a fraction from `0` to `1`. `detail` and the checkpoint name are
 optional human-readable values displayed by:
@@ -486,13 +644,99 @@ workers touched the same summary file at once.
 ## Install, uninstall, and persistence
 
 Use a project-local virtual environment so the package can be removed without
-changing the system Python installation:
+changing the system Python installation.
+
+### Install from source for development
+
+From the framework source directory containing `pyproject.toml`, create and
+activate a virtual environment, then install an editable development copy:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -e ".[test]"
 ```
+
+On Linux or WSL, activate with `source .venv/bin/activate` instead.
+
+An editable installation points Python at the source directory, so code changes
+are visible immediately. Use this form while developing MWF itself.
+
+### Build a wheel
+
+A wheel is an installation-ready `.whl` package. Build one from the framework
+source directory containing `pyproject.toml`:
+
+```powershell
+python -m pip install --upgrade build
+python -m build --wheel
+```
+
+The wheel is written to `dist/`. For version 0.2.5 the expected filename is:
+
+```text
+micro_workflow_manager-0.2.5-py3-none-any.whl
+```
+
+`py3-none-any` means the package is pure Python, supports Python 3, and does not
+contain operating-system-specific compiled code.
+
+To build both a wheel and a source archive, run:
+
+```powershell
+python -m build
+```
+
+This creates the wheel and a `.tar.gz` source distribution under `dist/`.
+
+### Install from a wheel
+
+Install the wheel by giving pip its actual file path. From the framework source
+directory after building:
+
+```powershell
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.2.5-py3-none-any.whl
+```
+
+From Linux or WSL:
+
+```bash
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.2.5-py3-none-any.whl
+```
+
+If the wheel is in Downloads or another directory, use its full path:
+
+```powershell
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.2.5-py3-none-any.whl"
+```
+
+Do not write `.micro-workflow-manager==0.2.5`; that is interpreted as a malformed
+package requirement rather than a file path. On PowerShell, a file in the
+current directory begins with `.\`, and the wheel filename uses underscores.
+
+Verify the installed version, module location, and CLI:
+
+```powershell
+python -c "import micro_workflow_manager; print(micro_workflow_manager.__version__); print(micro_workflow_manager.__file__)"
+mwf --help
+```
+
+A project can bundle the wheel in a directory such as `vendor/` and reference it
+from `requirements.txt`:
+
+```text
+./vendor/micro_workflow_manager-0.2.5-py3-none-any.whl
+```
+
+Then users can install the project and its framework together from the project
+root:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+### Uninstall and persistence
 
 The package installs no Windows service, daemon, scheduled task, registry entry,
 or background process. Runtime state stays in the project (`.mwf`, `node/`,
@@ -545,3 +789,23 @@ Run the marked long stress test explicitly:
 ```bash
 python -m pytest -q -m stress tests/test_markov_chain_stress.py
 ```
+
+## Checkpoint API
+
+A supervised task can report progress and set the deadline for its next section:
+
+```python
+@router.task(timeout=300)
+def work(ctx):
+    ctx.checkpoint("request started", timeout=60, progress=0.2)
+    result = call_service()
+    ctx.checkpoint("response received", timeout=20, progress=0.8, detail="validating")
+    return result
+```
+
+`JobContext.checkpoint()` accepts `name`, `timeout`, `progress`, and `detail`.
+The `timeout` value means that the handler must either finish or reach another
+checkpoint before that many seconds pass. Progress is a number from 0 through 1
+and is shown by `mwf inspect NODE job ID`. The total task/fallback `timeout=`
+keeps the handler on the centralized scheduler-supervised path; checkpoint
+timeouts may then be chosen dynamically in task code.

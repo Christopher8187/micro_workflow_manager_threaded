@@ -269,25 +269,38 @@ class JobContext(_ExecutionChecks):
         self,
         name: str | None = None,
         *,
+        timeout: float | int | None = None,
         progress: float | int | None = None,
         detail: str | None = None,
-        timeout: float | int | None = None,
-    ):
+    ) -> None:
         """Report progress and refresh the scheduler-owned checkpoint deadline.
 
-        ``progress`` is a fraction from 0 to 1. ``timeout`` overrides the next
-        checkpoint interval for this section. A dynamic timeout requires the
-        task/router to enable centralized supervision with ``checkpoint_timeout``
-        (or a total ``timeout``).
+        Supported forms include::
+
+            ctx.checkpoint()
+            ctx.checkpoint("request started")
+            ctx.checkpoint(name="request started", timeout=30)
+            ctx.checkpoint("page complete", progress=0.5, detail="5 of 10")
+
+        ``timeout`` is the maximum time allowed until the handler either
+        completes or reaches its next checkpoint. ``progress`` is a finite
+        fraction from 0 through 1. ``detail`` is optional human-readable text
+        shown by ``mwf inspect``.
+
+        A dynamic checkpoint timeout requires the handler to be on the
+        scheduler-supervised execution path. The normal way to enable that is
+        to declare a total ``timeout=...`` on the task or fallback. The legacy
+        ``checkpoint_timeout`` configuration remains supported for backward
+        compatibility.
         """
         self._check_execution()
         if self._attempt_watch is not None:
             self.system.scheduler_supervisor.report_checkpoint(
                 self._attempt_watch,
                 name=name,
+                timeout=timeout,
                 progress=progress,
                 detail=detail,
-                timeout=timeout,
             )
         self._check_execution()
 

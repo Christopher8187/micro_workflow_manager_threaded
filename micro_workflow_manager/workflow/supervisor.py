@@ -355,9 +355,9 @@ class SchedulerSupervisor:
 
         if timeout_value is not None and not watch.supervised:
             raise RuntimeError(
-                "A dynamic checkpoint timeout requires the task or router to set "
-                "checkpoint_timeout (or timeout) so MWF can run the handler under "
-                "the centralized scheduler watchdog."
+                "A dynamic checkpoint timeout requires the task or fallback to declare "
+                "timeout=... (or the legacy checkpoint_timeout setting) so MWF can "
+                "run the handler under the centralized scheduler watchdog."
             )
 
         now_text = datetime.now().astimezone().isoformat(timespec="milliseconds")
