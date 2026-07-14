@@ -26,7 +26,7 @@ def ensure_runtime_layout(root: Path) -> bool:
     """Move 0.2.6-and-earlier root state into the consolidated .mwf folder.
 
     Returns True when at least one legacy path was migrated. The operation is
-    deliberately small and idempotent so any 0.2.8 command can open an older
+    deliberately small and idempotent so any 0.2.9 command can open an older
     project without requiring a separate manual migration first.
     """
 

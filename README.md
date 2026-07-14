@@ -1,11 +1,11 @@
-# micro-workflow-manager 0.2.8
+# micro-workflow-manager 0.2.9
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
 
 ## Client-facing filesystem architecture
 
-MWF 0.2.8 encourages node behavior files to describe their filesystem contract
+MWF 0.2.9 encourages node behavior files to describe their filesystem contract
 next to the router. A task should read like workflow logic, while reusable
 filesystem objects hold the stable information about where data comes from,
 where it is written, and which downstream node receives it.
@@ -143,7 +143,7 @@ per-file background work.
 
 ## Consolidated project runtime directory
 
-MWF 0.2.8 keeps framework-owned project state together instead of scattering
+MWF 0.2.9 keeps framework-owned project state together instead of scattering
 hidden files across the project root:
 
 ```text
@@ -159,7 +159,11 @@ Projects created by MWF 0.2.6 or earlier are migrated automatically on first
 use: the old `.mwf` JSON file, `.mwf_run.json`, `.mwf_threads.json`, and
 `.mwf_locks/` are moved into the directory above. The migration is idempotent.
 The generated `.gitignore` now ignores `.mwf/` rather than listing obsolete
-root-level runtime paths.
+root-level runtime paths. It applies the same runtime-only exclusions to node
+clipboard snapshots: nested `input/` and `output/` directories, `jobs/`,
+`queued/`, and rebuildable node-state/index files are ignored, while direct
+files in `clipboard/<node>/input/` and `clipboard/<node>/output/` remain
+trackable.
 
 ## Explicit graph synchronization
 
@@ -771,10 +775,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.2.8 the expected filename is:
+The wheel is written to `dist/`. For version 0.2.9 the expected filename is:
 
 ```text
-micro_workflow_manager-0.2.8-py3-none-any.whl
+micro_workflow_manager-0.2.9-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -794,22 +798,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.2.8-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.2.9-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.2.8-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.2.9-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.2.8-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.2.9-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.2.8`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.2.9`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -824,7 +828,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.2.8-py3-none-any.whl
+./vendor/micro_workflow_manager-0.2.9-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project
