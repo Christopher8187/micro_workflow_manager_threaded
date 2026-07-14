@@ -6,9 +6,11 @@ from .events import JobEventStorageMixin
 from .job_index import JobIndexStorageMixin
 from .jobs import JobFileStorageMixin
 from .nodes import NodeFileStorageMixin
+from .runtime_config import RuntimeConfigStorageMixin
 
 
 class FileStorage(
+    RuntimeConfigStorageMixin,
     JobEventStorageMixin,
     JobExecutionStorageMixin,
     JobFileStorageMixin,

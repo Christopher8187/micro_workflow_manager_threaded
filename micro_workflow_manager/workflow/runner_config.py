@@ -27,11 +27,14 @@ class RunnerFactoryMixin:
             return DirectRunner()
 
         if effective_runner == "threaded":
-            return ThreadedRunner(max_threads=node.max_threads)
+            return ThreadedRunner(
+                max_threads=node.max_threads,
+                limit_provider=lambda: self.effective_max_threads(node.name),
+            )
 
         if effective_runner == "process":
             return ProcessPoolRunner(
-                max_processes=node.max_threads,
+                max_processes=self.effective_max_threads(node.name),
                 project_dir=self.storage.project_dir,
                 graph_path=self.process_graph_path,
                 allowed_run_nodes=self.allowed_run_nodes,

@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from micro_workflow_manager.models import VALID_STATUSES
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
+from micro_workflow_manager.paths import config_file, locks_dir, run_file
 
 
 class FileStorageBase:
@@ -169,10 +170,10 @@ class FileStorageBase:
             raise ValueError(f"Unsafe glob pattern: {pattern}")
 
     def workflow_file(self) -> Path:
-        return self.project_dir / ".mwf"
+        return config_file(self.project_dir)
 
     def run_state_file(self) -> Path:
-        return self.project_dir / ".mwf_run.json"
+        return run_file(self.project_dir)
 
     def write_run_state(self, data: dict):
         self.atomic_write_json(
@@ -190,7 +191,7 @@ class FileStorageBase:
         self.write_run_state(data)
 
     def lock_dir(self) -> Path:
-        path = self.project_dir / ".mwf_locks"
+        path = locks_dir(self.project_dir)
         path.mkdir(parents=True, exist_ok=True)
         return path
 

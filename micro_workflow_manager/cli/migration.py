@@ -9,8 +9,9 @@ from micro_workflow_manager.storage import FileStorage
 
 
 _METADATA_PATTERNS = (
-    ".mwf",
-    ".mwf_run.json",
+    ".mwf/project.json",
+    ".mwf/run.json",
+    ".mwf/threads.json",
     "node/*/node_state.json",
     "node/*/schema.json",
     "node/*/default_jobs.json",

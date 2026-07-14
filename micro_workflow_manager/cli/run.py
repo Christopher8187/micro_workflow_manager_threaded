@@ -53,7 +53,7 @@ def active_workflow_run(
     }
 
     # Claim the project run slot atomically. This prevents two terminals from
-    # replacing .mwf_run.json at the same time. The restart command does not
+    # replacing .mwf/run.json at the same time. The restart command does not
     # claim this slot; it only controls a job already owned by this run.
     with workflow.storage.interprocess_lock("active-run-state"):
         refuse_competing_run(workflow)

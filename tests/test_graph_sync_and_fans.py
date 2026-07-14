@@ -46,14 +46,14 @@ def test_graph_changes_require_explicit_update_and_do_not_recreate_renamed_nodes
     graph.write_text('EDGES = [("new_name", "sink")]\n', encoding="utf-8")
     _write_router(behavior / "new_name.py", "new_name")
 
-    before = (tmp_path / ".mwf").read_bytes()
+    before = (tmp_path / ".mwf" / "project.json").read_bytes()
     assert cli.main(["monitor", "--once"]) == 1
     error = capsys.readouterr().err
     assert "Graph state is out of date" in error
     assert "mwf graph --update" in error
     assert old_folder.is_dir()
     assert not new_folder.exists()
-    assert (tmp_path / ".mwf").read_bytes() == before
+    assert (tmp_path / ".mwf" / "project.json").read_bytes() == before
 
     assert cli.main(["graph", "--update"]) == 0
     output = capsys.readouterr().out
@@ -88,16 +88,16 @@ def test_graph_update_detects_edge_only_changes_without_mutating_early(
     capsys.readouterr()
 
     graph.write_text('EDGES = [("a", "c"), ("b", "c")]\n', encoding="utf-8")
-    before = (tmp_path / ".mwf").read_bytes()
+    before = (tmp_path / ".mwf" / "project.json").read_bytes()
 
     assert cli.main(["monitor", "--once"]) == 1
     error = capsys.readouterr().err
     assert "edges in graph.py differ" in error
-    assert (tmp_path / ".mwf").read_bytes() == before
+    assert (tmp_path / ".mwf" / "project.json").read_bytes() == before
 
     assert cli.main(["graph", "--update"]) == 0
     capsys.readouterr()
-    stored = json.loads((tmp_path / ".mwf").read_text(encoding="utf-8"))
+    stored = json.loads((tmp_path / ".mwf" / "project.json").read_text(encoding="utf-8"))
     assert stored["edges"] == [["a", "c"], ["b", "c"]]
 
 
@@ -124,7 +124,7 @@ EDGES = [
     assert cli.main(["graph", "src/graph.py"]) == 0
     capsys.readouterr()
 
-    stored = json.loads((tmp_path / ".mwf").read_text(encoding="utf-8"))
+    stored = json.loads((tmp_path / ".mwf" / "project.json").read_text(encoding="utf-8"))
     assert stored["edges"] == [
         ["source", "right_1"],
         ["source", "right_2"],
@@ -158,7 +158,7 @@ EDGES = [
     assert cli.main(["graph", "src/graph.py"]) == 0
     capsys.readouterr()
 
-    stored = json.loads((tmp_path / ".mwf").read_text(encoding="utf-8"))
+    stored = json.loads((tmp_path / ".mwf" / "project.json").read_text(encoding="utf-8"))
     assert stored["edges"] == [
         ["root", "a"],
         ["root", "b"],

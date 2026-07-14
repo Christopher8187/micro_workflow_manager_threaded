@@ -61,7 +61,7 @@ def recover_stale_jobs(
             control = storage.read_job_control(node, job_id)
             active_pid = control.get("active_pid") or pid
             if type(active_pid) is int and process_is_alive(active_pid):
-                # A job may belong to a programmatic run without .mwf_run.json.
+                # A job may belong to a programmatic run without .mwf/run.json.
                 # Do not recover a demonstrably live owner.
                 continue
 

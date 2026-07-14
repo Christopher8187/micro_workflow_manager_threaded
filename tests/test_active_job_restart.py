@@ -102,7 +102,7 @@ def test_restart_command_replaces_running_generation_inside_existing_runfrom(
     )
     wait_until(lambda: control_file.exists())
 
-    before = json.loads((tmp_path / ".mwf_run.json").read_text(encoding="utf-8"))
+    before = json.loads((tmp_path / ".mwf" / "run.json").read_text(encoding="utf-8"))
     assert before["status"] == "running"
 
     env = os.environ.copy()
@@ -134,7 +134,7 @@ def test_restart_command_replaces_running_generation_inside_existing_runfrom(
     assert not active_thread.is_alive()
     assert run_result == {"code": 0}
 
-    after = json.loads((tmp_path / ".mwf_run.json").read_text(encoding="utf-8"))
+    after = json.loads((tmp_path / ".mwf" / "run.json").read_text(encoding="utf-8"))
     assert after["run_id"] == before["run_id"]
     assert after["status"] == "done"
 
@@ -174,7 +174,7 @@ def test_restart_refuses_queued_job_even_when_a_run_record_is_live(
     tmp_path, monkeypatch, capsys
 ):
     make_restart_project(tmp_path, monkeypatch)
-    (tmp_path / ".mwf_run.json").write_text(
+    (tmp_path / ".mwf" / "run.json").write_text(
         json.dumps(
             {
                 "run_id": "fake-live-run",
@@ -197,7 +197,7 @@ def test_run_job_command_refuses_to_compete_with_live_sequence(
     tmp_path, monkeypatch, capsys
 ):
     make_restart_project(tmp_path, monkeypatch)
-    (tmp_path / ".mwf_run.json").write_text(
+    (tmp_path / ".mwf" / "run.json").write_text(
         json.dumps(
             {
                 "run_id": "fake-live-run",
@@ -220,9 +220,9 @@ def test_restart_fast_path_does_not_import_broken_graph_or_node_code(tmp_path, m
     monkeypatch.chdir(tmp_path)
     assert cli.main(["init"]) == 0
 
-    config = json.loads((tmp_path / ".mwf").read_text(encoding="utf-8"))
+    config = json.loads((tmp_path / ".mwf" / "project.json").read_text(encoding="utf-8"))
     config["graph_path"] = "src/graph.py"
-    (tmp_path / ".mwf").write_text(json.dumps(config), encoding="utf-8")
+    (tmp_path / ".mwf" / "project.json").write_text(json.dumps(config), encoding="utf-8")
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "graph.py").write_text("this is not valid python !!!", encoding="utf-8")
 

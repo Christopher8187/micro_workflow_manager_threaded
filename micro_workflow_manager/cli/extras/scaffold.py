@@ -8,17 +8,16 @@ VSCODE_EXCLUDES = {
     "**/*.egg-info": True,
     "**/__pycache__": True,
     "**/.pytest_cache": True,
-    "**/.mwf_locks": True,
-    "**/.mwf_run.json": True,
+    "**/.mwf": True,
 }
+
 
 GITIGNORE_SECTION_START = "# >>> micro-workflow-manager generated state >>>"
 GITIGNORE_SECTION_END = "# <<< micro-workflow-manager generated state <<<"
 GITIGNORE_ENTRIES = [
     GITIGNORE_SECTION_START,
-    "# Runtime state and scheduler locks",
-    ".mwf_locks/",
-    ".mwf_run.json",
+    "# Consolidated MWF runtime, locks, local deployment archives, and server setup",
+    ".mwf/",
     "",
     "# Node runtime folders. Keep direct input/output files, but ignore nested directories.",
     "node/*/input/*/",
@@ -49,6 +48,7 @@ GITIGNORE_ENTRIES = [
     ".DS_Store",
     GITIGNORE_SECTION_END,
 ]
+
 
 
 def ensure_project_sidecars(root: Path):

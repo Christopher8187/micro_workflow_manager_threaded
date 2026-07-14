@@ -52,6 +52,13 @@ class MicroWorkflow(
         self._included_router_ids: set[int] = set()
         self.scheduler_supervisor = SchedulerSupervisor(self)
 
+        # Runtime max_threads overrides are local testing controls stored in
+        # .mwf/threads.json. The cache is refreshed only when that one file's
+        # stat signature changes, so active runners do not repeatedly parse JSON.
+        self._thread_override_lock = RLock()
+        self._thread_override_signature: tuple[int, int] | None | object = object()
+        self._thread_overrides: dict[str, int] = {}
+
         # CLI safety controls. Normal library use keeps immediate autostarts.
         self.allowed_run_nodes: set[str] | None = None
         self.autostart_mode = "immediate"
@@ -67,3 +74,34 @@ class MicroWorkflow(
         # Running them recursively from inside the parent job can deadlock a
         # cyclic component when every worker is waiting for a child worker.
         self._job_context = local()
+    def _refresh_thread_overrides(self) -> dict[str, int]:
+        path = self.storage.thread_overrides_file()
+        try:
+            stat = path.stat()
+            signature: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            signature = None
+
+        with self._thread_override_lock:
+            if signature == self._thread_override_signature:
+                return self._thread_overrides
+            self._thread_overrides = self.storage.read_thread_overrides()
+            self._thread_override_signature = signature
+            return self._thread_overrides
+
+    def thread_override(self, node_name: str) -> int | None:
+        return self._refresh_thread_overrides().get(node_name)
+
+    def effective_max_threads(self, node_name: str) -> int:
+        node = self.nodes[node_name]
+        effective_runner = node.runner_override or self.runner
+        if effective_runner == "direct":
+            return 1
+        override = self.thread_override(node_name)
+        return override if override is not None else node.max_threads
+
+    def invalidate_thread_override_cache(self) -> None:
+        with self._thread_override_lock:
+            self._thread_override_signature = object()
+
+

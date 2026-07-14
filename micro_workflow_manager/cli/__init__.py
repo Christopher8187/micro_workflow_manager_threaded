@@ -17,6 +17,10 @@ def _dispatch_main(argv: list[str] | None = None) -> int:
         restart_module = import_module(".restart", __name__)
         return restart_module.restart_cli(resolved[1:])
 
+    if resolved and resolved[0] == "threads":
+        threads_module = import_module(".threads", __name__)
+        return threads_module.threads_cli(resolved[1:])
+
     full_module = import_module(".main", __name__)
     # Importing a child module named ``main`` makes Python assign that module to
     # this package's ``main`` attribute. Restore the longstanding callable API

@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .active_run import process_is_alive, run_state_liveness
+from micro_workflow_manager.paths import locks_dir, run_file, threads_file
 from .files import read_config
 from .migration import migration_plan
 from .project import import_file, read_edges, resolve_configured_graph_path
@@ -165,7 +166,30 @@ def doctor_command(root: Path) -> int:
             + "; inspect the job and verify the active scheduler heartbeat"
         )
 
-    state_path = root / ".mwf_run.json"
+    thread_override_path = threads_file(root)
+    if thread_override_path.exists():
+        problem = _json_problem(thread_override_path)
+        if problem:
+            errors.append(f"malformed JSON: {problem}")
+        else:
+            try:
+                from micro_workflow_manager.storage import FileStorage
+
+                overrides = FileStorage(root).read_thread_overrides()
+            except Exception as error:
+                errors.append(f"invalid runtime thread overrides: {error}")
+            else:
+                unknown = sorted(set(overrides) - graph_nodes)
+                if unknown:
+                    warnings.append(
+                        "runtime max_threads overrides reference nodes outside the graph: "
+                        + ", ".join(unknown)
+                    )
+                checks.append(
+                    f"checked {len(overrides)} runtime max_threads override(s)"
+                )
+
+    state_path = run_file(root)
     if state_path.exists():
         problem = _json_problem(state_path)
         if problem:
@@ -182,7 +206,7 @@ def doctor_command(root: Path) -> int:
     if temp_files:
         warnings.append(f"found {len(temp_files)} temporary files left by interrupted atomic writes")
 
-    lock_dir = root / ".mwf_locks"
+    lock_dir = locks_dir(root)
     if lock_dir.is_dir():
         checks.append(
             f"found {len(list(lock_dir.glob('*.lock')))} reusable lock files; lock files persist by design and are not treated as abandoned state"

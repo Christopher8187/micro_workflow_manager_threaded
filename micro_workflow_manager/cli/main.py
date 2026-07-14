@@ -7,6 +7,7 @@ from .describe import describe_command
 from .files import find_root, safe_node_name
 from .doctor import doctor_command
 from .inspect import inspect_command
+from .layout import ensure_runtime_layout
 from .migration import migrate_command
 from .recovery import recover_command
 from .graph_utils import component_topological_nodes
@@ -16,8 +17,11 @@ from .planning import print_run_plan
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
 from .restart import restart_active_jobs
+from .threads import threads_command
+from .deploy import deploy_command
 from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs
 from .validation import require_node
+from .node_clipboard import copy_node_to_clipboard, paste_node_from_clipboard
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,15 +37,28 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "init":
-            return init_project()
+            return init_project(args.archive)
 
         root = find_root()
+        ensure_runtime_layout(root)
+
+        if args.command == "copy":
+            return copy_node_to_clipboard(root, safe_node_name(args.node))
+
+        if args.command == "paste":
+            return paste_node_from_clipboard(root, safe_node_name(args.node))
+
+        if args.command == "deploy":
+            return deploy_command(root, args)
 
         if args.command == "graph":
             return setup_graph(root, args.path, args.runner, update=args.update, dry_run=args.dry_run)
 
         if args.command == "migrate":
             return migrate_command(root, dry_run=args.dry_run)
+
+        if args.command == "threads":
+            return threads_command(root, args.node, args.value)
 
         # Restart is intentionally handled before graph/router loading. The
         # generation fence reaches the running job as early as possible and the
@@ -67,10 +84,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "inspect":
             node = safe_node_name(args.node)
             require_node(workflow, node)
-            if args.job_mode is None and args.job_id is None:
+            if args.mode is None and args.job_id is None:
                 return inspect_command(workflow, node)
-            if args.job_mode != "job" or args.job_id is None or args.job_id < 1:
-                raise RuntimeError("Use: mwf inspect <node> job <id>")
+            if args.mode == "debug" and args.job_id is None:
+                return inspect_command(workflow, node, debug=True)
+            if args.mode != "job" or args.job_id is None or args.job_id < 1:
+                raise RuntimeError("Use: mwf inspect <node> [debug | job <id>]")
             return inspect_command(workflow, node, args.job_id)
 
         if args.command == "monitor":

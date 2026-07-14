@@ -17,6 +17,10 @@ Common flow:
   mwf run A --plan
   mwf run A
   mwf restart wait job 42
+  mwf threads wait +2
+  mwf deploy setup
+  mwf deploy local
+  mwf deploy remote
   mwf resumefrom A
   mwf monitor
 
@@ -30,7 +34,7 @@ for a longer essay explaining behavior, file effects, and abstract examples.
 """
 
 COMMAND_HELP_DESCRIPTIONS = {
-    "init": "Initialize the current folder as an MWF project. This creates .mwf and lightweight editor/git sidecars but does not load task code.",
+    "init": "Initialize the current folder as an MWF project. This creates .mwf/project.json and lightweight editor/git sidecars but does not load task code.",
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
     "migrate": "Upgrade only MWF-owned metadata to the current state schema. User inputs, outputs, returned files, and event logs are never rewritten.",
@@ -41,6 +45,8 @@ COMMAND_HELP_DESCRIPTIONS = {
     "wipe": "Like clean, but remove selected nodes' input files as well.",
     "run": "Reset and run one ready node, or reset and run explicitly selected job IDs.",
     "restart": "From a second terminal, safely replace running jobs inside an active run/runfrom/resume sequence without starting another scheduler.",
+    "threads": "View or change a node's local runtime max_threads override. Active threaded nodes scale without restarting the workflow.",
+    "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Continue unsuccessful or queued work for one node without resetting jobs that are already done or skipped.",
     "runfrom": "Reset and run one node and its descendants while respecting dependency readiness.",
     "resumefrom": "Continue unsuccessful or queued work from one node through its descendants without resetting completed jobs.",
@@ -50,7 +56,7 @@ COMMAND_HELP_DESCRIPTIONS = {
 COMMAND_DESCRIPTIONS = {
     "init": """
 The help text tells you that init creates an MWF project. In practical terms,
-this command places a small .mwf marker in the current folder so later commands
+this command creates a small .mwf/project.json marker in the current folder so later commands
 can find the project root from any subfolder. It does not import graph.py, create
 workflow nodes, or execute functions. That separation is useful because you can
 prepare a clean project shell before deciding what the graph should contain.
@@ -60,7 +66,7 @@ A minimal beginning is:
   cd simple_flow
   mwf init
 
-Afterward, create a graph file and register it with mwf graph. If .mwf already
+Afterward, create a graph file and register it with mwf graph. If .mwf/project.json already
 exists, init leaves the existing project configuration intact.
 """,
     "graph": """
@@ -81,7 +87,7 @@ After renaming a node or changing an edge, preview and then apply the change del
 
 MWF stores the relative path as src/graph.py even on Windows. Older or manually
 edited configurations containing src\\graph.py are also accepted, so the same
-project folder can move between Linux and Windows without rewriting .mwf first.
+project folder can move between Linux and Windows without rewriting .mwf/project.json first.
 Deleting or renaming a graph node during --update deletes that node's folder, so
 copy any data you still need before synchronizing.
 """,
@@ -112,7 +118,7 @@ Preview the exact files first:
 Then apply the migration:
   mwf migrate
 
-For a simple A -> B workflow, this may update .mwf, node_state.json, schema.json,
+For a simple A -> B workflow, this may update .mwf/project.json, node_state.json, schema.json,
 job.json, status.json, execution.json, and the rebuildable job index. If a file
 claims a newer schema than the installed package supports, MWF refuses to
 downgrade it and asks you to use a compatible newer package.
@@ -138,7 +144,7 @@ which fallback ran afterward.
     "recover": """
 Recover is for an interrupted command whose owning process is definitely gone.
 Active runs write a hostname, process ID, and scheduler heartbeat to
-.mwf_run.json. The scheduler supervisor also manages job checkpoint deadlines,
+.mwf/run.json. The scheduler supervisor also manages job checkpoint deadlines,
 but the two signals remain separate: a fresh run heartbeat proves the scheduler
 is alive, while runtime.json describes one job's latest progress. Recover uses
 run ownership and each running job's execution record before it acts. It advances
@@ -235,6 +241,48 @@ its old generation immediately loses permission to commit MWF-managed status,
 files, or downstream jobs. Cooperative code can call ctx.raise_if_cancelled();
 progress-aware code can call ctx.checkpoint("section", progress=0.5). Configured
 checkpoint deadlines are watched by the same centralized scheduler supervisor.
+""",
+    "threads": """
+Threads is a lightweight second-terminal control for testing node concurrency.
+The max_threads value declared in the node router remains the durable default;
+this command stores a local runtime override in .mwf/threads.json. It does not
+edit node_behavior source or restart the workflow.
+
+Examples:
+  mwf threads
+  mwf threads wait
+  mwf threads wait 8
+  mwf threads wait +2
+  mwf threads wait -1
+  mwf threads wait reset
+
+For an active threaded node, increasing the value starts additional queued jobs
+within roughly 0.2 seconds. Decreasing it never kills jobs already running; MWF
+stops launching replacements until active concurrency falls to the new limit.
+For example, a wait node declared with max_threads=2 can be raised to 5 during a
+test and later restored with reset. Process pools read the override when they are
+created, while a direct runner always executes one job at a time.
+""",
+    "deploy": """
+Deploy is an explicit two-stage copy workflow for testing code on another machine.
+The setup action stores only connection metadata under .mwf/deploy/server.json and
+creates .mwfignore. Passwords are never written to disk. Password authentication
+uses PuTTY pscp/plink; key authentication normally uses OpenSSH unless the key is
+a .ppk file.
+
+Typical Windows flow:
+  mwf deploy setup
+  mwf deploy local
+  mwf deploy remote
+
+The local action deletes the previous .mwf/deploy/local deployment, copies only
+paths allowed by .mwfignore, compresses each direct node subfolder independently,
+and creates one deployment.zip. The remote action confirms which local archive to
+use, asks for a destination path, uploads the single archive, and extracts both the
+project archive and per-node archives on the server. Existing files with matching
+paths are overwritten, while unrelated remote files are left alone. Review
+.mwfignore before every sensitive deployment, especially when the project contains
+.env files, API keys, large node outputs, or local credentials.
 """,
     "resume": """
 Resume continues one node without erasing successful work. Failed, cancelled,

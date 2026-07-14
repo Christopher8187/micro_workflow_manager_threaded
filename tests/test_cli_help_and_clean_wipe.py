@@ -412,13 +412,11 @@ def test_init_creates_vscode_settings_and_gitignore(tmp_path, monkeypatch, capsy
         assert settings[key]["**/*.egg-info"] is True
         assert settings[key]["**/__pycache__"] is True
         assert settings[key]["**/.pytest_cache"] is True
-        assert settings[key]["**/.mwf_locks"] is True
-        assert settings[key]["**/.mwf_run.json"] is True
+        assert settings[key]["**/.mwf"] is True
 
     gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
     for entry in [
-        ".mwf_locks/",
-        ".mwf_run.json",
+        ".mwf/",
         "node/*/input/*/",
         "node/*/jobs/**",
         "node/*/output/*/",

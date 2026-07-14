@@ -1,11 +1,11 @@
-# micro-workflow-manager 0.2.5
+# micro-workflow-manager 0.2.8
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
 
 ## Client-facing filesystem architecture
 
-MWF 0.2.5 encourages node behavior files to describe their filesystem contract
+MWF 0.2.8 encourages node behavior files to describe their filesystem contract
 next to the router. A task should read like workflow logic, while reusable
 filesystem objects hold the stable information about where data comes from,
 where it is written, and which downstream node receives it.
@@ -141,6 +141,26 @@ They are thin declarations over the same file-backed storage, scheduler guards,
 transactions, and downstream job APIs, so they do not add project scans or
 per-file background work.
 
+## Consolidated project runtime directory
+
+MWF 0.2.8 keeps framework-owned project state together instead of scattering
+hidden files across the project root:
+
+```text
+.mwf/
+  project.json       # graph path, stored edges, and default runner
+  run.json           # active/recent CLI run ownership and heartbeat
+  threads.json       # optional runtime max_threads overrides
+  locks/             # reusable cross-process lock files
+  deploy/            # server setup and the replaceable local deployment archive
+```
+
+Projects created by MWF 0.2.6 or earlier are migrated automatically on first
+use: the old `.mwf` JSON file, `.mwf_run.json`, `.mwf_threads.json`, and
+`.mwf_locks/` are moved into the directory above. The migration is idempotent.
+The generated `.gitignore` now ignores `.mwf/` rather than listing obsolete
+root-level runtime paths.
+
 ## Explicit graph synchronization
 
 The graph definition and the top-level `node/` folders are synchronized only by
@@ -161,7 +181,7 @@ mwf graph --update --dry-run
 mwf graph --update
 ```
 
-`mwf graph --update` uses the graph path already stored in `.mwf`. Relative graph
+`mwf graph --update` uses the graph path already stored in `.mwf/project.json`. Relative graph
 paths are stored with `/`, even on Windows. When reading an older or manually
 edited project, MWF accepts both `src/graph.py` and `src\graph.py`, resolves the
 path inside the project root, and rewrites it to the portable `/` form on the
@@ -270,6 +290,56 @@ creation remains explicit, so preparing a file never silently invents work.
 `NodeInputFileSystem.add_job()` delegates to the same guarded `NodeHandle.add()`
 operation.
 
+## Deploying a filtered project copy
+
+Deployment is explicit and uses a project-root `.mwfignore`, similar in spirit
+to `.gitignore` and `.dockerignore`. Later rules override earlier rules and a
+leading `!` re-includes a path. Server passwords are never stored.
+
+Configure a server and create the default ignore file:
+
+```powershell
+mwf deploy setup
+```
+
+The default `.mwfignore` excludes Git/editor metadata, `.mwf/`, virtual
+environments, Python caches, build output, and `.env` files. Review it before
+every sensitive deployment. Password authentication uses PuTTY `pscp` and
+`plink`; key authentication normally uses OpenSSH `scp` and `ssh`, while `.ppk`
+keys use PuTTY. Setup stores connection metadata at `.mwf/deploy/server.json`.
+
+Build a local deployment:
+
+```powershell
+mwf deploy local
+```
+
+This command deletes the previous `.mwf/deploy/local/` copy, filters the project
+through `.mwfignore`, compresses every direct `node/<name>/` subfolder into its
+own ZIP, and creates one outer `deployment.zip`. If a node subfolder contains no
+ignored path, MWF zips it directly without staging every small file first. The
+command prints ongoing copy/ZIP counts and final sizes. Rebuilding overwrites the
+old local archive so repeated tests do not accumulate large deployments.
+
+Upload and extract it on the configured server:
+
+```powershell
+mwf deploy remote
+```
+
+If no local deployment exists, MWF asks whether to build one. If one does exist,
+it asks whether to deploy that archive or rebuild it first. It then asks for the
+server destination path, uploads one compressed file, and uses remote Python to
+extract the outer archive and each node archive. Files with matching paths are
+overwritten; unrelated files already on the server are left in place.
+
+Noninteractive setup fields are also available for scripts:
+
+```powershell
+mwf deploy setup --host 192.0.2.10 --user worker --port 22 --auth key --key C:\keys\server_key
+mwf deploy remote --path /home/worker/simple_flow --yes
+```
+
 ## Runners
 
 The default runner is `threaded`.
@@ -284,6 +354,34 @@ mwf runfrom start_node
 - multiple queued jobs inside the same node at the same time, capped by that node's `max_threads`
 - multiple ready nodes at the same time, while still respecting DAG predecessor completion
 - newly-ready downstream nodes while unrelated nodes are still running
+
+### Change a node's concurrency while testing
+
+The router's `max_threads` value remains the readable source-code default. For
+local testing, use `mwf threads` to apply a temporary project-local override
+without editing the node behavior file or restarting an active workflow:
+
+```bash
+mwf threads                     # list declared, override, and effective values
+mwf threads explode            # inspect one node
+mwf threads explode 24         # set an absolute runtime limit
+mwf threads explode +8         # add eight slots
+mwf threads explode -4         # remove four slots
+mwf threads explode reset      # return to the router declaration
+```
+
+The override is stored in `.mwf/threads.json`, which is ignored by the generated
+`.gitignore`. For an active threaded node, an increase starts more queued jobs
+begins within roughly 0.2 seconds and grows geometrically toward very large limits. A decrease never cancels jobs already running; the
+runner stops launching replacements until active concurrency falls to the new
+limit. This makes it safe to tune Windows filesystem/API pressure from a second
+terminal.
+
+`mwf inspect NODE` shows the declared, overridden, and effective values.
+`mwf monitor` shows the effective value in its `threads` column and marks runtime
+overrides with `*`. A process runner reads the override when its process pool is
+created; an already-created process pool is not resized live. The direct runner
+always remains at one job.
 
 For CPU-heavy work, use the process-pool runner:
 
@@ -358,7 +456,7 @@ result.
 ## State schema migration and read-only previews
 
 MWF-owned metadata includes an explicit `schema_version`. This applies to files
-such as `.mwf`, `.mwf_run.json`, `node_state.json`, `schema.json`, `job.json`,
+such as `.mwf/project.json`, `.mwf/run.json`, `.mwf/threads.json`, `node_state.json`, `schema.json`, `job.json`,
 `status.json`, `execution.json`, `runtime.json`, and the rebuildable job index. It does not apply
 to `input.json`, `output.json`, returned files, or `events.jsonl`.
 
@@ -401,7 +499,7 @@ reported as runtime-dependent rather than guessed.
 ## Resume and crash recovery
 
 A CLI-owned run records its process ID, hostname, command, selected nodes, MWF
-version, and a lightweight heartbeat in `.mwf_run.json`. The same single
+version, and a lightweight heartbeat in `.mwf/run.json`. The same single
 scheduler-supervisor thread that manages timeout deadlines updates this run
 heartbeat. Run liveness and job progress remain separate signals: the run
 heartbeat proves the scheduler process is alive, while a job checkpoint proves
@@ -587,7 +685,7 @@ mwf restart wait jobs 42 57 80-82
 ```
 
 `mwf restart` does not start another scheduler and does not replace the active
-`.mwf_run.json` record. It atomically advances the selected job's execution
+`.mwf/run.json` record. It atomically advances the selected job's execution
 generation before clearing job-local `output.json` and `files/`. The scheduler
 that already owns the larger run sees the new generation and immediately starts
 the replacement attempt. The node remains active throughout this handoff, so it
@@ -673,10 +771,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.2.5 the expected filename is:
+The wheel is written to `dist/`. For version 0.2.8 the expected filename is:
 
 ```text
-micro_workflow_manager-0.2.5-py3-none-any.whl
+micro_workflow_manager-0.2.8-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -696,22 +794,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.2.5-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.2.8-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.2.5-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.2.8-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.2.5-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.2.8-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.2.5`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.2.8`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -726,7 +824,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.2.5-py3-none-any.whl
+./vendor/micro_workflow_manager-0.2.8-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project
@@ -739,8 +837,7 @@ python -m pip install -r requirements.txt
 ### Uninstall and persistence
 
 The package installs no Windows service, daemon, scheduled task, registry entry,
-or background process. Runtime state stays in the project (`.mwf`, `node/`,
-`.mwf_locks/`, and `.mwf_run.json`). Stop any active `mwf run`, `mwf runfrom`, `mwf resume`, `mwf resumefrom`,
+or background process. Runtime state stays in the project under the consolidated `.mwf/` directory and `node/`. Stop any active `mwf run`, `mwf runfrom`, `mwf resume`, `mwf resumefrom`,
 or `mwf monitor` process before uninstalling, especially on Windows where an
 active `mwf.exe` launcher can be locked.
 
@@ -750,7 +847,7 @@ python -m pip uninstall micro-workflow-manager
 
 Deleting the project-local `.venv` removes the entire isolated installation as
 an alternative. Deleting the Python package does not delete workflow project
-data; remove `.mwf`, `node/`, `.mwf_locks/`, and `.mwf_run.json` separately only
+data; remove `.mwf/` and `node/` separately only
 when you intentionally want to remove that data.
 
 If an older interrupted pip operation reports an invalid distribution such as
@@ -809,3 +906,50 @@ checkpoint before that many seconds pass. Progress is a number from 0 through 1
 and is shown by `mwf inspect NODE job ID`. The total task/fallback `timeout=`
 keeps the handler on the centralized scheduler-supervised path; checkpoint
 timeouts may then be chosen dynamically in task code.
+
+## Initialize from a deployment archive
+
+A local or copied remote deployment may remain compressed as `deployment.zip`.
+MWF can unpack the main archive and all independently compressed `node/<name>.zip`
+folders during initialization:
+
+```bash
+mwf init deployment.zip
+```
+
+When no archive argument is supplied, `mwf init` checks these common locations:
+
+- `./deployment.zip`
+- `./mwf-deployment.zip`
+- `./.mwf/deploy/local/deployment.zip`
+
+Extraction rejects paths that escape the project directory. Initialization prints
+each major step and each node archive as it is unpacked.
+
+## Node clipboard
+
+Save a node's complete file-backed folder beside `node/`:
+
+```bash
+mwf copy preprocess
+```
+
+This replaces `clipboard/preprocess` while leaving other saved nodes intact.
+Restore it later with:
+
+```bash
+mwf paste preprocess
+```
+
+Paste replaces `node/preprocess` with the saved clipboard version. The default
+`.mwfignore` excludes `clipboard/`, `.mwf/`, `.venv/`, version-control metadata,
+editor metadata, caches, and build output.
+
+## Inspect a node debug log
+
+```bash
+mwf inspect preprocess debug
+```
+
+This prints the node's `output/debug.txt` path and contents, or explains that the
+file does not exist yet.

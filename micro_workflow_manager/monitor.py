@@ -65,11 +65,7 @@ def _max_parallel_jobs(workflow, node_name: str) -> int:
     node = workflow.nodes.get(node_name)
     if node is None:
         return 1
-
-    if node.runner_override == "direct" or workflow.runner == "direct":
-        return 1
-
-    return max(1, int(getattr(node, "max_threads", 1) or 1))
+    return workflow.effective_max_threads(node_name)
 
 
 def node_stats(workflow, node_name: str) -> dict[str, Any]:
@@ -123,6 +119,8 @@ def node_stats(workflow, node_name: str) -> dict[str, Any]:
         "avg_duration_seconds": avg_duration,
         "eta_seconds": eta_seconds,
         "max_parallel_jobs": max_parallel,
+        "declared_max_threads": getattr(workflow.nodes.get(node_name), "max_threads", 1),
+        "thread_override": workflow.thread_override(node_name),
         "running_jobs": sorted(running_jobs),
         "running_elapsed_seconds": running_elapsed,
     }
@@ -216,6 +214,7 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
     headers = [
         ("node", 18),
         ("status", 9),
+        ("threads", 8),
         ("jobs", 6),
         ("Q", 5),
         ("R", 5),
@@ -239,6 +238,11 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
         values = [
             row["node"],
             row["status"],
+            (
+                f"{row['max_parallel_jobs']}*"
+                if row.get("thread_override") is not None
+                else str(row["max_parallel_jobs"])
+            ),
             row["total"],
             row["queued"],
             row["running"],
@@ -253,6 +257,7 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
 
     lines.append("")
     lines.append("ETA is a rough estimate from completed job durations; it is unknown until at least one job has finished.")
+    lines.append("threads marked with * use a runtime override from 'mwf threads'.")
     return "\n".join(lines)
 
 

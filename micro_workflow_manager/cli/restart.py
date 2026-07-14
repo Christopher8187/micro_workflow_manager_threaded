@@ -8,6 +8,7 @@ from pathlib import Path
 from micro_workflow_manager.storage import FileStorage
 
 from .active_run import live_active_run
+from .layout import ensure_runtime_layout
 from .files import find_root, safe_node_name
 from .jobs import selected_job_ids_from_args
 
@@ -104,6 +105,7 @@ def restart_cli(argv: list[str]) -> int:
 
     try:
         root = find_root()
+        ensure_runtime_layout(root)
         node = safe_node_name(args.node)
         job_ids = selected_job_ids_from_args(
             args.job_mode,

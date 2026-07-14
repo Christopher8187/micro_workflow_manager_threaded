@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import zipfile
 from pathlib import Path
 from types import ModuleType
 
@@ -11,32 +12,110 @@ from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.system import MicroWorkflow, normalize_workflow_runner
 
-from .constants import MWF_FILE
+from micro_workflow_manager.paths import config_file, mwf_dir
 from .extras.scaffold import ensure_project_sidecars
 from .files import find_root, read_config, safe_node_name, write_json
+from .layout import ensure_runtime_layout
 
 
-def init_project() -> int:
+def init_project(archive_path: str | None = None) -> int:
     root = Path.cwd()
-    path = root / MWF_FILE
-    ensure_project_sidecars(root)
+    print("MWF project initialization")
+    print(f"  working directory: {root}")
+
+    archive = _resolve_init_archive(root, archive_path)
+    if archive is not None:
+        print(f"  deployment archive: {archive}")
+        _extract_deployment_archive(archive, root)
+    else:
+        print("  deployment archive: none detected")
+
+    migrated = ensure_runtime_layout(root)
+    path = config_file(root)
+    sidecars = ensure_project_sidecars(root)
+
+    if migrated:
+        print(f"Migrated legacy runtime state into: {mwf_dir(root)}")
 
     if path.exists():
-        print(f"Already initialized: {path}")
-        return 0
+        print(f"  project configuration already exists: {path}")
+    else:
+        write_json(
+            path,
+            {
+                "version": 3,
+                "schema_version": CURRENT_STATE_SCHEMA_VERSION,
+                "graph_path": None,
+                "runner": "threaded",
+                "edges": [],
+            },
+        )
+        print(f"  created project configuration: {path}")
 
-    write_json(
-        path,
-        {
-            "version": 2,
-            "schema_version": CURRENT_STATE_SCHEMA_VERSION,
-            "graph_path": None,
-            "runner": "threaded",
-            "edges": [],
-        },
-    )
-    print(f"Initialized {path}")
+    print(f"  runtime directory: {mwf_dir(root)}")
+    print(f"  node directory: {root / 'node'}")
+    print(f"  deployment ignore file: {root / '.mwfignore'}")
+    print("Initialization complete")
+    if archive is not None:
+        print("  deployment contents are unpacked and ready for graph setup or normal commands")
+    else:
+        print("  next: run 'mwf graph src/graph.py' or pass a deployment.zip to 'mwf init'")
     return 0
+
+
+def _resolve_init_archive(root: Path, archive_path: str | None) -> Path | None:
+    if archive_path:
+        candidate = Path(archive_path).expanduser()
+        path = (candidate if candidate.is_absolute() else root / candidate).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        if path.suffix.lower() != ".zip":
+            raise RuntimeError(f"MWF deployment archive must be a .zip file: {path}")
+        return path
+
+    candidates = [
+        root / "deployment.zip",
+        root / "mwf-deployment.zip",
+        root / ".mwf" / "deploy" / "local" / "deployment.zip",
+    ]
+    found = [path.resolve() for path in candidates if path.is_file()]
+    if not found:
+        return None
+    # Prefer a deployment copied directly into the destination folder.
+    return found[0]
+
+
+def _safe_extract_zip(archive: Path, destination: Path) -> None:
+    base = destination.resolve()
+    with zipfile.ZipFile(archive, "r") as handle:
+        members = handle.infolist()
+        for member in members:
+            candidate = (destination / member.filename).resolve()
+            try:
+                candidate.relative_to(base)
+            except ValueError as error:
+                raise RuntimeError(f"Unsafe path in deployment archive: {member.filename}") from error
+        handle.extractall(destination)
+
+
+def _extract_deployment_archive(archive: Path, destination: Path) -> None:
+    print("Unpacking MWF deployment")
+    print("  extracting main deployment archive ...")
+    _safe_extract_zip(archive, destination)
+    node_dir = destination / "node"
+    node_archives = sorted(node_dir.glob("*.zip")) if node_dir.is_dir() else []
+    if not node_archives:
+        print("  nested node archives: none")
+    for index, node_archive in enumerate(node_archives, 1):
+        target = node_dir / node_archive.stem
+        print(f"  extracting node {index}/{len(node_archives)}: {node_archive.stem}")
+        target.mkdir(parents=True, exist_ok=True)
+        _safe_extract_zip(node_archive, target)
+        marker = target / ".mwf-empty"
+        if marker.exists():
+            marker.unlink()
+        node_archive.unlink()
+    print("  deployment extraction complete")
 
 
 def setup_graph(
@@ -76,7 +155,7 @@ def setup_graph(
         print("  no configuration or node folders were changed")
         return 0
 
-    config["version"] = 2
+    config["version"] = 3
     config["schema_version"] = CURRENT_STATE_SCHEMA_VERSION
     config["graph_path"] = path.relative_to(root).as_posix()
     config["edges"] = edges
@@ -89,7 +168,7 @@ def setup_graph(
     # Store the new graph state before mounting routers. Router mounting may
     # materialize schemas/default jobs, and those writes must only target nodes
     # that have already passed the explicit synchronization step.
-    write_json(root / MWF_FILE, config)
+    write_json(config_file(root), config)
     _synchronize_node_folders(root, expected_nodes, stale_nodes)
 
     workflow = load_workflow(root, runner, require_synced=True)

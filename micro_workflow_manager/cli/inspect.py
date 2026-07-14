@@ -76,7 +76,11 @@ def inspect_node(workflow, node: str) -> int:
     print(f"  jobs: total={summary['total']} " + " ".join(f"{key}={value}" for key, value in sorted(summary['counts'].items()) if value))
     if schema:
         print(f"  runner: {schema.get('runner_override') or workflow.runner}")
-        print(f"  max_threads: {schema.get('max_threads')}")
+        declared_threads = schema.get("max_threads")
+        override_threads = workflow.thread_override(node)
+        print(f"  declared max_threads: {declared_threads}")
+        print(f"  runtime max_threads override: {override_threads if override_threads is not None else '(none)'}")
+        print(f"  effective max_threads: {workflow.effective_max_threads(node)}")
         print(f"  timeout: {schema.get('timeout')}")
         print(f"  checkpoint_timeout: {schema.get('checkpoint_timeout')}")
         print(f"  fallbacks: {', '.join(schema.get('fallbacks') or []) or '(none)'}")
@@ -126,7 +130,25 @@ def inspect_job(workflow, node: str, job_id: int) -> int:
     return 0
 
 
-def inspect_command(workflow, node: str, job_id: int | None = None) -> int:
+def inspect_debug(workflow, node: str) -> int:
+    path = workflow.storage.debug_file(node)
+    print(f"Debug file for node {node}")
+    print(f"  path: {path}")
+    if not path.exists():
+        print("  (debug file does not exist yet)")
+        return 0
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text:
+        print("  (debug file is empty)")
+        return 0
+    print("--- debug.txt ---")
+    print(text, end="" if text.endswith("\n") else "\n")
+    return 0
+
+
+def inspect_command(workflow, node: str, job_id: int | None = None, *, debug: bool = False) -> int:
+    if debug:
+        return inspect_debug(workflow, node)
     if job_id is None:
         return inspect_node(workflow, node)
     return inspect_job(workflow, node, job_id)

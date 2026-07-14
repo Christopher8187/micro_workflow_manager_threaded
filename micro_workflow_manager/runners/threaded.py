@@ -1,136 +1,176 @@
 from __future__ import annotations
 
-from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
-from threading import Event, Lock
-from typing import Callable
+from threading import Condition, Lock, Thread
+from typing import Callable, Iterable
 
 from .base import BaseRunner
 
 
-class ThreadedRunner(BaseRunner):
-    """Dependency-free thread pool runner for jobs inside one node.
+MAX_RUNTIME_THREADS = 4096
+THREAD_LIMIT_POLL_SECONDS = 0.20
+INITIAL_WORKER_BURST = 8
 
-    It runs multiple queued jobs for the same node in parallel, capped by that
-    node's max_threads setting.
+
+class ThreadedRunner(BaseRunner):
+    """Adaptive local thread runner for jobs inside one node.
+
+    ``max_threads`` is the router-declared default. ``limit_provider`` may
+    return a runtime override written by ``mwf threads``. Scale-up starts more
+    worker loops within the polling interval; scale-down never kills a running
+    job and lets surplus workers retire after their current job.
+
+    Workers pull jobs lazily and remain alive for multiple jobs. This preserves
+    the low scheduling overhead of the original runner and avoids creating one
+    future per job or one empty worker per very large declared limit.
     """
 
-    def __init__(self, max_threads: int):
+    def __init__(
+        self,
+        max_threads: int,
+        *,
+        limit_provider: Callable[[], int] | None = None,
+        poll_interval: float = THREAD_LIMIT_POLL_SECONDS,
+    ):
         if type(max_threads) is not int or max_threads < 1:
             raise ValueError("max_threads must be an integer >= 1")
+        if max_threads > MAX_RUNTIME_THREADS:
+            raise ValueError(f"max_threads must be <= {MAX_RUNTIME_THREADS}")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be > 0")
         self.max_threads = max_threads
+        self.limit_provider = limit_provider
+        self.poll_interval = float(poll_interval)
+
+    def effective_limit(self) -> int:
+        value = self.max_threads
+        if self.limit_provider is not None:
+            value = self.limit_provider()
+        if type(value) is not int or value < 1:
+            raise ValueError("runtime max_threads must be an integer >= 1")
+        if value > MAX_RUNTIME_THREADS:
+            raise ValueError(
+                f"runtime max_threads must be <= {MAX_RUNTIME_THREADS}"
+            )
+        return value
+
+    def _run_adaptive(self, node_name: str, items: Iterable, run_one: Callable):
+        iterator = iter(items)
+        source_lock = Lock()
+        condition = Condition()
+
+        desired = self.effective_limit()
+        source_exhausted = False
+        stop = False
+        next_item_index = 0
+        next_worker_id = 0
+        workers: dict[int, Thread] = {}
+        results: dict[int, object] = {}
+        first_error: BaseException | None = None
+
+        def take_item():
+            nonlocal source_exhausted, next_item_index
+            with source_lock:
+                if source_exhausted:
+                    return None
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    source_exhausted = True
+                    return None
+                pair = (next_item_index, item)
+                next_item_index += 1
+                return pair
+
+        def worker_loop(worker_id: int) -> None:
+            nonlocal stop, first_error
+            try:
+                while True:
+                    with condition:
+                        if stop:
+                            return
+                        # Surplus workers retire only between jobs. Running jobs
+                        # are never interrupted by a scale-down command.
+                        if len(workers) > desired:
+                            return
+
+                    pair = take_item()
+                    if pair is None:
+                        with condition:
+                            condition.notify_all()
+                        return
+                    index, item = pair
+
+                    try:
+                        value = run_one(item)
+                    except BaseException as error:
+                        with condition:
+                            if first_error is None:
+                                first_error = error
+                            stop = True
+                            condition.notify_all()
+                        return
+
+                    with condition:
+                        results[index] = value
+                        condition.notify_all()
+            finally:
+                with condition:
+                    workers.pop(worker_id, None)
+                    condition.notify_all()
+
+        def spawn_worker() -> None:
+            nonlocal next_worker_id
+            worker_id = next_worker_id
+            next_worker_id += 1
+            thread = Thread(
+                target=worker_loop,
+                args=(worker_id,),
+                name=f"mwf-job-{node_name}-{worker_id}",
+            )
+            workers[worker_id] = thread
+            thread.start()
+
+        with condition:
+            # Preserve fast startup for normal nodes, while preventing a node
+            # declared with max_threads=1000 from creating 1000 empty workers
+            # before the lazy source has revealed how much work exists.
+            initial_workers = min(desired, INITIAL_WORKER_BURST)
+            for _ in range(initial_workers):
+                spawn_worker()
+
+            while workers or not source_exhausted:
+                condition.wait(self.poll_interval)
+
+                if first_error is not None:
+                    stop = True
+                    condition.notify_all()
+                    continue
+
+                desired = self.effective_limit()
+
+                if not source_exhausted and len(workers) < desired:
+                    needed = desired - len(workers)
+                    # Grow geometrically so large requested limits become
+                    # available quickly, but stop as soon as one worker proves
+                    # the lazy source is exhausted.
+                    growth = max(1, len(workers))
+                    for _ in range(min(needed, growth)):
+                        spawn_worker()
+
+                # Workers observe a lower desired value after their current job
+                # and retire themselves. The manager only needs to wake them.
+                condition.notify_all()
+
+        if first_error is not None:
+            raise first_error
+
+        return [results[index] for index in sorted(results)]
 
     def run_jobs(self, node_name: str, jobs: list, run_one: Callable):
         if not jobs:
             return []
-
-        max_workers = min(self.max_threads, len(jobs))
-        results_by_index = [None] * len(jobs)
-
-        with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix=f"mwf-job-{node_name}",
-        ) as executor:
-            futures = {
-                executor.submit(run_one, job): index
-                for index, job in enumerate(jobs)
-            }
-
-            done, not_done = wait(futures, return_when=FIRST_EXCEPTION)
-
-            first_error = None
-            for future in done:
-                index = futures[future]
-                try:
-                    results_by_index[index] = future.result()
-                except Exception as error:  # keep original traceback via raise below
-                    first_error = error
-                    break
-
-            if first_error is not None:
-                for future in not_done:
-                    future.cancel()
-
-                # Running futures cannot be force-stopped safely, so wait for any
-                # already-started jobs to finish writing their status/output files.
-                wait(not_done)
-                raise first_error
-
-            # No exception happened before the first wait returned. Collect every
-            # result, preserving input job order instead of completion order.
-            for future in not_done:
-                index = futures[future]
-                results_by_index[index] = future.result()
-
-        return results_by_index
+        return self._run_adaptive(node_name, jobs, run_one)
 
     def run_job_source(self, node_name: str, job_source, run_one: Callable):
-        """Run jobs from a lazy source without preloading every job.
-
-        Only max_threads worker loops are submitted. Each worker pulls the next
-        queued job ID/object when it is ready, so a node with thousands of jobs
-        can begin executing almost immediately instead of waiting for every job
-        JSON file to be loaded up front.
-        """
-        iterator = iter(job_source)
-        source_lock = Lock()
-        stop = Event()
-
-        def next_item():
-            if stop.is_set():
-                return None
-
-            with source_lock:
-                if stop.is_set():
-                    return None
-                try:
-                    return next(iterator)
-                except StopIteration:
-                    return None
-
-        def worker_loop():
-            results = []
-
-            while not stop.is_set():
-                item = next_item()
-                if item is None:
-                    break
-
-                try:
-                    results.append(run_one(item))
-                except Exception:
-                    stop.set()
-                    raise
-
-            return results
-
-        with ThreadPoolExecutor(
-            max_workers=self.max_threads,
-            thread_name_prefix=f"mwf-job-{node_name}",
-        ) as executor:
-            futures = [
-                executor.submit(worker_loop)
-                for _ in range(self.max_threads)
-            ]
-
-            done, not_done = wait(futures, return_when=FIRST_EXCEPTION)
-
-            first_error = None
-            for future in done:
-                try:
-                    future.result()
-                except Exception as error:  # keep original traceback via raise below
-                    first_error = error
-                    break
-
-            if first_error is not None:
-                stop.set()
-                for future in not_done:
-                    future.cancel()
-                wait(not_done)
-                raise first_error
-
-            results = []
-            for future in futures:
-                results.extend(future.result())
-
-        return results
+        """Run a lazy job source with a live-adjustable concurrency ceiling."""
+        return self._run_adaptive(node_name, job_source, run_one)

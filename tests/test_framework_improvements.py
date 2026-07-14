@@ -57,7 +57,7 @@ def test_graph_path_is_stored_with_slashes_and_accepts_backslashes(tmp_path, mon
     assert cli.main(["init"]) == 0
     # A Windows-style command path must also work when this test runs on Linux.
     assert cli.main(["graph", "src\\graph.py", "--runner", "direct"]) == 0
-    config_path = tmp_path / ".mwf"
+    config_path = tmp_path / ".mwf" / "project.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert config["graph_path"] == "src/graph.py"
 
@@ -74,7 +74,7 @@ def test_graph_path_is_stored_with_slashes_and_accepts_backslashes(tmp_path, mon
 def test_doctor_detects_missing_router_without_mutating_project(tmp_path, monkeypatch, capsys):
     behavior = write_project(tmp_path, monkeypatch)
     capsys.readouterr()
-    before = (tmp_path / ".mwf").read_bytes()
+    before = (tmp_path / ".mwf" / "project.json").read_bytes()
 
     assert cli.main(["doctor"]) == 0
     assert "Healthy" in capsys.readouterr().out
@@ -83,7 +83,7 @@ def test_doctor_detects_missing_router_without_mutating_project(tmp_path, monkey
     assert cli.main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "without node_behavior files: B" in out
-    assert (tmp_path / ".mwf").read_bytes() == before
+    assert (tmp_path / ".mwf" / "project.json").read_bytes() == before
 
 
 
@@ -365,18 +365,18 @@ def test_active_run_state_contains_ownership_and_heartbeat(tmp_path, monkeypatch
     write_project(tmp_path, monkeypatch)
     capsys.readouterr()
     assert cli.main(["run", "A"]) == 0
-    state = json.loads((tmp_path / ".mwf_run.json").read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / ".mwf" / "run.json").read_text(encoding="utf-8"))
     assert state["hostname"]
     assert state["pid"] > 0
     assert state["heartbeat_at"]
-    assert state["mwf_version"] == "0.2.5"
+    assert state["mwf_version"] == "0.2.8"
     assert state["status"] == "done"
 
 
 def test_migrate_versions_only_framework_metadata(tmp_path, monkeypatch, capsys):
     write_project(tmp_path, monkeypatch)
     capsys.readouterr()
-    config_path = tmp_path / ".mwf"
+    config_path = tmp_path / ".mwf" / "project.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config.pop("schema_version", None)
     config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -407,7 +407,7 @@ def test_runfrom_plan_is_read_only(tmp_path, monkeypatch, capsys):
     write_project(tmp_path, monkeypatch)
     capsys.readouterr()
     watched = [
-        tmp_path / ".mwf",
+        tmp_path / ".mwf" / "project.json",
         tmp_path / "node" / "A" / "node_state.json",
         tmp_path / "node" / "A" / "jobs" / "1" / "job.json",
     ]
@@ -418,20 +418,20 @@ def test_runfrom_plan_is_read_only(tmp_path, monkeypatch, capsys):
     assert "Plan for: mwf runfrom A" in out
     assert "no state, jobs, inputs, outputs, or node folders were changed" in out
     assert {path: path.read_bytes() for path in watched} == before
-    assert not (tmp_path / ".mwf_run.json").exists()
+    assert not (tmp_path / ".mwf" / "run.json").exists()
 
 
 def test_graph_update_dry_run_does_not_add_or_delete_nodes(tmp_path, monkeypatch, capsys):
     write_project(tmp_path, monkeypatch)
     capsys.readouterr()
-    config_before = (tmp_path / ".mwf").read_bytes()
+    config_before = (tmp_path / ".mwf" / "project.json").read_bytes()
     (tmp_path / "src" / "graph.py").write_text("EDGES = [('A', 'C')]\n", encoding="utf-8")
 
     assert cli.main(["graph", "--update", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "nodes to add: C" in out
     assert "nodes to delete: B" in out
-    assert (tmp_path / ".mwf").read_bytes() == config_before
+    assert (tmp_path / ".mwf" / "project.json").read_bytes() == config_before
     assert (tmp_path / "node" / "B").is_dir()
     assert not (tmp_path / "node" / "C").exists()
 
@@ -458,14 +458,14 @@ def test_cleanup_and_recover_dry_runs_do_not_mutate(tmp_path, monkeypatch, capsy
     )
     status_before = workflow.storage.status_file("A", 1).read_bytes()
     control_before = workflow.storage.job_control_file("A", 1).read_bytes()
-    run_before = (tmp_path / ".mwf_run.json").read_bytes()
+    run_before = (tmp_path / ".mwf" / "run.json").read_bytes()
     capsys.readouterr()
 
     assert cli.main(["recover", "--dry-run"]) == 0
     assert "Would recover" in capsys.readouterr().out
     assert workflow.storage.status_file("A", 1).read_bytes() == status_before
     assert workflow.storage.job_control_file("A", 1).read_bytes() == control_before
-    assert (tmp_path / ".mwf_run.json").read_bytes() == run_before
+    assert (tmp_path / ".mwf" / "run.json").read_bytes() == run_before
 
     node_before = sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node" / "A").rglob("*"))
     assert cli.main(["clean", "A", "--dry-run"]) == 0

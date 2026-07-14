@@ -30,12 +30,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands = parser.add_subparsers(dest="command", metavar="command")
 
-    commands.add_parser(
+    init_cmd = commands.add_parser(
         "init",
-        help="Create a .mwf project marker in the current directory.",
+        help="Initialize a project, optionally unpacking an MWF deployment archive first.",
         description=COMMAND_HELP_DESCRIPTIONS["init"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    init_cmd.add_argument(
+        "archive",
+        nargs="?",
+        help="Optional deployment.zip path. If omitted, mwf checks common local deployment archive locations.",
+    )
+
+
+    copy_cmd = commands.add_parser(
+        "copy",
+        help="Save one node folder into the sibling clipboard folder.",
+    )
+    copy_cmd.add_argument("node", help="Node folder name to copy into clipboard/<node>.")
+
+    paste_cmd = commands.add_parser(
+        "paste",
+        help="Replace one node folder with its saved clipboard copy.",
+    )
+    paste_cmd.add_argument("node", help="Node folder name to restore from clipboard/<node>.")
 
     graph_cmd = commands.add_parser(
         "graph",
@@ -79,8 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=COMMAND_HELP_DESCRIPTIONS["inspect"],
     )
     inspect_cmd.add_argument("node", help="Node name to inspect.")
-    inspect_cmd.add_argument("job_mode", nargs="?", metavar="job", help="Optional literal 'job'.")
-    inspect_cmd.add_argument("job_id", nargs="?", type=int, metavar="id", help="Job ID to inspect.")
+    inspect_cmd.add_argument("mode", nargs="?", metavar="job|debug", help="Optional literal job or debug.")
+    inspect_cmd.add_argument("job_id", nargs="?", type=int, metavar="id", help="Job ID when mode is job.")
 
     recover_cmd = commands.add_parser(
         "recover",
@@ -187,6 +205,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Running job IDs and ranges, for example: 1 3 8-10.",
     )
     restart_cmd.add_argument("--dry-run", action="store_true", help="Validate and show restart targets without fencing them.")
+
+    threads_cmd = commands.add_parser(
+        "threads",
+        help="View or change a node's runtime max_threads override.",
+        description=COMMAND_HELP_DESCRIPTIONS["threads"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    threads_cmd.add_argument("node", nargs="?", help="Node name. Omit to list every mounted node.")
+    threads_cmd.add_argument("value", nargs="?", help="Absolute integer, +N, -N, or reset/default/clear.")
+
+    deploy_cmd = commands.add_parser(
+        "deploy",
+        help="Build filtered local deployments and copy them to a configured server.",
+        description=COMMAND_HELP_DESCRIPTIONS["deploy"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    deploy_actions = deploy_cmd.add_subparsers(dest="deploy_command", metavar="action", required=True)
+
+    deploy_setup = deploy_actions.add_parser(
+        "setup",
+        help="Store server connection settings and create .mwfignore.",
+    )
+    deploy_setup.add_argument("--host", help="Server host or IP. Omit to be prompted.")
+    deploy_setup.add_argument("--user", help="SSH user. Omit to be prompted.")
+    deploy_setup.add_argument("--port", type=int, help="SSH port. Default: 22.")
+    deploy_setup.add_argument("--auth", choices=["password", "key"], help="Authentication mode.")
+    deploy_setup.add_argument("--tool", choices=["putty", "openssh"], help="Transfer client. Password mode requires putty.")
+    deploy_setup.add_argument("--key", help="Private key path. .ppk keys use PuTTY.")
+    deploy_setup.add_argument("--pscp", help="Path to PuTTY pscp.exe.")
+    deploy_setup.add_argument("--plink", help="Path to PuTTY plink.exe.")
+    deploy_setup.add_argument("--python-command", help="Remote Python command used for extraction. Default: python3.")
+
+    deploy_actions.add_parser(
+        "local",
+        help="Rebuild the filtered local deployment archive, replacing the previous one.",
+    )
+
+    deploy_remote = deploy_actions.add_parser(
+        "remote",
+        help="Upload the local deployment and extract it into a server path.",
+    )
+    deploy_remote.add_argument("--path", help="Destination directory on the server. Omit to be prompted.")
+    deploy_remote.add_argument("--yes", action="store_true", help="Deploy the existing local archive without the first confirmation prompt.")
 
     runfrom_cmd = commands.add_parser(
         "runfrom",
