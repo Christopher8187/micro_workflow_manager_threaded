@@ -93,11 +93,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_cmd = commands.add_parser(
         "inspect",
-        help="Explain a node or job and show its event history.",
+        help="Explain a node/job, list failed jobs, or show node debug output.",
         description=COMMAND_HELP_DESCRIPTIONS["inspect"],
     )
     inspect_cmd.add_argument("node", help="Node name to inspect.")
-    inspect_cmd.add_argument("mode", nargs="?", metavar="job|debug", help="Optional literal job or debug.")
+    inspect_cmd.add_argument(
+        "mode",
+        nargs="?",
+        metavar="job|failed|debug",
+        help="Optional literal job, failed, or debug.",
+    )
     inspect_cmd.add_argument("job_id", nargs="?", type=int, metavar="id", help="Job ID when mode is job.")
 
     recover_cmd = commands.add_parser(
@@ -188,11 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     restart_cmd = commands.add_parser(
         "restart",
-        help="Safely restart running jobs inside an active run/runfrom sequence.",
+        help="Restart active running jobs or requeue failed jobs without resetting done work.",
         description=COMMAND_HELP_DESCRIPTIONS["restart"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    restart_cmd.add_argument("node", help="Node containing the currently running job.")
+    restart_cmd.add_argument("node", help="Node containing the running or failed job.")
     restart_cmd.add_argument(
         "job_mode",
         metavar="job",
@@ -202,7 +207,7 @@ def build_parser() -> argparse.ArgumentParser:
         "job_specs",
         nargs="+",
         metavar="id|start-end",
-        help="Running job IDs and ranges, for example: 1 3 8-10.",
+        help="Running or failed job IDs and ranges, for example: 1 3 8-10.",
     )
     restart_cmd.add_argument("--dry-run", action="store_true", help="Validate and show restart targets without fencing them.")
 

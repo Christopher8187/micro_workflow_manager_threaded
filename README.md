@@ -1,11 +1,33 @@
-# micro-workflow-manager 0.2.9
+# micro-workflow-manager 0.3.1
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
 
+## What changed in 0.3.1
+
+- `mwf inspect <node-name> failed` prints failed job IDs, concise errors, and restart commands.
+- Extended CLI examples no longer use a node literally named `wait`; examples use neutral placeholders or simple operation names.
+
+## What changed in 0.3.0
+
+- Runtime `mwf threads` overrides are scoped to one workflow run. An override
+  configured before a run is claimed by that next run and deleted when the run
+  finishes; an override changed from a second terminal is deleted with the
+  active run. Stale overrides from a crashed older run are ignored.
+- `mwf restart` still generation-fences live attempts, and can now requeue
+  `failed` or `cancelled` jobs without resetting completed jobs. A retry queued
+  after the original run has ended can be executed with `mwf resume <node-name>`
+  or the appropriate `mwf resumefrom <node-name>`.
+- `mwf deploy setup` explicitly prompts for the SSH port when `--port` is not
+  supplied.
+- `mwf init` merges Material Icon Theme settings into `.vscode/settings.json`
+  and associates `.mwfignore` with the `routing` icon. Existing unrelated VS
+  Code settings are preserved.
+
+
 ## Client-facing filesystem architecture
 
-MWF 0.2.9 encourages node behavior files to describe their filesystem contract
+MWF 0.3.0 encourages node behavior files to describe their filesystem contract
 next to the router. A task should read like workflow logic, while reusable
 filesystem objects hold the stable information about where data comes from,
 where it is written, and which downstream node receives it.
@@ -143,7 +165,7 @@ per-file background work.
 
 ## Consolidated project runtime directory
 
-MWF 0.2.9 keeps framework-owned project state together instead of scattering
+MWF 0.3.0 keeps framework-owned project state together instead of scattering
 hidden files across the project root:
 
 ```text
@@ -164,6 +186,20 @@ clipboard snapshots: nested `input/` and `output/` directories, `jobs/`,
 `queued/`, and rebuildable node-state/index files are ignored, while direct
 files in `clipboard/<node>/input/` and `clipboard/<node>/output/` remain
 trackable.
+
+`mwf init` also merges these editor settings without replacing unrelated user
+settings:
+
+```json
+{
+  "workbench.iconTheme": "material-icon-theme",
+  "material-icon-theme.files.associations": {
+    ".mwfignore": "routing"
+  }
+}
+```
+
+Install the Material Icon Theme VS Code extension to see that association.
 
 ## Explicit graph synchronization
 
@@ -375,11 +411,17 @@ mwf threads explode reset      # return to the router declaration
 ```
 
 The override is stored in `.mwf/threads.json`, which is ignored by the generated
-`.gitignore`. For an active threaded node, an increase starts more queued jobs
-begins within roughly 0.2 seconds and grows geometrically toward very large limits. A decrease never cancels jobs already running; the
-runner stops launching replacements until active concurrency falls to the new
-limit. This makes it safe to tune Windows filesystem/API pressure from a second
-terminal.
+`.gitignore`. It is deliberately temporary: an override set before execution
+applies to the next run only, and an override changed during execution belongs
+to that active run. MWF removes the override when the run finishes, including
+failed runs. Stale values bound to an older crashed run are ignored and removed
+when a new run claims the project.
+
+For an active threaded node, an increase starts more queued jobs within roughly
+0.2 seconds and grows geometrically toward very large limits. A decrease never
+cancels jobs already running; the runner stops launching replacements until
+active concurrency falls to the new limit. This makes it safe to tune Windows
+filesystem/API pressure from a second terminal.
 
 `mwf inspect NODE` shows the declared, overridden, and effective values.
 `mwf monitor` shows the effective value in its `threads` column and marks runtime
@@ -483,7 +525,7 @@ mwf clean A --dry-run
 mwf reset A --dry-run
 mwf wipe A --dry-run
 mwf recover --dry-run
-mwf restart wait job 4 --dry-run
+mwf restart <node-name> job 4 --dry-run
 ```
 
 Execution commands provide `--plan` instead of pretending to run:
@@ -544,10 +586,10 @@ allowed silence for each section in task code:
 ```python
 from micro_workflow_manager import NodeRouter
 
-router = NodeRouter("wait")
+router = NodeRouter("process_number")
 
 @router.task(timeout=300)
-def wait(ctx):
+def process_number(ctx):
     ctx.checkpoint(
         "preparing request",
         timeout=20,
@@ -583,7 +625,8 @@ checkpoint deadlines in task code are preferred.
 optional human-readable values displayed by:
 
 ```bash
-mwf inspect wait job 3
+mwf inspect process_number failed
+mwf inspect process_number job 3
 ```
 
 All configured total/checkpoint deadlines are managed by one workflow-owned
@@ -672,20 +715,20 @@ mwf run start_node --stats --stats-interval 10
 
 ETA is intentionally approximate. It is calculated from completed job durations and becomes more useful after at least one job in the relevant node has finished.
 
-## Restart one running job from a second terminal
+## Restart a running job or requeue a failed job
 
-When an individual job is hung inside an active `mwf run` or `mwf runfrom`
-sequence, keep the original terminal running and use the dedicated restart
-command from a second terminal in the same project:
+When an individual job is hung inside an active `mwf run`, `runfrom`, `resume`,
+or `resumefrom` sequence, keep the original terminal running and use the
+dedicated restart command from a second terminal:
 
 ```bash
-mwf restart wait job 42
+mwf restart <node-name> job 42
 ```
 
 Several currently running jobs may be selected with IDs and ranges:
 
 ```bash
-mwf restart wait jobs 42 57 80-82
+mwf restart <node-name> jobs 42 57 80-82
 ```
 
 `mwf restart` does not start another scheduler and does not replace the active
@@ -699,11 +742,24 @@ The original `job.json` and `input.json` are preserved.
 An older generation is fenced from committing its final status, returned files,
 `ctx.write(...)`, `ctx.write_output(...)`, and `ctx.node(...).add(...)` effects.
 If it finishes while the restart command is preparing the replacement, its stale
-completion is discarded. The command only accepts a job that is still `running`,
-belongs to a live active run, and has a live execution lease; it refuses rather
-than creating an orphan queued job when the old attempt has already completed.
-Ordinary `mwf run` and `mwf runfrom` commands also refuse to start a competing
-sequence while another one owns the project.
+completion is discarded. A live `running` attempt must belong to the active run
+and have a live execution lease; MWF refuses rather than creating an orphan
+queued job when the attempt has already completed. Ordinary `mwf run` and
+`mwf runfrom` commands also refuse to start a competing sequence while another
+one owns the project.
+
+A job already marked `failed` or `cancelled` may be requeued even after the
+original workflow has ended:
+
+```bash
+mwf restart <node-name> job 42
+mwf resume <node-name>
+```
+
+This preserves `job.json` and `input.json`, advances the execution generation,
+clears only that job's old result/files, and never resets jobs already marked
+`done` or `skipped`. If a larger descendant sequence must continue, use the
+appropriate `mwf resumefrom <node-name>` after requeueing.
 
 Python cannot safely force-kill an arbitrary thread that is blocked inside a
 third-party HTTP request or native library. From MWF's point of view the old
@@ -718,7 +774,7 @@ returns.
 Use ordinary selected-job rerun syntax after the larger workflow has ended:
 
 ```bash
-mwf run wait job 42
+mwf run <node-name> job 42
 ```
 
 ## Large-node performance note
@@ -775,10 +831,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.2.9 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.1 the expected filename is:
 
 ```text
-micro_workflow_manager-0.2.9-py3-none-any.whl
+micro_workflow_manager-0.3.1-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -798,22 +854,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.2.9-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.1-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.2.9-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.1-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.2.9-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.1-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.2.9`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.1`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -828,7 +884,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.2.9-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.1-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

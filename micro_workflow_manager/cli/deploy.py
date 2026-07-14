@@ -89,7 +89,10 @@ def deploy_setup(root: Path, args) -> int:
     existing = read_server_config(root, required=False)
     host = args.host or _prompt("Server host or IP", existing.host if existing else None)
     user = args.user or _prompt("Server user", existing.user if existing else None)
-    port = args.port or (existing.port if existing else 22)
+    if args.port is not None:
+        port = args.port
+    else:
+        port = _prompt("SSH port", str(existing.port if existing else 22))
     auth = args.auth or _prompt_choice(
         "Authentication",
         {"password", "key"},

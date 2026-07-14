@@ -73,6 +73,7 @@ def _parse_new_limit(spec: str, current: int) -> int:
 
 def thread_status(root: Path, storage: FileStorage, node: str) -> dict:
     declared = _declared_limit(storage, node)
+    override_state = storage.read_thread_override_state()
     overrides = storage.read_thread_overrides()
     override = overrides.get(node)
     schema = _node_schema(storage, node)
@@ -88,6 +89,7 @@ def thread_status(root: Path, storage: FileStorage, node: str) -> dict:
         "runner": runner,
         "active": is_active_node,
         "run": active,
+        "override_run_id": override_state.get("run_id"),
     }
 
 
@@ -100,6 +102,9 @@ def print_thread_status(status: dict) -> None:
         + (str(status["override"]) if status["override"] is not None else "(none)")
     )
     print(f"  effective max_threads: {status['effective']}")
+    if status["override"] is not None:
+        scope = status.get("override_run_id")
+        print(f"  override scope: {'active run ' + scope if scope else 'next run only'}")
     if status["active"]:
         run = status["run"] or {}
         print(
@@ -145,14 +150,16 @@ def threads_command(root: Path, node: str | None, value: str | None) -> int:
         return 0
 
     if value.lower() in RESET_WORDS:
-        storage.clear_thread_override(node)
+        active = live_active_run(storage)
+        storage.clear_thread_override(node, run_id=(active or {}).get("run_id"))
         after = thread_status(root, storage, node)
         print(f"Cleared runtime max_threads override for {node}.")
         print(f"Effective max_threads: {before['effective']} -> {after['effective']}")
         return 0
 
     requested = _parse_new_limit(value, before["effective"])
-    storage.set_thread_override(node, requested)
+    active = live_active_run(storage)
+    storage.set_thread_override(node, requested, run_id=(active or {}).get("run_id"))
     after = thread_status(root, storage, node)
 
     print(f"Updated runtime max_threads for {node}: {before['effective']} -> {after['effective']}")
@@ -163,7 +170,7 @@ def threads_command(root: Path, node: str | None, value: str | None) -> int:
                 "0.2 seconds. Lowering the limit does not cancel jobs already running."
             )
         else:
-            print("The override will apply the next time this node runs.")
+            print("The override is pending for the next run only and will be cleared when that run finishes.")
     elif after["runner"] == "process":
         print(
             "The process runner reads this override when its node pool is created; "

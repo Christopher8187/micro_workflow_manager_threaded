@@ -88,8 +88,10 @@ def main(argv: list[str] | None = None) -> int:
                 return inspect_command(workflow, node)
             if args.mode == "debug" and args.job_id is None:
                 return inspect_command(workflow, node, debug=True)
+            if args.mode == "failed" and args.job_id is None:
+                return inspect_command(workflow, node, failed=True)
             if args.mode != "job" or args.job_id is None or args.job_id < 1:
-                raise RuntimeError("Use: mwf inspect <node> [debug | job <id>]")
+                raise RuntimeError("Use: mwf inspect <node> [failed | debug | job <id>]")
             return inspect_command(workflow, node, args.job_id)
 
         if args.command == "monitor":

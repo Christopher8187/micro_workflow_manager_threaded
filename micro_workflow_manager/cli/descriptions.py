@@ -16,8 +16,8 @@ Common flow:
   mwf migrate --dry-run
   mwf run A --plan
   mwf run A
-  mwf restart wait job 42
-  mwf threads wait +2
+  mwf restart <node-name> job 42
+  mwf threads <node-name> +2
   mwf deploy setup
   mwf deploy local
   mwf deploy remote
@@ -38,14 +38,14 @@ COMMAND_HELP_DESCRIPTIONS = {
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
     "migrate": "Upgrade only MWF-owned metadata to the current state schema. User inputs, outputs, returned files, and event logs are never rewritten.",
-    "inspect": "Explain one node or one job, including readiness, checkpoint progress/deadlines, execution generation, input/output, and append-only job events.",
+    "inspect": "Explain one node or job, list failed job IDs, or show node debug output, including checkpoint progress/deadlines and event history.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
     "clean": "Delete jobs and output for selected nodes while keeping node input files.",
     "reset": "Requeue every existing job for selected nodes while keeping job definitions and node input files.",
     "wipe": "Like clean, but remove selected nodes' input files as well.",
     "run": "Reset and run one ready node, or reset and run explicitly selected job IDs.",
-    "restart": "From a second terminal, safely replace running jobs inside an active run/runfrom/resume sequence without starting another scheduler.",
-    "threads": "View or change a node's local runtime max_threads override. Active threaded nodes scale without restarting the workflow.",
+    "restart": "Replace a live running attempt or requeue a failed/cancelled job without resetting completed work or starting a competing scheduler.",
+    "threads": "View or change a run-scoped max_threads override. Active threaded nodes scale live, and every override is cleared when its run finishes.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Continue unsuccessful or queued work for one node without resetting jobs that are already done or skipped.",
     "runfrom": "Reset and run one node and its descendants while respecting dependency readiness.",
@@ -132,12 +132,15 @@ checkpoint, checkpoint deadline, progress percentage/detail, input, output,
 execution generation, and chronological events.jsonl history.
 
 Examples:
-  mwf inspect wait
-  mwf inspect wait job 3
+  mwf inspect process_number
+  mwf inspect process_number failed
+  mwf inspect process_number job 3
+  mwf inspect process_number debug
 
-A simple wait task might report checkpoint "number chosen" with progress 50%,
-then sleep before doubling the number. The job view displays that live progress
-from runtime.json without executing or retrying anything. If the checkpoint
+A simple process_number task might report checkpoint "number chosen" with
+progress 50%, then call ctx.sleep(1) before doubling the number. The job view
+displays that live progress from runtime.json without executing or retrying
+anything. The failed view gives copyable failed job IDs and concise errors. If the checkpoint
 deadline expires, inspect shows the timeout reason and the event history shows
 which fallback ran afterward.
 """,
@@ -155,7 +158,7 @@ Preview or apply recovery:
   mwf recover --dry-run
   mwf recover
 
-Suppose A finished, B was running a short wait, and the terminal process crashed.
+Suppose A finished, B was running a short calculation, and the terminal process crashed.
 Recover leaves A done, requeues B, and records that the old run was recovered.
 You can then use mwf resume B or mwf resumefrom B. Recover refuses to operate
 while the recorded owner is still live.
@@ -201,8 +204,8 @@ folders empty. It is intended for a complete local restart of a node's stored
 material, not for ordinary failure recovery.
 
 Examples:
-  mwf wipe wait --dry-run
-  mwf wipe wait
+  mwf wipe temporary_result --dry-run
+  mwf wipe temporary_result
   mwf wipe "*"
 
 A node function is not executed by wipe. Because input files are removed, use
@@ -217,7 +220,7 @@ Examples:
   mwf run make_number --plan
   mwf run make_number
   mwf run double_number job 2
-  mwf run wait jobs 1 3-5
+  mwf run process_number jobs 1 3-5
 
 A basic task might choose a random integer, double it, or call ctx.sleep(1). Run
 uses the configured threaded, process, or direct runner and refuses to start if
@@ -225,16 +228,16 @@ another CLI sequence already owns the project. To preserve completed work after
 a failure, use resume rather than run.
 """,
     "restart": """
-Restart is the second-terminal control for one job that is currently running
-inside a live sequence. It does not import graph.py and does not launch another
+Restart is the control for an active running job or a failed/cancelled job.
+For a live attempt it is normally used from a second terminal inside the sequence. It does not import graph.py and does not launch another
 scheduler. Instead, it atomically advances the job's execution generation, clears
 that job's local result/files, and lets the existing scheduler start the new
 generation while the surrounding run remains intact.
 
 Examples:
-  mwf restart wait job 4 --dry-run
-  mwf restart wait job 4
-  mwf restart wait jobs 4 7-8
+  mwf restart <node-name> job 4 --dry-run
+  mwf restart <node-name> job 4
+  mwf restart <node-name> jobs 4 7-8
 
 A Python thread blocked in an outside library cannot always be force-killed, but
 its old generation immediately loses permission to commit MWF-managed status,
@@ -250,17 +253,17 @@ edit node_behavior source or restart the workflow.
 
 Examples:
   mwf threads
-  mwf threads wait
-  mwf threads wait 8
-  mwf threads wait +2
-  mwf threads wait -1
-  mwf threads wait reset
+  mwf threads <node-name>
+  mwf threads <node-name> 8
+  mwf threads <node-name> +2
+  mwf threads <node-name> -1
+  mwf threads <node-name> reset
 
 For an active threaded node, increasing the value starts additional queued jobs
 within roughly 0.2 seconds. Decreasing it never kills jobs already running; MWF
 stops launching replacements until active concurrency falls to the new limit.
-For example, a wait node declared with max_threads=2 can be raised to 5 during a
-test and later restored with reset. Process pools read the override when they are
+For example, a node declared with max_threads=2 can be raised to 5 during a
+test. The override is scoped to the active or next run and is cleared when that run finishes. Process pools read the override when they are
 created, while a direct runner always executes one job at a time.
 """,
     "deploy": """
@@ -309,8 +312,8 @@ For A -> B -> C:
   mwf runfrom A --plan
   mwf runfrom A
 
-A simple A task might generate a number, B might add one, and C might wait briefly
-before writing the answer. Runfrom resets that selected sequence. Use resumefrom
+A simple A task might generate a number, B might add one, and C might
+write the answer after a short ctx.sleep(1) delay. Runfrom resets that selected sequence. Use resumefrom
 when some jobs are already done and should stay done.
 """,
     "resumefrom": """

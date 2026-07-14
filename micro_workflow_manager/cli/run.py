@@ -58,6 +58,8 @@ def active_workflow_run(
     with workflow.storage.interprocess_lock("active-run-state"):
         refuse_competing_run(workflow)
         workflow.storage.write_run_state(data)
+        workflow.storage.bind_thread_overrides_to_run(run_id)
+        workflow.invalidate_thread_override_cache()
 
     # The scheduler supervisor owns both project-run heartbeats and handler
     # checkpoint deadlines. One thread services the whole workflow sequence.
@@ -71,6 +73,8 @@ def active_workflow_run(
             return
 
         workflow.scheduler_supervisor.stop_run_heartbeat(run_id)
+        workflow.storage.clear_thread_overrides_for_run(run_id)
+        workflow.invalidate_thread_override_cache()
         with workflow.storage.interprocess_lock("active-run-state"):
             current = workflow.storage.get_run_state()
             # Never let a stale process overwrite a newer run record.

@@ -130,6 +130,57 @@ def inspect_job(workflow, node: str, job_id: int) -> int:
     return 0
 
 
+def _one_line(value: Any, *, limit: int = 240) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def inspect_failed(workflow, node: str) -> int:
+    """Print a compact, copyable summary of failed jobs in one node.
+
+    This is an explicit diagnostic command, so it may scan that node's job
+    folders. The scheduler's normal fast paths and job index remain unchanged.
+    """
+    storage = workflow.storage
+    failed_rows: list[dict[str, Any]] = []
+    for job_id in storage.iter_job_ids(node):
+        row = storage.read_json(storage.status_file(node, job_id), default=None)
+        if isinstance(row, dict) and row.get("status") == FAILED:
+            failed_rows.append(row)
+    failed_rows.sort(key=lambda row: int(row.get("job_id") or 0))
+
+    print(f"Failed jobs for node {node}")
+    print(f"  count: {len(failed_rows)}")
+    if not failed_rows:
+        print("  IDs: (none)")
+        return 0
+
+    job_ids = [int(row["job_id"]) for row in failed_rows]
+    print("  IDs: " + " ".join(str(job_id) for job_id in job_ids))
+    print("Jobs:")
+
+    for row in failed_rows:
+        job_id = int(row["job_id"])
+        output = storage.read_json(storage.output_file(node, job_id), default={})
+        error = output.get("error") if isinstance(output, dict) else None
+        if not error:
+            runtime = storage.read_job_runtime(node, job_id)
+            error = runtime.get("timeout_message") if isinstance(runtime, dict) else None
+        duration = row.get("duration_seconds")
+        duration_text = f"{float(duration):.3f}s" if isinstance(duration, int | float) else "?"
+        finished_at = row.get("finished_at") or "?"
+        print(f"  {job_id}: finished={finished_at} duration={duration_text}")
+        print(f"     error: {_one_line(error or '(error not recorded)')}")
+
+    joined = " ".join(str(job_id) for job_id in job_ids)
+    print("Commands:")
+    print(f"  inspect one: mwf inspect {node} job {job_ids[0]}")
+    print(f"  restart all: mwf restart {node} jobs {joined}")
+    return 0
+
+
 def inspect_debug(workflow, node: str) -> int:
     path = workflow.storage.debug_file(node)
     print(f"Debug file for node {node}")
@@ -146,9 +197,18 @@ def inspect_debug(workflow, node: str) -> int:
     return 0
 
 
-def inspect_command(workflow, node: str, job_id: int | None = None, *, debug: bool = False) -> int:
+def inspect_command(
+    workflow,
+    node: str,
+    job_id: int | None = None,
+    *,
+    debug: bool = False,
+    failed: bool = False,
+) -> int:
     if debug:
         return inspect_debug(workflow, node)
+    if failed:
+        return inspect_failed(workflow, node)
     if job_id is None:
         return inspect_node(workflow, node)
     return inspect_job(workflow, node, job_id)

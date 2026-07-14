@@ -82,6 +82,13 @@ def ensure_vscode_settings(root: Path):
         if not isinstance(settings, dict):
             raise ValueError(f"Expected VS Code settings object: {settings_path}")
 
+    settings["workbench.iconTheme"] = "material-icon-theme"
+    associations = settings.get("material-icon-theme.files.associations")
+    if not isinstance(associations, dict):
+        associations = {}
+    associations[".mwfignore"] = "routing"
+    settings["material-icon-theme.files.associations"] = associations
+
     for key in ["files.exclude", "search.exclude"]:
         current = settings.get(key)
         if not isinstance(current, dict):

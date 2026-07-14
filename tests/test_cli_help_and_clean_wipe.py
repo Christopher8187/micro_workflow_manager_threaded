@@ -56,7 +56,7 @@ def test_top_level_help_points_to_command_help_and_describe(capsys):
     assert "mwf clean *" in out
     assert "mwf reset *" in out
     assert "mwf wipe *" in out
-    assert "mwf restart wait job 42" in out
+    assert "mwf restart <node-name> job 42" in out
 
 
 def test_describe_explains_command_context_and_current_project(tmp_path, monkeypatch, capsys):
@@ -408,6 +408,8 @@ def test_init_creates_vscode_settings_and_gitignore(tmp_path, monkeypatch, capsy
     capsys.readouterr()
 
     settings = json.loads((tmp_path / ".vscode" / "settings.json").read_text(encoding="utf-8"))
+    assert settings["workbench.iconTheme"] == "material-icon-theme"
+    assert settings["material-icon-theme.files.associations"][".mwfignore"] == "routing"
     for key in ["files.exclude", "search.exclude"]:
         assert settings[key]["**/*.egg-info"] is True
         assert settings[key]["**/__pycache__"] is True
