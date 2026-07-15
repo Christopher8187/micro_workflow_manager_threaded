@@ -176,6 +176,35 @@ def test_timeout_moves_to_fallback_and_blocks_late_context_write(tmp_path):
     assert any(event.get("event") == "fallback_started" for event in events)
 
 
+
+
+def test_all_failed_fallbacks_report_the_terminal_error(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+
+    @workflow.task("A")
+    def primary(ctx):
+        raise ValueError("primary validation error")
+
+    @workflow.fallback("A", name="final")
+    def final(ctx, error=None):
+        raise TimeoutError("terminal apply timeout")
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    job = workflow.start("A")
+    with pytest.raises(Exception) as raised:
+        workflow.run_job("A", job.job_id, ignore_readiness=True)
+
+    assert isinstance(raised.value.__cause__, TimeoutError)
+    assert "terminal apply timeout" in str(raised.value.__cause__)
+    output = workflow.storage.read_json(workflow.storage.output_file("A", job.job_id))
+    assert "terminal apply timeout" in output["error"]
+    assert "primary validation error" not in output["error"]
+
+
 def test_context_sleep_and_cancellation_alias(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
     workflow.graph([("A", "B")])
@@ -369,7 +398,7 @@ def test_active_run_state_contains_ownership_and_heartbeat(tmp_path, monkeypatch
     assert state["hostname"]
     assert state["pid"] > 0
     assert state["heartbeat_at"]
-    assert state["mwf_version"] == "0.3.1"
+    assert state["mwf_version"] == "0.3.2"
     assert state["status"] == "done"
 
 

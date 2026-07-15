@@ -418,6 +418,7 @@ class JobExecutionMixin:
         except JobRestartedError:
             raise
         except Exception as main_error:
+            terminal_error = main_error
             self.check_job_execution(
                 job.node_name,
                 job.job_id,
@@ -456,6 +457,7 @@ class JobExecutionMixin:
                 except JobRestartedError:
                     raise
                 except Exception as fallback_error:
+                    terminal_error = fallback_error
                     self.check_job_execution(
                         job.node_name,
                         job.job_id,
@@ -467,7 +469,9 @@ class JobExecutionMixin:
                         f"job {job.job_id} fallback {fallback_name} failed: {fallback_error}",
                     )
 
-            raise main_error
+            if terminal_error is main_error:
+                raise main_error
+            raise terminal_error from main_error
 
     def execute_mounted_task(
         self,

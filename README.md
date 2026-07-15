@@ -1,9 +1,14 @@
-# micro-workflow-manager 0.3.1
+# micro-workflow-manager 0.3.2
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
 
-## What changed in 0.3.1
+## What changed in 0.3.2
+
+- When every fallback fails, the job output now records the **terminal fallback error** rather than the stale main-task error.
+- This makes `mwf inspect <node-name> job <id>` agree with the final timeout/event that actually caused the job to fail.
+- Existing task, retry, checkpoint, restart, deployment, and thread-override behavior is unchanged.
+
 
 - `mwf inspect <node-name> failed` prints failed job IDs, concise errors, and restart commands.
 - Extended CLI examples no longer use a node literally named `wait`; examples use neutral placeholders or simple operation names.
@@ -831,10 +836,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.1 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.2 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.1-py3-none-any.whl
+micro_workflow_manager-0.3.2-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -854,22 +859,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.1-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.2-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.1-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.2-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.1-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.2-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.1`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.2`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -884,7 +889,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.1-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.2-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project
