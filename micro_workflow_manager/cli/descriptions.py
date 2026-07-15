@@ -38,7 +38,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
     "migrate": "Upgrade only MWF-owned metadata to the current state schema. User inputs, outputs, returned files, and event logs are never rewritten.",
-    "inspect": "Explain one node or job, list failed job IDs, or show node debug output, including checkpoint progress/deadlines and event history.",
+    "inspect": "Inspect a node/job; list failed job IDs, show retry/fallback filter bottlenecks, or show node debug output.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
     "clean": "Delete jobs and output for selected nodes while keeping node input files.",
     "reset": "Requeue every existing job for selected nodes while keeping job definitions and node input files.",
@@ -133,6 +133,7 @@ execution generation, and chronological events.jsonl history.
 
 Examples:
   mwf inspect process_number
+  mwf inspect process_number filter
   mwf inspect process_number failed
   mwf inspect process_number job 3
   mwf inspect process_number debug
@@ -140,7 +141,10 @@ Examples:
 A simple process_number task might report checkpoint "number chosen" with
 progress 50%, then call ctx.sleep(1) before doubling the number. The job view
 displays that live progress from runtime.json without executing or retrying
-anything. The failed view gives copyable failed job IDs and concise errors. If the checkpoint
+anything. The filter view reconstructs the current execution funnel from each
+job's append-only events, showing how many jobs entered, resolved at, and
+remained after every main retry and fallback retry. The failed view gives
+copyable failed job IDs and concise errors. If the checkpoint
 deadline expires, inspect shows the timeout reason and the event history shows
 which fallback ran afterward.
 """,

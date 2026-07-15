@@ -13,7 +13,7 @@ from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.system import MicroWorkflow, normalize_workflow_runner
 
 from micro_workflow_manager.paths import config_file, mwf_dir
-from .extras.scaffold import ensure_project_sidecars
+from .extras.scaffold import ensure_project_sidecars, ensure_vscode_settings
 from .files import find_root, read_config, safe_node_name, write_json
 from .layout import ensure_runtime_layout
 
@@ -133,6 +133,7 @@ def setup_graph(
     """
 
     config = read_config(root)
+    previous_nodes = _nodes_from_edges(_stored_edges(config))
     path = _resolve_graph_path(root, config, graph_path, update=update)
     module = import_file(path)
     edges = read_edges(module)
@@ -170,6 +171,11 @@ def setup_graph(
     # that have already passed the explicit synchronization step.
     write_json(config_file(root), config)
     _synchronize_node_folders(root, expected_nodes, stale_nodes)
+    ensure_vscode_settings(
+        root,
+        node_names=expected_nodes,
+        previous_node_names=previous_nodes,
+    )
 
     workflow = load_workflow(root, runner, require_synced=True)
 

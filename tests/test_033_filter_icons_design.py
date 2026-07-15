@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+import pytest
+
+from micro_workflow_manager import cli
+
+
+def _write_filter_project(root: Path) -> None:
+    behavior = root / "src" / "node_behavior"
+    behavior.mkdir(parents=True)
+    (root / "src" / "graph.py").write_text(
+        'EDGES = [("filter_numbers", "finished")]\n',
+        encoding="utf-8",
+    )
+    (behavior / "filter_numbers.py").write_text(
+        '''from micro_workflow_manager import NodeRouter
+router = NodeRouter("filter_numbers")
+router.create_job(number=10)
+
+@router.task(retries=1)
+def filter_numbers(ctx):
+    value = ctx.job_id
+    if value >= 8 or (value >= 5 and ctx.attempt == 1):
+        raise ValueError(f"main rejected {value} on attempt {ctx.attempt}")
+    return value
+
+@router.fallback(name="broader_filter", retries=1)
+def broader_filter(ctx, error):
+    value = ctx.job_id
+    if value >= 10 or (value >= 9 and ctx.attempt == 1):
+        raise ValueError(f"fallback rejected {value} on attempt {ctx.attempt}")
+    return value
+''',
+        encoding="utf-8",
+    )
+    (behavior / "finished.py").write_text(
+        '''from micro_workflow_manager import NodeRouter
+router = NodeRouter("finished")
+@router.task
+def finished(ctx):
+    return None
+''',
+        encoding="utf-8",
+    )
+
+
+def test_inspect_filter_reconstructs_retry_and_fallback_funnel(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.chdir(tmp_path)
+    _write_filter_project(tmp_path)
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["run", "filter_numbers"]) == 1
+    capsys.readouterr()
+    assert cli.main(["inspect", "filter_numbers", "filter"]) == 0
+    output = capsys.readouterr().out
+
+    assert "Filter funnel for node filter_numbers" in output
+    assert "main: filter_numbers — attempt 1/2" in output
+    assert "main: filter_numbers — attempt 2/2" in output
+    assert "fallback: broader_filter — attempt 1/2" in output
+    assert "fallback: broader_filter — attempt 2/2" in output
+    assert "entered   passed  remaining" in output
+    assert "attempt 1/2" in output and "      10        4        6" in output
+    assert "attempt 2/2" in output and "       6        3        3" in output
+    assert "       3        1        2" in output
+    assert "       2        1        1" in output
+    assert output.rstrip().endswith(
+        "10: ValueError('fallback rejected 10 on attempt 2')"
+    )
+
+
+def test_init_gitignore_and_material_icons_cover_runtime_structure(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    behavior = tmp_path / "src" / "node_behavior"
+    behavior.mkdir(parents=True)
+    (tmp_path / "src" / "graph.py").write_text(
+        'EDGES = [("ingest", "publish")]\n',
+        encoding="utf-8",
+    )
+    for node in ("ingest", "publish"):
+        (behavior / f"{node}.py").write_text(
+            "from micro_workflow_manager import NodeRouter\n"
+            f"router = NodeRouter({node!r})\n"
+            "@router.task\n"
+            "def run(ctx): return None\n",
+            encoding="utf-8",
+        )
+
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py"]) == 0
+
+    gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert "node/*/idempotency/**" in gitignore
+    assert "clipboard/*/idempotency/**" in gitignore
+
+    settings = json.loads(
+        (tmp_path / ".vscode" / "settings.json").read_text(encoding="utf-8")
+    )
+    files = settings["material-icon-theme.files.associations"]
+    folders = settings["material-icon-theme.folders.associations"]
+    assert files["graph.py"] == "routing"
+    assert folders["clipboard"] == "archive"
+    assert folders["node"] == "flow"
+    assert folders["queued"] == "queue"
+    assert folders["idempotency"] == "keys"
+    assert folders["ingest"] == "flow"
+    assert folders["publish"] == "flow"
+
+
+def test_readme_links_design_and_requires_output_provenance():
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    design = (root / "DESIGN.md").read_text(encoding="utf-8")
+    assert "# micro-workflow-manager 0.3.3" in readme
+    assert "[DESIGN.md](DESIGN.md)" in readme
+    assert "provenance" in readme.lower()
+    assert "## Advice first" in design
+    assert "Prompt chaining" in design
+    assert "Database change manager" in design
+    assert "Pygame state machine" in design
+
+
+EXAMPLE_STARTS = {
+    "document_refinery": "discover_sources",
+    "geometry_solver_lab": "parse_construction",
+    "agent_prompt_chain": "draft_brief",
+    "agent_router": "classify_request",
+    "agent_parallelization": "fan_out",
+    "agent_orchestrator_workers": "plan_work",
+    "agent_evaluator_optimizer": "generate_candidate",
+    "database_change_manager": "plan_schema_change",
+    "pygame_state_machine": "load_game_session",
+}
+
+
+@pytest.mark.parametrize("example_name,start_node", EXAMPLE_STARTS.items())
+def test_design_example_runs_and_writes_provenance(
+    example_name: str,
+    start_node: str,
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    source = Path(__file__).resolve().parents[1] / "examples" / example_name
+    project = tmp_path / example_name
+    shutil.copytree(source, project, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    monkeypatch.chdir(project)
+
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
+    assert cli.main(["runfrom", start_node]) == 0
+    capsys.readouterr()
+
+    provenance = list((project / "node").glob("*/output/provenance/*.json"))
+    assert provenance, f"{example_name} wrote no output provenance"
+    for path in provenance:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["node"]
+        assert record["job_id"] >= 1
+        assert "inputs" in record
+        assert "decisions" in record
+        assert "result" in record

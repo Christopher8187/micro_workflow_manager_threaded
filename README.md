@@ -1,6 +1,38 @@
-# micro-workflow-manager 0.3.2
+# micro-workflow-manager 0.3.3
 
 A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
+
+
+## Design requirement: durable result and debugging provenance
+
+The `output/` folder is not only a place for the final value. A well-designed
+node writes both the durable result that can be reused or reformatted **and**
+user-owned provenance that makes the result easier to debug and improve. Useful
+provenance includes the relevant inputs, algorithm/model/tool choice, attempt or
+fallback, validation evidence, and important parameters. Framework files such as
+`runtime.json` and `events.jsonl` explain scheduler behavior; they do not replace
+domain provenance written by the project.
+
+See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
+command workflows, provenance guidance, and runnable examples covering adapted
+`src/` + `utils/` pipelines, five common agentic patterns, a database change
+manager, and a Pygame state machine.
+
+## What changed in 0.3.3
+
+- `mwf inspect <node-name> filter` reconstructs a clear main-attempt,
+  retry, fallback, and fallback-retry funnel from each job's latest event
+  history. It shows jobs entered, passed, and remaining at every stage, then
+  ends with the exact failed jobs and restart commands.
+- Generated `.gitignore` rules now ignore every descendant of `idempotency/`
+  under both `node/<name>/` and `clipboard/<name>/`, matching `jobs/` and
+  `queued/` runtime handling.
+- `mwf init` and graph synchronization add Material Icon Theme associations for
+  `graph.py`, `node/`, `clipboard/`, actual node names, `input/`, `output/`,
+  `jobs/`, `queued/`, `idempotency/`, and related project folders while
+  preserving unrelated VS Code settings.
+- `DESIGN.md` and nine tested, offline examples demonstrate output provenance,
+  node naming, autostart, dynamic job passing, joins, retries, and fallbacks.
 
 
 ## What changed in 0.3.2
@@ -188,7 +220,7 @@ use: the old `.mwf` JSON file, `.mwf_run.json`, `.mwf_threads.json`, and
 The generated `.gitignore` now ignores `.mwf/` rather than listing obsolete
 root-level runtime paths. It applies the same runtime-only exclusions to node
 clipboard snapshots: nested `input/` and `output/` directories, `jobs/`,
-`queued/`, and rebuildable node-state/index files are ignored, while direct
+`queued/`, `idempotency/`, and rebuildable node-state/index files are ignored, while direct
 files in `clipboard/<node>/input/` and `clipboard/<node>/output/` remain
 trackable.
 
@@ -199,12 +231,25 @@ settings:
 {
   "workbench.iconTheme": "material-icon-theme",
   "material-icon-theme.files.associations": {
-    ".mwfignore": "routing"
+    ".mwfignore": "routing",
+    "graph.py": "routing"
+  },
+  "material-icon-theme.folders.associations": {
+    "node": "flow",
+    "clipboard": "archive",
+    "input": "input",
+    "output": "export",
+    "jobs": "tasks",
+    "queued": "queue",
+    "idempotency": "keys"
   }
 }
 ```
 
-Install the Material Icon Theme VS Code extension to see that association.
+After the graph is set, MWF also associates each exact graph node name with the
+`flow` icon. Because Material Icon Theme associations are name-based, the same
+mapping styles both `node/<name>/` and `clipboard/<name>/`. Install the Material
+Icon Theme VS Code extension to see these associations.
 
 ## Explicit graph synchronization
 
@@ -488,8 +533,16 @@ Use `inspect` when you need an explanation rather than a raw directory listing:
 
 ```bash
 mwf inspect A
+mwf inspect A filter
+mwf inspect A failed
 mwf inspect A job 3
 ```
+
+`mwf inspect A filter` shows how many jobs entered, passed, and remained after
+each main retry and fallback retry. It derives the funnel on demand from the
+latest execution segment in each job's append-only events, so it adds no shared
+provenance manifest or scheduler hot-path writes. The final section lists the
+jobs that still failed.
 
 Node inspection explains readiness, blockers, status counts, strongly connected
 component membership, runner, total timeout, checkpoint timeout, and fallbacks.
@@ -836,10 +889,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.2 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.3 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.2-py3-none-any.whl
+micro_workflow_manager-0.3.3-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -859,22 +912,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.2-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.3-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.2-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.3-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.2-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.3-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.2`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.3`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -889,7 +942,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.2-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.3-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

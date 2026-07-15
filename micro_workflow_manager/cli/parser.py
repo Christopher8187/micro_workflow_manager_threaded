@@ -93,15 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_cmd = commands.add_parser(
         "inspect",
-        help="Explain a node/job, list failed jobs, or show node debug output.",
+        help="Explain a node/job, show retry/fallback filters, list failed job IDs, or show debug output.",
         description=COMMAND_HELP_DESCRIPTIONS["inspect"],
     )
     inspect_cmd.add_argument("node", help="Node name to inspect.")
     inspect_cmd.add_argument(
         "mode",
         nargs="?",
-        metavar="job|failed|debug",
-        help="Optional literal job, failed, or debug.",
+        metavar="job|filter|failed|debug",
+        help="Optional literal job, filter, failed, or debug.",
     )
     inspect_cmd.add_argument("job_id", nargs="?", type=int, metavar="id", help="Job ID when mode is job.")
 

@@ -12,6 +12,25 @@ VSCODE_EXCLUDES = {
 }
 
 
+MATERIAL_FOLDER_ASSOCIATIONS = {
+    "node": "flow",
+    "clipboard": "archive",
+    "node_behavior": "flow",
+    "utils": "tools",
+    "input": "input",
+    "output": "export",
+    "jobs": "tasks",
+    "queued": "queue",
+    "idempotency": "keys",
+    "files": "resource",
+}
+
+MATERIAL_FILE_ASSOCIATIONS = {
+    ".mwfignore": "routing",
+    "graph.py": "routing",
+}
+
+
 GITIGNORE_SECTION_START = "# >>> micro-workflow-manager generated state >>>"
 GITIGNORE_SECTION_END = "# <<< micro-workflow-manager generated state <<<"
 GITIGNORE_ENTRIES = [
@@ -24,6 +43,7 @@ GITIGNORE_ENTRIES = [
     "node/*/jobs/**",
     "node/*/output/*/",
     "node/*/queued/**",
+    "node/*/idempotency/**",
     "",
     "# Rebuildable node metadata and caches",
     "node/*/node_state.json",
@@ -37,6 +57,7 @@ GITIGNORE_ENTRIES = [
     "clipboard/*/jobs/**",
     "clipboard/*/output/*/",
     "clipboard/*/queued/**",
+    "clipboard/*/idempotency/**",
     "",
     "# Rebuildable clipboard-node metadata and caches",
     "clipboard/*/node_state.json",
@@ -71,7 +92,12 @@ def ensure_project_sidecars(root: Path):
     ensure_gitignore(root)
 
 
-def ensure_vscode_settings(root: Path):
+def ensure_vscode_settings(
+    root: Path,
+    *,
+    node_names: set[str] | None = None,
+    previous_node_names: set[str] | None = None,
+):
     vscode_dir = root / ".vscode"
     vscode_dir.mkdir(parents=True, exist_ok=True)
     settings_path = vscode_dir / "settings.json"
@@ -83,11 +109,37 @@ def ensure_vscode_settings(root: Path):
             raise ValueError(f"Expected VS Code settings object: {settings_path}")
 
     settings["workbench.iconTheme"] = "material-icon-theme"
-    associations = settings.get("material-icon-theme.files.associations")
-    if not isinstance(associations, dict):
-        associations = {}
-    associations[".mwfignore"] = "routing"
-    settings["material-icon-theme.files.associations"] = associations
+
+    file_associations = settings.get("material-icon-theme.files.associations")
+    if not isinstance(file_associations, dict):
+        file_associations = {}
+    file_associations.update(MATERIAL_FILE_ASSOCIATIONS)
+    settings["material-icon-theme.files.associations"] = file_associations
+
+    folder_associations = settings.get("material-icon-theme.folders.associations")
+    if not isinstance(folder_associations, dict):
+        folder_associations = {}
+    folder_associations.update(MATERIAL_FOLDER_ASSOCIATIONS)
+
+    # Material Icon Theme associations are exact folder names rather than path
+    # wildcards. Map graph nodes and every direct node/clipboard child by name.
+    # This also covers saved clipboard snapshots that are no longer in the
+    # current graph without inventing path-specific wildcard settings.
+    associated_node_names = set(node_names or set())
+    for parent_name in ("node", "clipboard"):
+        parent = root / parent_name
+        if parent.is_dir():
+            associated_node_names.update(
+                child.name
+                for child in parent.iterdir()
+                if child.is_dir() and not child.name.startswith(".")
+            )
+    for old_name in previous_node_names or set():
+        if old_name not in associated_node_names and folder_associations.get(old_name) == "flow":
+            folder_associations.pop(old_name, None)
+    for node_name in associated_node_names:
+        folder_associations[node_name] = "flow"
+    settings["material-icon-theme.folders.associations"] = folder_associations
 
     for key in ["files.exclude", "search.exclude"]:
         current = settings.get(key)

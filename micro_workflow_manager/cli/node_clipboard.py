@@ -4,6 +4,8 @@ import shutil
 import uuid
 from pathlib import Path
 
+from .extras.scaffold import ensure_vscode_settings
+
 
 def clipboard_root(root: Path) -> Path:
     return root / "clipboard"
@@ -27,6 +29,7 @@ def copy_node_to_clipboard(root: Path, node: str) -> int:
     temporary.replace(destination)
     print(f"Saved clipboard node: {destination}")
     print(f"  files copied: {file_count}")
+    ensure_vscode_settings(root)
     return 0
 
 
@@ -47,4 +50,5 @@ def paste_node_from_clipboard(root: Path, node: str) -> int:
     temporary.replace(destination)
     print(f"Restored node from clipboard: {destination}")
     print(f"  files pasted: {file_count}")
+    ensure_vscode_settings(root)
     return 0
