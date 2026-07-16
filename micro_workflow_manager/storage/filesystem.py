@@ -7,6 +7,7 @@ from .job_index import JobIndexStorageMixin
 from .jobs import JobFileStorageMixin
 from .nodes import NodeFileStorageMixin
 from .runtime_config import RuntimeConfigStorageMixin
+from .sqlite_state import SQLiteStateMixin
 
 
 class FileStorage(
@@ -16,14 +17,11 @@ class FileStorage(
     JobFileStorageMixin,
     JobIndexStorageMixin,
     NodeFileStorageMixin,
+    SQLiteStateMixin,
     FileStorageBase,
 ):
-    """Default file-backed storage adapter.
+    """Hybrid storage: user payload files plus SQLite framework state."""
 
-    The rest of the workflow manager depends on this public storage API rather
-    than on one monolithic module. A future database adapter can implement the
-    same API and be selected at construction time without forcing scheduler or
-    CLI code to know where state is stored.
-    """
-
-    pass
+    def __init__(self, project_dir):
+        super().__init__(project_dir)
+        self._init_sqlite_state()

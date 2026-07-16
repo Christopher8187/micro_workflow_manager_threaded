@@ -9,6 +9,7 @@ import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeRouter, cli
 from micro_workflow_manager.models import DONE, FAILED, QUEUED, RUNNING
+from micro_workflow_manager.storage import FileStorage
 
 
 def write_project(tmp_path: Path, monkeypatch, *, graph="EDGES = [('A', 'B')]\n") -> Path:
@@ -87,16 +88,16 @@ def test_doctor_detects_missing_router_without_mutating_project(tmp_path, monkey
 
 
 
-def test_doctor_reports_malformed_status_and_continues(tmp_path, monkeypatch, capsys):
+def test_doctor_reports_malformed_payload_and_continues(tmp_path, monkeypatch, capsys):
     write_project(tmp_path, monkeypatch)
     capsys.readouterr()
-    status = tmp_path / "node" / "A" / "jobs" / "1" / "status.json"
-    status.write_text("{not json", encoding="utf-8")
+    payload = tmp_path / "node" / "A" / "jobs" / "1" / "input.json"
+    payload.write_text("{not json", encoding="utf-8")
 
     assert cli.main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "malformed JSON" in out
-    assert str(status) in out
+    assert str(payload) in out
 
 
 def test_events_and_inspect_show_job_history(tmp_path, monkeypatch, capsys):
@@ -105,8 +106,7 @@ def test_events_and_inspect_show_job_history(tmp_path, monkeypatch, capsys):
     assert cli.main(["run", "A"]) == 0
     capsys.readouterr()
 
-    events = tmp_path / "node" / "A" / "jobs" / "1" / "events.jsonl"
-    rows = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    rows = FileStorage(tmp_path).read_job_events("A", 1)
     names = [row["event"] for row in rows]
     assert "created" in names
     assert "started" in names
@@ -125,10 +125,11 @@ def test_recover_requeues_only_abandoned_running_jobs(tmp_path, monkeypatch, cap
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct", persist_graph=False, initialize_node_folders=False)
     workflow.graph([("A", "B")])
     workflow.storage.set_job_status("A", 1, RUNNING, pid=99999999, started_at="2020-01-01T00:00:00")
-    workflow.storage.atomic_write_json(
-        workflow.storage.job_control_file("A", 1),
-        {"version": 1, "generation": 0, "active_execution_id": "dead", "active_pid": 99999999},
-    )
+    with workflow.storage.db_transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET active_execution_id=?, active_pid=? WHERE node_name=? AND job_id=?",
+            ("dead", 99999999, "A", 1),
+        )
     workflow.storage.write_run_state(
         {
             "run_id": "dead-run",
@@ -303,16 +304,19 @@ def run(ctx, value):
 
     assert cli.main(["runfrom", "A"]) == 1
     capsys.readouterr()
-    a_status_before = json.loads((tmp_path / "node" / "A" / "jobs" / "1" / "status.json").read_text())
-    assert a_status_before["status"] == DONE
-    a_events_before = (tmp_path / "node" / "A" / "jobs" / "1" / "events.jsonl").read_text().count('"event":"started"')
+    storage = FileStorage(tmp_path)
+    assert storage.get_job_status("A", 1) == DONE
+    a_events_before = sum(
+        event.get("event") == "started" for event in storage.read_job_events("A", 1)
+    )
 
     assert cli.main(["resumefrom", "A"]) == 0
     capsys.readouterr()
-    a_events_after = (tmp_path / "node" / "A" / "jobs" / "1" / "events.jsonl").read_text().count('"event":"started"')
+    a_events_after = sum(
+        event.get("event") == "started" for event in storage.read_job_events("A", 1)
+    )
     assert a_events_after == a_events_before
-    b_status = json.loads((tmp_path / "node" / "B" / "jobs" / "1" / "status.json").read_text())
-    assert b_status["status"] == DONE
+    assert storage.get_job_status("B", 1) == DONE
 
 
 def test_describe_is_longer_than_help_and_uses_abstract_examples(capsys):
@@ -398,7 +402,7 @@ def test_active_run_state_contains_ownership_and_heartbeat(tmp_path, monkeypatch
     assert state["hostname"]
     assert state["pid"] > 0
     assert state["heartbeat_at"]
-    assert state["mwf_version"] == "0.3.3"
+    assert state["mwf_version"] == "0.3.4"
     assert state["status"] == "done"
 
 
@@ -410,43 +414,44 @@ def test_migrate_versions_only_framework_metadata(tmp_path, monkeypatch, capsys)
     config.pop("schema_version", None)
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    job_path = tmp_path / "node" / "A" / "jobs" / "1" / "job.json"
-    job_data = json.loads(job_path.read_text(encoding="utf-8"))
-    job_data.pop("schema_version", None)
-    job_path.write_text(json.dumps(job_data), encoding="utf-8")
     input_path = tmp_path / "node" / "A" / "jobs" / "1" / "input.json"
     output_path = tmp_path / "node" / "A" / "jobs" / "1" / "output.json"
     output_path.write_text('{"custom": true}', encoding="utf-8")
     input_before = input_path.read_bytes()
     output_before = output_path.read_bytes()
+    storage = FileStorage(tmp_path)
+    status_before = storage.read_job_status_data("A", 1)
 
     assert cli.main(["migrate", "--dry-run"]) == 0
     assert "Would migrate" in capsys.readouterr().out
     assert "schema_version" not in json.loads(config_path.read_text(encoding="utf-8"))
+    assert storage.read_job_status_data("A", 1) == status_before
 
     assert cli.main(["migrate"]) == 0
     capsys.readouterr()
-    assert json.loads(config_path.read_text(encoding="utf-8"))["schema_version"] == 1
-    assert json.loads(job_path.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert json.loads(config_path.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert storage.database_integrity_check() == "ok"
     assert input_path.read_bytes() == input_before
     assert output_path.read_bytes() == output_before
-
 
 def test_runfrom_plan_is_read_only(tmp_path, monkeypatch, capsys):
     write_project(tmp_path, monkeypatch)
     capsys.readouterr()
-    watched = [
-        tmp_path / ".mwf" / "project.json",
-        tmp_path / "node" / "A" / "node_state.json",
-        tmp_path / "node" / "A" / "jobs" / "1" / "job.json",
-    ]
-    before = {path: path.read_bytes() for path in watched}
+    storage = FileStorage(tmp_path)
+    config_path = tmp_path / ".mwf" / "project.json"
+    config_before = config_path.read_bytes()
+    jobs_before = storage.list_job_ids("A")
+    status_before = storage.read_job_status_data("A", 1)
+    tree_before = sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node").rglob("*"))
 
     assert cli.main(["runfrom", "A", "--plan"]) == 0
     out = capsys.readouterr().out
     assert "Plan for: mwf runfrom A" in out
     assert "no state, jobs, inputs, outputs, or node folders were changed" in out
-    assert {path: path.read_bytes() for path in watched} == before
+    assert config_path.read_bytes() == config_before
+    assert storage.list_job_ids("A") == jobs_before
+    assert storage.read_job_status_data("A", 1) == status_before
+    assert sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node").rglob("*")) == tree_before
     assert not (tmp_path / ".mwf" / "run.json").exists()
 
 
@@ -470,10 +475,11 @@ def test_cleanup_and_recover_dry_runs_do_not_mutate(tmp_path, monkeypatch, capsy
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct", persist_graph=False, initialize_node_folders=False)
     workflow.graph([("A", "B")])
     workflow.storage.set_job_status("A", 1, RUNNING, pid=99999999, started_at="2020-01-01T00:00:00")
-    workflow.storage.atomic_write_json(
-        workflow.storage.job_control_file("A", 1),
-        {"version": 1, "generation": 0, "active_execution_id": "dead", "active_pid": 99999999},
-    )
+    with workflow.storage.db_transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET active_execution_id=?, active_pid=? WHERE node_name=? AND job_id=?",
+            ("dead", 99999999, "A", 1),
+        )
     workflow.storage.write_run_state(
         {
             "run_id": "dead-run",
@@ -485,15 +491,15 @@ def test_cleanup_and_recover_dry_runs_do_not_mutate(tmp_path, monkeypatch, capsy
             "heartbeat_at": "2020-01-01T00:00:00",
         }
     )
-    status_before = workflow.storage.status_file("A", 1).read_bytes()
-    control_before = workflow.storage.job_control_file("A", 1).read_bytes()
+    status_before = workflow.storage.read_job_status_data("A", 1)
+    control_before = workflow.storage.read_job_control("A", 1)
     run_before = (tmp_path / ".mwf" / "run.json").read_bytes()
     capsys.readouterr()
 
     assert cli.main(["recover", "--dry-run"]) == 0
     assert "Would recover" in capsys.readouterr().out
-    assert workflow.storage.status_file("A", 1).read_bytes() == status_before
-    assert workflow.storage.job_control_file("A", 1).read_bytes() == control_before
+    assert workflow.storage.read_job_status_data("A", 1) == status_before
+    assert workflow.storage.read_job_control("A", 1) == control_before
     assert (tmp_path / ".mwf" / "run.json").read_bytes() == run_before
 
     node_before = sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node" / "A").rglob("*"))
@@ -685,7 +691,8 @@ def test_untimed_task_without_checkpoints_keeps_original_direct_fast_path(tmp_pa
 
     assert workflow.run_one("A") == "ok"
     assert observed == [caller]
-    assert not workflow.storage.job_runtime_file("A", 1).exists()
+    assert workflow.storage.read_job_runtime("A", 1) == {}
+    assert not (workflow.storage.job_base_dir("A", 1) / "runtime.json").exists()
     thread = workflow.scheduler_supervisor._thread
     assert thread is None or not thread.is_alive()
 
@@ -768,10 +775,7 @@ def run(ctx):
     output = json.loads((tmp_path / "node" / "A" / "jobs" / "1" / "output.json").read_text())
     assert output["result_repr"] == "'fallback'"
     assert not (tmp_path / "node" / "A" / "jobs" / "1" / "files" / "late.txt").exists()
-    events = [
-        json.loads(line)
-        for line in (tmp_path / "node" / "A" / "jobs" / "1" / "events.jsonl").read_text().splitlines()
-    ]
+    events = FileStorage(tmp_path).read_job_events("A", 1)
     assert any(
         event.get("event") == "timeout" and event.get("timeout_kind") == "checkpoint"
         for event in events

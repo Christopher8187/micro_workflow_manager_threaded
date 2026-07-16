@@ -4,6 +4,7 @@ import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeRouter
 from micro_workflow_manager.models import DONE
+from micro_workflow_manager.storage import FileStorage
 
 
 def test_router_rejects_bad_thread_and_retry_values():
@@ -365,8 +366,9 @@ def test_process_runner_executes_jobs_in_child_processes_and_keeps_dynamic_job_i
         "5",
         "6",
     ]
-    assert json.loads((tmp_path / "node" / "A" / "node_state.json").read_text())["status"] == "done"
-    assert json.loads((tmp_path / "node" / "B" / "node_state.json").read_text())["status"] == "done"
+    state = FileStorage(tmp_path)
+    assert state.get_node_status("A") == "done"
+    assert state.get_node_status("B") == "done"
 
 
 def test_process_runner_without_graph_path_explains_requirement(tmp_path):
@@ -384,8 +386,8 @@ def test_process_runner_without_graph_path_explains_requirement(tmp_path):
         workflow.run_node("A")
 
 
-def test_dirty_job_index_does_not_fail_dynamic_spawn(monkeypatch):
-    """A transient Windows-style index write failure must not kill job creation."""
+def test_dynamic_spawn_does_not_touch_legacy_job_index(monkeypatch):
+    """Dynamic creation is SQLite-native and never writes the legacy index file."""
     with tempfile.TemporaryDirectory() as project_dir:
         workflow = MicroWorkflow(project_dir=project_dir, runner="direct")
         workflow.graph([("A", "B")])
@@ -413,14 +415,14 @@ def test_dirty_job_index_does_not_fail_dynamic_spawn(monkeypatch):
         workflow.start("A")
         workflow.run()
 
-        assert failed_once["B"] is True
+        assert failed_once["B"] is False
         assert workflow.node_complete("A")
         assert workflow.node_complete("B")
         assert workflow.storage.node_job_summary("B")["counts"][DONE] == 1
 
 
-def test_threaded_high_fan_in_to_one_node_survives_index_contention(monkeypatch):
-    """Many workers spawning into one convergence node should not rely on a fragile index file."""
+def test_threaded_high_fan_in_to_one_node_avoids_legacy_index_contention(monkeypatch):
+    """Many workers spawning into one node use transactional SQLite allocation."""
     import time
 
     with tempfile.TemporaryDirectory() as project_dir:
@@ -454,7 +456,7 @@ def test_threaded_high_fan_in_to_one_node_survives_index_contention(monkeypatch)
 
         workflow.run()
 
-        assert failures_left["Z"] == 0
+        assert failures_left["Z"] == 5
         assert workflow.node_complete("A")
         assert workflow.node_complete("Z")
         assert workflow.storage.node_job_summary("Z")["total"] == 80

@@ -88,9 +88,8 @@ class JobCreationMixin:
                             self.storage.input_file(node_name, job_id),
                             default={},
                         )
-                        previous_job_data = self.storage.read_json(
-                            self.storage.job_file(node_name, job_id),
-                            default={},
+                        previous_job_data = self.storage.read_job_metadata(
+                            node_name, job_id
                         )
                         previous_parent = previous_job_data.get("parent")
                         previous_status = self.storage.get_job_status(node_name, job_id)

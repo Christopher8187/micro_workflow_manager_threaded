@@ -34,10 +34,10 @@ for a longer essay explaining behavior, file effects, and abstract examples.
 """
 
 COMMAND_HELP_DESCRIPTIONS = {
-    "init": "Initialize the current folder as an MWF project. This creates .mwf/project.json and lightweight editor/git sidecars but does not load task code.",
+    "init": "Initialize the current folder as an MWF project. This creates .mwf/project.json, .mwf/state.sqlite3, and lightweight editor/git sidecars but does not load task code.",
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
-    "migrate": "Upgrade only MWF-owned metadata to the current state schema. User inputs, outputs, returned files, and event logs are never rewritten.",
+    "migrate": "Upgrade MWF-owned JSON and SQLite state schemas. User inputs, outputs, returned files, and provenance are never rewritten.",
     "inspect": "Inspect a node/job; list failed job IDs, show retry/fallback filter bottlenecks, or show node debug output.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
     "clean": "Delete jobs and output for selected nodes while keeping node input files.",
@@ -45,7 +45,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "wipe": "Like clean, but remove selected nodes' input files as well.",
     "run": "Reset and run one ready node, or reset and run explicitly selected job IDs.",
     "restart": "Replace a live running attempt or requeue a failed/cancelled job without resetting completed work or starting a competing scheduler.",
-    "threads": "View or change a run-scoped max_threads override. Active threaded nodes scale live, and every override is cleared when its run finishes.",
+    "threads": "View or change a run-scoped max_threads override. Active threaded and API nodes scale live, and every override is cleared when its run finishes.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Continue unsuccessful or queued work for one node without resetting jobs that are already done or skipped.",
     "runfrom": "Reset and run one node and its descendants while respecting dependency readiness.",
@@ -56,8 +56,7 @@ COMMAND_HELP_DESCRIPTIONS = {
 COMMAND_DESCRIPTIONS = {
     "init": """
 The help text tells you that init creates an MWF project. In practical terms,
-this command creates a small .mwf/project.json marker in the current folder so later commands
-can find the project root from any subfolder. It does not import graph.py, create
+this command creates `.mwf/project.json`, initializes the transactional `.mwf/state.sqlite3` scheduler database, and writes editor/git sidecars. Later commands can find the project root from any subfolder. It does not import graph.py, create
 workflow nodes, or execute functions. That separation is useful because you can
 prepare a clean project shell before deciding what the graph should contain.
 
@@ -66,8 +65,7 @@ A minimal beginning is:
   cd simple_flow
   mwf init
 
-Afterward, create a graph file and register it with mwf graph. If .mwf/project.json already
-exists, init leaves the existing project configuration intact.
+Afterward, create a graph file and register it with mwf graph. If `.mwf/project.json` already exists, init preserves its configuration, upgrades sidecars, and ensures the SQLite schema is ready.
 """,
     "graph": """
 The help text describes graph as the explicit synchronization point. This means
@@ -94,8 +92,7 @@ copy any data you still need before synchronizing.
     "doctor": """
 Doctor is a read-only diagnostic pass. It builds on ordinary help by explaining
 why a project may fail before you spend time running it. It compares graph nodes,
-node folders, and node_behavior filenames; parses important JSON state files;
-checks whether a recorded run is live or stale; and warns about literal
+node folders, and node_behavior filenames; checks SQLite integrity and on-disk payload/config JSON; checks whether a recorded run is live or stale; and warns about literal
 ctx.node("B") calls whose A -> B edge is absent.
 
 Run it after editing the graph or moving the project between machines:
@@ -107,29 +104,31 @@ A warning does not necessarily make the project unusable, while an ERROR causes
 a nonzero exit status suitable for a simple test script.
 """,
     "migrate": """
-Migrate updates the schema_version field on framework-owned metadata so a project
-created by an older MWF release has an explicit, supported state format. It does
-not change input.json, output.json, returned files, or events.jsonl, because those
-contain user data or task results rather than scheduler metadata.
+Migrate upgrades low-churn MWF JSON metadata and the SQLite scheduler schema.
+On the first 0.3.4 migration it imports legacy job identity/status, queue markers,
+events, checkpoints, execution generations, idempotency keys, default-job
+manifests, and summary indexes into `.mwf/state.sqlite3`. User `input.json`,
+`output.json`, returned files, node input/output folders, and project provenance
+are never moved into the framework database.
 
-Preview the exact files first:
+Preview without creating the database or deleting legacy sidecars:
   mwf migrate --dry-run
 
 Then apply the migration:
   mwf migrate
 
-For a simple A -> B workflow, this may update .mwf/project.json, node_state.json, schema.json,
-job.json, status.json, execution.json, and the rebuildable job index. If a file
-claims a newer schema than the installed package supports, MWF refuses to
-downgrade it and asks you to use a compatible newer package.
+The importer removes only framework-owned legacy metadata after the transaction
+is durable. If JSON or SQLite state claims a newer incompatible schema, MWF
+refuses to downgrade it and asks you to install a compatible newer package.
 """,
+
     "inspect": """
-Inspect turns the file-backed state into a readable explanation. Node inspection
+Inspect turns the hybrid file/SQLite state into a readable explanation. Node inspection
 shows predecessors, successors, component membership, status counts, runner,
 total timeout, checkpoint timeout, and why the node is ready, blocked, complete,
 or failed. Job inspection additionally shows the active or last task, named
 checkpoint, checkpoint deadline, progress percentage/detail, input, output,
-execution generation, and chronological events.jsonl history.
+execution generation, and chronological lifecycle events stored in SQLite.
 
 Examples:
   mwf inspect process_number
@@ -140,9 +139,7 @@ Examples:
 
 A simple process_number task might report checkpoint "number chosen" with
 progress 50%, then call ctx.sleep(1) before doubling the number. The job view
-displays that live progress from runtime.json without executing or retrying
-anything. The filter view reconstructs the current execution funnel from each
-job's append-only events, showing how many jobs entered, resolved at, and
+displays that live progress from SQLite without executing or retrying anything. The filter view reconstructs the current execution funnel from each job's append-only event rows, showing how many jobs entered, resolved at, and
 remained after every main retry and fallback retry. The failed view gives
 copyable failed job IDs and concise errors. If the checkpoint
 deadline expires, inspect shows the timeout reason and the event history shows
@@ -153,7 +150,7 @@ Recover is for an interrupted command whose owning process is definitely gone.
 Active runs write a hostname, process ID, and scheduler heartbeat to
 .mwf/run.json. The scheduler supervisor also manages job checkpoint deadlines,
 but the two signals remain separate: a fresh run heartbeat proves the scheduler
-is alive, while runtime.json describes one job's latest progress. Recover uses
+is alive, while the job runtime row describes one job's latest progress. Recover uses
 run ownership and each running job's execution record before it acts. It advances
 the execution generation first, then requeues only abandoned running jobs, which
 prevents a late stale process from committing afterward.
@@ -189,8 +186,7 @@ five job records. It does not run the function and does not delete files you put
 in node/make_number/input/. Use reset when you want to keep the same jobs.
 """,
     "reset": """
-Reset preserves job.json and input.json but removes each selected job's status,
-result metadata, and job-local files so every existing job becomes queued again.
+Reset preserves each SQLite job identity and `input.json`, but clears status/result state and job-local returned files so every existing job becomes queued again.
 It also clears node output. This is useful when the inputs are correct and you
 simply want all jobs to execute again.
 
@@ -227,7 +223,7 @@ Examples:
   mwf run process_number jobs 1 3-5
 
 A basic task might choose a random integer, double it, or call ctx.sleep(1). Run
-uses the configured threaded, process, or direct runner and refuses to start if
+uses the configured threaded, API, process, or direct runner and refuses to start if
 another CLI sequence already owns the project. To preserve completed work after
 a failure, use resume rather than run.
 """,
@@ -263,12 +259,10 @@ Examples:
   mwf threads <node-name> -1
   mwf threads <node-name> reset
 
-For an active threaded node, increasing the value starts additional queued jobs
+For an active threaded or API node, increasing the value starts additional queued jobs
 within roughly 0.2 seconds. Decreasing it never kills jobs already running; MWF
 stops launching replacements until active concurrency falls to the new limit.
-For example, a node declared with max_threads=2 can be raised to 5 during a
-test. The override is scoped to the active or next run and is cleared when that run finishes. Process pools read the override when they are
-created, while a direct runner always executes one job at a time.
+For example, a node declared with `max_threads=2` can be raised to 5 during a test. The API runner interprets the setting as maximum in-flight blocking calls and fills it eagerly; the threaded runner grows adaptively. The override is scoped to the active or next run and is cleared when that run finishes. Process pools read it when created, while a direct runner always executes one job at a time.
 """,
     "deploy": """
 Deploy is an explicit two-stage copy workflow for testing code on another machine.
@@ -335,9 +329,9 @@ reruns the failed B job, and then allows C to continue when B completes. It does
 not delete parent-created jobs merely because they belong to a descendant node.
 """,
     "monitor": """
-Monitor is a read-only live view over node_state.json, job_index.json, and job
-status files. It is safe to run in another terminal because it never claims the
-run slot or calls node functions.
+Monitor is a read-only live view over SQLite node/job summaries plus the
+low-churn `.mwf/run.json` ownership record. It is safe to run in another
+terminal because WAL readers do not claim the run slot or call node functions.
 
 Examples:
   mwf monitor
@@ -345,7 +339,9 @@ Examples:
   mwf monitor --json --once
 
 During a task that waits for several seconds, monitor shows the running job ID,
-queued and completed counts, average duration, and approximate remaining time.
-Use inspect when you need the detailed history of one specific node or job.
+queued and completed counts, effective `max_threads`, average duration, and
+approximate remaining time. Use inspect when you need the detailed lifecycle,
+checkpoint, retry, or fallback history of one specific node or job.
 """,
+
 }

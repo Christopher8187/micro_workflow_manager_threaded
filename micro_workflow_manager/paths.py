@@ -8,6 +8,7 @@ MWF_RUN_NAME = "run.json"
 MWF_THREADS_NAME = "threads.json"
 MWF_LOCKS_NAME = "locks"
 MWF_DEPLOY_NAME = "deploy"
+MWF_STATE_DATABASE_NAME = "state.sqlite3"
 
 LEGACY_CONFIG_NAME = ".mwf"
 LEGACY_RUN_NAME = ".mwf_run.json"
@@ -37,3 +38,7 @@ def locks_dir(root: Path) -> Path:
 
 def deploy_dir(root: Path) -> Path:
     return mwf_dir(root) / MWF_DEPLOY_NAME
+
+
+def state_database_file(root: Path) -> Path:
+    return mwf_dir(root) / MWF_STATE_DATABASE_NAME

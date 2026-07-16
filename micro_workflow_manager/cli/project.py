@@ -43,7 +43,7 @@ def init_project(archive_path: str | None = None) -> int:
         write_json(
             path,
             {
-                "version": 3,
+                "version": 4,
                 "schema_version": CURRENT_STATE_SCHEMA_VERSION,
                 "graph_path": None,
                 "runner": "threaded",
@@ -51,6 +51,10 @@ def init_project(archive_path: str | None = None) -> int:
             },
         )
         print(f"  created project configuration: {path}")
+
+    storage = FileStorage(root)
+    database_path = storage.state_database_path()
+    print(f"  initialized SQLite state database: {database_path}")
 
     print(f"  runtime directory: {mwf_dir(root)}")
     print(f"  node directory: {root / 'node'}")
@@ -156,7 +160,7 @@ def setup_graph(
         print("  no configuration or node folders were changed")
         return 0
 
-    config["version"] = 3
+    config["version"] = 4
     config["schema_version"] = CURRENT_STATE_SCHEMA_VERSION
     config["graph_path"] = path.relative_to(root).as_posix()
     config["edges"] = edges
@@ -382,12 +386,13 @@ def _synchronize_node_folders(root: Path, expected_nodes: set[str], stale_nodes:
     node_root = root / "node"
     node_root.mkdir(parents=True, exist_ok=True)
 
+    storage = FileStorage(root)
     for node in stale_nodes:
         path = node_root / safe_node_name(node)
         if path.exists():
             shutil.rmtree(path)
+        storage.delete_node_state(node)
 
-    storage = FileStorage(root)
     for node in sorted(expected_nodes):
         storage.init_node_folders(node)
         if storage.get_node_status(node) is None:

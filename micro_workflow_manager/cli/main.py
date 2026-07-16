@@ -40,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
             return init_project(args.archive)
 
         root = find_root()
+        # Migration previews must be strictly read-only, including for projects
+        # that still contain legacy runtime layout or lock directories.
+        if args.command == "migrate" and args.dry_run:
+            return migrate_command(root, dry_run=True)
         ensure_runtime_layout(root)
 
         if args.command == "copy":

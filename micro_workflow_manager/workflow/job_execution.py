@@ -60,57 +60,6 @@ class JobExecutionMixin:
                 f"Job {node_name}/{job_id} generation {generation} was restarted"
             )
 
-    def _execute_job_attempt_in_thread(
-        self,
-        job: Job,
-        generation: int,
-        execution_id: str,
-    ) -> tuple[Event, Queue]:
-        """Start one handler attempt in an abandonable daemon thread.
-
-        Python cannot safely force-kill an arbitrary thread that may be inside a
-        third-party HTTP/C call. The supervisor can, however, stop waiting for a
-        superseded generation immediately and start the replacement generation.
-        The abandoned thread is fenced from all final commits and guarded
-        JobContext side effects.
-        """
-        done = Event()
-        outcomes: Queue = Queue(maxsize=1)
-
-        def target():
-            previous_node_name = getattr(self._job_context, "node_name", None)
-            previous_job_id = getattr(self._job_context, "job_id", None)
-            previous_generation = getattr(self._job_context, "generation", None)
-            previous_execution_id = getattr(self._job_context, "execution_id", None)
-            self._job_context.node_name = job.node_name
-            self._job_context.job_id = job.job_id
-            self._job_context.generation = generation
-            self._job_context.execution_id = execution_id
-
-            try:
-                result = self.execute_with_fallbacks(
-                    job,
-                    execution_generation=generation,
-                    execution_id=execution_id,
-                )
-            except BaseException as error:
-                outcomes.put(("error", error))
-            else:
-                outcomes.put(("result", result))
-            finally:
-                self._job_context.node_name = previous_node_name
-                self._job_context.job_id = previous_job_id
-                self._job_context.generation = previous_generation
-                self._job_context.execution_id = previous_execution_id
-                done.set()
-
-        Thread(
-            target=target,
-            name=f"mwf-attempt-{job.node_name}-{job.job_id}-g{generation}",
-            daemon=True,
-        ).start()
-        return done, outcomes
-
     def _run_job_unfenced(
         self,
         node_name: str,
@@ -208,43 +157,33 @@ class JobExecutionMixin:
         if not self.active_job_restart_enabled:
             return self._run_job_unfenced(node_name, job_id)
 
-        # A manual restart increments the generation. The same scheduler-owned
-        # run_job call notices that fence, abandons the old handler thread, and
-        # immediately loops into the replacement generation. This lets an
-        # existing run/runfrom sequence continue without a competing CLI run.
+        # The runner worker is now the attempt controller. It invokes the
+        # fallback/retry pipeline synchronously and creates only one extra
+        # abandonable thread for the currently executing user handler. A
+        # restart wakes this controller, which immediately loops into the new
+        # generation while the stale handler remains fenced.
         while True:
             job = self.storage.load_job(node_name, job_id)
             started_at = now()
             started_perf = perf_counter()
             generation, execution_id = self.storage.claim_job_execution(
-                node_name,
-                job_id,
-                started_at=started_at,
-            )
-            done, outcomes = self._execute_job_attempt_in_thread(
-                job,
-                generation,
-                execution_id,
+                node_name, job_id, started_at=started_at
             )
 
-            superseded = False
-            while not done.wait(self.restart_poll_interval_seconds):
-                if not self.storage.job_execution_is_current(
-                    node_name,
-                    job_id,
-                    generation,
-                    execution_id,
-                ):
-                    superseded = True
-                    break
-
-            if superseded:
+            try:
+                result = self.execute_with_fallbacks(
+                    job,
+                    execution_generation=generation,
+                    execution_id=execution_id,
+                )
+                outcome_kind, payload = "result", result
+            except JobRestartedError as error:
                 self.scheduler_supervisor.cancel_execution(
                     node_name,
                     job_id,
                     generation,
                     execution_id,
-                    reason=f"Job {node_name}/{job_id} generation {generation} was restarted",
+                    reason=str(error),
                 )
                 self.storage.write_debug(
                     node_name,
@@ -252,22 +191,17 @@ class JobExecutionMixin:
                     "starting the requested replacement",
                 )
                 continue
-
-            outcome_kind, payload = outcomes.get()
+            except BaseException as error:
+                outcome_kind, payload = "error", error
 
             try:
                 with self.storage.guard_job_execution(
-                    node_name,
-                    job_id,
-                    generation,
-                    execution_id,
+                    node_name, job_id, generation, execution_id
                 ):
                     if outcome_kind == "result":
                         result = payload
                         stored_files = self.storage.store_returned_files(
-                            node_name,
-                            job_id,
-                            result,
+                            node_name, job_id, result
                         )
                         self.storage.write_output(
                             node_name,
@@ -292,10 +226,7 @@ class JobExecutionMixin:
                         )
                     else:
                         error = payload
-                        self.storage.write_debug(
-                            node_name,
-                            f"job {job_id} failed: {error}",
-                        )
+                        self.storage.write_debug(node_name, f"job {job_id} failed: {error}")
                         self.storage.write_output(
                             node_name,
                             job_id,
@@ -328,12 +259,27 @@ class JobExecutionMixin:
 
             if outcome_kind == "result":
                 return payload
-
             error = payload
             if isinstance(error, BaseException) and not isinstance(error, Exception):
                 raise error
             raise JobFailedError(f"Job {node_name}/{job_id} failed") from error
 
+    def _call_mounted_handler(self, mounted, ctx: JobContext, params: dict):
+        previous_node_name = getattr(self._job_context, "node_name", None)
+        previous_job_id = getattr(self._job_context, "job_id", None)
+        previous_generation = getattr(self._job_context, "generation", None)
+        previous_execution_id = getattr(self._job_context, "execution_id", None)
+        self._job_context.node_name = ctx.current_node
+        self._job_context.job_id = ctx.job_id
+        self._job_context.generation = ctx.execution_generation
+        self._job_context.execution_id = ctx.execution_id
+        try:
+            return mounted.handler(ctx, **params)
+        finally:
+            self._job_context.node_name = previous_node_name
+            self._job_context.job_id = previous_job_id
+            self._job_context.generation = previous_generation
+            self._job_context.execution_id = previous_execution_id
 
     def _invoke_handler_with_timeout(
         self,
@@ -342,17 +288,18 @@ class JobExecutionMixin:
         params: dict,
         watch,
     ):
-        """Invoke one handler under the centralized scheduler supervisor.
+        """Invoke one handler with at most one abandonable handler thread.
 
-        Untimed handlers still execute directly. A total timeout or checkpoint
-        timeout opts the handler into one abandonable daemon thread, while the
-        single scheduler supervisor owns every deadline and the CLI heartbeat.
+        The current runner worker is the controller. Untimed programmatic jobs
+        execute directly. Timeout-supervised or actively restartable CLI jobs
+        run the user handler in exactly one daemon thread; the controller waits
+        for completion, a centralized deadline, or a changed execution lease.
         """
         supervisor = self.scheduler_supervisor
 
-        if not watch.supervised:
+        if not watch.abandonable:
             try:
-                result = mounted.handler(ctx, **params)
+                result = self._call_mounted_handler(mounted, ctx, params)
             except BaseException as error:
                 supervisor.finish_attempt(watch, state="failed", error=error)
                 raise
@@ -364,11 +311,12 @@ class JobExecutionMixin:
 
         def target():
             try:
-                outcomes.put(("result", mounted.handler(ctx, **params)))
+                outcomes.put(("result", self._call_mounted_handler(mounted, ctx, params)))
             except BaseException as error:
                 outcomes.put(("error", error))
             finally:
                 supervisor.signal_handler_complete(watch)
+                self.storage.close_thread_connection()
 
         Thread(
             target=target,
@@ -376,9 +324,24 @@ class JobExecutionMixin:
             daemon=True,
         ).start()
 
-        # The wake event is set by either handler completion or the one central
-        # scheduler watchdog. No per-attempt timeout polling/thread is needed.
-        watch.wake_event.wait()
+        while not watch.wake_event.wait(self.restart_poll_interval_seconds):
+            if ctx.execution_id is not None and not self.storage.job_execution_is_current(
+                ctx.current_node,
+                ctx.job_id,
+                ctx.execution_generation,
+                ctx.execution_id,
+            ):
+                supervisor.cancel_execution(
+                    ctx.current_node,
+                    ctx.job_id,
+                    ctx.execution_generation,
+                    ctx.execution_id,
+                    reason=(
+                        f"Job {ctx.current_node}/{ctx.job_id} generation "
+                        f"{ctx.execution_generation} was restarted"
+                    ),
+                )
+
         restart_error = supervisor.execution_cancel_error(watch)
         if restart_error is not None:
             supervisor.finish_attempt(watch, state="superseded", error=restart_error)
@@ -521,6 +484,9 @@ class JobExecutionMixin:
                         cancellation_event=cancellation_event,
                         total_timeout=mounted.timeout,
                         checkpoint_timeout=mounted.checkpoint_timeout,
+                        force_abandonable=(
+                            self.active_job_restart_enabled and execution_id is not None
+                        ),
                     )
                     ctx = JobContext(
                         system=self,

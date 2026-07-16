@@ -35,7 +35,6 @@ class NodeFileStorageMixin:
         job_id = self.validate_job_id(job_id)
         path = self.safe_join(self.jobs_dir(node_name), str(job_id))
         path.mkdir(parents=True, exist_ok=True)
-        self.files_dir(node_name, job_id)
         return path
 
     def files_dir(self, node_name: str, job_id: int) -> Path:
@@ -60,9 +59,8 @@ class NodeFileStorageMixin:
         return self.node_dir(node_name) / "job_index.json"
 
     def queued_dir(self, node_name: str) -> Path:
-        path = self.node_dir(node_name) / "queued"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        """Legacy compatibility path; queue membership now lives in SQLite."""
+        return self.node_dir(node_name) / "queued"
 
     def queued_marker_file(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
@@ -72,9 +70,8 @@ class NodeFileStorageMixin:
         return self.node_dir(node_name) / "job_index.dirty"
 
     def idempotency_dir(self, node_name: str) -> Path:
-        path = self.node_dir(node_name) / "idempotency"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        """Legacy compatibility path; idempotency keys now live in SQLite."""
+        return self.node_dir(node_name) / "idempotency"
 
     def idempotency_file(self, node_name: str, key_hash: str) -> Path:
         return self.idempotency_dir(node_name) / f"{key_hash}.json"
@@ -110,7 +107,6 @@ class NodeFileStorageMixin:
         self.node_input_dir(node_name)
         self.node_output_dir(node_name)
         self.jobs_dir(node_name)
-        self.queued_dir(node_name)
 
     def input_path(self, node_name: str, *parts: str) -> Path:
         return self.safe_join(self.node_input_dir(node_name), *parts)
@@ -272,31 +268,21 @@ class NodeFileStorageMixin:
 
     def set_node_status(self, node_name: str, status: str):
         status = self.validate_status(status)
-        path = self.node_state_file(node_name)
-        current = self.read_json(path, default=None)
-        if isinstance(current, dict) and current.get("status") == status:
-            return
-
-        with self.lock:
-            current = self.read_json(path, default=None)
-            if isinstance(current, dict) and current.get("status") == status:
-                return
-            self.atomic_write_json(
-                path,
-                {
-                    "schema_version": CURRENT_STATE_SCHEMA_VERSION,
-                    "node": node_name,
-                    "status": status,
-                },
+        node_name = self.validate_node_name(node_name)
+        with self.db_transaction() as connection:
+            connection.execute(
+                "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
+                "updated_at=CURRENT_TIMESTAMP",
+                (node_name, status),
             )
 
     def get_node_status(self, node_name: str) -> str | None:
-        data = self.read_json(self.node_state_file(node_name), default=None)
-
-        if data is None:
-            return None
-
-        return data.get("status")
+        row = self.db_connection().execute(
+            "SELECT status FROM nodes WHERE node_name=?",
+            (self.validate_node_name(node_name),),
+        ).fetchone()
+        return None if row is None else row["status"]
 
     def write_debug(self, node_name: str, message: str):
         from datetime import datetime

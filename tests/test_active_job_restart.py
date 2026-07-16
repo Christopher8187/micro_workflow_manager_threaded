@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from micro_workflow_manager import cli
+from micro_workflow_manager.storage import FileStorage
 
 
 def wait_until(predicate, timeout: float = 8.0, interval: float = 0.02):
@@ -92,15 +93,11 @@ def test_restart_command_replaces_running_generation_inside_existing_runfrom(
     active_thread.start()
 
     started_flag = tmp_path / "node" / "A" / "input" / "old_started.flag"
-    status_file = tmp_path / "node" / "A" / "jobs" / "1" / "status.json"
-    control_file = tmp_path / "node" / "A" / "jobs" / "1" / "execution.json"
+    state = FileStorage(tmp_path)
 
     wait_until(lambda: started_flag.exists())
-    wait_until(
-        lambda: status_file.exists()
-        and json.loads(status_file.read_text(encoding="utf-8")).get("status") == "running"
-    )
-    wait_until(lambda: control_file.exists())
+    wait_until(lambda: state.get_job_status("A", 1) == "running")
+    wait_until(lambda: bool(state.read_job_control("A", 1).get("active_execution_id")))
 
     before = json.loads((tmp_path / ".mwf" / "run.json").read_text(encoding="utf-8"))
     assert before["status"] == "running"
@@ -166,8 +163,7 @@ def test_restart_refuses_non_running_job_without_queueing_it(tmp_path, monkeypat
     error = capsys.readouterr().err
     assert "No live mwf run/runfrom sequence" in error
 
-    status_file = tmp_path / "node" / "A" / "jobs" / "1" / "status.json"
-    assert not status_file.exists()
+    assert FileStorage(tmp_path).get_job_status("A", 1) == "queued"
 
 
 def test_restart_refuses_queued_job_even_when_a_run_record_is_live(
@@ -190,7 +186,7 @@ def test_restart_refuses_queued_job_even_when_a_run_record_is_live(
     assert cli.main(["restart", "A", "job", "1"]) == 1
     error = capsys.readouterr().err
     assert "not currently running" in error
-    assert not (tmp_path / "node" / "A" / "jobs" / "1" / "status.json").exists()
+    assert FileStorage(tmp_path).get_job_status("A", 1) == "queued"
 
 
 def test_run_job_command_refuses_to_compete_with_live_sequence(
@@ -261,9 +257,12 @@ def test_restart_command_replaces_running_generation_in_process_runner(
 
     try:
         started_flag = tmp_path / "node" / "A" / "input" / "old_started.flag"
-        control_file = tmp_path / "node" / "A" / "jobs" / "1" / "execution.json"
+        state = FileStorage(tmp_path)
         wait_until(lambda: started_flag.exists(), timeout=20)
-        wait_until(lambda: control_file.exists(), timeout=20)
+        wait_until(
+            lambda: bool(state.read_job_control("A", 1).get("active_execution_id")),
+            timeout=20,
+        )
 
         command = subprocess.run(
             [sys.executable, "-m", "micro_workflow_manager", "restart", "A", "job", "1"],
@@ -339,10 +338,9 @@ def run(ctx):
     )
     active_thread.start()
 
-    runtime_file = tmp_path / "node" / "A" / "jobs" / "1" / "runtime.json"
+    state = FileStorage(tmp_path)
     wait_until(
-        lambda: runtime_file.exists()
-        and json.loads(runtime_file.read_text(encoding="utf-8")).get("checkpoint_name")
+        lambda: state.read_job_runtime("A", 1).get("checkpoint_name")
         == "old generation waiting"
     )
 
@@ -361,13 +359,12 @@ def run(ctx):
     # watch must have been removed rather than emitting a late timeout or
     # replacing the new generation's runtime state.
     time.sleep(0.55)
-    runtime = json.loads(runtime_file.read_text(encoding="utf-8"))
+    runtime = state.read_job_runtime("A", 1)
     assert runtime["generation"] == 1
     assert runtime["state"] == "completed"
     assert runtime["checkpoint_name"] == "replacement generation"
     assert runtime["progress"] == 1.0
 
-    events_file = tmp_path / "node" / "A" / "jobs" / "1" / "events.jsonl"
-    events = [json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()]
+    events = state.read_job_events("A", 1)
     assert not any(event.get("event") == "timeout" for event in events)
     assert not (tmp_path / "node" / "A" / "jobs" / "1" / "files" / "stale.txt").exists()

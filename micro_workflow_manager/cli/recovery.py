@@ -46,27 +46,18 @@ def recover_stale_jobs(
 
     recovered: list[dict[str, Any]] = []
     for node in sorted(set(candidate_nodes)):
-        jobs_root = node_root / node / "jobs"
-        if not jobs_root.is_dir():
-            continue
-        for path in sorted(jobs_root.iterdir(), key=lambda item: int(item.name) if item.name.isdigit() else 10**18):
-            if not path.is_dir() or not path.name.isdigit():
-                continue
-            job_id = int(path.name)
+        for job_id in storage.list_job_ids(node):
             if storage.get_job_status(node, job_id) != RUNNING:
                 continue
 
-            status_data = storage.read_json(storage.status_file(node, job_id), default={})
+            status_data = storage.read_job_status_data(node, job_id)
             pid = status_data.get("pid") if isinstance(status_data, dict) else None
             control = storage.read_job_control(node, job_id)
             active_pid = control.get("active_pid") or pid
             if type(active_pid) is int and process_is_alive(active_pid):
-                # A job may belong to a programmatic run without .mwf/run.json.
-                # Do not recover a demonstrably live owner.
                 continue
 
             if dry_run:
-                control = storage.read_job_control(node, job_id)
                 recovered.append({
                     "node": node,
                     "job_id": job_id,

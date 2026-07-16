@@ -4,6 +4,7 @@ import textwrap
 from pathlib import Path
 
 from micro_workflow_manager import cli
+from micro_workflow_manager.storage import FileStorage
 
 
 def make_cycle_project(tmp_path: Path, monkeypatch):
@@ -97,7 +98,7 @@ EDGES = [
 
 
 def node_status(tmp_path: Path, node: str) -> str:
-    return json.loads((tmp_path / "node" / node / "node_state.json").read_text())["status"]
+    return FileStorage(tmp_path).get_node_status(node)
 
 
 def test_runfrom_supports_self_and_mutual_autostart_cycles_before_downstream(tmp_path, monkeypatch, capsys):

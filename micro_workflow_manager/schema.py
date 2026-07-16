@@ -1,8 +1,10 @@
-"""Versioning for MWF-owned file-backed state.
+"""Versioning for MWF-owned persisted state.
 
-The schema version applies only to framework metadata. User inputs, task
-outputs, returned files, and events.jsonl are deliberately excluded.
+The JSON schema applies to low-churn framework configuration. High-churn job,
+queue, event, execution, checkpoint, idempotency, node-status, and advisory-lock
+state has its own SQLite schema version. User inputs, outputs, and returned
+files are deliberately excluded from both framework schemas.
 """
 
-CURRENT_STATE_SCHEMA_VERSION = 1
+CURRENT_STATE_SCHEMA_VERSION = 2
 STATE_SCHEMA_FIELD = "schema_version"

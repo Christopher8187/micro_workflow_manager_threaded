@@ -2,54 +2,41 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 
 class JobEventStorageMixin:
-    """Append-only, per-job lifecycle history.
-
-    Events are intentionally not part of scheduler state. A damaged or deleted
-    events.jsonl never changes whether a job can run; it only reduces history.
-    This keeps inspection useful without putting the hot scheduler path behind
-    a large shared manifest.
-    """
-
-    def job_events_file(self, node_name: str, job_id: int) -> Path:
-        return self.job_base_dir(node_name, job_id) / "events.jsonl"
+    """Append-only lifecycle history stored as indexed SQLite rows."""
 
     def append_job_event(self, node_name: str, job_id: int, event: str, **data: Any):
         self.validate_job_id(job_id)
-        row = {
-            "time": datetime.now().isoformat(timespec="milliseconds"),
-            "event": str(event),
-            **data,
-        }
-        line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
-        # Only executions of the same job contend on this lock. There is no
-        # node-wide or project-wide event log bottleneck.
-        with self.interprocess_lock(f"job-{node_name}-{job_id}-events"):
-            self.append_text(self.job_events_file(node_name, job_id), line)
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+        with self.db_transaction() as connection:
+            connection.execute(
+                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (
+                    node_name,
+                    job_id,
+                    event_time,
+                    str(event),
+                    json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
 
     def read_job_events(self, node_name: str, job_id: int) -> list[dict[str, Any]]:
-        path = self.job_events_file(node_name, job_id)
-        if not path.exists():
-            return []
-
-        rows: list[dict[str, Any]] = []
-        for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not raw.strip():
-                continue
+        rows = self.db_connection().execute(
+            "SELECT time, event, data_json FROM job_events "
+            "WHERE node_name=? AND job_id=? ORDER BY event_id",
+            (node_name, self.validate_job_id(job_id)),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
             try:
-                value = json.loads(raw)
+                data = json.loads(row["data_json"] or "{}")
             except json.JSONDecodeError as error:
-                rows.append({
-                    "event": "invalid_event_line",
-                    "line": line_number,
-                    "error": str(error),
-                    "raw": raw,
-                })
-                continue
-            if isinstance(value, dict):
-                rows.append(value)
-        return rows
+                data = {"error": str(error), "raw": row["data_json"]}
+            if not isinstance(data, dict):
+                data = {"value": data}
+            result.append({"time": row["time"], "event": row["event"], **data})
+        return result

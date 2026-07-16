@@ -5,7 +5,7 @@ from typing import Callable
 from .models import MountedTask
 
 
-NODE_RUNNER_CHOICES = {"direct", "threaded", "process"}
+NODE_RUNNER_CHOICES = {"direct", "threaded", "api", "process"}
 
 
 def validate_non_negative_int(name: str, value: int) -> int:
@@ -35,6 +35,8 @@ def validate_node_runner(runner: str | None) -> str | None:
 
     aliases = {
         "thread": "threaded",
+        "io": "api",
+        "network": "api",
         "processes": "process",
         "process_pool": "process",
         "processpool": "process",

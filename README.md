@@ -1,6 +1,6 @@
-# micro-workflow-manager 0.3.3
+# micro-workflow-manager 0.3.4
 
-A small file-backed DAG workflow manager. Each node has inspectable `input/`, `output/`, and `jobs/` folders, one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
+A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
 
 ## Design requirement: durable result and debugging provenance
@@ -9,30 +9,40 @@ The `output/` folder is not only a place for the final value. A well-designed
 node writes both the durable result that can be reused or reformatted **and**
 user-owned provenance that makes the result easier to debug and improve. Useful
 provenance includes the relevant inputs, algorithm/model/tool choice, attempt or
-fallback, validation evidence, and important parameters. Framework files such as
-`runtime.json` and `events.jsonl` explain scheduler behavior; they do not replace
-domain provenance written by the project.
+fallback, validation evidence, and important parameters. Framework diagnostics in `.mwf/state.sqlite3` explain scheduler behavior and are shown by `mwf inspect`; they do not replace domain provenance written by the project.
 
 See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
 
-## What changed in 0.3.3
+## What changed in 0.3.4
 
-- `mwf inspect <node-name> filter` reconstructs a clear main-attempt,
-  retry, fallback, and fallback-retry funnel from each job's latest event
-  history. It shows jobs entered, passed, and remaining at every stage, then
-  ends with the exact failed jobs and restart commands.
-- Generated `.gitignore` rules now ignore every descendant of `idempotency/`
-  under both `node/<name>/` and `clipboard/<name>/`, matching `jobs/` and
-  `queued/` runtime handling.
-- `mwf init` and graph synchronization add Material Icon Theme associations for
-  `graph.py`, `node/`, `clipboard/`, actual node names, `input/`, `output/`,
-  `jobs/`, `queued/`, `idempotency/`, and related project folders while
-  preserving unrelated VS Code settings.
-- `DESIGN.md` and nine tested, offline examples demonstrate output provenance,
-  node naming, autostart, dynamic job passing, joins, retries, and fallbacks.
+- The synchronous execution stack is flatter. A runner worker is now the
+  attempt controller and invokes retry/fallback orchestration directly. For a
+  supervised or actively restartable attempt, it creates exactly one
+  abandonable `mwf-handler-*` thread for the current user handler; the old
+  worker -> attempt thread -> handler thread stack is gone.
+- The new `api` runner is designed for blocking network/API/I/O jobs. It fills
+  the requested concurrency immediately and intentionally keeps the familiar
+  `max_threads` setting, where the value means maximum in-flight API jobs.
+  `io` and `network` are accepted aliases.
+- `mwf init` creates `.mwf/state.sqlite3`. Job identity and status, queue
+  membership, node status, lifecycle events, retries/fallback diagnostics,
+  execution generations, checkpoints, idempotency keys, default-job
+  declarations, summary counts, and cross-process advisory locks now live in
+  SQLite with WAL enabled.
+- User data remains ordinary files: node `input/`, node `output/`, job
+  `input.json`, job `output.json`, and returned `jobs/<id>/files/` are not moved
+  into the database. Existing 0.3.3-and-earlier metadata is imported once and
+  removed only after it is durable in SQLite.
+- `mwf migrate --dry-run` remains read-only, while `doctor`, `monitor`,
+  `inspect`, restart/recovery, cleanup, clipboard, deployment, process running,
+  and filter-funnel inspection preserve their previous functionality against
+  the new state backend.
+- The generated Material Icon Theme settings no longer force the top-level
+  `node` folder to use the `flow` icon. Exact graph-node folder names still use
+  `flow`, and unrelated user associations remain untouched.
 
 
 ## What changed in 0.3.2
@@ -196,35 +206,38 @@ A complete runnable version of the simple addition example is included in
 The original `ctx.input_path()`, `ctx.write_output()`, `ctx.write()`, and
 `ctx.node()` methods remain supported. Filesystem objects are the recommended
 client-facing architecture, not a forced migration or a second storage system.
-They are thin declarations over the same file-backed storage, scheduler guards,
-transactions, and downstream job APIs, so they do not add project scans or
-per-file background work.
+They are thin declarations over the same hybrid storage, scheduler guards, transactions, and downstream job APIs. Payload paths remain files, while scheduler mutations use SQLite, so the declarations do not add project scans or per-file background work.
 
 ## Consolidated project runtime directory
 
-MWF 0.3.0 keeps framework-owned project state together instead of scattering
-hidden files across the project root:
+Framework-owned project state is consolidated under `.mwf/`:
 
 ```text
 .mwf/
-  project.json       # graph path, stored edges, and default runner
-  run.json           # active/recent CLI run ownership and heartbeat
-  threads.json       # optional runtime max_threads overrides
-  locks/             # reusable cross-process lock files
-  deploy/            # server setup and the replaceable local deployment archive
+  project.json       # graph path, stored edges, default runner, low-churn config
+  run.json           # active/recent CLI ownership and scheduler heartbeat
+  threads.json       # optional run-scoped max_threads overrides
+  state.sqlite3      # jobs, queue, events, checkpoints, idempotency, advisory locks
+  deploy/            # server setup and replaceable local deployment archive
 ```
 
-Projects created by MWF 0.2.6 or earlier are migrated automatically on first
-use: the old `.mwf` JSON file, `.mwf_run.json`, `.mwf_threads.json`, and
-`.mwf_locks/` are moved into the directory above. The migration is idempotent.
-The generated `.gitignore` now ignores `.mwf/` rather than listing obsolete
-root-level runtime paths. It applies the same runtime-only exclusions to node
-clipboard snapshots: nested `input/` and `output/` directories, `jobs/`,
-`queued/`, `idempotency/`, and rebuildable node-state/index files are ignored, while direct
-files in `clipboard/<node>/input/` and `clipboard/<node>/output/` remain
-trackable.
+SQLite uses WAL mode so `monitor` and `inspect` readers do not block the
+scheduler's short writes. The database stores framework state only. Node
+`input/`, node `output/`, each job's `input.json` and `output.json`, and returned
+files remain ordinary files.
 
-`mwf init` also merges these editor settings without replacing unrelated user
+Projects from older releases are migrated automatically. Legacy `.mwf` root
+JSON, `.mwf_run.json`, and `.mwf_threads.json` are consolidated; legacy
+`.mwf_locks/`, `queued/`, `idempotency/`, `node_state.json`, `job.json`,
+`status.json`, `execution.json`, `runtime.json`, `events.jsonl`, default-job
+manifests, and job indexes are imported into SQLite when applicable. User
+payload files are not rewritten. Migration is idempotent.
+
+The generated `.gitignore` ignores `.mwf/` and legacy runtime-only paths under
+node and clipboard snapshots. Direct files in
+`clipboard/<node>/input/` and `clipboard/<node>/output/` remain trackable.
+
+`mwf init` merges Material Icon Theme settings without replacing unrelated user
 settings:
 
 ```json
@@ -235,7 +248,6 @@ settings:
     "graph.py": "routing"
   },
   "material-icon-theme.folders.associations": {
-    "node": "flow",
     "clipboard": "archive",
     "input": "input",
     "output": "export",
@@ -246,10 +258,11 @@ settings:
 }
 ```
 
-After the graph is set, MWF also associates each exact graph node name with the
-`flow` icon. Because Material Icon Theme associations are name-based, the same
-mapping styles both `node/<name>/` and `clipboard/<name>/`. Install the Material
-Icon Theme VS Code extension to see these associations.
+The top-level `node` folder deliberately keeps the icon theme's native icon.
+After the graph is set, MWF associates each exact graph node name with `flow`.
+Because Material Icon Theme associations are name-based, the same mapping styles
+both `node/<name>/` and `clipboard/<name>/`. Install the Material Icon Theme VS
+Code extension to see these associations.
 
 ## Explicit graph synchronization
 
@@ -445,6 +458,42 @@ mwf runfrom start_node
 - multiple ready nodes at the same time, while still respecting DAG predecessor completion
 - newly-ready downstream nodes while unrelated nodes are still running
 
+### API and blocking-I/O runner
+
+Use `api` for blocking HTTP clients, SDK calls, database drivers, filesystem
+waits, or other jobs whose wall time is mostly external latency:
+
+```bash
+mwf graph src/graph.py --runner api
+mwf runfrom fetch_requests
+```
+
+```python
+router = NodeRouter("fetch_requests", runner="api", max_threads=64)
+```
+
+For this runner, `max_threads=64` intentionally means at most 64 in-flight API
+jobs. The familiar name is retained so router code, `mwf threads`, `monitor`, and
+`inspect` use one concurrency vocabulary. Unlike the adaptive `threaded` runner,
+`api` fills the requested limit immediately. Executor threads are still created
+lazily, and `io` and `network` are aliases.
+
+### Synchronous controller and abandonable handler
+
+The runner worker is the attempt controller. Retry, repeat, and fallback logic
+runs synchronously in that controller. Normal untimed programmatic direct calls
+execute the user handler in the caller thread. A timeout-supervised or
+CLI-restartable attempt creates only one extra daemon handler thread:
+
+```text
+runner worker/controller -> one mwf-handler-* user thread
+```
+
+There is no intermediate `mwf-attempt-*` thread. If a timeout or manual restart
+abandons the handler, generation fencing immediately prevents stale MWF-managed
+writes and downstream job creation while the controller proceeds to the next
+fallback, retry, or generation.
+
 ### Change a node's concurrency while testing
 
 The router's `max_threads` value remains the readable source-code default. For
@@ -467,7 +516,7 @@ to that active run. MWF removes the override when the run finishes, including
 failed runs. Stale values bound to an older crashed run are ignored and removed
 when a new run claims the project.
 
-For an active threaded node, an increase starts more queued jobs within roughly
+For an active threaded or API node, an increase starts more queued jobs within roughly
 0.2 seconds and grows geometrically toward very large limits. A decrease never
 cancels jobs already running; the runner stops launching replacements until
 active concurrency falls to the new limit. This makes it safe to tune Windows
@@ -475,8 +524,7 @@ filesystem/API pressure from a second terminal.
 
 `mwf inspect NODE` shows the declared, overridden, and effective values.
 `mwf monitor` shows the effective value in its `threads` column and marks runtime
-overrides with `*`. A process runner reads the override when its process pool is
-created; an already-created process pool is not resized live. The direct runner
+overrides with `*`. An API runner fills the new limit eagerly; the adaptive threaded runner grows toward it. A process runner reads the override when its process pool is created; an already-created process pool is not resized live. The direct runner
 always remains at one job.
 
 For CPU-heavy work, use the process-pool runner:
@@ -548,21 +596,15 @@ Node inspection explains readiness, blockers, status counts, strongly connected
 component membership, runner, total timeout, checkpoint timeout, and fallbacks.
 Job inspection additionally shows the current/last handler, named checkpoint,
 checkpoint deadline, progress percentage, progress detail, execution generation,
-child jobs, and chronological lifecycle events. Explicit checkpoints and
-supervised handlers use a small job-local `runtime.json`; this is scheduler
-diagnostic state, not task output or a provenance manifest.
-
-Each job also has an append-only `events.jsonl` file containing small records
-such as `created`, `started`, `fallback_started`, `timeout`, `restart_requested`,
-and `done`. `output.json` and job-local output files remain the actual task
-result.
+child jobs, and chronological lifecycle events. Checkpoint state and lifecycle events are stored in `.mwf/state.sqlite3`; they are scheduler diagnostics, not task output or a provenance manifest. `mwf inspect` renders records such as `created`, `started`, `fallback_started`, `timeout`, `restart_requested`, and `done`. `output.json` and job-local returned files remain the actual task result.
 
 ## State schema migration and read-only previews
 
-MWF-owned metadata includes an explicit `schema_version`. This applies to files
-such as `.mwf/project.json`, `.mwf/run.json`, `.mwf/threads.json`, `node_state.json`, `schema.json`, `job.json`,
-`status.json`, `execution.json`, `runtime.json`, and the rebuildable job index. It does not apply
-to `input.json`, `output.json`, returned files, or `events.jsonl`.
+Low-churn MWF JSON metadata such as `.mwf/project.json`, `.mwf/run.json`,
+`.mwf/threads.json`, and node `schema.json` carries an explicit
+`schema_version`. High-churn job and scheduler state has its own SQLite schema
+version. Neither scheme applies to user `input.json`, `output.json`, returned
+files, node `input/`, or node `output/`.
 
 Preview and apply an upgrade from an older project:
 
@@ -571,9 +613,7 @@ mwf migrate --dry-run
 mwf migrate
 ```
 
-Migration is additive and atomic per metadata file. MWF remains able to read
-older unversioned state long enough to migrate it, but refuses state that claims
-a newer schema than the installed package supports.
+Migration upgrades low-churn JSON atomically and initializes/upgrades SQLite transactionally. A one-time importer reads legacy job metadata before deleting those framework-owned sidecars. `mwf migrate --dry-run` does not create the database or import/delete files. MWF refuses state that claims a newer incompatible schema.
 
 Several destructive commands support a read-only preview:
 
@@ -690,8 +730,7 @@ mwf inspect process_number job 3
 All configured total/checkpoint deadlines are managed by one workflow-owned
 scheduler supervisor using a deadline heap. There is no timer thread per job and
 no repeated scan of every job folder. Untimed handlers without checkpoints keep
-the original direct invocation path. An explicit progress checkpoint on an
-untimed handler writes only that job's `runtime.json` on demand.
+the original direct invocation path. An explicit progress checkpoint updates only that job row in SQLite on demand.
 
 When a watchdog deadline expires, MWF sets the attempt's cancellation fence,
 records one timeout event, wakes the normal fallback/retry path, and prevents the
@@ -754,7 +793,7 @@ While a workflow is running, open a second terminal in the same project and run:
 mwf monitor
 ```
 
-`mwf monitor` reads the file-backed job and node state and prints a live dashboard with running nodes, queued/running/done/failed job counts, jobs left, progress, running job IDs, average completed job duration, and rough ETA. It does not run task code.
+`mwf monitor` reads SQLite job/node summaries plus the low-churn run record and prints a live dashboard with running nodes, queued/running/done/failed job counts, jobs left, progress, running job IDs, average completed job duration, and rough ETA. It does not run task code.
 
 Useful forms:
 
@@ -795,7 +834,7 @@ generation before clearing job-local `output.json` and `files/`. The scheduler
 that already owns the larger run sees the new generation and immediately starts
 the replacement attempt. The node remains active throughout this handoff, so it
 cannot be finalized merely because the abandoned attempt stopped being current.
-The original `job.json` and `input.json` are preserved.
+The job row in SQLite and the original `input.json` are preserved.
 
 An older generation is fenced from committing its final status, returned files,
 `ctx.write(...)`, `ctx.write_output(...)`, and `ctx.node(...).add(...)` effects.
@@ -814,7 +853,7 @@ mwf restart <node-name> job 42
 mwf resume <node-name>
 ```
 
-This preserves `job.json` and `input.json`, advances the execution generation,
+This preserves the SQLite job identity and `input.json`, advances the execution generation,
 clears only that job's old result/files, and never resets jobs already marked
 `done` or `skipped`. If a larger descendant sequence must continue, use the
 appropriate `mwf resumefrom <node-name>` after requeueing.
@@ -835,27 +874,34 @@ Use ordinary selected-job rerun syntax after the larger workflow has ended:
 mwf run <node-name> job 42
 ```
 
-## Large-node performance note
+## Large-node performance and SQLite state
 
-For large nodes, `queued` is the implicit per-job status. A job with `job.json` and `input.json` but no `status.json` is treated as queued by the storage API. This avoids thousands of small JSON writes during reset/requeue and lets `node_state.json` switch to `running` before the runner loads every queued job. Explicit `status.json` files are still written for `running`, `done`, `failed`, `cancelled`, and `skipped` jobs.
+MWF 0.3.4 no longer creates per-job queue markers, status files, execution
+files, runtime files, event logs, or a shared `job_index.json`. High-churn state
+is normalized into `.mwf/state.sqlite3`:
 
-### Job index design
+- `jobs` stores job identity, status, execution generation/lease, and checkpoint runtime
+- `job_events` stores chronological lifecycle, retry, fallback, timeout, and restart records
+- `idempotency` stores downstream creation keys
+- `default_job_specs` stores idempotent router starter declarations
+- `nodes` stores node-level state
+- `advisory_locks` provides short cross-process critical sections without lock files
 
-`job_index.json` is a rebuildable per-node summary cache, not the source of truth.
-The source of truth is still the file-backed job state:
+The scheduler allocates dynamic job IDs and updates status counts with short
+transactions. WAL mode allows concurrent monitoring and inspection. This avoids
+thousands of tiny filesystem operations and removes contention on a shared
+index file for high-fan-in nodes.
 
-- `jobs/<id>/job.json` and `input.json` prove that a job exists
-- missing `status.json` means the job is queued
-- explicit `status.json` stores running/done/failed/cancelled/skipped
-- `queued/<id>.queued` is the cheap scheduler queue marker
+The user-visible source of payload truth stays on disk:
 
-The index stores fast monitor/scheduler summaries such as status counts,
-`last_job_id`, running job IDs, and completed-duration totals. It is maintained
-incrementally during normal runs, but if Windows or another process temporarily
-blocks `job_index.json`, the workflow marks the index dirty and continues. The
-next reader rebuilds it from the authoritative job folders/status files. This
-keeps high-fan-in spawn nodes such as `combine` from failing just because many
-workers touched the same summary file at once.
+- `node/<name>/input/` and `node/<name>/output/`
+- `node/<name>/jobs/<id>/input.json`
+- `node/<name>/jobs/<id>/output.json`
+- `node/<name>/jobs/<id>/files/` when the job returns or writes files
+
+A job that never creates returned files does not need an empty `files/` folder.
+Use `mwf inspect`, `mwf monitor`, and `mwf doctor` rather than querying SQLite
+directly in application code.
 
 ## Install, uninstall, and persistence
 
@@ -889,10 +935,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.3 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.4 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.3-py3-none-any.whl
+micro_workflow_manager-0.3.4-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -912,22 +958,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.3-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.4-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.3-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.4-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.3-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.4-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.3`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.4`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -942,7 +988,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.3-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.4-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project
@@ -1046,7 +1092,7 @@ each major step and each node archive as it is unpacked.
 
 ## Node clipboard
 
-Save a node's complete file-backed folder beside `node/`:
+Save a node's payload folder and a cold SQLite state snapshot beside `node/`:
 
 ```bash
 mwf copy preprocess
@@ -1059,7 +1105,7 @@ Restore it later with:
 mwf paste preprocess
 ```
 
-Paste replaces `node/preprocess` with the saved clipboard version. The default
+Paste replaces `node/preprocess` and restores that node's jobs, statuses, events, idempotency keys, and default-job declarations from `clipboard/preprocess/.mwf-node-state.sqlite3`. Pre-0.3.4 clipboard copies without a snapshot remain supported as payload-only copies. The default
 `.mwfignore` excludes `clipboard/`, `.mwf/`, `.venv/`, version-control metadata,
 editor metadata, caches, and build output.
 

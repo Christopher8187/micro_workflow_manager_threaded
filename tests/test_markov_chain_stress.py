@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from micro_workflow_manager import cli
+from micro_workflow_manager.storage import FileStorage
 
 
 DURATION_SECONDS = 5.0
@@ -13,7 +14,7 @@ INITIAL_A_JOBS = 30
 
 
 def _node_status(tmp_path: Path, node: str) -> str:
-    return json.loads((tmp_path / "node" / node / "node_state.json").read_text(encoding="utf-8"))["status"]
+    return FileStorage(tmp_path).get_node_status(node)
 
 
 def _job_count(tmp_path: Path, node: str) -> int:

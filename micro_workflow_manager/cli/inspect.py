@@ -100,7 +100,7 @@ def inspect_job(workflow, node: str, job_id: int) -> int:
     if not storage.job_exists(node, job_id):
         raise RuntimeError(f"Job does not exist: {node}/{job_id}")
     job = storage.load_job(node, job_id)
-    status = storage.read_json(storage.status_file(node, job_id), default={"status": QUEUED})
+    status = storage.read_job_status_data(node, job_id) or {"status": QUEUED}
     control = storage.read_job_control(node, job_id)
     output = storage.read_json(storage.output_file(node, job_id), default=None)
     runtime = storage.read_job_runtime(node, job_id)
@@ -232,14 +232,7 @@ def _stage_indexes_for_events(
 
 
 def _failed_job_rows(workflow, node: str) -> list[dict[str, Any]]:
-    storage = workflow.storage
-    failed_rows: list[dict[str, Any]] = []
-    for job_id in storage.iter_job_ids(node):
-        row = storage.read_json(storage.status_file(node, job_id), default=None)
-        if isinstance(row, dict) and row.get("status") == FAILED:
-            failed_rows.append(row)
-    failed_rows.sort(key=lambda row: int(row.get("job_id") or 0))
-    return failed_rows
+    return workflow.storage.list_jobs(node, status=FAILED)
 
 
 def inspect_filter(workflow, node: str) -> int:

@@ -8,7 +8,7 @@ from ..models import Job
 
 class DagSchedulerMixin:
     def run(self):
-        if self.runner in {"threaded", "process"}:
+        if self.runner in {"threaded", "api", "process"}:
             return self.run_concurrently()
 
         ran = []

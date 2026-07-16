@@ -70,10 +70,7 @@ A useful provenance record often includes:
 }
 ```
 
-MWF's `events.jsonl`, `runtime.json`, status files, and checkpoint data explain
-scheduler behavior. They do not replace domain provenance. Project provenance
-should explain *why the result is defensible*; scheduler diagnostics explain
-*what the framework did while running it*.
+MWF's SQLite lifecycle events, job statuses, execution generations, and checkpoint data explain scheduler behavior through `mwf inspect` and `mwf monitor`. They do not replace domain provenance. Project provenance should explain *why the result is defensible*; scheduler diagnostics explain *what the framework did while running it*.
 
 For an agent node, retain the model/provider/version, prompt or prompt hash,
 structured response, tool calls, validation failures, chosen fallback, and token
@@ -113,6 +110,33 @@ A node behavior file should read in this order:
 4. small pure helper functions;
 5. main task;
 6. fallbacks that preserve the main output contract.
+
+## Choose the runner by the dominant cost
+
+- Use `direct` for debugging and small sequential work.
+- Use `threaded` for mixed local I/O and modest parallelism where adaptive
+  worker growth is useful.
+- Use `api` for blocking model providers, HTTP SDKs, remote databases, and other
+  high-latency calls. Its `max_threads` value intentionally means maximum
+  in-flight calls, and it fills that limit immediately.
+- Use `process` for CPU-heavy, pickleable tasks that benefit from process
+  isolation.
+
+The CLI-restartable execution shape is one runner worker/controller plus one
+abandonable handler thread for the current user call. Retry and fallback
+orchestration remains synchronous in the controller, so there is no extra
+per-attempt orchestration thread. Keep external client timeouts even when MWF
+checkpoints are enabled because Python cannot force-kill an arbitrary blocked
+thread.
+
+## Treat SQLite as framework state, not an application database
+
+`.mwf/state.sqlite3` holds scheduler-owned job rows, queue state, events,
+checkpoints, execution leases, idempotency keys, and advisory locks. Do not make
+domain code query or mutate it directly. Use MWF APIs and CLI inspection. Keep
+application records, artifacts, and provenance in node input/output files or in
+a separate domain database owned by the project. This separation keeps
+clipboard, migration, restart fencing, and future schema upgrades reliable.
 
 Use pure functions in `src/utils/` for parsing, scoring, geometry, SQL planning,
 or state transitions. Keep MWF context calls at the node boundary. This makes
@@ -497,8 +521,7 @@ Test at three levels:
    node completes, joins receive all files, and retries/fallbacks produce the
    expected filter funnel.
 
-The repository test suite runs every project under `examples/` using the direct
-runner and verifies that provenance JSON is produced. To exercise them manually:
+The repository test suite runs every project under `examples/` using the direct runner and verifies that provenance JSON is produced. Add API-runner contract tests for provider-facing nodes and assert peak in-flight work never exceeds `max_threads`. To exercise them manually:
 
 ```bash
 python -m pytest -q tests/test_033_filter_icons_design.py

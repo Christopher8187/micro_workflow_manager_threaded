@@ -403,7 +403,7 @@ def run_nodes(
                 enabled=stats,
                 interval=stats_interval,
             ):
-                if workflow.runner in {"threaded", "process"}:
+                if workflow.runner in {"threaded", "api", "process"}:
                     ran = workflow.run_concurrently(
                         nodes=nodes,
                         ready_check=lambda item: ready_for_run_set(

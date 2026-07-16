@@ -3,6 +3,7 @@ import textwrap
 from pathlib import Path
 
 from micro_workflow_manager import cli
+from micro_workflow_manager.storage import FileStorage
 
 
 def make_monitor_project(tmp_path: Path, monkeypatch):
@@ -71,7 +72,7 @@ def test_run_stats_and_monitor_json_include_timing_metadata(tmp_path, monkeypatc
     assert "[stats]" in captured.err
     assert "[final stats]" in captured.err
 
-    status = json.loads((tmp_path / "node" / "A" / "jobs" / "1" / "status.json").read_text())
+    status = FileStorage(tmp_path).read_job_status_data("A", 1)
     assert status["status"] == "done"
     assert "started_at" in status
     assert "finished_at" in status

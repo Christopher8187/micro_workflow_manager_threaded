@@ -163,10 +163,11 @@ def threads_command(root: Path, node: str | None, value: str | None) -> int:
     after = thread_status(root, storage, node)
 
     print(f"Updated runtime max_threads for {node}: {before['effective']} -> {after['effective']}")
-    if after["runner"] == "threaded":
+    if after["runner"] in {"threaded", "api"}:
         if after["active"]:
+            runner_name = "API" if after["runner"] == "api" else "threaded"
             print(
-                "The active threaded runner will apply the new limit within about "
+                f"The active {runner_name} runner will apply the new limit within about "
                 "0.2 seconds. Lowering the limit does not cancel jobs already running."
             )
         else:
@@ -186,7 +187,7 @@ def threads_cli(argv: list[str]) -> int:
         prog="mwf threads",
         description=(
             "View or change a node's local runtime max_threads override. "
-            "With the threaded runner, an active node scales up or down live."
+            "With the threaded or API runner, an active node scales up or down live."
         ),
     )
     parser.add_argument(

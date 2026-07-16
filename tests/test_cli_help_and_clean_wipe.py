@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from micro_workflow_manager import cli
+from micro_workflow_manager.storage import FileStorage
+from tests.state_helpers import seed_job
 
 
 def make_cli_project(tmp_path: Path, monkeypatch):
@@ -28,22 +30,20 @@ def write_json(path: Path, data: dict):
 
 
 def read_status_or_queued(path: Path) -> str:
-    if not path.exists():
-        return "queued"
-    return json.loads(path.read_text(encoding="utf-8"))["status"]
+    root = path.parents[4]
+    node = path.parents[2].name
+    job_id = int(path.parent.name)
+    return FileStorage(root).get_job_status(node, job_id) or "queued"
 
 
 def seed_dirty_node(tmp_path: Path, node: str):
     node_dir = tmp_path / "node" / node
     (node_dir / "input" / "keep.txt").write_text("input", encoding="utf-8")
     (node_dir / "output" / "remove.txt").write_text("output", encoding="utf-8")
-    job_dir = node_dir / "jobs" / "1"
-    write_json(job_dir / "job.json", {"job_id": 1, "node_name": node, "created_at": "test", "parent": None})
-    write_json(job_dir / "input.json", {"value": node})
-    write_json(job_dir / "status.json", {"job_id": 1, "node_name": node, "status": "done"})
-    write_json(job_dir / "output.json", {"done": True})
-    (job_dir / "files").mkdir(parents=True, exist_ok=True)
-    (job_dir / "files" / "debug.txt").write_text("remove", encoding="utf-8")
+    state = seed_job(tmp_path, node, 1, "done", params={"value": node})
+    state.write_output(node, 1, {"done": True})
+    files = state.files_dir(node, 1)
+    (files / "debug.txt").write_text("remove", encoding="utf-8")
 
 
 def test_top_level_help_points_to_command_help_and_describe(capsys):
@@ -92,8 +92,7 @@ def test_clean_star_cleans_all_nodes_but_preserves_inputs(tmp_path, monkeypatch,
         assert not (node_dir / "output" / "remove.txt").exists()
         assert (node_dir / "jobs").is_dir()
         assert not (node_dir / "jobs" / "1").exists()
-        node_status = json.loads((node_dir / "node_state.json").read_text(encoding="utf-8"))
-        assert node_status["status"] == "queued"
+        assert FileStorage(tmp_path).get_node_status(node) == "queued"
 
 
 def test_reset_star_preserves_job_definitions_and_requeues_jobs(tmp_path, monkeypatch, capsys):
@@ -111,13 +110,12 @@ def test_reset_star_preserves_job_definitions_and_requeues_jobs(tmp_path, monkey
         job_dir = node_dir / "jobs" / "1"
         assert (node_dir / "input" / "keep.txt").read_text(encoding="utf-8") == "input"
         assert not (node_dir / "output" / "remove.txt").exists()
-        assert (job_dir / "job.json").exists()
+        assert FileStorage(tmp_path).job_exists(node, 1)
         assert json.loads((job_dir / "input.json").read_text(encoding="utf-8")) == {"value": node}
         assert read_status_or_queued(job_dir / "status.json") == "queued"
         assert not (job_dir / "output.json").exists()
         assert not (job_dir / "files" / "debug.txt").exists()
-        node_status = json.loads((node_dir / "node_state.json").read_text(encoding="utf-8"))
-        assert node_status["status"] == "queued"
+        assert FileStorage(tmp_path).get_node_status(node) == "queued"
 
 
 def test_wipe_star_wipes_all_nodes_and_removes_inputs(tmp_path, monkeypatch, capsys):
@@ -137,8 +135,7 @@ def test_wipe_star_wipes_all_nodes_and_removes_inputs(tmp_path, monkeypatch, cap
         assert not (node_dir / "output" / "remove.txt").exists()
         assert (node_dir / "jobs").is_dir()
         assert not (node_dir / "jobs" / "1").exists()
-        node_status = json.loads((node_dir / "node_state.json").read_text(encoding="utf-8"))
-        assert node_status["status"] == "queued"
+        assert FileStorage(tmp_path).get_node_status(node) == "queued"
 
 
 def test_clean_star_also_works_when_shell_expands_star(tmp_path, monkeypatch, capsys):
@@ -207,15 +204,15 @@ def test_run_b_after_run_a_keeps_a_finished_status(tmp_path, monkeypatch, capsys
 
     assert cli.main(["run", "A", "--runner", "direct"]) == 0
     capsys.readouterr()
-    assert json.loads((tmp_path / "node" / "A" / "node_state.json").read_text())["status"] == "done"
+    assert FileStorage(tmp_path).get_node_status("A") == "done"
 
     assert cli.main(["run", "B", "--runner", "direct"]) == 0
     out = capsys.readouterr().out
 
     assert "Ran:" in out
     assert "  B" in out
-    assert json.loads((tmp_path / "node" / "A" / "node_state.json").read_text())["status"] == "done"
-    assert json.loads((tmp_path / "node" / "B" / "node_state.json").read_text())["status"] == "done"
+    assert FileStorage(tmp_path).get_node_status("A") == "done"
+    assert FileStorage(tmp_path).get_node_status("B") == "done"
 
 
 def test_cleaning_a_removes_finished_status_and_blocks_b(tmp_path, monkeypatch, capsys):
@@ -227,7 +224,7 @@ def test_cleaning_a_removes_finished_status_and_blocks_b(tmp_path, monkeypatch, 
 
     assert cli.main(["clean", "A"]) == 0
     capsys.readouterr()
-    assert json.loads((tmp_path / "node" / "A" / "node_state.json").read_text())["status"] == "queued"
+    assert FileStorage(tmp_path).get_node_status("A") == "queued"
     assert not (tmp_path / "node" / "A" / "jobs" / "1").exists()
 
     assert cli.main(["run", "B", "--runner", "direct"]) == 1
@@ -292,7 +289,7 @@ def test_runfrom_preserves_router_created_jobs_on_descendant_nodes(tmp_path, mon
     make_runfrom_default_descendant_project(tmp_path, monkeypatch)
     capsys.readouterr()
 
-    assert (tmp_path / "node" / "disintegrate" / "jobs" / "1" / "job.json").exists()
+    assert FileStorage(tmp_path).job_exists("disintegrate", 1)
 
     assert cli.main(["runfrom", "split", "--runner", "direct"]) == 0
     out = capsys.readouterr().out
@@ -301,9 +298,9 @@ def test_runfrom_preserves_router_created_jobs_on_descendant_nodes(tmp_path, mon
     assert "  split" in out
     assert "  tagify" in out
     assert "  disintegrate" in out
-    assert (tmp_path / "node" / "disintegrate" / "jobs" / "1" / "job.json").exists()
+    assert FileStorage(tmp_path).job_exists("disintegrate", 1)
     assert (tmp_path / "node" / "disintegrate" / "jobs" / "1" / "files" / "combined.txt").read_text(encoding="utf-8") == "page 1"
-    assert json.loads((tmp_path / "node" / "disintegrate" / "node_state.json").read_text(encoding="utf-8"))["status"] == "done"
+    assert FileStorage(tmp_path).get_node_status("disintegrate") == "done"
 
     assert cli.main(["runfrom", "split", "--runner", "direct"]) == 0
     capsys.readouterr()
@@ -364,8 +361,7 @@ def test_run_job_selection_runs_individual_jobs_and_ranges_only(tmp_path, monkey
         status_path = tmp_path / "node" / "work" / "jobs" / str(job_id) / "status.json"
         assert read_status_or_queued(status_path) == "queued"
 
-    node_status = json.loads((tmp_path / "node" / "work" / "node_state.json").read_text(encoding="utf-8"))
-    assert node_status["status"] == "queued"
+    assert FileStorage(tmp_path).get_node_status("work") == "queued"
 
 
 def test_run_job_selection_resets_only_selected_job_artifacts(tmp_path, monkeypatch, capsys):

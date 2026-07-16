@@ -1,4 +1,5 @@
 from ..node import JobNode
+from ..runners.api import ApiRunner
 from ..runners.direct import DirectRunner
 from ..runners.process import ProcessPoolRunner
 from ..runners.threaded import ThreadedRunner
@@ -7,13 +8,15 @@ from ..runners.threaded import ThreadedRunner
 def normalize_workflow_runner(runner: str) -> str:
     aliases = {
         "thread": "threaded",
+        "io": "api",
+        "network": "api",
         "processes": "process",
         "process_pool": "process",
         "processpool": "process",
     }
     runner = aliases.get(runner, runner)
 
-    if runner not in {"direct", "threaded", "process"}:
+    if runner not in {"direct", "threaded", "api", "process"}:
         raise ValueError(f"Unknown runner: {runner}")
 
     return runner
@@ -28,6 +31,12 @@ class RunnerFactoryMixin:
 
         if effective_runner == "threaded":
             return ThreadedRunner(
+                max_threads=node.max_threads,
+                limit_provider=lambda: self.effective_max_threads(node.name),
+            )
+
+        if effective_runner == "api":
+            return ApiRunner(
                 max_threads=node.max_threads,
                 limit_provider=lambda: self.effective_max_threads(node.name),
             )

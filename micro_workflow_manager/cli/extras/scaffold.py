@@ -13,7 +13,6 @@ VSCODE_EXCLUDES = {
 
 
 MATERIAL_FOLDER_ASSOCIATIONS = {
-    "node": "flow",
     "clipboard": "archive",
     "node_behavior": "flow",
     "utils": "tools",
@@ -42,29 +41,30 @@ GITIGNORE_ENTRIES = [
     "node/*/input/*/",
     "node/*/jobs/**",
     "node/*/output/*/",
-    "node/*/queued/**",
-    "node/*/idempotency/**",
+    "node/*/queued/**",       # legacy 0.3.3 queue markers
+    "node/*/idempotency/**",  # legacy 0.3.3 idempotency records
     "",
-    "# Rebuildable node metadata and caches",
+    "# Generated schema and legacy framework metadata",
+    "node/*/schema.json",
     "node/*/node_state.json",
     "node/*/job_index.json",
     "node/*/job_index.dirty",
     "node/*/default_jobs.json",
-    "node/*/schema.json",
     "",
     "# Clipboard node runtime folders. Keep direct input/output files, but ignore nested directories.",
     "clipboard/*/input/*/",
     "clipboard/*/jobs/**",
     "clipboard/*/output/*/",
-    "clipboard/*/queued/**",
-    "clipboard/*/idempotency/**",
+    "clipboard/*/queued/**",       # legacy 0.3.3 queue markers
+    "clipboard/*/idempotency/**",  # legacy 0.3.3 idempotency records
     "",
-    "# Rebuildable clipboard-node metadata and caches",
+    "# Clipboard schema, legacy metadata, and cold SQLite state snapshot",
+    "clipboard/*/schema.json",
     "clipboard/*/node_state.json",
     "clipboard/*/job_index.json",
     "clipboard/*/job_index.dirty",
     "clipboard/*/default_jobs.json",
-    "clipboard/*/schema.json",
+    "clipboard/*/.mwf-node-state.sqlite3",
     "",
     "# Python/editor/cache files",
     "__pycache__/",
@@ -120,6 +120,9 @@ def ensure_vscode_settings(
     if not isinstance(folder_associations, dict):
         folder_associations = {}
     folder_associations.update(MATERIAL_FOLDER_ASSOCIATIONS)
+    # 0.3.4 deliberately leaves the top-level node folder on the theme's
+    # native icon. Remove the old generated association during upgrades.
+    folder_associations.pop("node", None)
 
     # Material Icon Theme associations are exact folder names rather than path
     # wildcards. Map graph nodes and every direct node/clipboard child by name.

@@ -63,6 +63,7 @@ class AttemptWatch:
     cancellation_event: Event
     total_timeout: float | None
     default_checkpoint_timeout: float | None
+    force_abandonable: bool = False
     watch_id: str = field(default_factory=lambda: uuid4().hex)
     wake_event: Event = field(default_factory=Event)
     started_at: str = field(default_factory=lambda: datetime.now().astimezone().isoformat(timespec="milliseconds"))
@@ -83,7 +84,13 @@ class AttemptWatch:
 
     @property
     def supervised(self) -> bool:
+        """Whether a deadline/checkpoint requires scheduler supervision."""
         return self.total_timeout is not None or self.default_checkpoint_timeout is not None
+
+    @property
+    def abandonable(self) -> bool:
+        """Whether the controller must isolate the handler in one daemon thread."""
+        return self.force_abandonable or self.supervised
 
     @property
     def key(self) -> str:
@@ -299,6 +306,7 @@ class SchedulerSupervisor:
         cancellation_event: Event,
         total_timeout: float | None,
         checkpoint_timeout: float | None,
+        force_abandonable: bool = False,
     ) -> AttemptWatch:
         total_timeout = _validate_timeout(total_timeout, name="timeout")
         checkpoint_timeout = _validate_timeout(
@@ -316,6 +324,7 @@ class SchedulerSupervisor:
             cancellation_event=cancellation_event,
             total_timeout=total_timeout,
             default_checkpoint_timeout=checkpoint_timeout,
+            force_abandonable=bool(force_abandonable),
         )
         if total_timeout is not None:
             watch.total_deadline = watch.started_monotonic + total_timeout

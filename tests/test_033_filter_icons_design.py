@@ -103,8 +103,12 @@ def test_init_gitignore_and_material_icons_cover_runtime_structure(
     assert cli.main(["graph", "src/graph.py"]) == 0
 
     gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert ".mwf/" in gitignore
+    assert "node/*/jobs/**" in gitignore
     assert "node/*/idempotency/**" in gitignore
     assert "clipboard/*/idempotency/**" in gitignore
+    assert "clipboard/*/.mwf-node-state.sqlite3" in gitignore
+    assert (tmp_path / ".mwf" / "state.sqlite3").is_file()
 
     settings = json.loads(
         (tmp_path / ".vscode" / "settings.json").read_text(encoding="utf-8")
@@ -113,7 +117,7 @@ def test_init_gitignore_and_material_icons_cover_runtime_structure(
     folders = settings["material-icon-theme.folders.associations"]
     assert files["graph.py"] == "routing"
     assert folders["clipboard"] == "archive"
-    assert folders["node"] == "flow"
+    assert "node" not in folders
     assert folders["queued"] == "queue"
     assert folders["idempotency"] == "keys"
     assert folders["ingest"] == "flow"
@@ -124,7 +128,7 @@ def test_readme_links_design_and_requires_output_provenance():
     root = Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     design = (root / "DESIGN.md").read_text(encoding="utf-8")
-    assert "# micro-workflow-manager 0.3.3" in readme
+    assert "# micro-workflow-manager 0.3.4" in readme
     assert "[DESIGN.md](DESIGN.md)" in readme
     assert "provenance" in readme.lower()
     assert "## Advice first" in design

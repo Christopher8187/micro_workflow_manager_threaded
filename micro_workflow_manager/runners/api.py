@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from typing import Callable, Iterable
+
+from .base import BaseRunner
+from .threaded import MAX_RUNTIME_THREADS, THREAD_LIMIT_POLL_SECONDS
+
+
+class ApiRunner(BaseRunner):
+    """Eager bounded-concurrency runner for high-latency API/I/O jobs.
+
+    ``max_threads`` is intentionally retained as the public setting even though
+    it acts as the maximum number of in-flight API job controllers. Executor
+    threads are created lazily only when work is submitted. Unlike the adaptive
+    threaded runner, this runner fills the requested concurrency immediately,
+    which is useful when most wall time is network wait rather than local CPU.
+    """
+
+    def __init__(
+        self,
+        max_threads: int,
+        *,
+        limit_provider: Callable[[], int] | None = None,
+        poll_interval: float = THREAD_LIMIT_POLL_SECONDS,
+    ):
+        if type(max_threads) is not int or max_threads < 1:
+            raise ValueError("max_threads must be an integer >= 1")
+        if max_threads > MAX_RUNTIME_THREADS:
+            raise ValueError(f"max_threads must be <= {MAX_RUNTIME_THREADS}")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be > 0")
+        self.max_threads = max_threads
+        self.limit_provider = limit_provider
+        self.poll_interval = float(poll_interval)
+
+    def effective_limit(self) -> int:
+        value = self.limit_provider() if self.limit_provider is not None else self.max_threads
+        if type(value) is not int or value < 1:
+            raise ValueError("runtime max_threads must be an integer >= 1")
+        if value > MAX_RUNTIME_THREADS:
+            raise ValueError(f"runtime max_threads must be <= {MAX_RUNTIME_THREADS}")
+        return value
+
+    def _run_source(self, node_name: str, items: Iterable, run_one: Callable):
+        iterator = iter(items)
+        source_exhausted = False
+        next_index = 0
+        futures = {}
+        results: dict[int, object] = {}
+
+        # A large executor ceiling is cheap: ThreadPoolExecutor creates worker
+        # threads lazily. Submission is still bounded by effective_limit().
+        with ThreadPoolExecutor(
+            max_workers=MAX_RUNTIME_THREADS,
+            thread_name_prefix=f"mwf-api-{node_name}",
+        ) as executor:
+            def fill() -> None:
+                nonlocal source_exhausted, next_index
+                limit = self.effective_limit()
+                while not source_exhausted and len(futures) < limit:
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        source_exhausted = True
+                        return
+                    index = next_index
+                    next_index += 1
+                    futures[executor.submit(run_one, item)] = index
+
+            fill()
+            while futures:
+                done, _ = wait(
+                    futures,
+                    timeout=self.poll_interval,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    # Runtime max_threads changes are observed without waiting
+                    # for an API call to complete.
+                    fill()
+                    continue
+                for future in done:
+                    index = futures.pop(future)
+                    try:
+                        results[index] = future.result()
+                    except BaseException:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
+                fill()
+
+        return [results[index] for index in sorted(results)]
+
+    def run_jobs(self, node_name: str, jobs: list, run_one: Callable):
+        if not jobs:
+            return []
+        return self._run_source(node_name, jobs, run_one)
+
+    def run_job_source(self, node_name: str, job_source, run_one: Callable):
+        return self._run_source(node_name, job_source, run_one)

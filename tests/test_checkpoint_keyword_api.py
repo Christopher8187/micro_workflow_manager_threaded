@@ -20,7 +20,7 @@ def test_released_checkpoint_signature_supports_keywords():
     for name in ("timeout", "progress", "detail"):
         assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
         assert signature.parameters[name].default is None
-    assert __version__ == "0.3.3"
+    assert __version__ == "0.3.4"
 
 
 def test_checkpoint_keywords_persist_for_inspect(tmp_path: Path):
@@ -39,7 +39,7 @@ def test_checkpoint_keywords_persist_for_inspect(tmp_path: Path):
     workflow.start("A")
     assert workflow.run_job("A", 1, ignore_readiness=True) == "ok"
 
-    runtime = json.loads((tmp_path / "node" / "A" / "jobs" / "1" / "runtime.json").read_text())
+    runtime = workflow.storage.read_job_runtime("A", 1)
     assert runtime["checkpoint_name"] == "halfway"
     assert runtime["checkpoint_timeout_seconds"] == 1.0
     assert runtime["progress"] == 0.5

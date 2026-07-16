@@ -3,6 +3,7 @@ from pathlib import Path
 
 from micro_workflow_manager import cli
 from micro_workflow_manager.cli.descriptions import COMMAND_DESCRIPTIONS
+from tests.state_helpers import seed_job
 
 
 def _write_json(path: Path, value: dict):
@@ -28,29 +29,20 @@ def _make_project(tmp_path: Path, monkeypatch):
 
 
 def _seed_job(tmp_path: Path, job_id: int, status: str, *, error: str | None = None):
-    root = tmp_path / "node" / "process_number" / "jobs" / str(job_id)
-    _write_json(
-        root / "job.json",
-        {
-            "job_id": job_id,
-            "node_name": "process_number",
-            "created_at": "2026-07-14T12:00:00",
-            "parent": None,
-        },
-    )
-    _write_json(root / "input.json", {"value": job_id})
-    _write_json(
-        root / "status.json",
-        {
-            "job_id": job_id,
-            "node_name": "process_number",
-            "status": status,
+    state = seed_job(
+        tmp_path,
+        "process_number",
+        job_id,
+        status,
+        params={"value": job_id},
+        created_at="2026-07-14T12:00:00",
+        status_extra={
             "finished_at": f"2026-07-14T12:00:{job_id:02d}",
             "duration_seconds": float(job_id),
         },
     )
     if error is not None:
-        _write_json(root / "output.json", {"status": "failed", "error": error})
+        state.write_output("process_number", job_id, {"status": "failed", "error": error})
 
 
 def test_inspect_failed_lists_ids_errors_and_restart_command(tmp_path, monkeypatch, capsys):
