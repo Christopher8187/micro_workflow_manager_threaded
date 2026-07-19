@@ -161,7 +161,8 @@ def test_restart_refuses_non_running_job_without_queueing_it(tmp_path, monkeypat
     # Router loading created A/1, but no run owns it and it is only queued.
     assert cli.main(["restart", "A", "job", "1"]) == 1
     error = capsys.readouterr().err
-    assert "No live mwf run/runfrom sequence" in error
+    assert "second terminal" in error
+    assert "mwf resume or mwf resumefrom" in error
 
     assert FileStorage(tmp_path).get_job_status("A", 1) == "queued"
 
@@ -185,7 +186,7 @@ def test_restart_refuses_queued_job_even_when_a_run_record_is_live(
 
     assert cli.main(["restart", "A", "job", "1"]) == 1
     error = capsys.readouterr().err
-    assert "not currently running" in error
+    assert "queued, not running or failed" in error
     assert FileStorage(tmp_path).get_job_status("A", 1) == "queued"
 
 
@@ -224,7 +225,8 @@ def test_restart_fast_path_does_not_import_broken_graph_or_node_code(tmp_path, m
 
     assert cli.main(["restart", "A", "job", "1"]) == 1
     error = capsys.readouterr().err
-    assert "No live mwf run/runfrom sequence" in error
+    assert "second terminal" in error
+    assert "mwf resume or mwf resumefrom" in error
     assert "invalid syntax" not in error.lower()
 
 

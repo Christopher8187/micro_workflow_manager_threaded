@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -60,8 +61,11 @@ def active_workflow_run(
     # claim this slot; it only controls a job already owned by this run.
     with workflow.storage.interprocess_lock("active-run-state"):
         refuse_competing_run(workflow)
-        workflow.storage.write_run_state(data)
+        # Bind the pending override before publishing a running sequence. If
+        # lock acquisition itself fails, no fresh stale run record is left
+        # behind for the next command to recover.
         workflow.storage.bind_thread_overrides_to_run(run_id)
+        workflow.storage.write_run_state(data)
         workflow.invalidate_thread_override_cache()
 
     # The scheduler supervisor owns both project-run heartbeats and handler
@@ -94,8 +98,11 @@ def active_workflow_run(
         stats_reporter.stop_periodic()
         monitor_reporter.stop_periodic()
         workflow.scheduler_supervisor.stop_run_heartbeat(run_id)
-        workflow.storage.clear_thread_overrides_for_run(run_id)
-        workflow.invalidate_thread_override_cache()
+
+        # Publish the terminal run state before cleaning up the optional
+        # override. A damaged/orphaned thread-overrides lock must never leave a
+        # completed workflow recorded as running. Bound overrides are already
+        # ignored once the run is terminal and are discarded by the next run.
         with workflow.storage.interprocess_lock("active-run-state"):
             current = workflow.storage.get_run_state()
             # Never let a stale process overwrite a newer run record.
@@ -107,9 +114,24 @@ def active_workflow_run(
                 if error is not None:
                     updates["error"] = error
                 workflow.storage.update_run_state(**updates)
+
+        override_cleanup_error: Exception | None = None
+        try:
+            workflow.storage.clear_thread_overrides_for_run(run_id)
+        except Exception as cleanup_error:
+            override_cleanup_error = cleanup_error
+        finally:
+            workflow.invalidate_thread_override_cache()
+
         finished = True
         stats_reporter.print_final()
         monitor_reporter.print_final()
+        if override_cleanup_error is not None:
+            print(
+                "Warning: the run completed, but its temporary thread override "
+                f"could not be removed: {override_cleanup_error}",
+                file=sys.stderr,
+            )
 
     try:
         yield finish

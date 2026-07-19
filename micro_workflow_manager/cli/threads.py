@@ -4,7 +4,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from micro_workflow_manager.runners.threaded import MAX_RUNTIME_THREADS
+from micro_workflow_manager.runners.threaded import (
+    HIGH_RUNTIME_THREAD_WARNING,
+    MAX_RUNTIME_THREADS,
+)
 from micro_workflow_manager.storage import FileStorage
 
 from .active_run import live_active_run
@@ -187,16 +190,30 @@ def threads_command(root: Path, node: str | None, value: str | None) -> int:
         return 0
 
     if value.lower() in RESET_WORDS:
-        active = live_active_run(storage)
-        storage.clear_thread_override(node, run_id=(active or {}).get("run_id"))
+        # Serialize active-run discovery with run startup. Otherwise a threads
+        # command can observe "no run", wait behind startup's override lock,
+        # and then incorrectly write a next-run override after the run is live.
+        with storage.interprocess_lock("active-run-state"):
+            active = live_active_run(storage)
+            storage.clear_thread_override(node, run_id=(active or {}).get("run_id"))
         after = thread_status(root, storage, node)
         print(f"Cleared runtime max_threads override for {node}.")
         print(f"Effective max_threads: {before['effective']} -> {after['effective']}")
         return 0
 
     requested = _parse_new_limit(value, before["effective"])
-    active = live_active_run(storage)
-    storage.set_thread_override(node, requested, run_id=(active or {}).get("run_id"))
+    if requested > HIGH_RUNTIME_THREAD_WARNING:
+        print(
+            f"Warning: {requested} in-flight jobs is an extreme local concurrency "
+            "setting. During CLI runs, restart/timeout supervision may use roughly "
+            "one controller thread plus one handler thread per active job, in "
+            "addition to SQLite and network resources. Increase gradually and "
+            "watch system thread, memory, and connection limits.",
+            file=sys.stderr,
+        )
+    with storage.interprocess_lock("active-run-state"):
+        active = live_active_run(storage)
+        storage.set_thread_override(node, requested, run_id=(active or {}).get("run_id"))
     after = thread_status(root, storage, node)
 
     print(f"Updated runtime max_threads for {node}: {before['effective']} -> {after['effective']}")

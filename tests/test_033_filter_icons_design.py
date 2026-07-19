@@ -128,7 +128,7 @@ def test_readme_links_design_and_requires_output_provenance():
     root = Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     design = (root / "DESIGN.md").read_text(encoding="utf-8")
-    assert "# micro-workflow-manager 0.3.6" in readme
+    assert "# micro-workflow-manager 0.3.8" in readme
     assert "[DESIGN.md](DESIGN.md)" in readme
     assert "provenance" in readme.lower()
     assert "## Advice first" in design

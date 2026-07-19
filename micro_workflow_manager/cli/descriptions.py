@@ -44,7 +44,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "reset": "Requeue every existing job for selected nodes while keeping job definitions and node input files.",
     "wipe": "Like clean, but remove selected nodes' input files as well.",
     "run": "Reset and run one ready node or selected jobs; --monitor prints the full timestamped dashboard in the same terminal.",
-    "restart": "Replace a live running attempt or requeue a failed/cancelled job without resetting completed work or starting a competing scheduler.",
+    "restart": "Second-terminal control for a running or failed/cancelled job inside the active workflow sequence; it never starts another scheduler.",
     "threads": "View or change a run-scoped max_threads override. Active threaded and API nodes scale live, and every override is cleared when its run finishes.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Continue unsuccessful or queued work for one node without resetting jobs that are already done or skipped.",
@@ -233,11 +233,12 @@ another CLI sequence already owns the project. To preserve completed work after
 a failure, use resume rather than run.
 """,
     "restart": """
-Restart is the control for an active running job or a failed/cancelled job.
-For a live attempt it is normally used from a second terminal inside the sequence. It does not import graph.py and does not launch another
-scheduler. Instead, it atomically advances the job's execution generation, clears
-that job's local result/files, and lets the existing scheduler start the new
-generation while the surrounding run remains intact.
+Restart is exclusively a second-terminal control for the workflow sequence that
+is currently active. It accepts a running attempt or a failed/cancelled job that
+still belongs to that active sequence. It does not import graph.py and does not
+launch another scheduler. Instead, it atomically advances the job's execution
+generation, clears that job's local result/files, and leaves the existing
+scheduler in control.
 
 Examples:
   mwf restart <node-name> job 4 --dry-run
@@ -249,6 +250,9 @@ its old generation immediately loses permission to commit MWF-managed status,
 files, or downstream jobs. Cooperative code can call ctx.raise_if_cancelled();
 progress-aware code can call ctx.checkpoint("section", progress=0.5). Configured
 checkpoint deadlines are watched by the same centralized scheduler supervisor.
+After the active sequence has ended, do not use restart: `mwf resume NODE` or
+`mwf resumefrom START` automatically resets failed/cancelled jobs while preserving
+done/skipped work.
 """,
     "threads": """
 Threads is a lightweight second-terminal control for testing node concurrency.

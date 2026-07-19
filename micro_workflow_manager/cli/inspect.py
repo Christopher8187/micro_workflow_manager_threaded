@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .active_run import live_active_run
+
 from micro_workflow_manager.models import (
     CANCELLED,
     DONE,
@@ -378,7 +380,12 @@ def inspect_failed(workflow, node: str) -> int:
     joined = " ".join(str(job_id) for job_id in job_ids)
     print("Commands:")
     print(f"  inspect one: mwf inspect {node} job {job_ids[0]}")
-    print(f"  restart all: mwf restart {node} jobs {joined}")
+    active = live_active_run(storage)
+    if active is not None and node in set(active.get("nodes") or []):
+        print(f"  restart all in the active run: mwf restart {node} jobs {joined}")
+    else:
+        print(f"  retry this node after the run: mwf resume {node}")
+        print("  retry a descendant sequence: mwf resumefrom <start-node>")
     return 0
 
 

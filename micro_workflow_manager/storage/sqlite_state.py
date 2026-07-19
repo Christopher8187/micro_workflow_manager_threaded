@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import threading
 import time
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 from micro_workflow_manager.models import QUEUED, RUNNING, VALID_STATUSES, now
 from micro_workflow_manager.paths import state_database_file
+from micro_workflow_manager.processes import process_is_alive
 
 
 DATABASE_SCHEMA_VERSION = 1
@@ -32,6 +34,8 @@ class SQLiteStateMixin:
     _initialized_databases: set[tuple[Path, int]] = set()
     _connection_registry: dict[tuple[Path, int, int], sqlite3.Connection] = {}
     _connection_registry_guard = threading.Lock()
+    _advisory_owner_registry: set[str] = set()
+    _advisory_owner_registry_guard = threading.Lock()
 
     def _init_sqlite_state(self) -> None:
         self._advisory_local = threading.local()
@@ -275,6 +279,94 @@ class SQLiteStateMixin:
     # ------------------------------------------------------------------
     # SQLite advisory locks replace .mwf/locks/*.lock files.
     # ------------------------------------------------------------------
+    def _new_advisory_owner(self) -> str:
+        return json.dumps(
+            {
+                "version": 2,
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "thread_id": threading.get_ident(),
+                "nonce": uuid4().hex,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def _parse_advisory_owner(self, owner: str) -> dict[str, Any] | None:
+        if not isinstance(owner, str) or not owner:
+            return None
+        try:
+            data = json.loads(owner)
+        except (TypeError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict):
+            pid = data.get("pid")
+            hostname = data.get("hostname")
+            if type(pid) is int and pid > 0 and isinstance(hostname, str):
+                return {"pid": pid, "hostname": hostname}
+
+        # MWF 0.3.4-0.3.6 stored ``pid:thread_id:uuid``. Those databases are
+        # local project state, so an owner without a hostname is treated as a
+        # local legacy owner for immediate dead-process recovery.
+        parts = owner.split(":", 2)
+        if len(parts) == 3:
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                return None
+            if pid > 0:
+                return {"pid": pid, "hostname": None}
+        return None
+
+    @classmethod
+    def _register_advisory_owner(cls, owner: str) -> None:
+        with cls._advisory_owner_registry_guard:
+            cls._advisory_owner_registry.add(owner)
+
+    @classmethod
+    def _unregister_advisory_owner(cls, owner: str) -> None:
+        with cls._advisory_owner_registry_guard:
+            cls._advisory_owner_registry.discard(owner)
+
+    @classmethod
+    def _advisory_owner_is_registered(cls, owner: str) -> bool:
+        with cls._advisory_owner_registry_guard:
+            return owner in cls._advisory_owner_registry
+
+    def _advisory_owner_liveness(self, owner: str) -> bool | None:
+        parsed = self._parse_advisory_owner(owner)
+        if parsed is None:
+            return None
+
+        hostname = parsed["hostname"]
+        if hostname not in {None, "", socket.gethostname()}:
+            # A shared project directory may be visible from another host. We
+            # cannot query that process locally, so its lease remains the
+            # fallback authority.
+            return None
+
+        pid = parsed["pid"]
+        if pid == os.getpid():
+            # The process-local registry distinguishes a genuinely held lock
+            # from a row orphaned by a terminated owner thread/storage object.
+            return self._advisory_owner_is_registered(owner)
+        return process_is_alive(pid)
+
+    def _advisory_lock_is_reclaimable(
+        self,
+        owner: str,
+        expires_at: float,
+        now_value: float,
+    ) -> bool:
+        liveness = self._advisory_owner_liveness(owner)
+        if liveness is False:
+            return True
+        if liveness is True:
+            # Do not steal a live local lock merely because a long critical
+            # section exceeded its nominal lease.
+            return False
+        return expires_at <= now_value
+
     @contextmanager
     def interprocess_lock(
         self,
@@ -301,7 +393,7 @@ class SQLiteStateMixin:
                     existing["count"] -= 1
                 return
 
-            owner = f"{os.getpid()}:{threading.get_ident()}:{uuid4().hex}"
+            owner = self._new_advisory_owner()
             deadline = time.monotonic() + timeout
             delay = 0.005
             while True:
@@ -312,7 +404,14 @@ class SQLiteStateMixin:
                         "SELECT owner, expires_at FROM advisory_locks WHERE name = ?",
                         (safe_name,),
                     ).fetchone()
-                    if row is None or float(row["expires_at"]) <= now_value:
+                    reclaimable = row is None
+                    if row is not None:
+                        reclaimable = self._advisory_lock_is_reclaimable(
+                            str(row["owner"]),
+                            float(row["expires_at"]),
+                            now_value,
+                        )
+                    if reclaimable:
                         connection.execute(
                             "INSERT INTO advisory_locks(name, owner, acquired_at, expires_at) "
                             "VALUES(?, ?, ?, ?) "
@@ -329,6 +428,7 @@ class SQLiteStateMixin:
                 time.sleep(delay)
                 delay = min(0.2, delay * 1.5)
 
+            self._register_advisory_owner(owner)
             held[safe_name] = {"owner": owner, "count": 1}
             try:
                 yield
@@ -338,11 +438,14 @@ class SQLiteStateMixin:
                     state["count"] -= 1
                     if state["count"] <= 0:
                         held.pop(safe_name, None)
-                        with self.db_transaction() as connection:
-                            connection.execute(
-                                "DELETE FROM advisory_locks WHERE name = ? AND owner = ?",
-                                (safe_name, owner),
-                            )
+                        try:
+                            with self.db_transaction() as connection:
+                                connection.execute(
+                                    "DELETE FROM advisory_locks WHERE name = ? AND owner = ?",
+                                    (safe_name, owner),
+                                )
+                        finally:
+                            self._unregister_advisory_owner(owner)
 
     # ------------------------------------------------------------------
     # One-time 0.3.3-and-earlier metadata import.

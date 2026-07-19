@@ -61,7 +61,8 @@ def test_inspect_failed_lists_ids_errors_and_restart_command(tmp_path, monkeypat
     assert "ValueError('bad value')" in out
     assert "TimeoutError('request exceeded deadline')" in out
     assert "mwf inspect process_number job 2" in out
-    assert "mwf restart process_number jobs 2 4" in out
+    assert "mwf resume process_number" in out
+    assert "mwf resumefrom <start-node>" in out
     assert "  1:" not in out
 
 

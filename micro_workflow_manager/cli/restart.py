@@ -24,12 +24,14 @@ def _restart_mode(
     *,
     active: dict | None,
 ) -> tuple[str, dict]:
+    if active is None:
+        raise RuntimeError(
+            "mwf restart is a second-terminal control and requires a live "
+            "mwf run, runfrom, resume, or resumefrom sequence. After a finished "
+            "partial run, use mwf resume or mwf resumefrom; those commands "
+            "requeue failed jobs automatically."
+        )
     if not storage.job_exists(node, job_id):
-        if active is None:
-            raise RuntimeError(
-                "No live mwf run/runfrom sequence was found, and the selected "
-                f"job does not exist: {node}/{job_id}."
-            )
         raise RuntimeError(f"Job does not exist: {node}/{job_id}")
 
     status = storage.get_job_status(node, job_id)
@@ -39,13 +41,9 @@ def _restart_mode(
     if status in RETRYABLE_FINISHED_STATUSES:
         return "failed", control
     if status == QUEUED:
-        if active is None:
-            raise RuntimeError(
-                "No live mwf run/runfrom sequence was found. The selected job "
-                f"{node}/{job_id} is queued rather than failed."
-            )
         raise RuntimeError(
-            f"Job {node}/{job_id} is not currently running; its status is queued."
+            f"Job {node}/{job_id} is queued, not running or failed. The active "
+            "scheduler already owns queued work."
         )
     raise RuntimeError(
         f"Job {node}/{job_id} has status {status!r}. Restart accepts an active "
@@ -54,20 +52,21 @@ def _restart_mode(
 
 
 def restart_active_jobs(root: Path, node: str, job_ids: list[int], *, dry_run: bool = False) -> int:
-    """Restart live attempts or requeue failed jobs without resetting done jobs."""
+    """Restart attempts inside the one active workflow sequence."""
     storage = FileStorage(root)
     active = live_active_run(storage)
-    active_nodes = set((active or {}).get("nodes") or [])
+    if active is None:
+        raise RuntimeError(
+            "mwf restart is only available from a second terminal while an MWF "
+            "run sequence is active. Use mwf resume or mwf resumefrom after the "
+            "original sequence has ended; failed jobs are reset automatically."
+        )
+    active_nodes = set(active.get("nodes") or [])
 
     modes: list[tuple[int, str, dict]] = []
     for job_id in job_ids:
         mode, control = _restart_mode(storage, node, job_id, active=active)
-        if mode == "running" and active is None:
-            raise RuntimeError(
-                f"Job {node}/{job_id} is marked running, but no live MWF sequence owns it. "
-                "Use 'mwf recover' after confirming the previous process is gone."
-            )
-        if active is not None and node not in active_nodes:
+        if node not in active_nodes:
             raise RuntimeError(
                 f"Node {node} is not part of active {active.get('command', 'workflow')} "
                 f"run {active.get('run_id', '?')}."
@@ -75,13 +74,10 @@ def restart_active_jobs(root: Path, node: str, job_ids: list[int], *, dry_run: b
         modes.append((job_id, mode, control))
 
     if dry_run:
-        if active is None:
-            print("Restart dry run with no active workflow:")
-        else:
-            print(
-                f"Restart dry run inside active {active.get('command', 'workflow')} "
-                f"run {active.get('run_id', '?')}:"
-            )
+        print(
+            f"Restart dry run inside active {active.get('command', 'workflow')} "
+            f"run {active.get('run_id', '?')}:"
+        )
         for job_id, mode, control in modes:
             action = "replace active generation" if mode == "running" else "requeue failed job"
             print(
@@ -110,27 +106,21 @@ def restart_active_jobs(root: Path, node: str, job_ids: list[int], *, dry_run: b
                 requested_by_pid=os.getpid(),
                 reason="manual retry of failed/cancelled job",
             )
-            storage.set_node_status(node, RUNNING if active is not None else QUEUED)
+            storage.set_node_status(node, RUNNING)
         item["mode"] = mode
         restarted.append(item)
 
-    if active is None:
-        print("Requeued failed jobs:")
-    else:
-        print(
-            f"Restarted inside active {active.get('command', 'workflow')} "
-            f"run {active.get('run_id', '?')}:"
-        )
+    print(
+        f"Restarted inside active {active.get('command', 'workflow')} "
+        f"run {active.get('run_id', '?')}:"
+    )
     for item in restarted:
         label = "active restart" if item["mode"] == "running" else "failed-job retry"
         print(
             f"  {node}/{item['job_id']} ({label}) "
             f"generation {item['previous_generation']} -> {item['generation']}"
         )
-    if active is None:
-        print(f"Run 'mwf resume {node}' (or the appropriate 'mwf resumefrom <node-name>') to execute the queued retry.")
-    else:
-        print("The existing run remains in control; no second workflow was started.")
+    print("The existing run remains in control; no second workflow was started.")
     return 0
 
 
@@ -138,8 +128,8 @@ def restart_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="mwf restart",
         description=(
-            "Replace an active running attempt or requeue a failed/cancelled job "
-            "without resetting completed jobs."
+            "From a second terminal, replace a running attempt or requeue a "
+            "failed/cancelled job inside the active workflow sequence."
         ),
     )
     parser.add_argument("node", help="Node containing the job.")

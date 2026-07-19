@@ -46,7 +46,7 @@ def print_run_plan(
     fresh = command in {"run", "runfrom"}
     print(f"Plan for: mwf {command} {node}")
     print("  mode: " + (
-        "fresh producer-component rerun; delete only jobs produced by selected Hoeflein components"
+        "fresh rerun; fully reset the start component and rebuild selected-producer work in descendants"
         if fresh
         else "preserve done/skipped jobs and continue queued or unsuccessful work"
     ))

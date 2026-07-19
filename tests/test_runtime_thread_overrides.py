@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 
 from micro_workflow_manager import MicroWorkflow, cli
+from micro_workflow_manager.cli.project import load_workflow
+from micro_workflow_manager.cli.run import active_workflow_run
+from micro_workflow_manager.cli.threads import threads_command
 from micro_workflow_manager.runners.threaded import ThreadedRunner
 
 
@@ -203,3 +206,83 @@ def test_large_declared_limit_does_not_create_one_empty_worker_per_slot(monkeypa
     runner = threaded_module.ThreadedRunner(max_threads=1000, poll_interval=0.01)
     assert runner.run_jobs("A", [1, 2], lambda value: value) == [1, 2]
     assert len(created) <= threaded_module.INITIAL_WORKER_BURST
+
+
+def test_threads_warns_before_extreme_runtime_concurrency(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _make_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["threads", "A", "750"]) == 0
+    captured = capsys.readouterr()
+    assert "extreme local concurrency" in captured.err
+    assert "one controller thread plus one handler thread" in captured.err
+
+
+def test_threads_command_scopes_override_to_run_that_starts_concurrently(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _make_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    workflow = load_workflow(tmp_path, require_synced=True)
+
+    bind_entered = threading.Event()
+    release_bind = threading.Event()
+    run_ready = threading.Event()
+    finish_run = threading.Event()
+    command_done = threading.Event()
+    command_result: dict[str, object] = {}
+    original_bind = workflow.storage.bind_thread_overrides_to_run
+
+    def delayed_bind(run_id: str):
+        bind_entered.set()
+        assert release_bind.wait(3)
+        return original_bind(run_id)
+
+    monkeypatch.setattr(workflow.storage, "bind_thread_overrides_to_run", delayed_bind)
+
+    def run_sequence():
+        with active_workflow_run(
+            workflow,
+            command="run",
+            start_node="A",
+            nodes=["A"],
+        ) as finish:
+            run_ready.set()
+            assert finish_run.wait(3)
+            finish("done")
+
+    def set_override():
+        command_result["code"] = threads_command(tmp_path, "A", "9")
+        command_done.set()
+
+    run_thread = threading.Thread(target=run_sequence)
+    run_thread.start()
+    assert bind_entered.wait(3)
+
+    command_thread = threading.Thread(target=set_override)
+    command_thread.start()
+    time.sleep(0.05)
+    assert not command_done.is_set()
+
+    release_bind.set()
+    assert run_ready.wait(3)
+    assert command_done.wait(3)
+
+    active = workflow.storage.get_run_state()
+    override_state = workflow.storage.read_thread_override_state()
+    assert command_result["code"] == 0
+    assert active["status"] == "running"
+    assert override_state["run_id"] == active["run_id"]
+    assert override_state["overrides"] == {"A": 9}
+
+    finish_run.set()
+    run_thread.join(3)
+    command_thread.join(3)
+    assert not run_thread.is_alive()
+    assert not command_thread.is_alive()

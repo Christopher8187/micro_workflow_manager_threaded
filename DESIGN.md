@@ -156,7 +156,8 @@ mutually reachable autostart structure.
 
 For merge graphs, producer provenance is part of the design. With `A -> C` and
 `B -> C`, jobs arriving at C carry producer components `{A}` or `{B}`. A fresh
-`runfrom B` removes only B-produced jobs and preserves A-produced jobs. Therefore:
+`runfrom B` fully resets B's selected start component, removes B-produced jobs
+in descendants, and preserves A-produced jobs in shared merge components. Therefore:
 
 - use stable idempotency keys within each producer branch;
 - keep job-local output/provenance attributable to one producer;
@@ -201,10 +202,12 @@ mwf resume NODE
 mwf resumefrom NODE
 ```
 
-Use `run` for one selected Hoeflein component and `runfrom` for that component plus its quotient-DAG descendants.
-Use `resume`/`resumefrom` after a partial failure so successful jobs and their
-outputs are preserved. Use `restart` to replace a specific live attempt or
-requeue a failed job.
+Use `run` for a fresh reset of one selected Hoeflein component and `runfrom`
+for a fresh reset of that component plus producer-scoped rebuilding through its
+quotient-DAG descendants. Use `resume`/`resumefrom` after a partial failure so
+successful jobs and their outputs are preserved while failed/cancelled jobs are
+requeued automatically. Use `restart` only from a second terminal to control a
+specific running or failed job inside the active sequence.
 
 For a timestamped diagnostic timeline in the execution terminal, add `--monitor`:
 
@@ -563,22 +566,18 @@ Use a **new node** when the stage has a different contract, owner, concurrency
 limit, validation criterion, or side effect. Do not hide approval, validation, or
 publication inside a fallback.
 
-A useful failure workflow is:
+A useful post-failure workflow is:
 
 ```bash
 mwf inspect NODE filter
 mwf inspect NODE failed
 mwf inspect NODE job 42
-mwf restart NODE job 42
 mwf resume NODE
 ```
 
-For a descendant sequence:
-
-```bash
-mwf restart NODE jobs 42 57 80-82
-mwf resumefrom NODE
-```
+For a descendant sequence, use `mwf resumefrom START`; it automatically resets
+failed/cancelled jobs throughout the selected scope. Use `mwf restart NODE job
+42` only from a second terminal while the original sequence is active.
 
 # Testing recommendations
 

@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.6
+# micro-workflow-manager 0.3.8
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,47 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.8
+
+- `mwf run NODE` is again a true fresh run even when NODE's jobs were created by
+  an external predecessor. Every remaining job in the explicitly selected
+  Hoeflein start component is requeued and its generated output/files are
+  cleared before scheduling.
+- `mwf runfrom NODE` applies that full reset to the selected start component,
+  then keeps producer-scoped cleanup for descendant merge components. Work from
+  unselected incoming branches is still preserved exactly as before.
+- `mwf resumefrom NODE` automatically generation-fences and requeues failed,
+  cancelled, and abandoned-running jobs throughout the selected descendant set.
+  A separate `mwf restart` step is not required after a completed partial run.
+- `mwf restart` is now strictly a second-terminal control for a live `run`,
+  `runfrom`, `resume`, or `resumefrom` sequence. It may replace a running attempt
+  or requeue a failed/cancelled job owned by that active sequence, but it no
+  longer edits failed jobs after the sequence has ended. Use `resume` or
+  `resumefrom` for post-failure continuation.
+- Fresh-run, branch-preservation, resumefrom, restart, and final run-state
+  behavior are covered by repeated CLI regression tests using `--monitor`.
+
+## What changed in 0.3.7
+
+- SQLite advisory locks now record the owning host and process and immediately
+  reclaim rows whose local owner process has exited. An interrupted or killed
+  `mwf threads`/`mwf run` command therefore cannot strand `thread-overrides`
+  behind its old 300-second lease and make the next run time out after 120
+  seconds.
+- A live local owner is no longer displaced merely because a long critical
+  section exceeded the nominal lease. Unknown or remote owners still use the
+  lease as the safe fallback.
+- Run startup binds temporary thread overrides before publishing `run.json` as
+  running. `mwf threads` serializes active-run discovery with that startup, so a
+  concurrent command cannot accidentally scope its value to the following run.
+  Run completion publishes its terminal state before best-effort override
+  cleanup, so an override cleanup problem cannot leave a completed run falsely
+  recorded as active.
+- `mwf threads NODE VALUE` prints a resource warning above 256 in-flight jobs.
+  CLI restart/timeout supervision can use roughly one controller and one handler
+  thread per active job, so settings such as 750 can put severe pressure on
+  Windows thread, memory, SQLite, socket, and API connection limits.
 
 ## What changed in 0.3.6
 
@@ -98,7 +139,7 @@ manager, and a Pygame state machine.
 - Existing task, retry, checkpoint, restart, deployment, and thread-override behavior is unchanged.
 
 
-- `mwf inspect <node-name> failed` prints failed job IDs, concise errors, and restart commands.
+- `mwf inspect <node-name> failed` prints failed job IDs, concise errors, and the appropriate resume/resumefrom command; during a live sequence it also shows the second-terminal restart form.
 - Extended CLI examples no longer use a node literally named `wait`; examples use neutral placeholders or simple operation names.
 
 ## What changed in 0.3.0
@@ -107,10 +148,10 @@ manager, and a Pygame state machine.
   configured before a run is claimed by that next run and deleted when the run
   finishes; an override changed from a second terminal is deleted with the
   active run. Stale overrides from a crashed older run are ignored.
-- `mwf restart` still generation-fences live attempts, and can now requeue
-  `failed` or `cancelled` jobs without resetting completed jobs. A retry queued
-  after the original run has ended can be executed with `mwf resume <node-name>`
-  or the appropriate `mwf resumefrom <node-name>`.
+- `mwf restart` generation-fenced live attempts and originally allowed offline
+  failed/cancelled requeueing. Version 0.3.8 reserves restart for a live
+  second-terminal sequence; post-failure continuation now belongs directly to
+  `mwf resume` and `mwf resumefrom`.
 - `mwf deploy setup` explicitly prompts for the SSH port when `--port` is not
   supplied.
 - `mwf init` merges Material Icon Theme settings into `.vscode/settings.json`
@@ -430,9 +471,11 @@ jobs crossed a quotient-DAG edge. Root/default jobs have no producer.
 
 For a fresh `mwf run COMPONENT_MEMBER`, MWF first deletes every job produced by
 that component, including internal component jobs and jobs it produced in later
-components. It then requeues the component's root/default jobs. For
-`mwf runfrom`, the same operation applies to every selected component. Work
-produced by unselected components is retained.
+components. It then requeues **every remaining job in the selected start
+component**, including jobs created there by an external predecessor. For
+`mwf runfrom`, that same full reset applies to the start component. Descendant
+merge components rebuild selected-producer and root/default work while preserving
+completed jobs produced by unselected incoming branches.
 
 Example with ordinary edges `A -> C` and `B -> C`:
 
@@ -617,8 +660,18 @@ when a new run claims the project.
 For an active threaded or API node, an increase starts more queued jobs within roughly
 0.2 seconds and grows geometrically toward very large limits. A decrease never
 cancels jobs already running; the runner stops launching replacements until
-active concurrency falls to the new limit. This makes it safe to tune Windows
-filesystem/API pressure from a second terminal.
+active concurrency falls to the new limit.
+
+Increase large values gradually. During CLI runs, each active job may use one
+runner/controller thread and one supervised handler thread so that timeout and
+second-terminal restart can abandon stale work safely. An override of 750 can
+therefore approach 1,500 Python threads before counting the scheduler, SQLite,
+HTTP-client, DNS, and operating-system work. MWF warns above 256 but deliberately
+does not silently clamp the requested test value.
+
+If a process is killed while changing the override, the next command detects
+that the advisory-lock owner is no longer alive and immediately reclaims the
+lock. It does not wait for the old five-minute lease to expire.
 
 `mwf inspect NODE` shows the declared, overridden, and effective values.
 `mwf monitor` shows the effective value in its `threads` column and marks runtime
@@ -922,7 +975,7 @@ becomes more useful after at least one relevant job has finished. See
 [AGENT.md](AGENT.md) for using snapshots to separate resource pressure, timeout
 policy, test-code stalls, and scheduler defects.
 
-## Restart a running job or requeue a failed job
+## Restart inside an active sequence
 
 When an individual job is hung inside an active `mwf run`, `runfrom`, `resume`,
 or `resumefrom` sequence, keep the original terminal running and use the
@@ -955,18 +1008,21 @@ queued job when the attempt has already completed. Ordinary `mwf run` and
 `mwf runfrom` commands also refuse to start a competing sequence while another
 one owns the project.
 
-A job already marked `failed` or `cancelled` may be requeued even after the
-original workflow has ended:
+`mwf restart` requires that the owning workflow sequence is still live. It may
+also requeue a job that has already reached `failed` or `cancelled` while that
+sequence remains active, but it never creates an offline queued retry after the
+run record becomes terminal.
+
+After a partial run has ended, continue directly with:
 
 ```bash
-mwf restart <node-name> job 42
 mwf resume <node-name>
+mwf resumefrom <start-node>
 ```
 
-This preserves the SQLite job identity and `input.json`, advances the execution generation,
-clears only that job's old result/files, and never resets jobs already marked
-`done` or `skipped`. If a larger descendant sequence must continue, use the
-appropriate `mwf resumefrom <node-name>` after requeueing.
+Those commands automatically advance the generation and clear old result/files
+for failed, cancelled, or abandoned-running jobs while preserving `done` and
+`skipped` jobs.
 
 Python cannot safely force-kill an arbitrary thread that is blocked inside a
 third-party HTTP request or native library. From MWF's point of view the old
@@ -1045,10 +1101,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.6 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.8 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.6-py3-none-any.whl
+micro_workflow_manager-0.3.8-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1068,22 +1124,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.6-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.8-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.6-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.8-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.6-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.8-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.6`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.8`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1098,7 +1154,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.6-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.8-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

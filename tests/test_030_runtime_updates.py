@@ -69,7 +69,7 @@ def test_stale_run_bound_thread_override_is_ignored_and_cleared_by_next_run(tmp_
     assert not (tmp_path / ".mwf" / "threads.json").exists()
 
 
-def test_restart_requeues_failed_job_without_active_run(tmp_path, monkeypatch, capsys):
+def test_restart_refuses_failed_job_without_active_run(tmp_path, monkeypatch, capsys):
     _project(tmp_path, monkeypatch, failing=True)
     capsys.readouterr()
     assert cli.main(["run", "A", "--runner", "direct"]) == 1
@@ -77,11 +77,11 @@ def test_restart_requeues_failed_job_without_active_run(tmp_path, monkeypatch, c
 
     storage = FileStorage(tmp_path)
     assert storage.get_job_status("A", 1) == "failed"
-    assert cli.main(["restart", "A", "job", "1"]) == 0
-    output = capsys.readouterr().out
-    assert "failed-job retry" in output
-    assert "mwf resume A" in output
-    assert storage.get_job_status("A", 1) == "queued"
+    assert cli.main(["restart", "A", "job", "1"]) == 1
+    error = capsys.readouterr().err
+    assert "second terminal" in error
+    assert "mwf resume or mwf resumefrom" in error
+    assert storage.get_job_status("A", 1) == "failed"
 
 
 def test_restart_refuses_done_job(tmp_path, monkeypatch, capsys):
@@ -90,7 +90,7 @@ def test_restart_refuses_done_job(tmp_path, monkeypatch, capsys):
     assert cli.main(["run", "A", "--runner", "direct"]) == 0
     capsys.readouterr()
     assert cli.main(["restart", "A", "job", "1"]) == 1
-    assert "never resets done work" in capsys.readouterr().err
+    assert "second terminal" in capsys.readouterr().err
 
 
 def test_deploy_setup_prompts_for_nonstandard_port(tmp_path, monkeypatch, capsys):

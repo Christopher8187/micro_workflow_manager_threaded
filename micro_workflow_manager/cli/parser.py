@@ -193,11 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     restart_cmd = commands.add_parser(
         "restart",
-        help="Restart active running jobs or requeue failed jobs without resetting done work.",
+        help="From a second terminal, restart running or failed jobs inside the active sequence.",
         description=COMMAND_HELP_DESCRIPTIONS["restart"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    restart_cmd.add_argument("node", help="Node containing the running or failed job.")
+    restart_cmd.add_argument("node", help="Node containing the running or failed job in the active sequence.")
     restart_cmd.add_argument(
         "job_mode",
         metavar="job",
