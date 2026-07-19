@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
-from micro_workflow_manager.models import QUEUED, VALID_STATUSES
+from micro_workflow_manager.models import QUEUED, RUNNING, VALID_STATUSES, now
 from micro_workflow_manager.paths import state_database_file
 
 
@@ -573,6 +573,99 @@ class SQLiteStateMixin:
         finally:
             snapshot.close()
         return destination
+
+    def reconcile_pasted_node_state(self, node_name: str) -> dict[str, int]:
+        """Make pasted payload folders and SQLite metadata immediately consistent.
+
+        Older clipboard snapshots may not contain a SQLite export, while a snapshot
+        captured during execution may contain stale ``running`` leases. Pasting is a
+        cold restore: missing metadata rows are rebuilt as queued jobs and running
+        rows are requeued with their execution leases cleared.
+        """
+        node_name = self.validate_node_name(node_name)
+        jobs_root = self.project_dir / "node" / node_name / "jobs"
+        payload_ids: set[int] = set()
+        if jobs_root.is_dir():
+            for child in jobs_root.iterdir():
+                if not child.is_dir() or not child.name.isdigit():
+                    continue
+                job_id = int(child.name)
+                if job_id < 1 or not (child / "input.json").is_file():
+                    continue
+                payload_ids.add(job_id)
+
+        created = 0
+        requeued = 0
+        removed = 0
+        with self.db_transaction() as connection:
+            existing_rows = connection.execute(
+                "SELECT job_id, status FROM jobs WHERE node_name=?", (node_name,)
+            ).fetchall()
+            existing = {int(row["job_id"]): str(row["status"]) for row in existing_rows}
+
+            for job_id in sorted(set(existing) - payload_ids):
+                connection.execute(
+                    "DELETE FROM job_events WHERE node_name=? AND job_id=?",
+                    (node_name, job_id),
+                )
+                connection.execute(
+                    "DELETE FROM jobs WHERE node_name=? AND job_id=?",
+                    (node_name, job_id),
+                )
+                connection.execute(
+                    "DELETE FROM idempotency WHERE node_name=? AND job_id=?",
+                    (node_name, job_id),
+                )
+                removed += 1
+
+            for job_id in sorted(payload_ids - set(existing)):
+                connection.execute(
+                    "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
+                    "VALUES(?, ?, NULL, ?, ?, '{}')",
+                    (node_name, job_id, now(), QUEUED),
+                )
+                connection.execute(
+                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                    "VALUES(?, ?, ?, 'clipboard_restored', ?)",
+                    (node_name, job_id, now(), json.dumps({"status": QUEUED})),
+                )
+                created += 1
+
+            running_ids = [job_id for job_id, status in existing.items() if job_id in payload_ids and status == RUNNING]
+            for job_id in running_ids:
+                connection.execute(
+                    "UPDATE jobs SET status=?, status_json='{}', active_execution_id=NULL, "
+                    "active_pid=NULL, active_thread_id=NULL, active_started_at=NULL, "
+                    "restart_requested_at=NULL, restart_requested_by_pid=NULL, restart_reason=NULL, "
+                    "runtime_json=NULL WHERE node_name=? AND job_id=?",
+                    (QUEUED, node_name, job_id),
+                )
+                connection.execute(
+                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                    "VALUES(?, ?, ?, 'clipboard_requeued', ?)",
+                    (node_name, job_id, now(), json.dumps({"previous_status": RUNNING, "status": QUEUED})),
+                )
+                requeued += 1
+
+            queued_count = connection.execute(
+                "SELECT COUNT(*) FROM jobs WHERE node_name=? AND status=?",
+                (node_name, QUEUED),
+            ).fetchone()[0]
+            if queued_count:
+                connection.execute(
+                    "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
+                    "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status",
+                    (node_name, QUEUED),
+                )
+            elif payload_ids and connection.execute(
+                "SELECT 1 FROM nodes WHERE node_name=?", (node_name,)
+            ).fetchone() is None:
+                connection.execute(
+                    "INSERT INTO nodes(node_name, status) VALUES(?, ?)",
+                    (node_name, QUEUED),
+                )
+
+        return {"created": created, "requeued": requeued, "removed": removed, "jobs": len(payload_ids)}
 
     def import_node_state(self, node_name: str, source_path: Path) -> None:
         node_name = self.validate_node_name(node_name)

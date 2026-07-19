@@ -17,7 +17,7 @@ from .planning import print_run_plan
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
 from .restart import restart_active_jobs
-from .threads import threads_command
+from .threads import threads_command, update_declared_threads
 from .deploy import deploy_command
 from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs
 from .validation import require_node
@@ -62,6 +62,10 @@ def main(argv: list[str] | None = None) -> int:
             return migrate_command(root, dry_run=args.dry_run)
 
         if args.command == "threads":
+            if args.update:
+                if args.node is not None or args.value is not None:
+                    raise RuntimeError("mwf threads --update does not accept a node or runtime value")
+                return update_declared_threads(root)
             return threads_command(root, args.node, args.value)
 
         # Restart is intentionally handled before graph/router loading. The
@@ -159,23 +163,25 @@ def main(argv: list[str] | None = None) -> int:
                     job_ids,
                     stats=args.stats,
                     stats_interval=args.stats_interval,
+                    monitor=args.monitor,
+                    monitor_interval=args.monitor_interval,
                 )
-            return run_node(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval)
+            return run_node(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval, monitor=args.monitor, monitor_interval=args.monitor_interval)
 
         if args.command == "resume":
             if args.plan:
                 return print_run_plan(root, workflow, command="resume", node=node)
-            return resume_node(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval)
+            return resume_node(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval, monitor=args.monitor, monitor_interval=args.monitor_interval)
 
         if args.command == "runfrom":
             if args.plan:
                 return print_run_plan(root, workflow, command="runfrom", node=node)
-            return run_from(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval)
+            return run_from(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval, monitor=args.monitor, monitor_interval=args.monitor_interval)
 
         if args.command == "resumefrom":
             if args.plan:
                 return print_run_plan(root, workflow, command="resumefrom", node=node)
-            return resume_from(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval)
+            return resume_from(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval, monitor=args.monitor, monitor_interval=args.monitor_interval)
 
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)

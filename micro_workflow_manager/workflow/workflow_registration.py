@@ -20,10 +20,9 @@ class WorkflowRegistrationMixin:
                 self.ensure_node(end)
                 self.graph_obj.add_edge(start, end)
 
-            # Cycles are allowed. A strongly connected component is treated as
-            # one communicating class for readiness and completion. This lets
-            # autostart loops such as A -> A or A -> B -> A keep generating
-            # jobs until the whole component becomes quiescent.
+            # Cycles are allowed. Scheduling uses Hoeflein components: SCCs of
+            # the directed graph after explicit autostart edges receive reverse
+            # reachability arcs. The quotient of those components is the DAG.
             if self.persist_graph:
                 self.storage.write_graph(edges)
 

@@ -32,7 +32,7 @@ class DagSchedulerMixin:
     ) -> list[str]:
         """Run ready execution units concurrently.
 
-        A cyclic SCC is scheduled as one execution unit, not as several
+        A Hoeflein component is scheduled as one execution unit, not as several
         independent node schedulers. This prevents autostart cycles such as
         A -> B -> A from starting competing schedulers that fight over the same
         queue/status files or recursively wait on child jobs.
@@ -100,18 +100,17 @@ class DagSchedulerMixin:
         return ran
 
     def run_node(self, node_name: str, ignore_readiness: bool = False):
-        if not ignore_readiness and not self.node_ready(node_name):
-            raise InvalidGraphError(f"Node {node_name} is not ready yet")
+        component = self.component_for(node_name)
+        if not ignore_readiness and not self.component_ready(component):
+            raise InvalidGraphError(f"Hoeflein component {sorted(component)} is not ready yet")
 
-        # Make the node-level status flip immediately. Queued jobs are then
-        # streamed to the runner by ID, so execution can start before every job
-        # folder has been scanned and before every input.json has been loaded.
+        # The programmatic API follows the same semantics as ``mwf run NODE``:
+        # naming any member of a Hoeflein component pumps the whole component.
+        if len(component) > 1 or self.component_is_cyclic(component):
+            return self.run_component(component, ignore_readiness=True)
+
         self.storage.set_node_status(node_name, RUNNING)
-
-        return self.run_queued_node_jobs(
-            node_name=node_name,
-            ignore_readiness=True,
-        )
+        return self.run_queued_node_jobs(node_name=node_name, ignore_readiness=True)
 
     def run_queued_node_jobs(
         self,

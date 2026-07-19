@@ -219,6 +219,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     threads_cmd.add_argument("node", nargs="?", help="Node name. Omit to list every mounted node.")
     threads_cmd.add_argument("value", nargs="?", help="Absolute integer, +N, -N, or reset/default/clear.")
+    threads_cmd.add_argument(
+        "--update",
+        action="store_true",
+        help="Reload node behavior files and refresh declared max_threads/runner values in mounted schemas.",
+    )
 
     deploy_cmd = commands.add_parser(
         "deploy",
@@ -332,11 +337,22 @@ def add_stats_arguments(command: argparse.ArgumentParser):
     command.add_argument(
         "--stats",
         action="store_true",
-        help="Print compact live statistics while this command runs. For a cleaner dashboard, use mwf monitor in another terminal.",
+        help="Print compact timestamped statistics while this command runs.",
     )
     command.add_argument(
         "--stats-interval",
         type=positive_float,
         default=5.0,
         help="Seconds between --stats lines. Default: 5.",
+    )
+    command.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Print the full timestamped monitor dashboard in this terminal while the command runs.",
+    )
+    command.add_argument(
+        "--monitor-interval",
+        type=positive_float,
+        default=2.0,
+        help="Seconds between inline --monitor snapshots. Default: 2.",
     )

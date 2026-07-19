@@ -61,11 +61,17 @@ def paste_node_from_clipboard(root: Path, node: str) -> int:
     temporary.replace(destination)
     storage = FileStorage(root)
     storage.import_node_state(node, source / SNAPSHOT_NAME)
+    reconciled = storage.reconcile_pasted_node_state(node)
     if storage.get_node_status(node) is None:
         from micro_workflow_manager.models import QUEUED
         storage.set_node_status(node, QUEUED)
     print(f"Restored node from clipboard: {destination}")
     print(f"  files pasted: {file_count}")
-    print("  SQLite job state restored")
+    print("  SQLite job state restored and synchronized immediately")
+    print(
+        f"  jobs available: {reconciled['jobs']} "
+        f"(rebuilt: {reconciled['created']}, requeued: {reconciled['requeued']}, "
+        f"removed stale rows: {reconciled['removed']})"
+    )
     ensure_vscode_settings(root)
     return 0

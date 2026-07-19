@@ -58,7 +58,7 @@ def _node_explanation(workflow, node: str) -> str:
     if counts.get(RUNNING, 0):
         return f"The node is active because {counts[RUNNING]} job(s) are running."
     if counts.get(QUEUED, 0):
-        blockers = [p for p in workflow.graph_obj.predecessors(node) if not workflow.node_complete(p)]
+        blockers = [p for p in workflow.component_predecessors(workflow.component_for(node)) if not workflow.node_complete(p)]
         if blockers:
             return "Queued jobs are waiting for incomplete predecessors: " + ", ".join(sorted(blockers)) + "."
         return f"The node has {counts[QUEUED]} queued job(s) ready for scheduling."
@@ -77,7 +77,7 @@ def inspect_node(workflow, node: str) -> int:
     component = sorted(workflow.component_for(node))
     print(f"Node {node}")
     print(f"  status: {workflow.storage.get_node_status(node) or 'missing'}")
-    print(f"  component: {', '.join(component)}")
+    print(f"  Hoeflein component: {', '.join(component)}")
     print(f"  predecessors: {', '.join(sorted(workflow.graph_obj.predecessors(node))) or '(none)'}")
     print(f"  successors: {', '.join(sorted(workflow.graph_obj.successors(node))) or '(none)'}")
     print(f"  jobs: total={summary['total']} " + " ".join(f"{key}={value}" for key, value in sorted(summary['counts'].items()) if value))
@@ -108,6 +108,8 @@ def inspect_job(workflow, node: str, job_id: int) -> int:
     print(f"Job {node}/{job_id}")
     print(f"  status: {status.get('status', QUEUED)}")
     print(f"  parent: {job.parent or '(none)'}")
+    print(f"  producer component: {', '.join(job.producer_component or ()) or '(none)'}")
+    print(f"  job kind: {job.job_kind or 'root'}")
     print(f"  generation: {control.get('generation', 0)}")
     if control.get("active_execution_id"):
         print(f"  active process: {control.get('active_pid')}")

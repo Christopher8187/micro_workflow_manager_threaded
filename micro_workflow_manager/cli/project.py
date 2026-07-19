@@ -234,6 +234,15 @@ def load_workflow(
         initialize_node_folders=False,
     )
     workflow.graph(edges)
+    # Static autostart declarations define the reverse reachability arcs used
+    # to construct Hoeflein components before any job begins.
+    from .autostart_scan import scan_autostarts
+    scanned_autostarts = scan_autostarts(graph_file.parent / "node_behavior")
+    workflow.set_autostart_edges(
+        (start, end)
+        for start, targets in scanned_autostarts.items()
+        for end in targets
+    )
     workflow.include_node_dir(
         graph_file.parent / "node_behavior",
         allowed_node_names=graph_nodes,

@@ -262,3 +262,62 @@ def test_cli_migrate_dry_run_preserves_legacy_lock_directory(tmp_path, monkeypat
     capsys.readouterr()
     assert (locks / "legacy.lock").is_file()
     assert not (mwf_dir / "state.sqlite3").exists()
+
+
+def test_paste_rebuilds_legacy_payload_jobs_and_runs_immediately(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_cli_project(tmp_path, runner="direct")
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
+
+    clipboard = tmp_path / "clipboard" / "A"
+    job = clipboard / "jobs" / "7"
+    job.mkdir(parents=True)
+    (job / "input.json").write_text("{}", encoding="utf-8")
+    (clipboard / "input").mkdir()
+    (clipboard / "output").mkdir()
+    (clipboard / "schema.json").write_text(
+        (tmp_path / "node" / "A" / "schema.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["paste", "A"]) == 0
+    storage = FileStorage(tmp_path)
+    assert storage.get_job_status("A", 7) == "queued"
+    assert storage.get_node_status("A") == "queued"
+    storage.close_database_connections()
+    assert cli.main(["run", "A", "job", "7", "--runner", "direct"]) == 0
+    storage = FileStorage(tmp_path)
+    assert storage.get_job_status("A", 7) == DONE
+    storage.close_database_connections()
+
+
+def test_paste_requeues_running_snapshot_immediately(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_cli_project(tmp_path, runner="direct")
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
+    storage = FileStorage(tmp_path)
+    storage.set_job_status("A", 1, "running")
+    storage.close_database_connections()
+    assert cli.main(["copy", "A"]) == 0
+    assert cli.main(["paste", "A"]) == 0
+    storage = FileStorage(tmp_path)
+    assert storage.get_job_status("A", 1) == "queued"
+    assert storage.get_node_status("A") == "queued"
+    storage.close_database_connections()
+
+
+def test_threads_update_refreshes_schema_from_node_behavior(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _write_cli_project(tmp_path, runner="api", max_threads=4)
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "threaded"]) == 0
+    behavior = tmp_path / "src" / "node_behavior" / "A.py"
+    behavior.write_text(behavior.read_text(encoding="utf-8").replace("max_threads=4", "max_threads=11"), encoding="utf-8")
+    assert json.loads((tmp_path / "node" / "A" / "schema.json").read_text())["max_threads"] == 4
+    assert cli.main(["threads", "--update"]) == 0
+    schema = json.loads((tmp_path / "node" / "A" / "schema.json").read_text())
+    assert schema["max_threads"] == 11
+    assert schema["runner_override"] == "api"
+    assert "A: 4 -> 11" in capsys.readouterr().out

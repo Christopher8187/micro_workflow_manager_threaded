@@ -47,6 +47,9 @@ class MicroWorkflow(
         self.initialize_node_folders = bool(initialize_node_folders)
 
         self.graph_obj = nx.DiGraph()
+        # Explicit autostart edges add reverse reachability when constructing
+        # Hoeflein components. Ordinary graph edges retain their direction.
+        self.autostart_edges: set[tuple[str, str]] = set()
         self.nodes: dict[str, JobNode] = {}
         self.lock = RLock()
         self._included_router_ids: set[int] = set()

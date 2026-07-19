@@ -15,7 +15,7 @@ Common flow:
   mwf doctor
   mwf migrate --dry-run
   mwf run A --plan
-  mwf run A
+  mwf run A --monitor
   mwf restart <node-name> job 42
   mwf threads <node-name> +2
   mwf deploy setup
@@ -43,14 +43,14 @@ COMMAND_HELP_DESCRIPTIONS = {
     "clean": "Delete jobs and output for selected nodes while keeping node input files.",
     "reset": "Requeue every existing job for selected nodes while keeping job definitions and node input files.",
     "wipe": "Like clean, but remove selected nodes' input files as well.",
-    "run": "Reset and run one ready node, or reset and run explicitly selected job IDs.",
+    "run": "Reset and run one ready node or selected jobs; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Replace a live running attempt or requeue a failed/cancelled job without resetting completed work or starting a competing scheduler.",
     "threads": "View or change a run-scoped max_threads override. Active threaded and API nodes scale live, and every override is cleared when its run finishes.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Continue unsuccessful or queued work for one node without resetting jobs that are already done or skipped.",
-    "runfrom": "Reset and run one node and its descendants while respecting dependency readiness.",
+    "runfrom": "Reset and run one node and its descendants; --monitor retains a timestamped dashboard timeline in the same terminal.",
     "resumefrom": "Continue unsuccessful or queued work from one node through its descendants without resetting completed jobs.",
-    "monitor": "Show live or one-shot node/job statistics without running task code.",
+    "monitor": "Show live or one-shot node/job statistics without running task code; completed sequences report active run: none.",
 }
 
 COMMAND_DESCRIPTIONS = {
@@ -218,9 +218,14 @@ the named job IDs, leaving the other jobs in that node untouched.
 
 Examples:
   mwf run make_number --plan
-  mwf run make_number
-  mwf run double_number job 2
+  mwf run make_number --monitor
+  mwf run double_number job 2 --monitor
   mwf run process_number jobs 1 3-5
+
+`--monitor` prints the full timestamped dashboard in this terminal without
+clearing prior task output. `--monitor-interval` controls the cadence. The final
+snapshot is emitted after the run record becomes terminal, so it reports
+`active run: none`. `--stats` remains the compact alternative.
 
 A basic task might choose a random integer, double it, or call ctx.sleep(1). Run
 uses the configured threaded, API, process, or direct runner and refuses to start if
@@ -301,18 +306,23 @@ append-only event history records the resume transition so inspect can explain
 what happened later.
 """,
     "runfrom": """
-Runfrom is the fresh-run form for a node and all of its descendants. It resets
-the selected path, checks external predecessors, and then schedules ready nodes
-in dependency order while allowing independent work to overlap under a concurrent
-runner.
+Runfrom is the fresh-run form for one Hoeflein component and its quotient-DAG
+descendants. Naming any member selects the whole component. It deletes only jobs
+produced by selected components, preserves jobs produced by other branches, and
+then schedules the selected branch in dependency order.
 
 For A -> B -> C:
   mwf runfrom A --plan
-  mwf runfrom A
+  mwf runfrom A --monitor
 
-A simple A task might generate a number, B might add one, and C might
-write the answer after a short ctx.sleep(1) delay. Runfrom resets that selected sequence. Use resumefrom
-when some jobs are already done and should stay done.
+The inline dashboard observes the complete descendant set and retains every
+timestamped snapshot in the terminal, which is useful for diagnosing readiness
+or cyclic-component stalls. A simple A task might generate a number, B might add
+one, and C might write the answer after a short ctx.sleep(1) delay. Runfrom
+rebuilds only work attributable to the selected producer components. A later
+runfrom from another incoming branch keeps this branch's completed descendant
+jobs. Use resumefrom when unsuccessful jobs should continue without fresh
+producer cleanup.
 """,
     "resumefrom": """
 Resumefrom mirrors runfrom's graph selection but uses resume semantics. It keeps
@@ -325,8 +335,8 @@ For A -> B -> C:
   mwf resumefrom A
 
 If A is done, one B job failed, and C has not run yet, resumefrom preserves A,
-reruns the failed B job, and then allows C to continue when B completes. It does
-not delete parent-created jobs merely because they belong to a descendant node.
+reruns the failed B job, and then allows C to continue when B completes. It does not perform producer-component cleanup and therefore preserves every
+existing successful descendant job.
 """,
     "monitor": """
 Monitor is a read-only live view over SQLite node/job summaries plus the
@@ -337,10 +347,13 @@ Examples:
   mwf monitor
   mwf monitor A B --once
   mwf monitor --json --once
+  mwf runfrom A --monitor
 
-During a task that waits for several seconds, monitor shows the running job ID,
-queued and completed counts, effective `max_threads`, average duration, and
-approximate remaining time. Use inspect when you need the detailed lifecycle,
+During a task that waits for several seconds, monitor shows the observation time,
+running job ID, queued and completed counts, effective `max_threads`, average
+duration, and approximate remaining time. A run record is called active only
+while its status is `running`; terminal records are shown as `active run: none`
+plus a separate last-run line. Use inspect when you need the detailed lifecycle,
 checkpoint, retry, or fallback history of one specific node or job.
 """,
 

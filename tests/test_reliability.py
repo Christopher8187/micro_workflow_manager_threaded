@@ -42,10 +42,13 @@ def test_generated_job_records_parent_node_and_job_id():
         }
 
 
-def test_autostarted_downstream_job_does_not_complete_node_early():
+def test_programmatic_hoeflein_component_waits_for_external_predecessor():
+    from micro_workflow_manager.errors import InvalidGraphError
+
     with tempfile.TemporaryDirectory() as project_dir:
         workflow = MicroWorkflow(project_dir=project_dir, runner="direct")
         workflow.graph([("A", "B"), ("C", "B")])
+        workflow.set_autostart_edges([("A", "B")])
 
         @workflow.task("A")
         def a(ctx):
@@ -62,12 +65,12 @@ def test_autostarted_downstream_job_does_not_complete_node_early():
         workflow.start("A")
         workflow.start("C")
 
-        workflow.run_node("A")
-        assert workflow.storage.get_node_status("B") == "queued"
-        assert not workflow.node_complete("B")
+        with pytest.raises(InvalidGraphError):
+            workflow.run_node("A")
 
         workflow.run_node("C")
-        workflow.ready_nodes()
+        workflow.run_node("A")
+        assert workflow.node_complete("A")
         assert workflow.node_complete("B")
 
 

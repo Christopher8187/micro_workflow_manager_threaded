@@ -230,8 +230,8 @@ def test_cleaning_a_removes_finished_status_and_blocks_b(tmp_path, monkeypatch, 
     assert cli.main(["run", "B", "--runner", "direct"]) == 1
     out = capsys.readouterr().out
 
-    assert "B is not ready yet." in out
-    assert "Previous nodes not finished:" in out
+    assert "Cannot run B: incomplete predecessor components: A" in out
+    assert "Hoeflein components are scheduled on the quotient DAG" in out
     assert "A: queued" in out
 
 

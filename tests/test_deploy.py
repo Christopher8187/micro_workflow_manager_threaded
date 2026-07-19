@@ -199,3 +199,32 @@ def test_deploy_remote_uses_putty_for_password_setup(tmp_path, monkeypatch, caps
     assert commands[1][0] == str(plink)
     assert "/srv/example" not in " ".join(commands[0])
     assert "python3" in commands[1][-1]
+
+
+def test_deploy_local_with_sqlite_state_reinitializes_cleanly(tmp_path, monkeypatch, capsys):
+    _init(tmp_path, monkeypatch)
+    capsys.readouterr()
+    (tmp_path / "src" / "node_behavior").mkdir(parents=True)
+    (tmp_path / "src" / "graph.py").write_text("EDGES=[('A','B')]", encoding="utf-8")
+    for node in ("A", "B"):
+        (tmp_path / "src" / "node_behavior" / f"{node}.py").write_text(
+            "from micro_workflow_manager import NodeRouter\n"
+            f"router=NodeRouter('{node}')\n"
+            "@router.task\n"
+            "def run(ctx): return None\n",
+            encoding="utf-8",
+        )
+    assert cli.main(["graph", "src/graph.py"]) == 0
+    assert (tmp_path / ".mwf" / "state.sqlite3").is_file()
+    (tmp_path / "key").write_text("test-key", encoding="utf-8")
+    assert cli.main(["deploy", "setup", "--host", "server.example", "--user", "u", "--port", "22", "--auth", "key", "--tool", "openssh", "--key", str(tmp_path / "key")]) == 0
+    assert cli.main(["deploy", "local"]) == 0
+    archive = tmp_path / ".mwf" / "deploy" / "local" / "deployment.zip"
+    target = tmp_path / "deployed"
+    target.mkdir()
+    with zipfile.ZipFile(archive) as outer:
+        assert ".mwf/state.sqlite3" not in outer.namelist()
+        outer.extractall(target)
+    monkeypatch.chdir(target)
+    assert cli.main(["init"]) == 0
+    assert (target / ".mwf" / "state.sqlite3").is_file()

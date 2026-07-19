@@ -113,11 +113,21 @@ class JobFileStorageMixin:
         ).fetchone()
         if row is None:
             return {}
-        parent = json.loads(row["parent_json"]) if row["parent_json"] else None
+        raw_parent = json.loads(row["parent_json"]) if row["parent_json"] else None
+        producer_component = None
+        job_kind = None
+        parent = raw_parent
+        if isinstance(raw_parent, dict):
+            raw_parent = dict(raw_parent)
+            producer_component = raw_parent.pop("_mwf_from_component", raw_parent.pop("from_component", None))
+            job_kind = raw_parent.pop("_mwf_job_kind", raw_parent.pop("job_kind", None))
+            parent = raw_parent or None
         return {
             "job_id": int(row["job_id"]),
             "node_name": str(row["node_name"]),
             "parent": parent,
+            "producer_component": tuple(producer_component) if isinstance(producer_component, list) else None,
+            "job_kind": job_kind,
             "created_at": str(row["created_at"]),
         }
 
@@ -130,7 +140,11 @@ class JobFileStorageMixin:
         job_dir = self.job_dir(job.node_name, job.job_id)
         input_path = self.input_file(job.node_name, job.job_id)
         self.atomic_write_json(input_path, job.params)
-        parent_json = json.dumps(job.parent, ensure_ascii=False) if job.parent is not None else None
+        stored_parent = dict(job.parent) if job.parent is not None else None
+        if stored_parent is not None and job.producer_component is not None:
+            stored_parent["_mwf_from_component"] = list(job.producer_component)
+            stored_parent["_mwf_job_kind"] = job.job_kind
+        parent_json = json.dumps(stored_parent, ensure_ascii=False) if stored_parent is not None else None
         try:
             with self.db_transaction() as connection:
                 connection.execute(
@@ -147,6 +161,8 @@ class JobFileStorageMixin:
             "created",
             status=QUEUED,
             parent=job.parent,
+            producer_component=list(job.producer_component or ()),
+            job_kind=job.job_kind,
         )
 
     def ensure_job(self, job: Job) -> Job:
@@ -180,6 +196,8 @@ class JobFileStorageMixin:
             node_name=metadata["node_name"],
             params=params,
             parent=metadata.get("parent"),
+            producer_component=metadata.get("producer_component"),
+            job_kind=metadata.get("job_kind"),
             created_at=metadata["created_at"],
         )
 

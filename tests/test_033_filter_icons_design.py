@@ -128,13 +128,19 @@ def test_readme_links_design_and_requires_output_provenance():
     root = Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     design = (root / "DESIGN.md").read_text(encoding="utf-8")
-    assert "# micro-workflow-manager 0.3.4" in readme
+    assert "# micro-workflow-manager 0.3.6" in readme
     assert "[DESIGN.md](DESIGN.md)" in readme
     assert "provenance" in readme.lower()
     assert "## Advice first" in design
     assert "Prompt chaining" in design
     assert "Database change manager" in design
     assert "Pygame state machine" in design
+    agent = (root / "AGENT.md").read_text(encoding="utf-8")
+    assert "mwf run NODE --monitor" in agent
+    assert "Reduce concurrency first" in agent
+    assert "test-code freezing from framework freezing" in agent
+    assert "Repeat-use matrix" in agent
+    assert "STUBBORN_ISSUE.md" in agent
 
 
 EXAMPLE_STARTS = {

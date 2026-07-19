@@ -10,6 +10,7 @@ from micro_workflow_manager.storage import FileStorage
 from .active_run import live_active_run
 from .layout import ensure_runtime_layout
 from .files import find_root, read_config, safe_node_name
+from .project import load_workflow
 
 
 RESET_WORDS = {"reset", "default", "clear"}
@@ -137,6 +138,42 @@ def list_thread_statuses(root: Path, storage: FileStorage) -> int:
     return 0
 
 
+
+def update_declared_threads(root: Path) -> int:
+    """Reload node behavior files and refresh mounted schema concurrency values."""
+    storage = FileStorage(root)
+    before: dict[str, tuple[int, str]] = {}
+    node_root = root / "node"
+    if node_root.is_dir():
+        for path in node_root.iterdir():
+            if path.is_dir() and (path / "schema.json").is_file():
+                try:
+                    schema = _node_schema(storage, path.name)
+                    before[path.name] = (int(schema.get("max_threads", 0)), str(schema.get("runner_override") or ""))
+                except (RuntimeError, TypeError, ValueError):
+                    pass
+
+    workflow = load_workflow(root, require_synced=True)
+    updated = 0
+    unchanged = 0
+    print("Refreshing declared max_threads from src/node_behavior ...")
+    for node_name in sorted(workflow.graph_obj.nodes):
+        schema = _node_schema(storage, node_name)
+        new_limit = int(schema["max_threads"])
+        new_runner = str(schema.get("runner_override") or "")
+        old = before.get(node_name)
+        if old is None or old != (new_limit, new_runner):
+            old_text = "(unmounted)" if old is None else str(old[0])
+            runner_text = new_runner or "project default"
+            print(f"  {node_name}: {old_text} -> {new_limit} ({runner_text})")
+            updated += 1
+        else:
+            unchanged += 1
+    print(f"Updated declarations: {updated}; unchanged: {unchanged}")
+    print("Runtime overrides were preserved. Use 'mwf threads NODE reset' to clear one.")
+    workflow.storage.close_database_connections()
+    return 0
+
 def threads_command(root: Path, node: str | None, value: str | None) -> int:
     storage = FileStorage(root)
     if node is None:
@@ -200,11 +237,20 @@ def threads_cli(argv: list[str]) -> int:
         nargs="?",
         help="Absolute integer, +N, -N, or reset/default/clear.",
     )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Reload node behavior files and refresh declared max_threads/runner values.",
+    )
     args = parser.parse_args(argv)
 
     try:
         root = find_root()
         ensure_runtime_layout(root)
+        if args.update:
+            if args.node is not None or args.value is not None:
+                raise RuntimeError("mwf threads --update does not accept a node or runtime value")
+            return update_declared_threads(root)
         return threads_command(root, args.node, args.value)
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)

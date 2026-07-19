@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.4
+# micro-workflow-manager 0.3.6
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,52 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.6
+
+- Scheduling now uses **Hoeflein components**. Let `A ⊆ E` be the graph edges
+  explicitly used with `autostart=True` in node behavior code. MWF constructs
+  the augmented directed graph
+  `G_H = (V, E ∪ {(v, u) : (u, v) ∈ A})` and takes its strongly connected
+  components. The quotient keeps the direction of the original graph edges and
+  is the scheduler DAG, `HDAG(G)`.
+- Naming any node in a multi-node Hoeflein component with `mwf run`,
+  `mwf runfrom`, `mwf resume`, or `mwf resumefrom` selects the whole component.
+  MWF prints a reminder before execution. Every original graph edge whose ends
+  lie in the same component is automatically treated as component-autostart,
+  even when that particular `add(...)` call omits `autostart=True`.
+- A Hoeflein component is one lifecycle unit: its nodes enter running together,
+  become done together when quiescent, and become failed together if any job
+  fails. The component pump stops launching new batches after the first failure.
+- Generated jobs retain their immediate parent node/job and also record a stable
+  producer-component identity plus whether they are a `dag` or `component` job.
+  Fresh runs remove only jobs produced by the selected Hoeflein components.
+  Jobs produced by unselected branches are preserved with their status, input,
+  output, returned files, and provenance.
+- `mwf runfrom A` may process A's branch through a later merge component while
+  another incoming branch is unfinished. A later `mwf runfrom B` removes and
+  rebuilds only B-produced work; it does not delete A-produced jobs already in
+  the shared descendant. By contrast, the *starting* component must have every
+  external predecessor complete. For `A -> C` and `B autostarts C`, the quotient
+  is `A -> {B,C}`, so `mwf run B` is refused until A has completed.
+- `mwf inspect NODE job ID` now shows the producer component and the job kind.
+  `--plan` explains component selection and producer-scoped cleanup.
+
+## What changed in 0.3.5
+
+- `mwf run NODE --monitor` and `mwf runfrom NODE --monitor` print the full
+  timestamped monitor dashboard in the execution terminal. Inline snapshots do
+  not clear task output; `--monitor-interval` controls their cadence. The same
+  option is available on resume forms and selected-job runs.
+- A terminal monitor snapshot reports `active run: none` after a sequence is
+  done, blocked, incomplete, or failed, and separately identifies the last run.
+- `AGENT.md` defines the required testing and failure-diagnosis protocol: focused
+  reproduction, concurrency and timeout experiments, freeze classification,
+  repeated command use, separate-process cyclic tests, test maintenance, and the
+  rare stubborn-issue escalation format.
+- Execution reporters are lifecycle-owned by the active run, preventing stale
+  inline reporter threads or final snapshots that still describe a finished run
+  as active.
 
 ## What changed in 0.3.4
 
@@ -327,26 +373,78 @@ EDGES = [
 A collection on both sides is rejected because that would describe a complete
 bipartite graph rather than one directed fan.
 
-## Important workflow rule
+## Hoeflein components and the quotient DAG
 
-A finished job is not the same thing as a finished node. This matters for dynamically-created jobs: a downstream node can receive and finish one job before all of its predecessor nodes have completed and before those predecessors have finished creating every downstream job. The library only marks a node `done` during node-level finalization after its predecessors are complete.
+A finished job is not the same thing as a finished scheduling component. MWF
+separates ordinary dependency direction from explicit autostart communication.
+Let `G = (V, E)` be the project graph and let `A ⊆ E` contain exactly the edges
+statically declared with `autostart=True`. Construct:
 
-## Cyclic autostart components
+```text
+G_H = (V, E union reverse(A))
+reverse(A) = {(v, u) : (u, v) in A}
+Hoeflein(G) = SCC(G_H)
+HDAG(G) = G / Hoeflein(G)
+```
 
-Graphs may contain self-loops and mutually reachable autostart nodes. The
-workflow manager treats each strongly connected component as one communicating
-class for readiness and completion. For example, if `A -> A`, `A -> B`,
-`B -> A`, and `A -> D`, then `D` is not ready merely because one A job
-finished. `D` waits until all queued/running jobs across the whole A/B
-component are done and the component is finalized together.
+The quotient edges come from the original `E`, not from the synthetic reverse
+arcs. Therefore, with `A -> C` and `B autostarts C`, B and C form one component
+and the quotient is:
 
-See `examples/autostart_cycle_lab` for a runnable four-node experiment.
+```text
+A -> {B, C}
+```
 
-### Same-component autostart scheduling
+There is no reverse dependency from `{B,C}` to A. Running B or C selects the
+whole `{B,C}` component, but it is refused until A is complete.
 
-Inside a cyclic strongly connected component, `autostart=True` means "enqueue the child job and wake the component scheduler". It does not recursively run the child job inside the parent job thread. This avoids cyclic autostart deadlocks where every worker slot is held by parent jobs trying to synchronously run children from the same communicating class.
+Within one Hoeflein component, every original directed edge behaves as
+component-autostart. Child work is queued and the component scheduler pumps all
+member nodes until quiescence; it is never executed recursively inside the
+parent handler. All member nodes are reported running, done, or failed together.
+A node that has no jobs is vacuously successful when the component's actual jobs
+all finish.
 
-For acyclic edges, normal autostart behavior is preserved. For CLI `mwf run` / `mwf runfrom`, the selected run set is still protected: dynamic autostarts outside the approved nodes are blocked, while jobs created inside the selected cyclic component are pumped until the whole component is quiescent.
+A partial `runfrom` deliberately permits a later merge component to process the
+selected incoming branch while other incoming branches remain unfinished. That
+component may reactivate when another producer creates new jobs later. Starting
+component readiness is stricter: all external predecessors of the start
+component must already be complete.
+
+See `examples/autostart_cycle_lab` and the fan, K4, and C5 cyclic tests for
+runnable communicating-component examples.
+
+### Producer-component provenance and fresh-run cleanup
+
+Every generated job records:
+
+```text
+parent.from_node
+parent.from_job_id
+producer_component
+job_kind = dag | component
+```
+
+`component` jobs were generated inside their target Hoeflein component. `dag`
+jobs crossed a quotient-DAG edge. Root/default jobs have no producer.
+
+For a fresh `mwf run COMPONENT_MEMBER`, MWF first deletes every job produced by
+that component, including internal component jobs and jobs it produced in later
+components. It then requeues the component's root/default jobs. For
+`mwf runfrom`, the same operation applies to every selected component. Work
+produced by unselected components is retained.
+
+Example with ordinary edges `A -> C` and `B -> C`:
+
+```bash
+mwf runfrom A   # creates and completes A-produced jobs in C
+mwf runfrom B   # preserves A-produced jobs; rebuilds only B-produced jobs
+```
+
+Node-level `output/` is preserved whenever a node still contains jobs from an
+unselected producer, because that directory may contain shared debugging
+provenance. Job-local outputs remain attributable and are removed only with the
+job that owns them.
 
 ## Explicit jobs
 
@@ -592,8 +690,8 @@ latest execution segment in each job's append-only events, so it adds no shared
 provenance manifest or scheduler hot-path writes. The final section lists the
 jobs that still failed.
 
-Node inspection explains readiness, blockers, status counts, strongly connected
-component membership, runner, total timeout, checkpoint timeout, and fallbacks.
+Node inspection explains readiness, blockers, status counts, Hoeflein-component
+membership, runner, total timeout, checkpoint timeout, and fallbacks.
 Job inspection additionally shows the current/last handler, named checkpoint,
 checkpoint deadline, progress percentage, progress detail, execution generation,
 child jobs, and chronological lifecycle events. Checkpoint state and lifecycle events are stored in `.mwf/state.sqlite3`; they are scheduler diagnostics, not task output or a provenance manifest. `mwf inspect` renders records such as `created`, `started`, `fallback_started`, `timeout`, `restart_requested`, and `done`. `output.json` and job-local returned files remain the actual task result.
@@ -787,30 +885,42 @@ change statuses.
 
 ## Monitoring and live statistics
 
-While a workflow is running, open a second terminal in the same project and run:
+Use the full dashboard in the same terminal as an execution command:
+
+```bash
+mwf run start_node --monitor
+mwf runfrom start_node --monitor
+mwf runfrom start_node --monitor --monitor-interval 0.5
+```
+
+Inline monitoring prints timestamped snapshots without clearing earlier task or
+monitor output, making it suitable as a diagnostic timeline. The final snapshot
+is emitted after the run record becomes terminal and therefore says
+`active run: none`; the previous sequence is shown separately as the last run.
+
+For an independent observer, open a second terminal and use:
 
 ```bash
 mwf monitor
-```
-
-`mwf monitor` reads SQLite job/node summaries plus the low-churn run record and prints a live dashboard with running nodes, queued/running/done/failed job counts, jobs left, progress, running job IDs, average completed job duration, and rough ETA. It does not run task code.
-
-Useful forms:
-
-```bash
 mwf monitor --once          # one snapshot
 mwf monitor A B             # monitor selected nodes only
 mwf monitor --json --once   # machine-readable snapshot
 ```
 
-You can also print compact status lines in the same terminal as the run:
+`mwf monitor` reads SQLite job/node summaries plus the low-churn run record. It
+shows running nodes, queued/running/done/failed counts, jobs left, progress,
+running job IDs, effective concurrency, average completed duration, and rough
+ETA without calling task code. Compact same-terminal lines remain available:
 
 ```bash
 mwf runfrom start_node --stats
 mwf run start_node --stats --stats-interval 10
 ```
 
-ETA is intentionally approximate. It is calculated from completed job durations and becomes more useful after at least one job in the relevant node has finished.
+`--monitor` and `--stats` may be combined. ETA is intentionally approximate and
+becomes more useful after at least one relevant job has finished. See
+[AGENT.md](AGENT.md) for using snapshots to separate resource pressure, timeout
+policy, test-code stalls, and scheduler defects.
 
 ## Restart a running job or requeue a failed job
 
@@ -935,10 +1045,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.4 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.6 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.4-py3-none-any.whl
+micro_workflow_manager-0.3.6-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -958,22 +1068,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.4-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.6-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.4-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.6-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.4-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.6-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.4`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.6`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -988,7 +1098,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.4-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.6-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project
@@ -1029,6 +1139,8 @@ python -m pip uninstall micro-workflow-manager
 ```
 
 ## Run tests
+
+[AGENT.md](AGENT.md) is the authoritative testing and diagnosis protocol for automated contributors. It requires focused reproduction, repeat-use testing, concurrency and timeout experiments, and explicit freeze analysis before changing scheduler semantics.
 
 Run the ordinary suite without combining the timing-sensitive cyclic tests:
 
@@ -1117,3 +1229,17 @@ mwf inspect preprocess debug
 
 This prints the node's `output/debug.txt` path and contents, or explains that the
 file does not exist yet.
+
+### Refresh declared concurrency after editing node files
+
+After changing `max_threads=` or a node-level `runner=` in `src/node_behavior/*.py`, refresh the mounted schemas without synchronizing the graph:
+
+```bash
+mwf threads --update
+```
+
+This reloads the synchronized node behavior files and updates their declared concurrency and runner values. It does not change graph edges, create/delete node folders, or clear runtime overrides. Use `mwf threads NODE reset` separately when an override should be removed.
+
+### Clipboard restore consistency
+
+`mwf paste NODE` now synchronizes the restored payload folders with SQLite before returning. Clipboard snapshots made before 0.3.4 have their numeric `jobs/<id>/input.json` payloads rebuilt as queued database jobs. A snapshot captured while a job was running is treated as a cold restore: stale running leases are cleared and those jobs are immediately queued, so the node can be run or resumed without another migration command.

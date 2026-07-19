@@ -146,8 +146,15 @@ class JobCreationMixin:
 
         if from_node is not None:
             self.validate_edge(from_node, to_node)
+            if autostart:
+                self.register_autostart_edge(from_node, to_node)
 
-        if autostart and self.allowed_run_nodes is not None and to_node not in self.allowed_run_nodes:
+        source_component = self.component_id(from_node) if from_node is not None else None
+        target_component = self.component_id(to_node)
+        same_component = source_component is not None and source_component == target_component
+        effective_autostart = bool(autostart or same_component)
+
+        if effective_autostart and self.allowed_run_nodes is not None and to_node not in self.allowed_run_nodes:
             parent = f"{from_node}/{_parent_job_id}" if _parent_job_id is not None else str(from_node)
             raise InvalidGraphError(
                 f"Autostart from {parent} to {to_node} was blocked because "
@@ -183,6 +190,8 @@ class JobCreationMixin:
                     node_name=to_node,
                     params=params,
                     parent=parent,
+                    producer_component=source_component,
+                    job_kind="component" if same_component else ("dag" if from_node is not None else None),
                 )
 
                 self.storage.create_job(job)
@@ -190,7 +199,7 @@ class JobCreationMixin:
                     self.storage.record_idempotent_job(to_node, idempotency_key, job_id)
                 self.storage.set_node_status(to_node, QUEUED)
 
-        if autostart and self.autostart_mode == "immediate":
+        if effective_autostart and self.autostart_mode == "immediate":
             # Outside a running task, preserve the old convenience behavior:
             # start the requested job now. Inside a running task, preserve
             # immediate DAG autostart, but never recursively execute a job in
@@ -199,7 +208,7 @@ class JobCreationMixin:
             current_node = getattr(self._job_context, "node_name", None)
             same_component_spawn = (
                 current_node is not None
-                and to_node in self.component_for(current_node)
+                and self.component_id(current_node) == self.component_id(to_node)
             )
             if not same_component_spawn:
                 return self.run_job(

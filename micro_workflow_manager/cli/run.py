@@ -9,13 +9,12 @@ from typing import Callable
 from uuid import uuid4
 
 from micro_workflow_manager import __version__
-from micro_workflow_manager.models import CANCELLED, FAILED, QUEUED, RUNNING
-from micro_workflow_manager.monitor import InlineStatsReporter, now_iso
+from micro_workflow_manager.models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED
+from micro_workflow_manager.monitor import InlineMonitorReporter, InlineStatsReporter, now_iso
 from micro_workflow_manager.system import MicroWorkflow
 
 from .active_run import refuse_competing_run
-from .autostart_scan import autostart_closure
-from .cleanup import reset_job_for_run, reset_node_for_run
+from .cleanup import prepare_fresh_components, reset_job_for_run
 from .files import read_config
 from .project import resolve_configured_graph_path
 from .graph_utils import (
@@ -36,6 +35,10 @@ def active_workflow_run(
     start_node: str,
     nodes: list[str],
     selected_jobs: list[int] | None = None,
+    stats: bool = False,
+    stats_interval: float = 5.0,
+    monitor: bool = False,
+    monitor_interval: float = 2.0,
 ):
     run_id = f"{int(time.time())}-{os.getpid()}-{uuid4().hex[:8]}"
     data = {
@@ -65,6 +68,19 @@ def active_workflow_run(
     # checkpoint deadlines. One thread services the whole workflow sequence.
     workflow.scheduler_supervisor.start_run_heartbeat(run_id, interval=2.0)
 
+    stats_reporter = InlineStatsReporter(
+        workflow,
+        nodes=nodes,
+        enabled=stats,
+        interval=stats_interval,
+    ).start()
+    monitor_reporter = InlineMonitorReporter(
+        workflow,
+        nodes=nodes,
+        enabled=monitor,
+        interval=monitor_interval,
+    ).start()
+
     finished = False
 
     def finish(status: str, error: str | None = None):
@@ -72,6 +88,11 @@ def active_workflow_run(
         if finished:
             return
 
+        # Stop periodic output before changing the run record, then print one
+        # final snapshot after the record is terminal. This guarantees that an
+        # inline or standalone monitor never labels a completed sequence active.
+        stats_reporter.stop_periodic()
+        monitor_reporter.stop_periodic()
         workflow.scheduler_supervisor.stop_run_heartbeat(run_id)
         workflow.storage.clear_thread_overrides_for_run(run_id)
         workflow.invalidate_thread_override_cache()
@@ -87,6 +108,8 @@ def active_workflow_run(
                     updates["error"] = error
                 workflow.storage.update_run_state(**updates)
         finished = True
+        stats_reporter.print_final()
+        monitor_reporter.print_final()
 
     try:
         yield finish
@@ -105,6 +128,8 @@ def run_selected_jobs(
     *,
     stats: bool = False,
     stats_interval: float = 5.0,
+    monitor: bool = False,
+    monitor_interval: float = 2.0,
 ) -> int:
     refuse_competing_run(workflow)
 
@@ -130,6 +155,10 @@ def run_selected_jobs(
             start_node=node,
             nodes=[node],
             selected_jobs=job_ids,
+            stats=stats,
+            stats_interval=stats_interval,
+            monitor=monitor,
+            monitor_interval=monitor_interval,
         ) as finish_run:
             # The run slot is claimed before any selected-job artifacts are
             # reset, so a second run command cannot race with preparation.
@@ -137,14 +166,8 @@ def run_selected_jobs(
             for job_id in job_ids:
                 reset_job_for_run(root, workflow, node, job_id, mark_queued=False)
 
-            with InlineStatsReporter(
-                workflow,
-                nodes=[node],
-                enabled=stats,
-                interval=stats_interval,
-            ):
-                jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
-                workflow.run_node_jobs(node, jobs, ignore_readiness=True)
+            jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
+            workflow.run_node_jobs(node, jobs, ignore_readiness=True)
             finish_run("done")
     finally:
         workflow.allowed_run_nodes = previous_allowed_run_nodes
@@ -157,105 +180,80 @@ def run_selected_jobs(
 
     return 0
 
-def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0) -> int:
-    refuse_competing_run(workflow)
+def _component_notice(workflow: MicroWorkflow, node: str) -> list[str]:
+    component = list(workflow.component_key(workflow.component_for(node)))
+    if len(component) > 1:
+        print(
+            f"Node {node} belongs to Hoeflein component "
+            f"{{{', '.join(component)}}}; this command runs the whole component."
+        )
+    return component
 
-    if not is_ready(workflow, node):
-        print_not_ready(workflow, node)
+
+def _refuse_start_component_inputs(workflow: MicroWorkflow, node: str, command: str) -> bool:
+    component = workflow.component_for(node)
+    blockers = {
+        previous for previous in workflow.component_predecessors(component)
+        if not workflow.node_complete(previous)
+    }
+    if not blockers:
+        return False
+    print(f"Cannot {command}: incomplete predecessor components: {', '.join(sorted(blockers))}")
+    print("Hoeflein components are scheduled on the quotient DAG; run or resume those predecessors first.")
+    for previous in sorted(blockers):
+        print(f"  {previous}: {workflow.storage.get_node_status(previous) or 'missing'}")
+    return True
+
+
+def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0, monitor: bool = False, monitor_interval: float = 2.0) -> int:
+    refuse_competing_run(workflow)
+    nodes = _component_notice(workflow, node)
+    if _refuse_start_component_inputs(workflow, node, f"run {node}"):
         return 1
 
-    graph_file = resolve_configured_graph_path(root, read_config(root))
-    autostart_nodes = autostart_closure(workflow, graph_file, [node])
-    nodes = topo_subset(workflow, expand_to_components(workflow, {node}))
-
-    if autostart_nodes:
-        print("Detected autostarts to:", ", ".join(autostart_nodes))
-        if not ask("Run all detected nodes sequentially?"):
-            print("Stopped without running.")
-            return 1
-        nodes = topo_subset(workflow, expand_to_components(workflow, {node, *autostart_nodes}))
-
-    blockers = (
-        direct_incomplete_inputs(workflow, set(nodes))
-        - workflow.component_predecessors(workflow.component_for(node))
-    )
-    ignore_external = False
-
-    if blockers:
-        print("Detected incomplete nodes:", ", ".join(sorted(blockers)))
-        print("These nodes directly lead into the requested run set.")
-        if not ask("Run anyway?"):
-            print("Stopped without running.")
-            return 1
-        ignore_external = True
+    component = set(nodes)
 
     def prepare():
-        # The active run slot is claimed before this destructive preparation.
         workflow.storage.set_node_status(node, RUNNING)
-        reset_node_for_run(root, workflow, node, mark_queued=False)
-        for item in nodes:
-            if item != node:
-                reset_node_for_run(root, workflow, item, remove_parented_jobs=True)
+        removed = prepare_fresh_components(root, workflow, [component])
+        if removed:
+            summary = ", ".join(f"{name}={count}" for name, count in sorted(removed.items()))
+            print(f"Removed jobs produced by Hoeflein component {{{', '.join(nodes)}}}: {summary}")
 
     return run_nodes(
-        workflow,
-        nodes,
-        node,
-        ignore_external=ignore_external,
-        command="run",
-        stats=stats,
-        stats_interval=stats_interval,
-        prepare=prepare,
+        workflow, nodes, node, ignore_external=False, command="run",
+        stats=stats, stats_interval=stats_interval, monitor=monitor,
+        monitor_interval=monitor_interval, prepare=prepare,
     )
 
-def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0) -> int:
+
+def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0, monitor: bool = False, monitor_interval: float = 2.0) -> int:
     refuse_competing_run(workflow)
-
-    nodes = component_topological_nodes(
-        workflow,
-        expand_to_components(workflow, {node, *descendants_in_order(workflow, node)}),
-    )
-    graph_file = resolve_configured_graph_path(root, read_config(root))
-    autostart_nodes = autostart_closure(workflow, graph_file, nodes)
-    extra_autostart_nodes = [item for item in autostart_nodes if item not in nodes]
-
-    if extra_autostart_nodes:
-        print("Detected autostarts outside the runfrom set:", ", ".join(extra_autostart_nodes))
-        if not ask("Include these nodes and run all selected nodes sequentially?"):
-            print("Stopped without running.")
-            return 1
-        nodes = topo_subset(
-            workflow,
-            expand_to_components(workflow, {node, *nodes, *extra_autostart_nodes}),
+    start_component = workflow.component_for(node)
+    start_nodes = _component_notice(workflow, node)
+    components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
+    nodes = [name for component in components for name in workflow.component_key(component)]
+    if _refuse_start_component_inputs(workflow, node, f"runfrom {node}"):
+        return 1
+    external_descendant_blockers = direct_incomplete_inputs(workflow, set(nodes))
+    if external_descendant_blockers:
+        print(
+            "Partial runfrom: preserving work from external predecessor components "
+            f"and running this branch independently: {', '.join(sorted(external_descendant_blockers))}"
         )
 
-    blockers = direct_incomplete_inputs(workflow, set(nodes))
-    ignore_external = False
-
-    if blockers:
-        print("Detected incomplete nodes:", ", ".join(sorted(blockers)))
-        print("These nodes directly lead into the runfrom node set.")
-        if not ask("Run anyway?"):
-            print("Stopped without running.")
-            return 1
-        ignore_external = True
-
     def prepare():
         workflow.storage.set_node_status(node, RUNNING)
-        reset_node_for_run(root, workflow, node, mark_queued=False)
-        for child in nodes:
-            if child != node:
-                reset_node_for_run(root, workflow, child, remove_parented_jobs=True)
+        removed = prepare_fresh_components(root, workflow, components)
+        if removed:
+            summary = ", ".join(f"{name}={count}" for name, count in sorted(removed.items()))
+            selected = "; ".join("{" + ", ".join(workflow.component_key(c)) + "}" for c in components)
+            print(f"Removed jobs produced by selected Hoeflein components {selected}: {summary}")
 
     return run_nodes(
-        workflow,
-        nodes,
-        node,
-        ignore_external=ignore_external,
-        command="runfrom",
-        stats=stats,
-        stats_interval=stats_interval,
-        prepare=prepare,
+        workflow, nodes, node, ignore_external=True, command="runfrom",
+        stats=stats, stats_interval=stats_interval, monitor=monitor,
+        monitor_interval=monitor_interval, prepare=prepare,
     )
 
 def _prepare_node_for_resume(workflow: MicroWorkflow, node: str) -> int:
@@ -282,15 +280,13 @@ def resume_node(
     *,
     stats: bool = False,
     stats_interval: float = 5.0,
+    monitor: bool = False,
+    monitor_interval: float = 2.0,
 ) -> int:
     refuse_competing_run(workflow)
-    graph_file = resolve_configured_graph_path(root, read_config(root))
-    autostart_nodes = autostart_closure(workflow, graph_file, [node])
-    nodes = topo_subset(workflow, expand_to_components(workflow, {node, *autostart_nodes}))
+    nodes = list(workflow.component_key(workflow.component_for(node)))
 
-    blockers = direct_incomplete_inputs(workflow, set(nodes)) - workflow.component_predecessors(
-        workflow.component_for(node)
-    )
+    blockers = direct_incomplete_inputs(workflow, set(nodes))
     ignore_external = not not blockers
     if blockers:
         print("Resuming with incomplete external inputs:", ", ".join(sorted(blockers)))
@@ -307,6 +303,8 @@ def resume_node(
         command="resume",
         stats=stats,
         stats_interval=stats_interval,
+        monitor=monitor,
+        monitor_interval=monitor_interval,
         prepare=prepare,
         require_start_queued=False,
     )
@@ -319,16 +317,13 @@ def resume_from(
     *,
     stats: bool = False,
     stats_interval: float = 5.0,
+    monitor: bool = False,
+    monitor_interval: float = 2.0,
 ) -> int:
     refuse_competing_run(workflow)
-    nodes = component_topological_nodes(
-        workflow,
-        expand_to_components(workflow, {node, *descendants_in_order(workflow, node)}),
-    )
-    graph_file = resolve_configured_graph_path(root, read_config(root))
-    extra = [item for item in autostart_closure(workflow, graph_file, nodes) if item not in nodes]
-    if extra:
-        nodes = topo_subset(workflow, expand_to_components(workflow, {*nodes, *extra}))
+    start_component = workflow.component_for(node)
+    components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
+    nodes = [name for component in components for name in workflow.component_key(component)]
 
     blockers = direct_incomplete_inputs(workflow, set(nodes))
     ignore_external = not not blockers
@@ -347,6 +342,8 @@ def resume_from(
         command="resumefrom",
         stats=stats,
         stats_interval=stats_interval,
+        monitor=monitor,
+        monitor_interval=monitor_interval,
         prepare=prepare,
         require_start_queued=False,
     )
@@ -361,6 +358,8 @@ def run_nodes(
     command: str = "run",
     stats: bool = False,
     stats_interval: float = 5.0,
+    monitor: bool = False,
+    monitor_interval: float = 2.0,
     prepare: Callable[[], None] | None = None,
     require_start_queued: bool = True,
 ) -> int:
@@ -379,12 +378,16 @@ def run_nodes(
             command=command,
             start_node=start_node,
             nodes=nodes,
+            stats=stats,
+            stats_interval=stats_interval,
+            monitor=monitor,
+            monitor_interval=monitor_interval,
         ) as finish_run:
             if prepare is not None:
                 prepare()
 
             has_any_queued = any(workflow.storage.has_queued_jobs(item) for item in nodes)
-            if (require_start_queued and not workflow.storage.has_queued_jobs(start_node)) or not has_any_queued:
+            if not has_any_queued:
                 if require_start_queued:
                     workflow.storage.set_node_status(start_node, QUEUED)
                     print(
@@ -397,44 +400,53 @@ def run_nodes(
                 finish_run("done")
                 return 0
 
-            with InlineStatsReporter(
-                workflow,
-                nodes=nodes,
-                enabled=stats,
-                interval=stats_interval,
-            ):
-                if workflow.runner in {"threaded", "api", "process"}:
-                    ran = workflow.run_concurrently(
-                        nodes=nodes,
-                        ready_check=lambda item: ready_for_run_set(
-                            workflow,
-                            item,
-                            run_set,
-                            ignore_external,
-                        ),
-                    )
-                else:
-                    ran = []
-                    units = workflow.execution_components(nodes)
+            if workflow.runner in {"threaded", "api", "process"}:
+                ran = workflow.run_concurrently(
+                    nodes=nodes,
+                    ready_check=lambda item: ready_for_run_set(
+                        workflow,
+                        item,
+                        run_set,
+                        ignore_external,
+                    ),
+                )
+            else:
+                ran = []
+                units = workflow.execution_components(nodes)
 
-                    while True:
-                        ready_units = [
-                            unit
-                            for unit in units
-                            if any(workflow.storage.has_queued_jobs(node) for node in unit)
-                            and all(
-                                ready_for_run_set(workflow, node, run_set, ignore_external)
-                                for node in unit
-                            )
-                        ]
+                while True:
+                    ready_units = [
+                        unit
+                        for unit in units
+                        if any(workflow.storage.has_queued_jobs(node) for node in unit)
+                        and all(
+                            ready_for_run_set(workflow, node, run_set, ignore_external)
+                            for node in unit
+                        )
+                    ]
 
-                        if not ready_units:
-                            break
+                    if not ready_units:
+                        break
 
-                        for unit in ready_units:
-                            ran.extend(workflow.run_component(set(unit), ignore_readiness=True))
+                    for unit in ready_units:
+                        ran.extend(workflow.run_component(set(unit), ignore_readiness=True))
 
             workflow.finalize_ready_nodes()
+            if ignore_external:
+                # A partial runfrom may intentionally process one incoming branch
+                # of a later component before its other predecessors run. Mark a
+                # selected component complete for this branch when all jobs that
+                # currently exist are successful and quiescent. Future producers
+                # will queue new jobs and reactivate it.
+                for unit in workflow.execution_components(nodes):
+                    counts = [workflow.storage.job_status_counts(name) for name in unit]
+                    total = sum(sum(item.values()) for item in counts)
+                    failed = any(item.get(FAILED, 0) for item in counts)
+                    active = any(item.get(RUNNING, 0) or item.get(QUEUED, 0) for item in counts)
+                    successful = sum(item.get(DONE, 0) + item.get(SKIPPED, 0) for item in counts)
+                    if total > 0 and successful == total and not failed and not active:
+                        for name in unit:
+                            workflow.storage.set_node_status(name, "done")
 
             blocked = [node for node in nodes if workflow.storage.has_queued_jobs(node)]
 

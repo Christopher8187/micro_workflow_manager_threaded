@@ -105,10 +105,16 @@ def test_runfrom_supports_self_and_mutual_autostart_cycles_before_downstream(tmp
     make_cycle_project(tmp_path, monkeypatch)
     capsys.readouterr()
 
-    assert cli.main(["runfrom", "A", "--runner", "direct"]) == 0
-    out = capsys.readouterr().out
+    assert cli.main([
+        "runfrom", "A", "--runner", "direct",
+        "--monitor", "--monitor-interval", "0.02",
+    ]) == 0
+    captured = capsys.readouterr()
+    out = captured.out
 
     assert "Ran:" in out
+    assert "active run: runfrom A" in captured.err
+    assert "last run: runfrom A | status=done" in captured.err
     assert "  A" in out
     assert "  B" in out
     assert "  C" in out

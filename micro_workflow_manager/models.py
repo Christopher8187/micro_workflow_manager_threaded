@@ -13,6 +13,8 @@ class Job:
     node_name: str
     params: dict[str, Any]
     parent: dict[str, Any] | None = None
+    producer_component: tuple[str, ...] | None = None
+    job_kind: str | None = None
     created_at: str = field(default_factory=now)
 
 

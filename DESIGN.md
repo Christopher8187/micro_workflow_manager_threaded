@@ -129,6 +129,45 @@ per-attempt orchestration thread. Keep external client timeouts even when MWF
 checkpoints are enabled because Python cannot force-kill an arbitrary blocked
 thread.
 
+## Design the quotient DAG, not only individual nodes
+
+MWF 0.3.6 schedules **Hoeflein components**. Ordinary graph edges retain their
+one-way dependency meaning. An edge explicitly used with `autostart=True` also
+adds reverse reachability for component construction. Formally, if `A` is the
+set of explicit autostart edges:
+
+```text
+G_H = (V, E union {(v, u) : (u, v) in A})
+Hoeflein(G) = SCC(G_H)
+HDAG(G) = G / Hoeflein(G)
+```
+
+Design each Hoeflein component as one communicating subsystem. Its member nodes
+start, quiesce, and fail together. Every original edge between members is
+implicitly component-autostart, so do not rely on a non-autostart internal edge
+to create a later DAG barrier. Put a real barrier between separate components.
+
+Use explicit autostart only when the child belongs to the same communicating
+subsystem or must wake immediately as part of that subsystem. Keep ordinary
+cross-component edges for directed dependency flow. A useful review question is:
+"Should these nodes be independently rerunnable, or should naming any one of them
+run the whole group?" If independently rerunnable, do not connect them into a
+mutually reachable autostart structure.
+
+For merge graphs, producer provenance is part of the design. With `A -> C` and
+`B -> C`, jobs arriving at C carry producer components `{A}` or `{B}`. A fresh
+`runfrom B` removes only B-produced jobs and preserves A-produced jobs. Therefore:
+
+- use stable idempotency keys within each producer branch;
+- keep job-local output/provenance attributable to one producer;
+- avoid deleting shared node-level output blindly when other producer jobs remain;
+- expect a merge component to reactivate as later branches produce new work.
+
+The starting component of `run`/`runfrom` requires all external predecessor
+components complete. Descendant components in a partial `runfrom` may process the
+selected branch before other incoming branches finish. This is deliberate and is
+what makes branch-by-branch testing and reruns safe.
+
 ## Treat SQLite as framework state, not an application database
 
 `.mwf/state.sqlite3` holds scheduler-owned job rows, queue state, events,
@@ -162,10 +201,42 @@ mwf resume NODE
 mwf resumefrom NODE
 ```
 
-Use `run` for one selected node and `runfrom` for a complete descendant sequence.
+Use `run` for one selected Hoeflein component and `runfrom` for that component plus its quotient-DAG descendants.
 Use `resume`/`resumefrom` after a partial failure so successful jobs and their
 outputs are preserved. Use `restart` to replace a specific live attempt or
 requeue a failed job.
+
+For a timestamped diagnostic timeline in the execution terminal, add `--monitor`:
+
+```bash
+mwf run NODE --monitor
+mwf runfrom NODE --monitor --monitor-interval 1
+```
+
+Inline snapshots deliberately retain prior output and finish with `active run:
+none`. This makes them useful for differentiating slow progress, resource
+pressure, timeout escalation, and a genuine scheduler freeze. Automated
+contributors must follow [AGENT.md](AGENT.md), including repeat-use tests and
+controlled concurrency/timeout experiments.
+
+
+## Design tests as experiments, not wall-clock guesses
+
+A reliable workflow test should expose state transitions, not merely wait longer.
+Use deterministic inputs and probabilities, inspect SQLite-backed status/events,
+and capture inline monitor snapshots at known intervals. When a high-concurrency
+test fails, compare lower `max_threads` values and runner modes before changing
+scheduler code. When a timeout fires, identify whether it belongs to the harness,
+task, checkpoint, or external client. Run cycle stress cases in separate
+processes, then preserve both a small deterministic regression and an explicit
+high-load test.
+
+Stateful commands should be exercised repeatedly: rerun the same node, run a
+different node, repeat `runfrom`, refresh declarations, copy/paste, and rebuild a
+deployment archive. This catches stale caches, leaked lifecycle threads, and
+second-use database bugs that a clean one-shot test misses. The complete required
+protocol and rare escalation rules are in [AGENT.md](AGENT.md).
+
 
 ---
 

@@ -183,16 +183,25 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
     lines.append(title)
     lines.append("=" * len(title))
 
-    if run_state:
-        state_status = run_state.get("status", "unknown")
+    if run_state.get("status") == "running":
         command = run_state.get("command", "run")
         start_node = run_state.get("start_node", "?")
         elapsed = human_seconds(seconds_since(run_state.get("started_at")))
         selected = run_state.get("nodes") or []
         selected_text = ", ".join(selected) if selected else "all graph nodes"
         lines.append(
-            f"active run: {command} {start_node} | status={state_status} | elapsed={elapsed} | nodes={selected_text}"
+            f"active run: {command} {start_node} | status=running | elapsed={elapsed} | nodes={selected_text}"
         )
+    else:
+        lines.append("active run: none")
+        if run_state:
+            command = run_state.get("command", "run")
+            start_node = run_state.get("start_node", "?")
+            state_status = run_state.get("status", "unknown")
+            finished_at = run_state.get("finished_at") or "?"
+            lines.append(
+                f"last run: {command} {start_node} | status={state_status} | finished={finished_at}"
+            )
 
     running_nodes = snapshot.get("running_nodes") or []
     running_text = ", ".join(running_nodes) if running_nodes else "none"
@@ -293,7 +302,75 @@ def monitor_loop(
             return
 
 
-class InlineStatsReporter:
+class _InlineReporterBase:
+    def __init__(
+        self,
+        workflow,
+        nodes: list[str] | None = None,
+        *,
+        enabled: bool = False,
+        interval: float = 5.0,
+        thread_name: str,
+    ):
+        self.workflow = workflow
+        self.nodes = nodes
+        self.enabled = enabled
+        self.interval = interval
+        self.thread_name = thread_name
+        self.stop = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self):
+        if not self.enabled or self.thread is not None:
+            return self
+        self.thread = threading.Thread(target=self._loop, name=self.thread_name, daemon=True)
+        self.thread.start()
+        return self
+
+    def stop_periodic(self):
+        if not self.enabled:
+            return
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=max(1.0, min(5.0, self.interval + 0.5)))
+            self.thread = None
+
+    def print_final(self):
+        if self.enabled:
+            self._safe_print(final=True)
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop_periodic()
+        self.print_final()
+        return False
+
+    def _loop(self):
+        # Print immediately after the active run is claimed, then periodically.
+        while not self.stop.is_set():
+            self._safe_print(final=False)
+            self.stop.wait(self.interval)
+
+    def _safe_print(self, *, final: bool):
+        try:
+            self._print(final=final)
+        except Exception as error:
+            # Diagnostics must never change workflow correctness. Report a
+            # snapshot failure and allow the scheduler/run finalization to
+            # continue; a later interval may succeed.
+            print(
+                f"[{self.thread_name} error] snapshot unavailable: {error!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _print(self, *, final: bool):
+        raise NotImplementedError
+
+
+class InlineStatsReporter(_InlineReporterBase):
     def __init__(
         self,
         workflow,
@@ -302,45 +379,23 @@ class InlineStatsReporter:
         enabled: bool = False,
         interval: float = 5.0,
     ):
-        self.workflow = workflow
-        self.nodes = nodes
-        self.enabled = enabled
-        self.interval = interval
-        self.stop = threading.Event()
-        self.thread: threading.Thread | None = None
+        super().__init__(
+            workflow,
+            nodes,
+            enabled=enabled,
+            interval=interval,
+            thread_name="mwf-stats",
+        )
 
-    def __enter__(self):
-        if not self.enabled:
-            return self
-
-        self.thread = threading.Thread(target=self._loop, name="mwf-stats", daemon=True)
-        self.thread.start()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if not self.enabled:
-            return False
-
-        self.stop.set()
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
-
-        self._print_compact(prefix="final stats")
-        return False
-
-    def _loop(self):
-        # Print immediately after the run starts, then periodically.
-        while not self.stop.is_set():
-            self._print_compact(prefix="stats")
-            self.stop.wait(self.interval)
-
-    def _print_compact(self, prefix: str):
+    def _print(self, *, final: bool):
         snapshot = workflow_snapshot(self.workflow, nodes=self.nodes)
         totals = snapshot["totals"]
         running_nodes = snapshot.get("running_nodes") or []
         running_text = ",".join(running_nodes) if running_nodes else "none"
+        prefix = "final stats" if final else "stats"
         print(
             f"[{prefix}] "
+            f"time={snapshot['generated_at']} "
             f"running_nodes={running_text} "
             f"jobs={totals['jobs']} "
             f"done={totals['done']} "
@@ -353,3 +408,33 @@ class InlineStatsReporter:
             file=sys.stderr,
             flush=True,
         )
+
+
+class InlineMonitorReporter(_InlineReporterBase):
+    """Print timestamped full monitor snapshots beside an execution command.
+
+    Inline monitoring never clears the terminal. Task output remains visible and
+    every snapshot is retained as a chronological diagnostic record.
+    """
+
+    def __init__(
+        self,
+        workflow,
+        nodes: list[str] | None = None,
+        *,
+        enabled: bool = False,
+        interval: float = 2.0,
+    ):
+        super().__init__(
+            workflow,
+            nodes,
+            enabled=enabled,
+            interval=interval,
+            thread_name="mwf-inline-monitor",
+        )
+
+    def _print(self, *, final: bool):
+        snapshot = workflow_snapshot(self.workflow, nodes=self.nodes)
+        label = "final monitor" if final else "monitor"
+        print(f"\n--- mwf {label} snapshot ---", file=sys.stderr, flush=True)
+        print(render_snapshot(snapshot), file=sys.stderr, flush=True)
