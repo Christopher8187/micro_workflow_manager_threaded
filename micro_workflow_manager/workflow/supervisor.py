@@ -123,11 +123,17 @@ class SchedulerSupervisor:
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = Thread(
-            target=self._loop,
+            target=self._thread_entry,
             name="mwf-scheduler-supervisor",
             daemon=True,
         )
         self._thread.start()
+
+    def _thread_entry(self):
+        try:
+            self._loop()
+        finally:
+            self.storage.close_thread_connection()
 
     def _push_deadline_locked(
         self,

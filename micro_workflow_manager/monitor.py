@@ -349,9 +349,15 @@ class _InlineReporterBase:
 
     def _loop(self):
         # Print immediately after the active run is claimed, then periodically.
-        while not self.stop.is_set():
-            self._safe_print(final=False)
-            self.stop.wait(self.interval)
+        try:
+            while not self.stop.is_set():
+                self._safe_print(final=False)
+                self.stop.wait(self.interval)
+        finally:
+            storage = getattr(self.workflow, "storage", None)
+            close = getattr(storage, "close_thread_connection", None)
+            if close is not None:
+                close()
 
     def _safe_print(self, *, final: bool):
         try:

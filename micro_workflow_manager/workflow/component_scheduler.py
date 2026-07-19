@@ -68,8 +68,14 @@ class ComponentSchedulerMixin:
                 max_workers=max(1, len(queued_nodes)),
                 thread_name_prefix="mwf-hoeflein-node",
             )
+            def run_node_worker(node_name: str):
+                try:
+                    return self.run_queued_node_jobs(node_name, True)
+                finally:
+                    self.storage.close_thread_connection()
+
             futures = {
-                executor.submit(self.run_queued_node_jobs, node_name, True): node_name
+                executor.submit(run_node_worker, node_name): node_name
                 for node_name in queued_nodes
             }
             first_error = None

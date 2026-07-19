@@ -30,6 +30,7 @@ class ThreadedRunner(BaseRunner):
         max_threads: int,
         *,
         limit_provider: Callable[[], int] | None = None,
+        worker_cleanup: Callable[[], None] | None = None,
         poll_interval: float = THREAD_LIMIT_POLL_SECONDS,
     ):
         if type(max_threads) is not int or max_threads < 1:
@@ -40,6 +41,7 @@ class ThreadedRunner(BaseRunner):
             raise ValueError("poll_interval must be > 0")
         self.max_threads = max_threads
         self.limit_provider = limit_provider
+        self.worker_cleanup = worker_cleanup
         self.poll_interval = float(poll_interval)
 
     def effective_limit(self) -> int:
@@ -115,6 +117,8 @@ class ThreadedRunner(BaseRunner):
                         results[index] = value
                         condition.notify_all()
             finally:
+                if self.worker_cleanup is not None:
+                    self.worker_cleanup()
                 with condition:
                     workers.pop(worker_id, None)
                     condition.notify_all()

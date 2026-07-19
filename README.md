@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.8
+# micro-workflow-manager 0.3.9
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,28 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.9
+
+- Framework-created API, threaded-runner, Hoeflein node, scheduler-supervisor,
+  and inline monitor threads now close their per-thread SQLite connection when
+  the thread or job finishes. Dead thread identifiers cannot inherit an older
+  connection if Python later reuses the numeric thread ID.
+- Same-process SQLite writers are serialized before `BEGIN IMMEDIATE`. SQLite
+  still provides cross-process coordination, but hundreds of local workers no
+  longer enter `busy_timeout` together. Commit failures now always roll back so
+  a persistent connection cannot retain a write transaction and poison later
+  scheduler rounds.
+- Checkpoint runtime persistence is one conditional `UPDATE` instead of a
+  database advisory-lock acquire, runtime update, and advisory-lock release.
+  Late checkpoints from a timed-out or restarted watch still cannot overwrite
+  its terminal runtime state.
+- Generation/restart-fenced file mutations now use per-job operating-system file
+  locks in `.mwf/execution-fences/`. This preserves second-terminal `restart`
+  ordering without writing SQLite advisory-lock rows around every file write.
+- Repeated high-concurrency API rounds and repeated CLI `run --monitor` rounds
+  now have regression coverage for connection cleanup, runtime writes, file
+  fencing, database integrity, and progressive slowdown.
 
 ## What changed in 0.3.8
 
@@ -1051,7 +1073,15 @@ is normalized into `.mwf/state.sqlite3`:
 - `idempotency` stores downstream creation keys
 - `default_job_specs` stores idempotent router starter declarations
 - `nodes` stores node-level state
-- `advisory_locks` provides short cross-process critical sections without lock files
+- `advisory_locks` provides infrequent CLI-wide cross-process critical sections
+
+Per-job execution/restart fences are intentionally not database advisory rows.
+They use `.mwf/execution-fences/*.lock`, so a managed payload write does not add
+an advisory-lock acquire and release around its normal work. Checkpoints update
+their job runtime with one conditional SQLite statement. Framework-created
+worker, handler, component, supervisor, and inline-monitor threads close their
+connection at lifecycle end; same-process writers queue before entering SQLite,
+while WAL keeps monitor/inspect readers concurrent.
 
 The scheduler allocates dynamic job IDs and updates status counts with short
 transactions. WAL mode allows concurrent monitoring and inspection. This avoids
@@ -1101,10 +1131,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.8 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.9 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.8-py3-none-any.whl
+micro_workflow_manager-0.3.9-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1124,22 +1154,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.8-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.9-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.8-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.9-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.8-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.9-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.8`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.9`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1154,7 +1184,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.8-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.9-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

@@ -34,17 +34,29 @@ class JobExecutionStorageMixin:
 
     def write_job_runtime(self, node_name: str, job_id: int, data: dict[str, Any]):
         job_id = self.validate_job_id(job_id)
-        with self.interprocess_lock(f"job-{node_name}-{job_id}-runtime"):
-            current = self.read_job_runtime(node_name, job_id)
-            same_watch = current.get("watch_id") == data.get("watch_id")
-            terminal = {"timed_out", "completed", "failed", "restarted", "recovered"}
-            if same_watch and current.get("state") in terminal and data.get("state") == "running":
-                return
-            with self.db_transaction() as connection:
-                connection.execute(
-                    "UPDATE jobs SET runtime_json=? WHERE node_name=? AND job_id=?",
-                    (json.dumps(data, ensure_ascii=False, separators=(",", ":")), node_name, job_id),
-                )
+        serialized = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        # One atomic conditional UPDATE replaces the old advisory-lock acquire,
+        # runtime UPDATE, and advisory-lock release. The WHERE clause preserves
+        # terminal runtime state when a late checkpoint from the same handler
+        # races with timeout/restart completion.
+        with self.db_transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET runtime_json=? WHERE node_name=? AND job_id=? "
+                "AND NOT ("
+                "?='running' AND runtime_json IS NOT NULL "
+                "AND json_valid(runtime_json)=1 "
+                "AND json_extract(runtime_json, '$.watch_id')=? "
+                "AND json_extract(runtime_json, '$.state') IN "
+                "('timed_out','completed','failed','restarted','recovered')"
+                ")",
+                (
+                    serialized,
+                    node_name,
+                    job_id,
+                    data.get("state"),
+                    data.get("watch_id"),
+                ),
+            )
 
     def job_execution_lock_name(self, node_name: str, job_id: int) -> str:
         self.validate_node_name(node_name)
@@ -77,7 +89,10 @@ class JobExecutionStorageMixin:
     def claim_job_execution(self, node_name: str, job_id: int, *, started_at: str) -> tuple[int, str]:
         if not self.job_exists(node_name, job_id):
             raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
-        with self.interprocess_lock(self.job_execution_lock_name(node_name, job_id)):
+        with self.filesystem_interprocess_lock(
+            "execution-fences",
+            self.job_execution_lock_name(node_name, job_id),
+        ):
             control = self.read_job_control(node_name, job_id)
             generation = int(control["generation"])
             execution_id = uuid4().hex
@@ -140,7 +155,10 @@ class JobExecutionStorageMixin:
         generation: int,
         execution_id: str | None = None,
     ) -> Iterator[None]:
-        with self.interprocess_lock(self.job_execution_lock_name(node_name, job_id)):
+        with self.filesystem_interprocess_lock(
+            "execution-fences",
+            self.job_execution_lock_name(node_name, job_id),
+        ):
             if not self.job_execution_is_current(node_name, job_id, generation, execution_id):
                 raise JobRestartedError(
                     f"Job {node_name}/{job_id} generation {generation} was restarted"
@@ -252,7 +270,10 @@ class JobExecutionStorageMixin:
     ) -> dict[str, Any]:
         if not self.job_exists(node_name, job_id):
             raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
-        with self.interprocess_lock(self.job_execution_lock_name(node_name, job_id)):
+        with self.filesystem_interprocess_lock(
+            "execution-fences",
+            self.job_execution_lock_name(node_name, job_id),
+        ):
             return self._request_job_restart_locked(
                 node_name,
                 job_id,
@@ -271,7 +292,10 @@ class JobExecutionStorageMixin:
     ) -> dict[str, Any]:
         if not self.job_exists(node_name, job_id):
             raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
-        with self.interprocess_lock(self.job_execution_lock_name(node_name, job_id)):
+        with self.filesystem_interprocess_lock(
+            "execution-fences",
+            self.job_execution_lock_name(node_name, job_id),
+        ):
             return self._request_job_restart_locked(
                 node_name,
                 job_id,

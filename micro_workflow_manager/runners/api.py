@@ -22,6 +22,7 @@ class ApiRunner(BaseRunner):
         max_threads: int,
         *,
         limit_provider: Callable[[], int] | None = None,
+        worker_cleanup: Callable[[], None] | None = None,
         poll_interval: float = THREAD_LIMIT_POLL_SECONDS,
     ):
         if type(max_threads) is not int or max_threads < 1:
@@ -32,6 +33,7 @@ class ApiRunner(BaseRunner):
             raise ValueError("poll_interval must be > 0")
         self.max_threads = max_threads
         self.limit_provider = limit_provider
+        self.worker_cleanup = worker_cleanup
         self.poll_interval = float(poll_interval)
 
     def effective_limit(self) -> int:
@@ -66,7 +68,14 @@ class ApiRunner(BaseRunner):
                         return
                     index = next_index
                     next_index += 1
-                    futures[executor.submit(run_one, item)] = index
+                    def run_with_cleanup(value=item):
+                        try:
+                            return run_one(value)
+                        finally:
+                            if self.worker_cleanup is not None:
+                                self.worker_cleanup()
+
+                    futures[executor.submit(run_with_cleanup)] = index
 
             fill()
             while futures:

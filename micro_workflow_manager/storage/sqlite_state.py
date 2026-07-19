@@ -7,7 +7,7 @@ import socket
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -31,8 +31,11 @@ class SQLiteStateMixin:
 
     _db_init_locks: dict[Path, threading.Lock] = {}
     _db_init_locks_guard = threading.Lock()
+    _db_write_locks: dict[Path, threading.RLock] = {}
+    _db_write_locks_guard = threading.Lock()
     _initialized_databases: set[tuple[Path, int]] = set()
     _connection_registry: dict[tuple[Path, int, int], sqlite3.Connection] = {}
+    _connection_threads: dict[tuple[Path, int, int], threading.Thread] = {}
     _connection_registry_guard = threading.Lock()
     _advisory_owner_registry: set[str] = set()
     _advisory_owner_registry_guard = threading.Lock()
@@ -71,19 +74,68 @@ class SQLiteStateMixin:
 
     def db_connection(self) -> sqlite3.Connection:
         key = self._connection_key()
+        current_thread = threading.current_thread()
+        stale_connection = None
         with self._connection_registry_guard:
             connection = self._connection_registry.get(key)
+            owner_thread = self._connection_threads.get(key)
+            # Python may reuse a dead thread's integer identifier. Never hand
+            # its persistent SQLite connection to a new worker merely because
+            # the recycled ident produced the same registry key.
+            if connection is not None and owner_thread is not current_thread:
+                stale_connection = self._connection_registry.pop(key, None)
+                self._connection_threads.pop(key, None)
+                connection = None
             if connection is None:
                 connection = self._new_db_connection()
                 self._connection_registry[key] = connection
+                self._connection_threads[key] = current_thread
+        if stale_connection is not None:
+            try:
+                stale_connection.close()
+            except sqlite3.Error:
+                pass
             return connection
+        return connection
 
     def close_thread_connection(self) -> None:
         key = self._connection_key()
         with self._connection_registry_guard:
             connection = self._connection_registry.pop(key, None)
+            self._connection_threads.pop(key, None)
         if connection is not None:
-            connection.close()
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+
+    def prune_dead_thread_connections(self) -> int:
+        """Close database connections owned by framework threads that exited.
+
+        Normal runners now close their own connection explicitly. This sweep is
+        a defensive boundary for interrupted tests, custom runner extensions,
+        and any older thread path that exits before its cleanup callback runs.
+        """
+        path = self.state_database_path().resolve()
+        pid = os.getpid()
+        current = threading.current_thread()
+        stale: list[sqlite3.Connection] = []
+        with self._connection_registry_guard:
+            for key, connection in list(self._connection_registry.items()):
+                if key[0] != path or key[1] != pid:
+                    continue
+                owner = self._connection_threads.get(key)
+                if owner is current or (owner is not None and owner.is_alive()):
+                    continue
+                self._connection_registry.pop(key, None)
+                self._connection_threads.pop(key, None)
+                stale.append(connection)
+        for connection in stale:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        return len(stale)
 
     def close_database_connections(self) -> None:
         path = self.state_database_path().resolve()
@@ -96,20 +148,39 @@ class SQLiteStateMixin:
             ]
             for key, _ in matches:
                 self._connection_registry.pop(key, None)
+                self._connection_threads.pop(key, None)
         for _, connection in matches:
-            connection.close()
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+
+    def _database_write_lock(self) -> threading.RLock:
+        path = self.state_database_path().resolve()
+        with self._db_write_locks_guard:
+            return self._db_write_locks.setdefault(path, threading.RLock())
 
     @contextmanager
     def db_transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
         connection = self.db_connection()
-        connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-        try:
-            yield connection
-        except BaseException:
-            connection.rollback()
-            raise
-        else:
-            connection.commit()
+        # SQLite has one writer even in WAL mode. Serialize same-process
+        # writers before they enter SQLite instead of allowing hundreds of
+        # worker connections to sit inside busy_timeout simultaneously.
+        lock = self._database_write_lock() if immediate else nullcontext()
+        with lock:
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield connection
+                connection.commit()
+            except BaseException:
+                # A commit failure must also roll back. Leaving a transaction
+                # open on a persistent worker connection is enough to poison
+                # every later round with "database is locked" failures.
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
 
     def initialize_state_database(self) -> Path:
         connection = self._new_db_connection()

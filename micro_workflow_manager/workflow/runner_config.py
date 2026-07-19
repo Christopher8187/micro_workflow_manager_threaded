@@ -33,12 +33,14 @@ class RunnerFactoryMixin:
             return ThreadedRunner(
                 max_threads=node.max_threads,
                 limit_provider=lambda: self.effective_max_threads(node.name),
+                worker_cleanup=self.storage.close_thread_connection,
             )
 
         if effective_runner == "api":
             return ApiRunner(
                 max_threads=node.max_threads,
                 limit_provider=lambda: self.effective_max_threads(node.name),
+                worker_cleanup=self.storage.close_thread_connection,
             )
 
         if effective_runner == "process":

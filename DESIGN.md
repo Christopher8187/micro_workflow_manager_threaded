@@ -178,6 +178,14 @@ application records, artifacts, and provenance in node input/output files or in
 a separate domain database owned by the project. This separation keeps
 clipboard, migration, restart fencing, and future schema upgrades reliable.
 
+SQLite WAL permits concurrent readers, but SQLite still has one writer. MWF
+therefore serializes same-process framework writes before opening an immediate
+transaction, closes each framework worker's connection when that worker exits,
+and rolls back failed commits. High-frequency checkpoint updates use one atomic
+row update. Per-job restart fences use operating-system file locks rather than
+database advisory rows, because wrapping every payload write in an advisory
+lock would add two unnecessary SQLite writes to the critical path.
+
 Use pure functions in `src/utils/` for parsing, scoring, geometry, SQL planning,
 or state transitions. Keep MWF context calls at the node boundary. This makes
 unit testing possible without creating a workflow project for every calculation.

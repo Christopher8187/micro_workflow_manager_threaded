@@ -176,6 +176,13 @@ executor growth, SQLite contention, operating-system thread limits, or the test'
 own workload before declaring a scheduler deadlock. Do not permanently reduce
 concurrency without explaining the observed ratio and throughput tradeoff.
 
+For progressive degradation, repeat the same synthetic round in one Python
+process and record elapsed time, live thread count, and the number of registered
+SQLite connections after each round. Framework-created worker, handler,
+supervisor, component, and inline-monitor threads must release their connection
+when they exit. A checkpoint should perform one runtime-row write, and a
+restart-fenced payload write must not create SQLite advisory-lock rows.
+
 ### 3. Test timeout policy separately
 
 Determine which timeout fired: test-harness timeout, task total timeout, dynamic

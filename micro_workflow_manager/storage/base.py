@@ -199,16 +199,31 @@ class FileStorageBase:
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "lock"
         return self.lock_dir() / f"{safe}.lock"
 
-    @contextmanager
-    def interprocess_lock(self, name: str):
-        """Cross-process lock with same-process thread serialization.
+    def filesystem_lock_file(self, namespace: str, name: str) -> Path:
+        """Return a dedicated OS-lock path outside SQLite advisory locking.
 
-        On Linux/macOS, fcntl/flock locks are process-level and can behave badly
-        when many threads in the same process try to acquire the same lock file
-        at once. The per-lock RLock serializes threads before taking the OS lock.
-        The OS lock still protects process-pool workers and separate CLI commands.
+        SQLite advisory locks remain appropriate for infrequent CLI-wide
+        coordination. Restart fencing is different: every generation-guarded
+        file mutation takes a per-job lock, so routing those locks through the
+        database turns ordinary file writes into two extra SQLite writes. Keep
+        those high-frequency fences in their own filesystem namespace instead.
         """
-        path = self.lock_file(name)
+        safe_namespace = re.sub(r"[^A-Za-z0-9_.-]+", "_", namespace).strip("._")
+        safe_namespace = safe_namespace or "locks"
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "lock"
+        directory = self.project_dir / ".mwf" / safe_namespace
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{safe_name}.lock"
+
+    @contextmanager
+    def filesystem_interprocess_lock(self, namespace: str, name: str):
+        """Cross-process file lock that deliberately bypasses SQLite.
+
+        The per-path ``RLock`` prevents same-process threads from contending on
+        platform file-lock APIs. The file lock still synchronizes a live
+        ``mwf restart`` command in a second process with the running job.
+        """
+        path = self.filesystem_lock_file(namespace, name)
         thread_lock = self.thread_lock_for(path)
 
         with thread_lock:
@@ -221,22 +236,46 @@ class FileStorageBase:
                         file.write(b"0")
                         file.flush()
                     file.seek(0)
-                    self.retry_fs(lambda: msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1), attempts=120)
+                    self.retry_fs(
+                        lambda: msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1),
+                        attempts=120,
+                    )
                     try:
                         yield
                     finally:
                         file.seek(0)
-                        self.retry_fs(lambda: msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1), attempts=20)
+                        self.retry_fs(
+                            lambda: msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1),
+                            attempts=20,
+                        )
                 else:
                     import fcntl
 
-                    self.retry_fs(lambda: fcntl.flock(file.fileno(), fcntl.LOCK_EX), attempts=120)
+                    self.retry_fs(
+                        lambda: fcntl.flock(file.fileno(), fcntl.LOCK_EX),
+                        attempts=120,
+                    )
                     try:
                         yield
                     finally:
-                        self.retry_fs(lambda: fcntl.flock(file.fileno(), fcntl.LOCK_UN), attempts=20)
+                        self.retry_fs(
+                            lambda: fcntl.flock(file.fileno(), fcntl.LOCK_UN),
+                            attempts=20,
+                        )
             finally:
                 file.close()
+
+    @contextmanager
+    def interprocess_lock(self, name: str):
+        """Cross-process lock with same-process thread serialization.
+
+        On Linux/macOS, fcntl/flock locks are process-level and can behave badly
+        when many threads in the same process try to acquire the same lock file
+        at once. The per-lock RLock serializes threads before taking the OS lock.
+        The OS lock still protects process-pool workers and separate CLI commands.
+        """
+        with self.filesystem_interprocess_lock("locks", name):
+            yield
 
     def validate_job_id(self, job_id: int) -> int:
         if type(job_id) is not int or job_id < 1:
