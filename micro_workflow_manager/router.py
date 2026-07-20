@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 from dataclasses import dataclass
+from collections.abc import Iterable
 from typing import Any
 from pathlib import Path
 from types import ModuleType
@@ -14,6 +15,7 @@ from .node import (
     validate_non_negative_int,
     validate_positive_int,
     validate_positive_float,
+    normalize_wait_for,
 )
 
 
@@ -63,11 +65,15 @@ class NodeRouter:
         sequential: bool = False,
         timeout: float | None = None,
         checkpoint_timeout: float | None = None,
+        waiting: bool = False,
+        wait_for: str | Iterable[str] | None = None,
     ):
         self.name = name
         self.max_threads = validate_positive_int("max_threads", max_threads)
         self.timeout = validate_positive_float("timeout", timeout)
         self.checkpoint_timeout = validate_positive_float("checkpoint_timeout", checkpoint_timeout)
+        self.waiting = bool(waiting or wait_for is not None)
+        self.wait_for = normalize_wait_for(wait_for)
         self.runner_override = sequential_runner_value(
             runner=runner,
             sequential=sequential,
@@ -88,6 +94,8 @@ class NodeRouter:
         sequential: bool = False,
         timeout: float | None = None,
         checkpoint_timeout: float | None = None,
+        waiting: bool = False,
+        wait_for: str | Iterable[str] | None = None,
     ) -> "NodeRouter":
         """Create a router whose node name is the Python file stem."""
         return cls(
@@ -97,7 +105,26 @@ class NodeRouter:
             sequential=sequential,
             timeout=timeout,
             checkpoint_timeout=checkpoint_timeout,
+            waiting=waiting,
+            wait_for=wait_for,
         )
+
+    def wait_for_nodes(self, *node_names: str) -> "NodeRouter":
+        """Make this node wait for the selected peers' queued work to drain.
+
+        Waiting only applies inside the node's Hoeflein component. Once this
+        node's pump starts it keeps running normally; the gate is checked again
+        only before a later pump starts.
+        """
+        self.waiting = True
+        self.wait_for = normalize_wait_for(node_names)
+        return self
+
+    def wait_for_component(self) -> "NodeRouter":
+        """Wait for every other node in this Hoeflein component."""
+        self.waiting = True
+        self.wait_for = None
+        return self
 
     def run_sequentially(self) -> "NodeRouter":
         """Force this node's jobs to run with the direct runner.
@@ -251,6 +278,8 @@ class NodeRouter:
             timeout=self.main_task.timeout,
             checkpoint_timeout=self.main_task.checkpoint_timeout,
             runner=self.runner_override,
+            waiting=self.waiting,
+            wait_for=self.wait_for,
         )(self.main_task.handler)
 
         for fallback in self.fallbacks:

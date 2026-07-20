@@ -655,3 +655,27 @@ network waiting directly instead of requiring exact heartbeat timing.
 New fibers are admitted in bounded bursts. Between bursts MWF processes future
 completions, cancellation, sleepers, and watchdog deadlines. This avoids startup
 starvation when thousands of jobs are claimed at once.
+
+
+## Waiting-node phase gates and component cleanup (0.3.16)
+
+A waiting declaration is an admission gate for a node pump inside one Hoeflein
+component. `waiting=True, wait_for=None` resolves to all other component
+vertices; an explicit list resolves to that subset. The scheduler checks only
+durable queued counts, matching the public contract: a dependency is drained
+when it has no queued jobs left. Running jobs do not count as queued.
+
+The gate is checked only before a pump starts. Once admitted, a pump continues
+to refill and drain its live source even if a waited-for peer later receives
+new work. This gives cyclic router/worker graphs stable phases without cancelling
+or pausing active jobs. If a restored state has a complete mutual-wait cycle and
+no active pump, stable component order releases one pump once, avoiding permanent
+deadlock; later admissions obey the declarations normally.
+
+Node status `waiting` is lifecycle metadata. Individual job rows remain `queued`,
+so cleanup, resume, restart, and provenance semantics do not acquire a new job
+status. Monitor computes `waiting_on` from current durable queues.
+
+Clean, reset, and wipe operate on component-expanded selections. This aligns
+destructive lifecycle changes with scheduling: no command may leave half of an
+SCC reset while its peers retain incompatible jobs or outputs.

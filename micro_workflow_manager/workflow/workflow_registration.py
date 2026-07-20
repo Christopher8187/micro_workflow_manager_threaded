@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Callable
 
@@ -90,6 +91,8 @@ class WorkflowRegistrationMixin:
         max_threads: int = 5,
         runner: str | None = None,
         sequential: bool = False,
+        waiting: bool | None = None,
+        wait_for: str | Iterable[str] | None = None,
     ) -> JobNode:
         name = self.storage.validate_node_name(name)
         max_threads = validate_positive_int("max_threads", max_threads)
@@ -104,6 +107,8 @@ class WorkflowRegistrationMixin:
                     name,
                     max_threads=max_threads,
                     runner=runner_override,
+                    waiting=bool(waiting),
+                    wait_for=wait_for,
                 )
                 self.graph_obj.add_node(name)
 
@@ -116,7 +121,11 @@ class WorkflowRegistrationMixin:
                 node = self.nodes[name]
                 if runner_override is not None:
                     node.set_runner(runner=runner_override)
+                if waiting is not None:
+                    node.configure_waiting(waiting=waiting, wait_for=wait_for)
 
+            if waiting is not None:
+                self.validate_waiting_configuration(name)
             return self.nodes[name]
 
     def task(
@@ -129,6 +138,8 @@ class WorkflowRegistrationMixin:
         sequential: bool = False,
         timeout: float | None = None,
         checkpoint_timeout: float | None = None,
+        waiting: bool = False,
+        wait_for: str | Iterable[str] | None = None,
     ):
         max_threads_checked = validate_positive_int("max_threads", max_threads)
         retries_checked = validate_non_negative_int("retries", retries)
@@ -145,6 +156,8 @@ class WorkflowRegistrationMixin:
                 node_name,
                 max_threads=max_threads_checked,
                 runner=runner_override,
+                waiting=waiting or wait_for is not None,
+                wait_for=wait_for,
             )
             node.max_threads = max_threads_checked
             if runner_override is not None:
@@ -170,6 +183,9 @@ class WorkflowRegistrationMixin:
                 max_threads=node.max_threads,
                 timeout=node.main_task.timeout,
                 checkpoint_timeout=node.main_task.checkpoint_timeout,
+                waiting=node.waiting,
+                wait_for=node.wait_for,
+                resolved_wait_for=sorted(self.waiting_dependencies(node_name)),
             )
 
             return fn
@@ -213,6 +229,9 @@ class WorkflowRegistrationMixin:
                     max_threads=node.max_threads,
                     timeout=node.main_task.timeout,
                     checkpoint_timeout=node.main_task.checkpoint_timeout,
+                    waiting=node.waiting,
+                    wait_for=node.wait_for,
+                    resolved_wait_for=sorted(self.waiting_dependencies(node_name)),
                 )
 
             return fn

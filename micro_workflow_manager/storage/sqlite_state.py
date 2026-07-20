@@ -12,7 +12,13 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
-from micro_workflow_manager.models import QUEUED, RUNNING, VALID_STATUSES, now
+from micro_workflow_manager.models import (
+    JOB_VALID_STATUSES,
+    NODE_VALID_STATUSES,
+    QUEUED,
+    RUNNING,
+    now,
+)
 from micro_workflow_manager.paths import state_database_file
 from micro_workflow_manager.processes import process_is_alive
 
@@ -545,7 +551,7 @@ class SQLiteStateMixin:
 
     def _import_legacy_node(self, node_name: str, node_dir: Path) -> None:
         node_state = self.read_json(node_dir / "node_state.json", default=None)
-        if isinstance(node_state, dict) and node_state.get("status") in VALID_STATUSES:
+        if isinstance(node_state, dict) and node_state.get("status") in NODE_VALID_STATUSES:
             with self.db_transaction() as connection:
                 connection.execute(
                     "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
@@ -614,7 +620,7 @@ class SQLiteStateMixin:
         status_data = self.read_json(job_dir / "status.json", default=None)
         status_data = status_data if isinstance(status_data, dict) else {}
         status = status_data.get("status", QUEUED)
-        if status not in VALID_STATUSES:
+        if status not in JOB_VALID_STATUSES:
             status = QUEUED
         control = self.read_json(job_dir / "execution.json", default=None)
         control = control if isinstance(control, dict) else {}

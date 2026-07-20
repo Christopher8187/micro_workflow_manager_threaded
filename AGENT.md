@@ -300,3 +300,17 @@ enough that the first pump remains alive, and assert that the handler's in-fligh
 count grows toward its configured API limit while routing is still in progress.
 This catches static queued-job snapshots that superficially look like live
 component pumping but leave hundreds of later jobs queued.
+
+
+## Waiting nodes and cleanup invariants (0.3.16)
+
+- Treat a Hoeflein component as the minimum unit for `clean`, `reset`, and
+  `wipe`; tests must include a multi-node cycle selected by one member.
+- Waiting dependencies must be peers in the same component. Do not reinterpret
+  them as DAG predecessor edges.
+- Keep waiting jobs in job status `queued`; only node/monitor lifecycle status
+  is `waiting`.
+- Check waiting gates at node-pump admission, not before every job, so an active
+  pump cannot deadlock halfway through its queue.
+- Test restored mutual-wait states where both sides already have queued work and
+  verify deterministic bootstrap plus eventual quiescence.

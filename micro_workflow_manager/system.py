@@ -78,6 +78,9 @@ class MicroWorkflow(
         # Running them recursively from inside the parent job can deadlock a
         # cyclic component when every worker is waiting for a child worker.
         self._job_context = FiberLocal()
+        # Non-fatal graph/router configuration reminders collected while routers
+        # mount. CLI loading prints these to stderr once per invocation.
+        self.configuration_notices: list[str] = []
     def _refresh_runtime_limits(self) -> dict[str, int]:
         path = self.storage.thread_overrides_file()
         try:

@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from .models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED
+from .models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, WAITING
 
 STATUSES = [QUEUED, RUNNING, DONE, FAILED, SKIPPED, CANCELLED]
 TERMINAL = {DONE, FAILED, SKIPPED, CANCELLED}
@@ -104,6 +104,7 @@ def node_stats(workflow, node_name: str) -> dict[str, Any]:
     progress = (completed / total * 100.0) if total else 0.0
 
     stored_status = workflow.storage.get_node_status(node_name) or "missing"
+    waiting_on = sorted(workflow.waiting_blockers(node_name))
     # Node-state files describe component lifecycle and can briefly be broader
     # than the work actually executing in this node. For monitor display, job
     # counts are the source of truth: queued work must not look running merely
@@ -114,7 +115,7 @@ def node_stats(workflow, node_name: str) -> dict[str, Any]:
     elif counts.get(RUNNING, 0) > 0:
         display_status = RUNNING
     elif counts.get(QUEUED, 0) > 0:
-        display_status = QUEUED
+        display_status = WAITING if waiting_on else QUEUED
     elif total > 0 and counts.get(CANCELLED, 0) > 0:
         display_status = CANCELLED
     elif total > 0 and completed == total:
@@ -145,6 +146,7 @@ def node_stats(workflow, node_name: str) -> dict[str, Any]:
         "thread_override": workflow.thread_override(node_name),
         "running_jobs": sorted(running_jobs),
         "running_elapsed_seconds": running_elapsed,
+        "waiting_on": waiting_on,
     }
 
 
@@ -175,6 +177,7 @@ def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any
     totals["rough_eta_seconds"] = sum(etas) if etas else None
 
     running_nodes = [row["node"] for row in node_rows if row["running"] > 0 or row["status"] == RUNNING]
+    waiting_nodes = [row["node"] for row in node_rows if row["status"] == WAITING]
     api_node_names = {
         node_name
         for node_name in selected
@@ -200,6 +203,7 @@ def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any
         "runner": workflow.runner,
         "run_state": run_state,
         "running_nodes": running_nodes,
+        "waiting_nodes": waiting_nodes,
         "totals": totals,
         "api_runtime": api_runtime,
         "nodes": node_rows,
@@ -269,6 +273,9 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
             "aggregate_limit=none"
         )
     lines.append(f"running nodes: {running_text}")
+    waiting_nodes = snapshot.get("waiting_nodes") or []
+    waiting_text = ", ".join(waiting_nodes) if waiting_nodes else "none"
+    lines.append(f"waiting nodes: {waiting_text}")
     lines.append("")
 
     headers = [

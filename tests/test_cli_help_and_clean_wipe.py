@@ -516,3 +516,75 @@ def test_reinit_updates_sidecars_without_duplicating_gitignore_section(tmp_path,
     gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
     assert gitignore.count("# >>> micro-workflow-manager generated state >>>") == 1
     assert gitignore.count("# <<< micro-workflow-manager generated state <<<") == 1
+
+
+def make_cleanup_component_project(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    src = tmp_path / "src"
+    behavior = src / "node_behavior"
+    behavior.mkdir(parents=True)
+    (src / "graph.py").write_text(
+        "EDGES = [('A', 'B'), ('B', 'C'), ('C', 'B'), ('C', 'D')]\n",
+        encoding="utf-8",
+    )
+    for node in ["A", "B", "C", "D"]:
+        (behavior / f"{node}.py").write_text(
+            f'''from micro_workflow_manager import NodeRouter
+router = NodeRouter("{node}")
+@router.task
+def run(ctx): return "{node}"
+''',
+            encoding="utf-8",
+        )
+    assert cli.main(["init"]) == 0
+    assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
+
+
+@pytest.mark.parametrize("command", ["clean", "reset", "wipe"])
+def test_cleanup_commands_expand_one_node_to_whole_hoeflein_component(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    command,
+):
+    make_cleanup_component_project(tmp_path, monkeypatch)
+    for node in ["A", "B", "C", "D"]:
+        seed_dirty_node(tmp_path, node)
+    capsys.readouterr()
+
+    assert cli.main([command, "B"]) == 0
+    out = capsys.readouterr().out
+    assert "Hoeflein component(s) {B, C}" in out
+
+    storage = FileStorage(tmp_path)
+    for node in ["B", "C"]:
+        node_dir = tmp_path / "node" / node
+        assert not (node_dir / "output" / "remove.txt").exists()
+        if command == "reset":
+            assert storage.job_exists(node, 1)
+            assert storage.get_job_status(node, 1) == "queued"
+            assert (node_dir / "input" / "keep.txt").exists()
+        else:
+            assert not storage.job_exists(node, 1)
+            if command == "wipe":
+                assert not (node_dir / "input" / "keep.txt").exists()
+            else:
+                assert (node_dir / "input" / "keep.txt").exists()
+
+    for node in ["A", "D"]:
+        node_dir = tmp_path / "node" / node
+        assert (node_dir / "output" / "remove.txt").exists()
+        assert storage.job_exists(node, 1)
+        assert storage.get_job_status(node, 1) == "done"
+
+
+def test_cleanup_component_dry_run_lists_expanded_component(tmp_path, monkeypatch, capsys):
+    make_cleanup_component_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    assert cli.main(["reset", "C", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "selected Hoeflein components: {B, C}" in out
+    assert "  B: would preserve jobs/input" in out
+    assert "  C: would preserve jobs/input" in out
+    assert "  A:" not in out
+    assert "  D:" not in out

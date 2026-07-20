@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from micro_workflow_manager.models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, VALID_STATUSES
+from micro_workflow_manager.models import CANCELLED, DONE, FAILED, JOB_VALID_STATUSES, QUEUED, RUNNING, SKIPPED
 
 
 class JobIndexStorageMixin:
@@ -22,7 +22,7 @@ class JobIndexStorageMixin:
         return {
             "node": node_name,
             "last_job_id": 0,
-            "counts": {status: 0 for status in sorted(VALID_STATUSES)},
+            "counts": {status: 0 for status in sorted(JOB_VALID_STATUSES)},
             "running_jobs": {},
             "duration_total": 0.0,
             "duration_count": 0,
@@ -79,7 +79,7 @@ class JobIndexStorageMixin:
         return self.read_job_index(node_name)
 
     def job_status_counts(self, node_name: str) -> dict[str, int]:
-        counts = {status: 0 for status in sorted(VALID_STATUSES)}
+        counts = {status: 0 for status in sorted(JOB_VALID_STATUSES)}
         rows = self.db_connection().execute(
             "SELECT status, COUNT(*) AS count FROM jobs WHERE node_name=? GROUP BY status",
             (node_name,),

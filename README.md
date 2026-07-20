@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.15
+# micro-workflow-manager 0.3.16
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,45 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.16
+
+- `mwf clean`, `mwf reset`, and `mwf wipe` now treat a Hoeflein component as
+  the indivisible cleanup unit. Naming one member expands to every member of
+  that component; DAG nodes remain singleton components.
+- Nodes may declare an intra-component waiting gate with `waiting=True` and
+  `wait_for=...`. Queued jobs remain durably queued, but the node displays as
+  `waiting` and no new node pump starts until the selected peers have no queued
+  jobs left. A pump that already started continues normally.
+- `wait_for=None` with `waiting=True` means all other vertices in the component.
+  A list selects a subset. Waiting targets outside the component are rejected.
+- Waiting on a singleton DAG component is allowed but has no effect; CLI loading
+  prints a reminder that ordinary DAG predecessor readiness is the available
+  queue-independent mechanism.
+- Mutual waiting cycles use a deterministic one-pump bootstrap only when a
+  resumed component has queued work on every side and no active pump can change
+  the queues. Normal waiting gates resume immediately after that bootstrap.
+
+### Waiting-node example
+
+```python
+from micro_workflow_manager import NodeRouter
+
+router = NodeRouter(
+    "router",
+    runner="threaded",
+    waiting=True,
+    wait_for=["worker_a", "worker_b"],
+)
+
+# Equivalent fluent forms:
+# router.wait_for_nodes("worker_a", "worker_b")
+# router.wait_for_component()  # every other component member
+```
+
+Waiting is a node-pump admission rule, not a job-status rewrite. Jobs stay
+`queued` in SQLite so reset/resume semantics remain unchanged; `mwf monitor`
+shows the node lifecycle state as `waiting` and includes `waiting_on` in JSON.
 
 ## What changed in 0.3.15
 
@@ -1251,10 +1290,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.15 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.16 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.15-py3-none-any.whl
+micro_workflow_manager-0.3.16-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1274,22 +1313,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.15-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.16-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.15-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.16-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.15-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.16-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.15`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.16`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1304,7 +1343,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.15-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.16-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project
@@ -1449,3 +1488,11 @@ This reloads the synchronized node behavior files and updates their declared con
 ### Clipboard restore consistency
 
 `mwf paste NODE` now synchronizes the restored payload folders with SQLite before returning. Clipboard snapshots made before 0.3.4 have their numeric `jobs/<id>/input.json` payloads rebuilt as queued database jobs. A snapshot captured while a job was running is treated as a cold restore: stale running leases are cleared and those jobs are immediately queued, so the node can be run or resumed without another migration command.
+
+
+## Component-level cleanup (0.3.16)
+
+`mwf clean NODE`, `mwf reset NODE`, and `mwf wipe NODE` expand `NODE` to its
+whole Hoeflein component. Use `--dry-run` to see the expanded component before
+anything changes. Selecting several members of one component does not duplicate
+work. `*` still selects every graph node.

@@ -14,7 +14,7 @@ from threading import Lock, RLock
 from typing import Any
 from uuid import uuid4
 
-from micro_workflow_manager.models import VALID_STATUSES
+from micro_workflow_manager.models import JOB_VALID_STATUSES, NODE_VALID_STATUSES
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.paths import config_file, locks_dir, run_file
 
@@ -334,8 +334,18 @@ class FileStorageBase:
         return job_id
 
     def validate_status(self, status: str) -> str:
-        if status not in VALID_STATUSES:
-            raise ValueError(f"Invalid status: {status}")
+        """Validate a job status.
+
+        ``waiting`` is deliberately excluded: waiting is a node scheduling
+        state while every affected job remains durably queued.
+        """
+        if status not in JOB_VALID_STATUSES:
+            raise ValueError(f"Invalid job status: {status}")
+        return status
+
+    def validate_node_status(self, status: str) -> str:
+        if status not in NODE_VALID_STATUSES:
+            raise ValueError(f"Invalid node status: {status}")
         return status
 
     def json_text(self, path: Path, data: Any) -> str:

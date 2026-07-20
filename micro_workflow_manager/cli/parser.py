@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     clean_cmd = commands.add_parser(
         "clean",
-        help="Reset node output/job artifacts while keeping input files. Use '*' for all nodes.",
+        help="Reset whole Hoeflein-component output/job artifacts while keeping input files. Use '*' for all nodes.",
         description=COMMAND_HELP_DESCRIPTIONS["clean"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -122,13 +122,13 @@ def build_parser() -> argparse.ArgumentParser:
         "nodes",
         nargs="+",
         metavar="node",
-        help="One or more node names, or '*' to clean every graph node.",
+        help="One or more node names; each selects its entire Hoeflein component, or '*' for all nodes.",
     )
     clean_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
 
     reset_cmd = commands.add_parser(
         "reset",
-        help="Reset node output/status artifacts while keeping input files and jobs. Use '*' for all nodes.",
+        help="Reset whole Hoeflein-component output/status artifacts while keeping input files and jobs. Use '*' for all nodes.",
         description=COMMAND_HELP_DESCRIPTIONS["reset"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -136,13 +136,13 @@ def build_parser() -> argparse.ArgumentParser:
         "nodes",
         nargs="+",
         metavar="node",
-        help="One or more node names, or '*' to reset every graph node.",
+        help="One or more node names; each selects its entire Hoeflein component, or '*' for all nodes.",
     )
     reset_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
 
     wipe_cmd = commands.add_parser(
         "wipe",
-        help="Like clean, but remove input files too. Use '*' for all nodes.",
+        help="Like component-level clean, but remove input files too. Use '*' for all nodes.",
         description=COMMAND_HELP_DESCRIPTIONS["wipe"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "nodes",
         nargs="+",
         metavar="node",
-        help="One or more node names, or '*' to wipe every graph node.",
+        help="One or more node names; each selects its entire Hoeflein component, or '*' for all nodes.",
     )
     wipe_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
 

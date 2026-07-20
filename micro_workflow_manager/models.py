@@ -31,13 +31,14 @@ class MountedTask:
 
 
 QUEUED = "queued"
+WAITING = "waiting"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
 CANCELLED = "cancelled"
 SKIPPED = "skipped"
 
-VALID_STATUSES = {
+JOB_VALID_STATUSES = {
     QUEUED,
     RUNNING,
     DONE,
@@ -45,6 +46,13 @@ VALID_STATUSES = {
     CANCELLED,
     SKIPPED,
 }
+
+NODE_VALID_STATUSES = JOB_VALID_STATUSES | {WAITING}
+
+# Backward-compatible alias for callers that historically treated this as the
+# complete lifecycle vocabulary. Storage paths distinguish jobs from nodes via
+# the two explicit sets above.
+VALID_STATUSES = NODE_VALID_STATUSES
 
 # Jobs in these statuses are considered successful inputs for completing a node.
 # CANCELLED is intentionally excluded: cancelling every job should not silently

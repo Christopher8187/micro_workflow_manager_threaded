@@ -1,5 +1,6 @@
 from inspect import Parameter, signature
 from threading import RLock
+from collections.abc import Iterable
 from typing import Callable
 
 from .models import MountedTask
@@ -28,6 +29,34 @@ def validate_positive_float(name: str, value: float | int | None) -> float | Non
         raise ValueError(f"{name} must be a positive number or None")
     return float(value)
 
+
+
+
+def normalize_wait_for(value: str | Iterable[str] | None) -> tuple[str, ...] | None:
+    """Normalize a declared intra-component waiting subset.
+
+    ``None`` means "all other vertices in this Hoeflein component" when the
+    node is marked waiting. An explicit iterable means exactly that subset.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        values = [value]
+    else:
+        try:
+            values = list(value)
+        except TypeError as error:
+            raise ValueError("wait_for must be a node name, an iterable of node names, or None") from error
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("wait_for entries must be non-empty node names")
+        name = item.strip()
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return tuple(result)
 
 def validate_node_runner(runner: str | None) -> str | None:
     if runner is None:
@@ -69,14 +98,29 @@ class JobNode:
         name: str,
         max_threads: int = 5,
         runner: str | None = None,
+        *,
+        waiting: bool = False,
+        wait_for: str | Iterable[str] | None = None,
     ):
         self.name = name
         self.max_threads = validate_positive_int("max_threads", max_threads)
         self.runner_override = validate_node_runner(runner)
+        self.waiting = bool(waiting or wait_for is not None)
+        self.wait_for = normalize_wait_for(wait_for)
         self.main_task: MountedTask | None = None
         self.fallbacks: dict[str, MountedTask] = {}
         self.fallback_order: list[str] = []
         self.lock = RLock()
+
+
+    def configure_waiting(
+        self,
+        *,
+        waiting: bool,
+        wait_for: str | Iterable[str] | None = None,
+    ) -> None:
+        self.waiting = bool(waiting or wait_for is not None)
+        self.wait_for = normalize_wait_for(wait_for)
 
     @property
     def sequential(self) -> bool:

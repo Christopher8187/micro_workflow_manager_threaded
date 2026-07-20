@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import networkx as nx
 
+from ..errors import InvalidGraphError
 from ..models import (
     CANCELLED,
     DONE,
     FAILED,
     NODE_COMPLETE_STATUSES,
     QUEUED,
+    WAITING,
     RUNNING,
     SKIPPED,
 )
@@ -102,6 +104,67 @@ class ComponentStateMixin:
             for node_name in component
         )
 
+    def validate_waiting_configuration(self, node_name: str) -> None:
+        """Validate one node's waiting declaration against its Hoeflein component."""
+        node = self.nodes[node_name]
+        if not node.waiting:
+            return
+        component = self.component_for(node_name)
+        peers = component - {node_name}
+        declared = node.wait_for
+        if declared is not None:
+            invalid_self = node_name in declared
+            unknown = sorted(name for name in declared if name not in self.graph_obj)
+            outside = sorted(name for name in declared if name in self.graph_obj and name not in peers)
+            if invalid_self:
+                raise InvalidGraphError(f"Waiting node {node_name} cannot wait for itself")
+            if unknown:
+                raise InvalidGraphError(
+                    f"Waiting node {node_name} references unknown node(s): {', '.join(unknown)}"
+                )
+            if outside:
+                raise InvalidGraphError(
+                    f"Waiting node {node_name} can only wait for vertices in Hoeflein component "
+                    f"{{{', '.join(sorted(component))}}}; outside target(s): {', '.join(outside)}"
+                )
+        if not peers:
+            message = (
+                f"Node {node_name} is declared waiting, but Hoeflein component "
+                f"{{{node_name}}} is trivial. DAG-type nodes have no queue-independent "
+                "waiting functionality; ordinary predecessor readiness still applies."
+            )
+            notices = getattr(self, "configuration_notices", None)
+            if notices is not None and message not in notices:
+                notices.append(message)
+
+    def waiting_dependencies(self, node_name: str) -> set[str]:
+        node = self.nodes[node_name]
+        if not node.waiting:
+            return set()
+        self.validate_waiting_configuration(node_name)
+        peers = self.component_for(node_name) - {node_name}
+        if node.wait_for is None:
+            return peers
+        return set(node.wait_for)
+
+    def waiting_blockers(self, node_name: str) -> set[str]:
+        """Peers whose durable queues still block a later pump for node_name."""
+        return {
+            peer
+            for peer in self.waiting_dependencies(node_name)
+            if self.storage.has_queued_jobs(peer)
+        }
+
+    def node_is_waiting(self, node_name: str) -> bool:
+        if not self.storage.has_queued_jobs(node_name):
+            return False
+        if self.storage.job_status_counts(node_name).get(RUNNING, 0):
+            return False
+        return bool(self.waiting_blockers(node_name))
+
+    def node_waiting_ready(self, node_name: str) -> bool:
+        return not self.waiting_blockers(node_name)
+
     def component_predecessors(self, component: set[str]) -> set[str]:
         predecessors: set[str] = set()
         for node_name in component:
@@ -146,11 +209,17 @@ class ComponentStateMixin:
             for counts in counts_by_node.values()
         )
         if has_running:
-            # Actual running jobs make the whole scheduler-owned component
-            # active. Queued work alone must not do this: before ``mwf run`` a
-            # ready component is queued, not already running.
+            # Actual running jobs make the scheduler-owned component active, but
+            # an idle waiting node with queued work keeps its own WAITING state.
             for node_name in component:
-                self.storage.set_node_status(node_name, RUNNING)
+                counts = counts_by_node[node_name]
+                if counts.get(RUNNING, 0):
+                    status = RUNNING
+                elif counts.get(QUEUED, 0) and self.waiting_blockers(node_name):
+                    status = WAITING
+                else:
+                    status = RUNNING
+                self.storage.set_node_status(node_name, status)
             return
 
         has_queued = any(
@@ -159,7 +228,8 @@ class ComponentStateMixin:
         )
         if has_queued:
             for node_name in component:
-                self.storage.set_node_status(node_name, QUEUED)
+                status = WAITING if self.node_is_waiting(node_name) else QUEUED
+                self.storage.set_node_status(node_name, status)
             return
 
         if total_jobs == 0:
@@ -213,7 +283,10 @@ class ComponentStateMixin:
             self.storage.set_node_status(node_name, RUNNING)
             return
         if counts.get(QUEUED, 0):
-            self.storage.set_node_status(node_name, QUEUED)
+            self.storage.set_node_status(
+                node_name,
+                WAITING if self.node_is_waiting(node_name) else QUEUED,
+            )
             return
         successful = counts.get(DONE, 0) + counts.get(SKIPPED, 0)
         if successful == total:
@@ -236,6 +309,10 @@ class ComponentStateMixin:
         self.finalize_ready_nodes()
         ready = []
         for node_name in self.graph_obj.nodes:
-            if self.storage.has_queued_jobs(node_name) and self.node_ready(node_name):
+            if (
+                self.storage.has_queued_jobs(node_name)
+                and self.node_ready(node_name)
+                and self.node_waiting_ready(node_name)
+            ):
                 ready.append(node_name)
         return ready

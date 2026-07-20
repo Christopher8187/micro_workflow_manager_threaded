@@ -40,9 +40,9 @@ COMMAND_HELP_DESCRIPTIONS = {
     "migrate": "Upgrade MWF-owned JSON and SQLite state schemas. User inputs, outputs, returned files, and provenance are never rewritten.",
     "inspect": "Inspect a node/job; list failed job IDs, show retry/fallback filter bottlenecks, or show node debug output.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
-    "clean": "Delete jobs and output for selected nodes while keeping node input files.",
-    "reset": "Requeue every existing job for selected nodes while keeping job definitions and node input files.",
-    "wipe": "Like clean, but remove selected nodes' input files as well.",
+    "clean": "Delete jobs and output for selected Hoeflein components while keeping node input files.",
+    "reset": "Requeue every existing job for selected Hoeflein components while keeping job definitions and node input files.",
+    "wipe": "Like component-level clean, but remove the selected components' input files as well.",
     "run": "Reset and run one ready node or selected jobs; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control for a running or failed/cancelled job inside the active workflow sequence; it never starts another scheduler.",
     "threads": "View or change run-scoped per-node max_threads overrides. API values are cooperative fiber counts with no aggregate framework cap; active nodes scale live.",
@@ -167,8 +167,9 @@ while the recorded owner is still live.
     "clean": """
 Code context:
 Clean loads the configured graph and routers only to validate node names; it does
-not execute a task function. It removes the selected nodes' job folders and output
-while preserving their input folders.
+not execute a task function. Naming any node selects its entire Hoeflein component.
+Clean removes every selected component member's job folders and output while
+preserving their input folders.
 
 File-system context:
 The jobs and output directories are recreated empty, while input remains in place. It is the broad reset to use when existing job definitions are no
@@ -186,9 +187,10 @@ five job records. It does not run the function and does not delete files you put
 in node/make_number/input/. Use reset when you want to keep the same jobs.
 """,
     "reset": """
-Reset preserves each SQLite job identity and `input.json`, but clears status/result state and job-local returned files so every existing job becomes queued again.
-It also clears node output. This is useful when the inputs are correct and you
-simply want all jobs to execute again.
+Reset preserves each SQLite job identity and `input.json`, but clears status/result
+state and job-local returned files so every existing job becomes queued again.
+Naming any node resets its entire Hoeflein component, because component members are
+one scheduling and lifecycle unit. It also clears each member's node output.
 
 Examples:
   mwf reset double_number --dry-run
@@ -199,9 +201,10 @@ If jobs 1 and 2 were done, both are requeued. If you only want to continue the
 failed job while preserving the done one, use mwf resume double_number instead.
 """,
     "wipe": """
-Wipe performs the same cleanup as clean and also recreates the selected input
-folders empty. It is intended for a complete local restart of a node's stored
-material, not for ordinary failure recovery.
+Wipe performs the same component-level cleanup as clean and also recreates every
+selected component member's input folder empty. It is intended for a complete
+local restart of a Hoeflein component's stored material, not for ordinary failure
+recovery.
 
 Examples:
   mwf wipe temporary_result --dry-run

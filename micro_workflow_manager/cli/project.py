@@ -247,6 +247,8 @@ def load_workflow(
         graph_file.parent / "node_behavior",
         allowed_node_names=graph_nodes,
     )
+    for notice in workflow.configuration_notices:
+        print(f"Warning: {notice}", file=sys.stderr)
     return workflow
 
 

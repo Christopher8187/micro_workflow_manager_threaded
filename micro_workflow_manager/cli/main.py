@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import sys
 
-from .cleanup import clean_node, is_all_nodes_request, reset_node_for_run, resolve_node_targets
+from .cleanup import (
+    clean_node,
+    is_all_nodes_request,
+    reset_node_for_run,
+    resolve_node_targets,
+    resolve_component_targets,
+    selected_component_labels,
+)
 from .describe import describe_command
 from .files import find_root, safe_node_name
 from .doctor import doctor_command
@@ -118,7 +125,8 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.command in {"clean", "reset", "wipe"}:
-            nodes = resolve_node_targets(workflow, args.nodes)
+            nodes = resolve_component_targets(workflow, args.nodes)
+            components = selected_component_labels(workflow, nodes)
 
             if args.dry_run:
                 action = {
@@ -127,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
                     "wipe": "delete jobs, output, and input",
                 }[args.command]
                 print(f"Dry run for mwf {args.command}:")
+                print("  selected Hoeflein components: " + ", ".join(components))
                 for item in nodes:
                     print(f"  {item}: would {action}")
                 print("  no files or statuses were changed")
@@ -145,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
             if is_all_nodes_request(args.nodes):
                 print(f"{verb} all nodes: {', '.join(nodes)}")
             else:
-                print(f"{verb}: {', '.join(nodes)}")
+                print(f"{verb} Hoeflein component(s) {', '.join(components)}: {', '.join(nodes)}")
             return 0
 
         node = safe_node_name(args.node)

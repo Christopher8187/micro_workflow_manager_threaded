@@ -3,7 +3,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import networkx as nx
 
 from ..errors import InvalidGraphError
-from ..models import RUNNING
+from ..models import QUEUED, RUNNING, WAITING
 
 
 class ComponentSchedulerMixin:
@@ -24,6 +24,56 @@ class ComponentSchedulerMixin:
     def component_has_queued_jobs(self, component: set[str]) -> bool:
         return any(self.storage.has_queued_jobs(node_name) for node_name in component)
 
+    def _component_queued_nodes(self, component_nodes: list[str]) -> list[str]:
+        return [
+            node_name
+            for node_name in component_nodes
+            if self.storage.has_queued_jobs(node_name)
+        ]
+
+    def _waiting_startable_nodes(
+        self,
+        component_nodes: list[str],
+        *,
+        active_nodes: set[str] | None = None,
+        forced_ready: set[str] | None = None,
+    ) -> list[str]:
+        active = active_nodes or set()
+        forced = forced_ready or set()
+        result: list[str] = []
+        for node_name in component_nodes:
+            if node_name in active or not self.storage.has_queued_jobs(node_name):
+                continue
+            if node_name in forced or self.node_waiting_ready(node_name):
+                result.append(node_name)
+            else:
+                self.storage.set_node_status(node_name, WAITING)
+        return result
+
+    def _waiting_cycle_breaker(
+        self,
+        component_nodes: list[str],
+        queued_nodes: list[str],
+    ) -> str:
+        """Choose a deterministic phase leader when waiting gates form a cycle.
+
+        Mutual waiting is intentionally useful for router/worker phase barriers.
+        A resumed project may contain queued work on both sides before any pump
+        is active. In that state every gate can be true simultaneously. Release
+        the first queued vertex in stable component order for one pump; once it
+        starts, normal waiting rules resume. This avoids an inert component while
+        keeping at most one side of the waiting cycle newly admitted.
+        """
+        queued = set(queued_nodes)
+        chosen = next(node for node in component_nodes if node in queued)
+        blockers = sorted(self.waiting_blockers(chosen))
+        self.storage.write_debug(
+            chosen,
+            "waiting-cycle bootstrap: released one pump while blocked by "
+            + (", ".join(blockers) if blockers else "an empty waiting cycle"),
+        )
+        return chosen
+
     def run_component(
         self,
         component: set[str] | tuple[str, ...] | list[str],
@@ -31,9 +81,9 @@ class ComponentSchedulerMixin:
     ) -> list[str]:
         """Pump one Hoeflein component until it is quiescent.
 
-        Every original edge inside the component behaves as autostart, whether or
-        not the individual ``add`` call repeats ``autostart=True``. A failure in
-        any node marks the entire component failed and prevents another batch.
+        A waiting node is admitted only after its selected peers have no queued
+        jobs left. The gate is checked before a node pump starts; a pump that is
+        already active continues normally until it exhausts its own live queue.
         """
         component_set = set(component)
         if not component_set:
@@ -45,20 +95,20 @@ class ComponentSchedulerMixin:
         component_nodes = list(self.component_key(component_set))
 
         while True:
-            queued_nodes = [
-                node_name for node_name in component_nodes
-                if self.storage.has_queued_jobs(node_name)
-            ]
+            queued_nodes = self._component_queued_nodes(component_nodes)
             if not queued_nodes:
                 self.refresh_component_status(component_set, allow_complete=True)
                 return ran
 
-            for node_name in component_nodes:
-                self.storage.set_node_status(node_name, RUNNING)
+            self.refresh_component_status(component_set, allow_complete=False)
 
             if self.runner == "direct":
+                startable = self._waiting_startable_nodes(component_nodes)
+                if not startable:
+                    startable = [self._waiting_cycle_breaker(component_nodes, queued_nodes)]
                 try:
-                    for node_name in queued_nodes:
+                    for node_name in startable:
+                        self.storage.set_node_status(node_name, RUNNING)
                         self.run_queued_node_jobs(node_name, ignore_readiness=True)
                         ran.append(node_name)
                 except Exception:
@@ -66,13 +116,10 @@ class ComponentSchedulerMixin:
                     raise
                 continue
 
-            # A cyclic component is a live work graph, not a sequence of static
-            # batches. A node pump may exhaust the queue snapshot it saw while
-            # another still-running node is creating more jobs for it. Keep at
-            # most one pump active per node, and immediately resubmit a node as
-            # soon as its previous pump exits and new queued work is visible.
-            # This lets explode handlers continue alongside the explode router
-            # instead of waiting for the router's entire queue to drain.
+            # A Hoeflein component is a live work graph. Keep at most one pump
+            # active per node and discover newly queued sibling work while other
+            # pumps remain active. Waiting gates affect only admission of a new
+            # pump, never a pump that is already running.
             executor = ThreadPoolExecutor(
                 max_workers=max(1, len(component_nodes)),
                 thread_name_prefix="mwf-hoeflein-node",
@@ -86,29 +133,36 @@ class ComponentSchedulerMixin:
 
             futures = {}
             active_nodes: set[str] = set()
+            forced_ready: set[str] = set()
             first_error = None
             try:
                 while True:
-                    for node_name in component_nodes:
-                        if (
-                            node_name not in active_nodes
-                            and self.storage.has_queued_jobs(node_name)
-                        ):
-                            future = executor.submit(run_node_worker, node_name)
-                            futures[future] = node_name
-                            active_nodes.add(node_name)
+                    startable = self._waiting_startable_nodes(
+                        component_nodes,
+                        active_nodes=active_nodes,
+                        forced_ready=forced_ready,
+                    )
+                    for node_name in startable:
+                        future = executor.submit(run_node_worker, node_name)
+                        futures[future] = node_name
+                        active_nodes.add(node_name)
+                        forced_ready.discard(node_name)
+                        self.storage.set_node_status(node_name, RUNNING)
 
                     if not futures:
-                        # Rescan after all completed workers have published their
-                        # downstream jobs. If no work remains, the component is
-                        # genuinely quiescent.
-                        if self.component_has_queued_jobs(component_set):
-                            continue
-                        self.refresh_component_status(
-                            component_set,
-                            allow_complete=True,
+                        queued_nodes = self._component_queued_nodes(component_nodes)
+                        if not queued_nodes:
+                            self.refresh_component_status(
+                                component_set,
+                                allow_complete=True,
+                            )
+                            return ran
+                        # No active pump can change queue state, so all queued
+                        # nodes are mutually waiting. Bootstrap one stable phase.
+                        forced_ready.add(
+                            self._waiting_cycle_breaker(component_nodes, queued_nodes)
                         )
-                        return ran
+                        continue
 
                     done, _ = wait(
                         futures,
@@ -116,10 +170,6 @@ class ComponentSchedulerMixin:
                         return_when=FIRST_COMPLETED,
                     )
                     if not done:
-                        # A still-running node may have just created work for an
-                        # idle sibling. Poll the component queues while pumps are
-                        # active rather than waiting for one whole node pump to
-                        # finish before discovering that work.
                         continue
                     for future in done:
                         node_name = futures.pop(future)
@@ -128,9 +178,6 @@ class ComponentSchedulerMixin:
                             future.result()
                         except Exception as error:
                             first_error = error
-                            # Publish failure before waiting for already-running
-                            # sibling node pumps to wind down, so monitor cannot
-                            # keep presenting a dead component as running.
                             self.mark_component_failed(component_set)
                             break
                         ran.append(node_name)
@@ -141,9 +188,6 @@ class ComponentSchedulerMixin:
                     for future in futures:
                         future.cancel()
                     executor.shutdown(wait=True, cancel_futures=True)
-                    # A sibling pump may have refreshed component state while
-                    # it was winding down. Reassert the terminal component
-                    # failure after every active pump has stopped.
                     self.mark_component_failed(component_set)
                 else:
                     executor.shutdown(wait=True)

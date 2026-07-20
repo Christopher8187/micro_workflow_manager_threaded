@@ -302,6 +302,9 @@ class NodeFileStorageMixin:
         max_threads: int | None = None,
         timeout: float | None = None,
         checkpoint_timeout: float | None = None,
+        waiting: bool = False,
+        wait_for: tuple[str, ...] | list[str] | None = None,
+        resolved_wait_for: list[str] | tuple[str, ...] | None = None,
     ):
         self.atomic_write_json(
             self.node_schema_file(node_name),
@@ -318,6 +321,9 @@ class NodeFileStorageMixin:
                 "max_threads": max_threads,
                 "timeout": timeout,
                 "checkpoint_timeout": checkpoint_timeout,
+                "waiting": bool(waiting),
+                "wait_for": None if wait_for is None else list(wait_for),
+                "resolved_wait_for": list(resolved_wait_for or ()),
                 "input_dir": str(self.node_input_dir(node_name)),
                 "output_dir": str(self.node_output_dir(node_name)),
                 "jobs_dir": str(self.jobs_dir(node_name)),
@@ -325,7 +331,7 @@ class NodeFileStorageMixin:
         )
 
     def set_node_status(self, node_name: str, status: str):
-        status = self.validate_status(status)
+        status = self.validate_node_status(status)
         node_name = self.validate_node_name(node_name)
         with self.db_transaction() as connection:
             connection.execute(

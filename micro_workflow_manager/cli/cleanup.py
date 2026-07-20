@@ -7,7 +7,7 @@ from micro_workflow_manager.models import QUEUED
 from micro_workflow_manager.system import MicroWorkflow
 
 from .files import remove_dir, remove_path, safe_node_dir, safe_node_name
-from .graph_utils import component_topological_nodes
+from .graph_utils import component_topological_nodes, expand_to_components
 from .validation import require_node
 
 
@@ -35,6 +35,30 @@ def resolve_node_targets(workflow: MicroWorkflow, requested: list[str]) -> list[
             seen.add(node)
             result.append(node)
     return result
+
+
+def resolve_component_targets(workflow: MicroWorkflow, requested: list[str]) -> list[str]:
+    """Resolve cleanup targets as whole Hoeflein components.
+
+    Naming any member selects every vertex in that component. Repeated members
+    or multiple names from the same component are deduplicated in quotient-DAG
+    order.
+    """
+    selected_nodes = resolve_node_targets(workflow, requested)
+    expanded = expand_to_components(workflow, set(selected_nodes))
+    return component_topological_nodes(workflow, expanded)
+
+
+def selected_component_labels(workflow: MicroWorkflow, nodes: list[str]) -> list[str]:
+    seen: set[tuple[str, ...]] = set()
+    labels: list[str] = []
+    for node in nodes:
+        component = workflow.component_id(node)
+        if component in seen:
+            continue
+        seen.add(component)
+        labels.append("{" + ", ".join(component) + "}")
+    return labels
 
 
 def clean_node(root: Path, workflow: MicroWorkflow, node: str, remove_input: bool = False):

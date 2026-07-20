@@ -13,6 +13,7 @@ from micro_workflow_manager.models import (
     QUEUED,
     RUNNING,
     SKIPPED,
+    WAITING,
 )
 
 
@@ -60,6 +61,13 @@ def _node_explanation(workflow, node: str) -> str:
     if counts.get(RUNNING, 0):
         return f"The node is active because {counts[RUNNING]} job(s) are running."
     if counts.get(QUEUED, 0):
+        waiting_blockers = sorted(workflow.waiting_blockers(node))
+        if waiting_blockers:
+            return (
+                f"The node is waiting with {counts[QUEUED]} queued job(s) until "
+                + ", ".join(waiting_blockers)
+                + " has no queued work left."
+            )
         blockers = [p for p in workflow.component_predecessors(workflow.component_for(node)) if not workflow.node_complete(p)]
         if blockers:
             return "Queued jobs are waiting for incomplete predecessors: " + ", ".join(sorted(blockers)) + "."
@@ -92,6 +100,13 @@ def inspect_node(workflow, node: str) -> int:
         print(f"  effective max_threads: {workflow.effective_max_threads(node)}")
         print(f"  timeout: {schema.get('timeout')}")
         print(f"  checkpoint_timeout: {schema.get('checkpoint_timeout')}")
+        print(f"  waiting node: {'yes' if schema.get('waiting') else 'no'}")
+        declared_wait = schema.get('wait_for')
+        if schema.get('waiting'):
+            declared_text = 'all component peers' if declared_wait is None else (', '.join(declared_wait) or '(empty subset)')
+            print(f"  declared wait_for: {declared_text}")
+            print(f"  resolved wait_for: {', '.join(schema.get('resolved_wait_for') or []) or '(none)'}")
+            print(f"  currently waiting on: {', '.join(sorted(workflow.waiting_blockers(node))) or '(none)'}")
         print(f"  fallbacks: {', '.join(schema.get('fallbacks') or []) or '(none)'}")
     print(f"  explanation: {_node_explanation(workflow, node)}")
     return 0
