@@ -81,6 +81,10 @@ class AttemptWatch:
     timeout_message: str | None = None
     cancel_message: str | None = None
     runtime_written: bool = False
+    external_wait_depth: int = 0
+    external_wait_name: str | None = None
+    external_wait_timeout: float | None = None
+    external_wait_deadline: float | None = None
 
     @property
     def supervised(self) -> bool:
@@ -149,6 +153,13 @@ class SchedulerSupervisor:
             (deadline, self._serial, watch.key, kind, watch.revision),
         )
 
+    def _schedule_watch_locked(self, watch: AttemptWatch):
+        self._push_deadline_locked(watch, "total", watch.total_deadline)
+        if watch.external_wait_depth > 0:
+            self._push_deadline_locked(watch, "external", watch.external_wait_deadline)
+        else:
+            self._push_deadline_locked(watch, "checkpoint", watch.checkpoint_deadline)
+
     def _compact_deadlines_locked(self):
         limit = max(256, len(self._watches) * 8)
         if len(self._deadlines) <= limit:
@@ -159,7 +170,10 @@ class SchedulerSupervisor:
                 continue
             for kind, deadline in (
                 ("total", watch.total_deadline),
-                ("checkpoint", watch.checkpoint_deadline),
+                (
+                    "external" if watch.external_wait_depth > 0 else "checkpoint",
+                    watch.external_wait_deadline if watch.external_wait_depth > 0 else watch.checkpoint_deadline,
+                ),
             ):
                 if deadline is None:
                     continue
@@ -175,7 +189,11 @@ class SchedulerSupervisor:
             if watch is None or watch.state != "active" or watch.revision != revision:
                 heapq.heappop(self._deadlines)
                 continue
-            current = watch.total_deadline if kind == "total" else watch.checkpoint_deadline
+            current = (
+                watch.total_deadline if kind == "total"
+                else watch.external_wait_deadline if kind == "external"
+                else watch.checkpoint_deadline
+            )
             if current is None or abs(current - deadline) > 1e-9:
                 heapq.heappop(self._deadlines)
                 continue
@@ -198,7 +216,11 @@ class SchedulerSupervisor:
                     watch = self._watches.get(key)
                     if watch is None or watch.state != "active" or watch.revision != revision:
                         continue
-                    current = watch.total_deadline if kind == "total" else watch.checkpoint_deadline
+                    current = (
+                watch.total_deadline if kind == "total"
+                else watch.external_wait_deadline if kind == "external"
+                else watch.checkpoint_deadline
+            )
                     if current is None or abs(current - deadline) > 1e-9:
                         continue
                     watch.state = "timed_out"
@@ -209,6 +231,13 @@ class SchedulerSupervisor:
                         watch.timeout_message = (
                             f"{watch.node_name}.{watch.task_name} made no checkpoint progress "
                             f"for {seconds:g}s after {checkpoint!r}"
+                        )
+                    elif kind == "external":
+                        seconds = watch.external_wait_timeout
+                        operation = watch.external_wait_name or "framework-managed network request"
+                        watch.timeout_message = (
+                            f"{watch.node_name}.{watch.task_name} network wait {operation!r} "
+                            f"exceeded its {seconds:g}s transport lease"
                         )
                     else:
                         seconds = watch.total_timeout
@@ -343,8 +372,7 @@ class SchedulerSupervisor:
         with self._condition:
             self._watches[watch.key] = watch
             if watch.supervised:
-                self._push_deadline_locked(watch, "total", watch.total_deadline)
-                self._push_deadline_locked(watch, "checkpoint", watch.checkpoint_deadline)
+                self._schedule_watch_locked(watch)
                 self._compact_deadlines_locked()
                 self._ensure_thread_locked()
                 self._condition.notify_all()
@@ -403,13 +431,73 @@ class SchedulerSupervisor:
                 watch.checkpoint_timeout = effective
                 watch.checkpoint_deadline = now_value + effective
                 watch.revision += 1
-                self._push_deadline_locked(watch, "total", watch.total_deadline)
-                self._push_deadline_locked(watch, "checkpoint", watch.checkpoint_deadline)
+                self._schedule_watch_locked(watch)
                 self._compact_deadlines_locked()
                 self._ensure_thread_locked()
                 self._condition.notify_all()
 
         self._persist_runtime(watch, state="running")
+
+    def begin_external_wait(
+        self,
+        watch: AttemptWatch,
+        *,
+        name: str,
+        timeout: float | int,
+        cleanup_grace: float = 30.0,
+    ) -> None:
+        """Suspend checkpoint expiry while a framework-managed network call is live.
+
+        The transport timeout remains bounded and the task's total timeout is
+        never suspended. This removes the dependency on user-space heartbeat
+        callbacks arriving exactly on schedule under extreme concurrency.
+        """
+        timeout_value = _validate_timeout(timeout, name="external wait timeout")
+        assert timeout_value is not None
+        grace = _validate_timeout(cleanup_grace, name="external wait cleanup grace")
+        assert grace is not None
+        now_value = monotonic()
+        with self._condition:
+            if watch.state != "active":
+                error = self.timeout_error(watch) or self.execution_cancel_error(watch)
+                if error is not None:
+                    raise error
+                return
+            watch.external_wait_depth += 1
+            watch.external_wait_name = str(name)
+            watch.external_wait_timeout = timeout_value + grace
+            deadline = now_value + timeout_value + grace
+            watch.external_wait_deadline = max(watch.external_wait_deadline or 0.0, deadline)
+            watch.revision += 1
+            self._schedule_watch_locked(watch)
+            self._compact_deadlines_locked()
+            self._ensure_thread_locked()
+            self._condition.notify_all()
+        # Do not synchronously persist every network transition. At thousands of
+        # requests this would add two serialized SQLite writes per HTTP call.
+        # Checkpoints, completion, and timeout persistence still capture state.
+
+    def end_external_wait(self, watch: AttemptWatch) -> None:
+        now_value = monotonic()
+        with self._condition:
+            if watch.external_wait_depth <= 0:
+                return
+            watch.external_wait_depth -= 1
+            if watch.external_wait_depth == 0:
+                completed_name = watch.external_wait_name or "network request"
+                watch.external_wait_name = None
+                watch.external_wait_timeout = None
+                watch.external_wait_deadline = None
+                watch.checkpoint_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                watch.checkpoint_name = f"{completed_name} completed"
+                effective = watch.checkpoint_timeout or watch.default_checkpoint_timeout
+                watch.checkpoint_deadline = now_value + effective if effective is not None else None
+            watch.revision += 1
+            if watch.state == "active":
+                self._schedule_watch_locked(watch)
+                self._compact_deadlines_locked()
+                self._condition.notify_all()
+        # See begin_external_wait: avoid per-request SQLite churn.
 
     def signal_handler_complete(self, watch: AttemptWatch):
         if not watch.supervised:
@@ -539,6 +627,9 @@ class SchedulerSupervisor:
             "checkpoint_deadline_at": _deadline_iso(checkpoint_remaining),
             "timeout_kind": watch.timeout_kind,
             "timeout_message": watch.timeout_message,
+            "external_wait_active": watch.external_wait_depth > 0,
+            "external_wait_name": watch.external_wait_name,
+            "external_wait_timeout_seconds": watch.external_wait_timeout,
         }
         if error is not None:
             payload["error"] = error
@@ -564,7 +655,11 @@ class SchedulerSupervisor:
         ):
             return
         self._persist_runtime(watch, state="timed_out")
-        seconds = watch.checkpoint_timeout if kind == "checkpoint" else watch.total_timeout
+        seconds = (
+            watch.checkpoint_timeout if kind == "checkpoint"
+            else watch.external_wait_timeout if kind == "external"
+            else watch.total_timeout
+        )
         self.storage.append_job_event(
             watch.node_name,
             watch.job_id,

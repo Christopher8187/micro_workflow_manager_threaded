@@ -123,8 +123,11 @@ A node behavior file should read in this order:
 - Use `threaded` for mixed local I/O and modest parallelism where adaptive
   worker growth is useful.
 - Use `api` for blocking model providers, HTTP SDKs, remote databases, and other
-  high-latency calls. Its `max_threads` value intentionally means maximum
-  in-flight calls, and it fills that limit immediately.
+  high-latency calls. Its `max_threads` value intentionally means the node's
+  maximum in-flight calls. All API nodes additionally share a default
+  workflow-wide budget of 256, preventing their independent limits from
+  oversubscribing one provider/account. Active nodes receive proportional fair
+  shares and may borrow unused sibling capacity.
 - Use `process` for CPU-heavy, pickleable tasks that benefit from process
   isolation.
 
@@ -635,3 +638,20 @@ thread limit. Row insertion order is used rather than job ID order because
 concurrent batch producers may reserve lower IDs and commit them after a higher
 reserved range. Non-API runners retain the existing snapshot iterator and job-ID
 ordering.
+
+## Cooperative API networking and watchdog leases (0.3.15)
+
+API nodes are limited only by each node's effective `max_threads`, interpreted
+as a fiber count. The framework does not apply an aggregate admission ceiling.
+Each node pump hosts greenlet job controllers and one scheduler loop, while one
+process-wide asyncio thread owns a pooled `httpx.AsyncClient`.
+
+A framework HTTP request registers an external-wait lease on its attempt watch.
+While that bounded lease is active, checkpoint-progress expiry is suspended;
+the task total deadline and transport deadline are never suspended. On return,
+checkpoint timing restarts from the completed network operation. This models
+network waiting directly instead of requiring exact heartbeat timing.
+
+New fibers are admitted in bounded bursts. Between bursts MWF processes future
+completions, cancellation, sleepers, and watchdog deadlines. This avoids startup
+starvation when thousands of jobs are claimed at once.

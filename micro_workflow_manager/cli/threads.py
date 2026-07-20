@@ -49,7 +49,7 @@ def _effective_runner(root: Path, schema: dict) -> str:
     return value if isinstance(value, str) else "threaded"
 
 
-def _parse_new_limit(spec: str, current: int) -> int:
+def _parse_new_limit(spec: str, current: int, *, maximum: int | None) -> int:
     text = spec.strip()
     if not text:
         raise ValueError("thread limit cannot be empty")
@@ -68,10 +68,8 @@ def _parse_new_limit(spec: str, current: int) -> int:
 
     if value < 1:
         raise ValueError("effective max_threads must remain at least 1")
-    if value > MAX_RUNTIME_THREADS:
-        raise ValueError(
-            f"effective max_threads cannot exceed {MAX_RUNTIME_THREADS}"
-        )
+    if maximum is not None and value > maximum:
+        raise ValueError(f"effective max_threads cannot exceed {maximum}")
     return value
 
 
@@ -129,6 +127,7 @@ def list_thread_statuses(root: Path, storage: FileStorage) -> int:
         return 0
 
     print("Runtime max_threads")
+    print("API node limits are cooperative fiber counts; there is no aggregate API cap.")
     print("node                     runner    declared  override  effective")
     print("-----------------------  --------  --------  --------  ---------")
     for node in nodes:
@@ -139,7 +138,6 @@ def list_thread_statuses(root: Path, storage: FileStorage) -> int:
             f"{status['declared']:8}  {str(override):8}  {status['effective']:9}"
         )
     return 0
-
 
 
 def update_declared_threads(root: Path) -> int:
@@ -201,16 +199,22 @@ def threads_command(root: Path, node: str | None, value: str | None) -> int:
         print(f"Effective max_threads: {before['effective']} -> {after['effective']}")
         return 0
 
-    requested = _parse_new_limit(value, before["effective"])
+    maximum = None if before["runner"] == "api" else MAX_RUNTIME_THREADS
+    requested = _parse_new_limit(value, before["effective"], maximum=maximum)
     if requested > HIGH_RUNTIME_THREAD_WARNING:
-        print(
-            f"Warning: {requested} in-flight jobs is an extreme local concurrency "
-            "setting. During CLI runs, restart/timeout supervision may use roughly "
-            "one controller thread plus one handler thread per active job, in "
-            "addition to SQLite and network resources. Increase gradually and "
-            "watch system thread, memory, and connection limits.",
-            file=sys.stderr,
-        )
+        if before["runner"] == "api":
+            print(
+                f"Notice: {requested} is a large cooperative API fiber count. It does not "
+                "create one OS thread per job, but provider, socket, memory, and rate limits "
+                "still apply.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Warning: {requested} is an extreme local concurrency setting for OS workers. "
+                "Increase gradually and watch system thread, process, and memory limits.",
+                file=sys.stderr,
+            )
     with storage.interprocess_lock("active-run-state"):
         active = live_active_run(storage)
         storage.set_thread_override(node, requested, run_id=(active or {}).get("run_id"))
@@ -240,8 +244,8 @@ def threads_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="mwf threads",
         description=(
-            "View or change a node's local runtime max_threads override. "
-            "With the threaded or API runner, an active node scales up or down live."
+            "View or change a node's local runtime max_threads override. API values "
+            "are cooperative fiber counts and have no workflow-wide aggregate cap."
         ),
     )
     parser.add_argument(

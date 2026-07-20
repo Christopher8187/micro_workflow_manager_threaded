@@ -13,6 +13,8 @@ from ..errors import (
     JobTimeoutError,
 )
 from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
+from ..fibers import cancellation_scope, in_fiber_runtime
+from ..networking import network_attempt_context
 
 
 T = TypeVar("T")
@@ -296,6 +298,29 @@ class JobExecutionMixin:
         for completion, a centralized deadline, or a changed execution lease.
         """
         supervisor = self.scheduler_supervisor
+
+        if in_fiber_runtime():
+            def check_cancelled() -> None:
+                ctx.raise_if_cancelled()
+            try:
+                with cancellation_scope(check_cancelled), network_attempt_context(self, ctx, watch):
+                    result = self._call_mounted_handler(mounted, ctx, params)
+                check_cancelled()
+            except BaseException as error:
+                restart_error = supervisor.execution_cancel_error(watch)
+                timeout_error = supervisor.timeout_error(watch)
+                final_error = restart_error or timeout_error or error
+                state = (
+                    "superseded" if restart_error is not None
+                    else "timed_out" if timeout_error is not None
+                    else "failed"
+                )
+                supervisor.finish_attempt(watch, state=state, error=final_error)
+                raise final_error
+            else:
+                supervisor.signal_handler_complete(watch)
+                supervisor.finish_attempt(watch, state="completed")
+                return result
 
         if not watch.abandonable:
             try:

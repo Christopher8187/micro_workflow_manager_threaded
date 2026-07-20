@@ -96,11 +96,19 @@ class JobIndexStorageMixin:
         avg_duration = (
             float(index["duration_total"]) / duration_count if duration_count else None
         )
+        recent = self.db_connection().execute(
+            "SELECT COUNT(*) AS count FROM jobs WHERE node_name=? "
+            "AND status IN ('done','skipped') "
+            "AND julianday(json_extract(status_json, '$.finished_at')) "
+            ">= julianday('now', '-60 seconds')",
+            (node_name,),
+        ).fetchone()
         return {
             "total": sum(counts.values()),
             "counts": counts,
             "running_jobs": dict(index["running_jobs"]),
             "avg_duration_seconds": avg_duration,
+            "completed_last_60_seconds": int(recent["count"] or 0),
         }
 
     def register_job_created(self, node_name: str, job_id: int, status: str = QUEUED):

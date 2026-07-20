@@ -56,7 +56,14 @@ class ThreadedRunner(BaseRunner):
             )
         return value
 
-    def _run_adaptive(self, node_name: str, items: Iterable, run_one: Callable):
+    def _run_adaptive(
+        self,
+        node_name: str,
+        items: Iterable,
+        run_one: Callable,
+        *,
+        known_count: int | None = None,
+    ):
         iterator = iter(items)
         source_lock = Lock()
         condition = Condition()
@@ -140,6 +147,8 @@ class ThreadedRunner(BaseRunner):
             # declared with max_threads=1000 from creating 1000 empty workers
             # before the lazy source has revealed how much work exists.
             initial_workers = min(desired, INITIAL_WORKER_BURST)
+            if known_count is not None:
+                initial_workers = min(initial_workers, known_count)
             for _ in range(initial_workers):
                 spawn_worker()
 
@@ -161,6 +170,12 @@ class ThreadedRunner(BaseRunner):
 
                 if not source_exhausted and len(workers) < desired:
                     needed = desired - len(workers)
+                    if known_count is not None:
+                        # For an in-memory list, never create workers after all
+                        # items have already been claimed. This avoids a fast
+                        # two-item run waking the manager between completion
+                        # and StopIteration and triggering a second empty burst.
+                        needed = min(needed, max(0, known_count - next_item_index))
                     # Grow geometrically so large requested limits become
                     # available quickly, but stop as soon as one worker proves
                     # the lazy source is exhausted.
@@ -180,7 +195,9 @@ class ThreadedRunner(BaseRunner):
     def run_jobs(self, node_name: str, jobs: list, run_one: Callable):
         if not jobs:
             return []
-        return self._run_adaptive(node_name, jobs, run_one)
+        return self._run_adaptive(
+            node_name, jobs, run_one, known_count=len(jobs)
+        )
 
     def run_job_source(self, node_name: str, job_source, run_one: Callable):
         """Run a lazy job source with a live-adjustable concurrency ceiling."""

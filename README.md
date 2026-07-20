@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.12
+# micro-workflow-manager 0.3.15
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,45 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.15
+
+- MWF now owns one process-wide pooled `httpx.AsyncClient`. Synchronous API tasks
+  call `shared_http_transport` and suspend cooperatively on the existing fiber
+  runtime; projects no longer need to embed an asyncio thread/client bridge.
+- Framework HTTP waits are explicit scheduler states. A bounded live transport
+  request suspends checkpoint-progress expiry, while the task total timeout and
+  the HTTP transport timeout remain active. This prevents synchronized watchdog
+  cancellation waves when hundreds of model requests are legitimately waiting.
+- Timed `concurrent.futures.Future.result(timeout=...)` retains its periodic
+  timeout behavior inside fibers, so heartbeat loops continue to run.
+- Fiber admission occurs in bounded bursts with scheduler servicing between
+  bursts. Starting thousands of jobs cannot starve earlier fibers for an entire
+  checkpoint window.
+- `ctx.sleep()` is cooperative in API fibers. Per-node API limits may be set into
+  the thousands; there is no workflow-wide aggregate API cap.
+
+### Framework-owned HTTP transport
+
+```python
+from micro_workflow_manager import shared_http_transport
+
+payload = shared_http_transport.post_json(
+    "https://api.example.com/v1/chat",
+    headers={"Authorization": "Bearer ..."},
+    json={"model": "...", "messages": [...]},
+    timeout=(30, 1800),
+    heartbeat_callback=lambda elapsed: ctx.checkpoint(
+        f"model request active for {elapsed:.0f}s", timeout=90
+    ),
+    heartbeat_interval=15,
+    wait_name="model request",
+)
+```
+
+The transport uses `httpx` connection pooling and integrates directly with the
+scheduler watchdog. The checkpoint lease is suspended only while the bounded
+network operation is active.
 
 ## What changed in 0.3.12
 
@@ -382,7 +421,7 @@ Framework-owned project state is consolidated under `.mwf/`:
 .mwf/
   project.json       # graph path, stored edges, default runner, low-churn config
   run.json           # active/recent CLI ownership and scheduler heartbeat
-  threads.json       # optional run-scoped max_threads overrides
+  threads.json       # optional run-scoped node overrides and API total budget
   state.sqlite3      # jobs, queue, events, checkpoints, idempotency, advisory locks
   deploy/            # server setup and replaceable local deployment archive
 ```
@@ -712,10 +751,14 @@ router = NodeRouter("fetch_requests", runner="api", max_threads=64)
 ```
 
 For this runner, `max_threads=64` intentionally means at most 64 in-flight API
-jobs. The familiar name is retained so router code, `mwf threads`, `monitor`, and
-`inspect` use one concurrency vocabulary. Unlike the adaptive `threaded` runner,
-`api` fills the requested limit immediately. Executor threads are still created
-lazily, and `io` and `network` are aliases.
+jobs **for that node**. API nodes also share a workflow-wide admission budget,
+which defaults to 256. Therefore ten nodes declared at 100 do not create 1,000
+simultaneous provider calls: they receive fair shares of the 256 slots and can
+borrow capacity when sibling queues are light. The familiar `max_threads` name
+is retained so router code, `mwf threads`, `monitor`, and `inspect` use one
+concurrency vocabulary. Unlike the adaptive `threaded` runner, `api` fills its
+available per-node and shared slots immediately. Executor threads are still
+created lazily, and `io` and `network` are aliases.
 
 ### Synchronous controller and abandonable handler
 
@@ -755,25 +798,26 @@ to that active run. MWF removes the override when the run finishes, including
 failed runs. Stale values bound to an older crashed run are ignored and removed
 when a new run claims the project.
 
-For an active threaded or API node, an increase starts more queued jobs within roughly
-0.2 seconds and grows geometrically toward very large limits. A decrease never
-cancels jobs already running; the runner stops launching replacements until
-active concurrency falls to the new limit.
+For an active threaded or API node, an increase starts more queued jobs within
+roughly 0.2 seconds. A decrease never cancels jobs already running; the runner
+stops launching replacements until active concurrency falls to the new limit.
 
-Increase large values gradually. During CLI runs, each active job may use one
-runner/controller thread and one supervised handler thread so that timeout and
-second-terminal restart can abandon stale work safely. An override of 750 can
-therefore approach 1,500 Python threads before counting the scheduler, SQLite,
-HTTP-client, DNS, and operating-system work. MWF warns above 256 but deliberately
-does not silently clamp the requested test value.
+API values are cooperative fiber counts. They may be set into the thousands
+without one controller or supervisor OS thread per request, and values from
+multiple API nodes add together without an aggregate framework cap. Provider,
+socket, memory, and rate limits still apply. Threaded and process runners retain
+their OS-worker safety ceiling and warnings.
 
 If a process is killed while changing the override, the next command detects
 that the advisory-lock owner is no longer alive and immediately reclaims the
 lock. It does not wait for the old five-minute lease to expire.
 
 `mwf inspect NODE` shows the declared, overridden, and effective values.
-`mwf monitor` shows the effective value in its `threads` column and marks runtime
-overrides with `*`. An API runner fills the new limit eagerly; the adaptive threaded runner grows toward it. A process runner reads the override when its process pool is created; an already-created process pool is not resized live. The direct runner
+`mwf monitor` shows the effective per-node value in its `threads` column, marks
+runtime overrides with `*`, and prints cooperative API fiber totals with
+`aggregate_limit=none`. Each API runner grows toward its own node limit; the
+adaptive threaded runner grows toward its OS-worker limit. A process runner reads the override when its process pool is
+created; an already-created process pool is not resized live. The direct runner
 always remains at one job.
 
 For CPU-heavy work, use the process-pool runner:
@@ -1207,10 +1251,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.12 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.15 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.12-py3-none-any.whl
+micro_workflow_manager-0.3.15-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1230,22 +1274,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.12-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.15-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.12-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.15-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.12-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.15-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.12`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.15`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1260,7 +1304,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.12-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.15-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

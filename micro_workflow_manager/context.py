@@ -284,6 +284,13 @@ class JobContext(_ExecutionChecks):
 
     def _check_execution(self):
         """Validate cancellation/restart without reporting progress."""
+        if self._attempt_watch is not None:
+            restart_error = self.system.scheduler_supervisor.execution_cancel_error(self._attempt_watch)
+            if restart_error is not None:
+                raise restart_error
+            timeout_error = self.system.scheduler_supervisor.timeout_error(self._attempt_watch)
+            if timeout_error is not None:
+                raise timeout_error
         self._check_local_execution()
         if self.execution_id is not None:
             self.system.check_job_execution(
@@ -367,6 +374,9 @@ class JobContext(_ExecutionChecks):
             if remaining <= 0:
                 return
             wait_for = min(check_interval, remaining)
+            from .fibers import cooperative_sleep
+            if cooperative_sleep(wait_for, check_interval=check_interval):
+                continue
             if self._cancellation_event is not None:
                 self._cancellation_event.wait(wait_for)
             else:

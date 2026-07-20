@@ -161,6 +161,8 @@ Reduce concurrency first and compare behavior:
 mwf threads NODE 1
 mwf runfrom NODE --monitor
 mwf threads NODE reset
+mwf threads --api-total 128
+mwf threads --api-total reset
 ```
 
 For source-level experiments, temporarily lower `max_threads` in the node router
@@ -175,6 +177,11 @@ lower concurrency reliably fixes the test, investigate resource saturation,
 executor growth, SQLite contention, operating-system thread limits, or the test's
 own workload before declaring a scheduler deadlock. Do not permanently reduce
 concurrency without explaining the observed ratio and throughput tradeoff.
+
+For API components, distinguish the node limit from the shared admission budget.
+Several nodes can each be configured at 100 while the workflow admits only 256
+provider calls in total. Tune `--api-total` first when all API nodes slow down
+together; tune one node when only that queue needs a different share.
 
 For progressive degradation, repeat the same synthetic round in one Python
 process and record elapsed time, live thread count, and the number of registered

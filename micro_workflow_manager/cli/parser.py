@@ -213,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     threads_cmd = commands.add_parser(
         "threads",
-        help="View or change a node's runtime max_threads override.",
+        help="View or change per-node runtime limits.",
         description=COMMAND_HELP_DESCRIPTIONS["threads"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

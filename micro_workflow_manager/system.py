@@ -1,5 +1,5 @@
 from pathlib import Path
-from threading import RLock, local
+from threading import RLock
 
 import networkx as nx
 
@@ -13,6 +13,7 @@ from .workflow.runner_config import RunnerFactoryMixin, normalize_workflow_runne
 from .workflow.supervisor import SchedulerSupervisor
 from .storage import FileStorage
 from .workflow.workflow_registration import WorkflowRegistrationMixin
+from .fibers import FiberLocal
 
 
 class MicroWorkflow(
@@ -76,8 +77,8 @@ class MicroWorkflow(
         # a game loop: enqueue them and let the component scheduler run them.
         # Running them recursively from inside the parent job can deadlock a
         # cyclic component when every worker is waiting for a child worker.
-        self._job_context = local()
-    def _refresh_thread_overrides(self) -> dict[str, int]:
+        self._job_context = FiberLocal()
+    def _refresh_runtime_limits(self) -> dict[str, int]:
         path = self.storage.thread_overrides_file()
         try:
             stat = path.stat()
@@ -88,12 +89,25 @@ class MicroWorkflow(
         with self._thread_override_lock:
             if signature == self._thread_override_signature:
                 return self._thread_overrides
-            self._thread_overrides = self.storage.read_thread_overrides()
+            state = self.storage.read_runtime_limit_state()
+            self._thread_overrides = dict(state["overrides"])
             self._thread_override_signature = signature
             return self._thread_overrides
 
     def thread_override(self, node_name: str) -> int | None:
-        return self._refresh_thread_overrides().get(node_name)
+        return self._refresh_runtime_limits().get(node_name)
+
+    def api_total_limit_override(self) -> None:
+        """Compatibility shim: aggregate API admission was removed in 0.3.15."""
+        return None
+
+    def effective_api_total_limit(self) -> int:
+        """Descriptive aggregate API capacity; never an admission ceiling."""
+        total = 0
+        for name, node in self.nodes.items():
+            if (node.runner_override or self.runner) == "api":
+                total += self.effective_max_threads(name)
+        return max(1, total)
 
     def effective_max_threads(self, node_name: str) -> int:
         node = self.nodes[node_name]

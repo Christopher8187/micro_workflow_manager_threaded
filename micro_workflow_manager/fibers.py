@@ -1,0 +1,440 @@
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import heapq
+import threading
+import time as _time
+from concurrent.futures import FIRST_COMPLETED, Future, TimeoutError as FutureTimeoutError, wait
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable
+
+from greenlet import greenlet, getcurrent
+
+
+_ORIGINAL_SLEEP = _time.sleep
+_ORIGINAL_FUTURE_RESULT = Future.result
+_RUNTIME: contextvars.ContextVar["FiberRuntime | None"] = contextvars.ContextVar(
+    "mwf_fiber_runtime", default=None
+)
+_CANCELLATION_CHECK: contextvars.ContextVar[Callable[[], None] | None] = contextvars.ContextVar(
+    "mwf_fiber_cancellation_check", default=None
+)
+_PATCHED = False
+
+
+class FiberLocal:
+    """ContextVar-backed attribute storage safe across threads and greenlets."""
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_state", contextvars.ContextVar(f"mwf_fiber_local_{id(self)}", default={}))
+
+    def __getattr__(self, name: str) -> Any:
+        state = object.__getattribute__(self, "_state").get()
+        if name not in state:
+            raise AttributeError(name)
+        return state[name]
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        state_var = object.__getattribute__(self, "_state")
+        state = dict(state_var.get())
+        state[name] = value
+        state_var.set(state)
+
+    def __delattr__(self, name: str) -> None:
+        state_var = object.__getattribute__(self, "_state")
+        state = dict(state_var.get())
+        if name not in state:
+            raise AttributeError(name)
+        del state[name]
+        state_var.set(state)
+
+
+@dataclass(slots=True)
+class _FutureWait:
+    future: Future
+    deadline: float | None
+    cancellation_check: Callable[[], None] | None
+
+
+@dataclass(slots=True)
+class _SleepWait:
+    deadline: float
+    cancellation_check: Callable[[], None] | None
+
+
+@dataclass(slots=True)
+class _Resume:
+    value: Any = None
+    error: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _FiberState:
+    index: int
+    item: Any
+    fiber: greenlet
+    result: Any = None
+    done: bool = False
+    wait_token: int = 0
+    pending_future: Future | None = None
+
+
+class cancellation_scope:
+    def __init__(self, check: Callable[[], None] | None):
+        self.check = check
+        self.token = None
+
+    def __enter__(self):
+        self.token = _CANCELLATION_CHECK.set(self.check)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.token is not None:
+            _CANCELLATION_CHECK.reset(self.token)
+        return False
+
+
+def in_fiber_runtime() -> bool:
+    return _RUNTIME.get() is not None
+
+
+def _switch_wait(request: _FutureWait | _SleepWait) -> Any:
+    current = getcurrent()
+    parent = current.parent
+    if parent is None:
+        raise RuntimeError("cooperative wait requires a managed greenlet")
+    resumed = parent.switch(request)
+    if not isinstance(resumed, _Resume):
+        raise RuntimeError("fiber runtime returned an invalid resume payload")
+    if resumed.error is not None:
+        raise resumed.error
+    return resumed.value
+
+
+def await_future(future: Future, timeout: float | None = None) -> Any:
+    """Wait for a concurrent future without blocking the API node-pump thread."""
+    runtime = _RUNTIME.get()
+    if runtime is None:
+        return _ORIGINAL_FUTURE_RESULT(future, timeout=timeout)
+    if future.done():
+        return _ORIGINAL_FUTURE_RESULT(future, timeout=0)
+    if timeout is not None:
+        timeout = float(timeout)
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
+    deadline = None if timeout is None else _time.monotonic() + timeout
+    return _switch_wait(
+        _FutureWait(
+            future=future,
+            deadline=deadline,
+            cancellation_check=_CANCELLATION_CHECK.get(),
+        )
+    )
+
+
+def cooperative_sleep(seconds: float, *, check_interval: float = 0.1) -> bool:
+    """Yield the current API fiber for ``seconds``; return False outside fibers."""
+    runtime = _RUNTIME.get()
+    if runtime is None:
+        return False
+    seconds = float(seconds)
+    if seconds < 0:
+        raise ValueError("seconds must be >= 0")
+    if seconds == 0:
+        check = _CANCELLATION_CHECK.get()
+        if check is not None:
+            check()
+        return True
+    _switch_wait(
+        _SleepWait(
+            deadline=_time.monotonic() + seconds,
+            cancellation_check=_CANCELLATION_CHECK.get(),
+        )
+    )
+    return True
+
+
+def _patched_sleep(seconds: float) -> None:
+    if cooperative_sleep(seconds):
+        return None
+    return _ORIGINAL_SLEEP(seconds)
+
+
+def _patched_future_result(self: Future, timeout: float | None = None):
+    if in_fiber_runtime():
+        return await_future(self, timeout=timeout)
+    return _ORIGINAL_FUTURE_RESULT(self, timeout=timeout)
+
+
+def install_bridges() -> None:
+    global _PATCHED
+    if _PATCHED:
+        return
+    _time.sleep = _patched_sleep
+    Future.result = _patched_future_result
+    _PATCHED = True
+
+
+class FiberRuntime:
+    """Cooperative runner for synchronous API job controllers.
+
+    Each job is a greenlet. Framework networking and ``ctx.sleep`` suspend the
+    greenlet, allowing thousands of controllers to share one node-pump thread.
+    """
+
+    def __init__(self, *, poll_interval: float = 0.05, start_burst: int = 64):
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+        if type(start_burst) is not int or start_burst < 1:
+            raise ValueError("start_burst must be an integer >= 1")
+        self.poll_interval = float(poll_interval)
+        self.start_burst = start_burst
+        self._parent = getcurrent()
+        self._states: dict[int, _FiberState] = {}
+        self._future_waiters: dict[Future, list[tuple[_FiberState, int, float | None, Callable[[], None] | None]]] = {}
+        self._sleepers: list[tuple[float, int, _FiberState, int, Callable[[], None] | None]] = []
+        self._serial = 0
+        self._ready: list[tuple[_FiberState, _Resume]] = []
+        self._results: dict[int, Any] = {}
+        self._first_error: BaseException | None = None
+
+    def _resume_state(self, state: _FiberState, resume: _Resume | None = None) -> None:
+        if state.done:
+            return
+        try:
+            yielded = state.fiber.switch(resume or _Resume())
+        except BaseException as error:
+            state.done = True
+            self._first_error = self._first_error or error
+            return
+
+        if state.fiber.dead:
+            state.done = True
+            self._results[state.index] = yielded
+            return
+        state.wait_token += 1
+        wait_token = state.wait_token
+        if isinstance(yielded, _FutureWait):
+            state.pending_future = yielded.future
+            self._future_waiters.setdefault(yielded.future, []).append(
+                (state, wait_token, yielded.deadline, yielded.cancellation_check)
+            )
+            return
+        if isinstance(yielded, _SleepWait):
+            self._serial += 1
+            heapq.heappush(self._sleepers, (yielded.deadline, self._serial, state, wait_token, yielded.cancellation_check))
+            return
+        state.done = True
+        self._first_error = self._first_error or RuntimeError(
+            f"API fiber yielded unsupported value {type(yielded).__name__}"
+        )
+
+    def _new_state(self, index: int, item: Any, run_one: Callable[[Any], Any]) -> _FiberState:
+        context = contextvars.copy_context()
+
+        def entry(_initial_resume=None):
+            def invoke():
+                token = _RUNTIME.set(self)
+                try:
+                    return run_one(item)
+                finally:
+                    _RUNTIME.reset(token)
+            return context.run(invoke)
+
+        child = greenlet(entry, parent=self._parent)
+        return _FiberState(index=index, item=item, fiber=child)
+
+    def _check_waiter(self, state: _FiberState, wait_token: int, check: Callable[[], None] | None) -> bool:
+        if state.done or state.wait_token != wait_token:
+            return False
+        if check is None:
+            return True
+        try:
+            check()
+        except BaseException as error:
+            if state.pending_future is not None:
+                state.pending_future.cancel()
+            state.pending_future = None
+            self._ready.append((state, _Resume(error=error)))
+            return False
+        return True
+
+    def _process_futures(self) -> None:
+        for future in list(self._future_waiters):
+            if not future.done():
+                continue
+            waiters = self._future_waiters.pop(future)
+            try:
+                value = _ORIGINAL_FUTURE_RESULT(future, timeout=0)
+                resume = _Resume(value=value)
+            except BaseException as error:
+                resume = _Resume(error=error)
+            for state, wait_token, _deadline, _check in waiters:
+                if state.done or state.wait_token != wait_token:
+                    continue
+                state.pending_future = None
+                self._ready.append((state, resume))
+
+    def _process_deadlines(self, now_value: float) -> None:
+        while self._sleepers and self._sleepers[0][0] <= now_value:
+            _, _, state, wait_token, check = heapq.heappop(self._sleepers)
+            if state.done or state.wait_token != wait_token:
+                continue
+            if check is not None:
+                try:
+                    check()
+                except BaseException as error:
+                    self._ready.append((state, _Resume(error=error)))
+                    continue
+            self._ready.append((state, _Resume()))
+
+        for future, waiters in list(self._future_waiters.items()):
+            keep = []
+            for state, wait_token, deadline, check in waiters:
+                if state.done or state.wait_token != wait_token:
+                    continue
+                if deadline is not None and deadline <= now_value:
+                    state.pending_future = None
+                    self._ready.append((state, _Resume(error=FutureTimeoutError())))
+                else:
+                    keep.append((state, wait_token, deadline, check))
+            if keep:
+                self._future_waiters[future] = keep
+            else:
+                self._future_waiters.pop(future, None)
+
+    def _poll_cancellation(self) -> None:
+        for future, waiters in list(self._future_waiters.items()):
+            keep = []
+            for state, wait_token, deadline, check in waiters:
+                if state.done or state.wait_token != wait_token:
+                    continue
+                if check is not None:
+                    try:
+                        check()
+                    except BaseException as error:
+                        state.pending_future = None
+                        self._ready.append((state, _Resume(error=error)))
+                        continue
+                keep.append((state, wait_token, deadline, check))
+            if keep:
+                self._future_waiters[future] = keep
+            else:
+                self._future_waiters.pop(future, None)
+
+        rebuilt = []
+        while self._sleepers:
+            deadline, serial, state, wait_token, check = heapq.heappop(self._sleepers)
+            if state.done or state.wait_token != wait_token:
+                continue
+            if check is not None:
+                try:
+                    check()
+                except BaseException as error:
+                    self._ready.append((state, _Resume(error=error)))
+                    continue
+            rebuilt.append((deadline, serial, state, wait_token, check))
+        for item in rebuilt:
+            heapq.heappush(self._sleepers, item)
+
+    def _next_wait_timeout(self) -> float:
+        now_value = _time.monotonic()
+        timeout = self.poll_interval
+        if self._sleepers:
+            timeout = min(timeout, max(0.0, self._sleepers[0][0] - now_value))
+        for waiters in self._future_waiters.values():
+            for _state, _token, deadline, _check in waiters:
+                if deadline is not None:
+                    timeout = min(timeout, max(0.0, deadline - now_value))
+        return timeout
+
+    def run_source(
+        self,
+        node_name: str,
+        items: Iterable,
+        run_one: Callable[[Any], Any],
+        *,
+        limit_provider: Callable[[], int],
+    ) -> list[Any]:
+        pull = getattr(items, "pull", None)
+        refreshable = callable(pull)
+        iterator = None if refreshable else iter(items)
+        source_exhausted = False
+        next_index = 0
+
+        def pull_items(capacity: int) -> list[Any]:
+            nonlocal source_exhausted
+            if capacity <= 0:
+                return []
+            if refreshable:
+                return list(pull(capacity))
+            values = []
+            while len(values) < capacity and not source_exhausted:
+                try:
+                    values.append(next(iterator))
+                except StopIteration:
+                    source_exhausted = True
+                    break
+            return values
+
+        while True:
+            if self._first_error is not None:
+                for future in self._future_waiters:
+                    future.cancel()
+                raise self._first_error
+
+            active = sum(1 for state in self._states.values() if not state.done)
+            limit = limit_provider()
+            if type(limit) is not int or limit < 1:
+                raise ValueError("runtime API concurrency must be an integer >= 1")
+            capacity = max(0, limit - active)
+            pulled = pull_items(min(capacity, self.start_burst))
+            added = len(pulled)
+            for item in pulled:
+                state = self._new_state(next_index, item, run_one)
+                self._states[next_index] = state
+                next_index += 1
+                self._resume_state(state)
+                if self._first_error is not None:
+                    break
+
+            while self._ready:
+                state, resume = self._ready.pop(0)
+                self._resume_state(state, resume)
+                if self._first_error is not None:
+                    break
+
+            self._poll_cancellation()
+            self._process_futures()
+            self._process_deadlines(_time.monotonic())
+            while self._ready:
+                state, resume = self._ready.pop(0)
+                self._resume_state(state, resume)
+                if self._first_error is not None:
+                    break
+
+            active = sum(1 for state in self._states.values() if not state.done)
+            if self._first_error is not None:
+                continue
+            if active == 0:
+                if refreshable and added == 0:
+                    break
+                if not refreshable and source_exhausted:
+                    break
+
+            # Keep admitting in bounded bursts without blocking while capacity
+            # remains, but service futures, sleepers, cancellation, and watchdog
+            # deadlines between bursts. This prevents a thousand-job startup from
+            # starving the earliest fibers for an entire checkpoint window.
+            if added > 0 and active < limit:
+                continue
+
+            futures = [future for future in self._future_waiters if not future.done()]
+            timeout = self._next_wait_timeout()
+            if futures:
+                wait(futures, timeout=timeout, return_when=FIRST_COMPLETED)
+            else:
+                _ORIGINAL_SLEEP(timeout)
+
+        return [self._results[index] for index in sorted(self._results)]

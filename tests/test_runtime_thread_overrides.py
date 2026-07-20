@@ -219,7 +219,7 @@ def test_threads_warns_before_extreme_runtime_concurrency(
     assert cli.main(["threads", "A", "750"]) == 0
     captured = capsys.readouterr()
     assert "extreme local concurrency" in captured.err
-    assert "one controller thread plus one handler thread" in captured.err
+    assert "OS workers" in captured.err
 
 
 def test_threads_command_scopes_override_to_run_that_starts_concurrently(

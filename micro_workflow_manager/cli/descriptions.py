@@ -45,7 +45,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "wipe": "Like clean, but remove selected nodes' input files as well.",
     "run": "Reset and run one ready node or selected jobs; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control for a running or failed/cancelled job inside the active workflow sequence; it never starts another scheduler.",
-    "threads": "View or change a run-scoped max_threads override. Active threaded and API nodes scale live, and every override is cleared when its run finishes.",
+    "threads": "View or change run-scoped per-node max_threads overrides. API values are cooperative fiber counts with no aggregate framework cap; active nodes scale live.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Continue unsuccessful or queued work for one node without resetting jobs that are already done or skipped.",
     "runfrom": "Reset and run one node and its descendants; --monitor retains a timestamped dashboard timeline in the same terminal.",
@@ -271,7 +271,12 @@ Examples:
 For an active threaded or API node, increasing the value starts additional queued jobs
 within roughly 0.2 seconds. Decreasing it never kills jobs already running; MWF
 stops launching replacements until active concurrency falls to the new limit.
-For example, a node declared with `max_threads=2` can be raised to 5 during a test. The API runner interprets the setting as maximum in-flight blocking calls and fills it eagerly; the threaded runner grows adaptively. The override is scoped to the active or next run and is cleared when that run finishes. Process pools read it when created, while a direct runner always executes one job at a time.
+For example, a node declared with `max_threads=2` can be raised to 5 during a test.
+API node values are cooperative fiber counts. They may be set into the thousands
+without one OS thread per job, and there is no workflow-wide aggregate API cap.
+Per-node overrides are scoped to the active or next run and are cleared when that
+run finishes. Process pools read overrides when created, while a direct runner
+always executes one job at a time.
 """,
     "deploy": """
 Deploy is an explicit two-stage copy workflow for testing code on another machine.

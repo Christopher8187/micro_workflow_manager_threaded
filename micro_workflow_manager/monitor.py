@@ -138,6 +138,7 @@ def node_stats(workflow, node_name: str) -> dict[str, Any]:
         "completed": completed,
         "progress_percent": round(progress, 1),
         "avg_duration_seconds": avg_duration,
+        "completed_last_60_seconds": int(summary.get("completed_last_60_seconds") or 0),
         "eta_seconds": eta_seconds,
         "max_parallel_jobs": max_parallel,
         "declared_max_threads": getattr(workflow.nodes.get(node_name), "max_threads", 1),
@@ -174,6 +175,24 @@ def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any
     totals["rough_eta_seconds"] = sum(etas) if etas else None
 
     running_nodes = [row["node"] for row in node_rows if row["running"] > 0 or row["status"] == RUNNING]
+    api_node_names = {
+        node_name
+        for node_name in selected
+        if node_name in workflow.nodes
+        and (workflow.nodes[node_name].runner_override or workflow.runner) == "api"
+    }
+    api_rows = [row for row in node_rows if row["node"] in api_node_names]
+    api_runtime = {
+        "mode": "cooperative",
+        "aggregate_limit": None,
+        "declared_capacity": sum(int(row["max_parallel_jobs"]) for row in api_rows),
+        "running": sum(row["running"] for row in api_rows),
+        "queued": sum(row["queued"] for row in api_rows),
+        "completed_last_60_seconds": sum(
+            row.get("completed_last_60_seconds", 0) for row in api_rows
+        ),
+        "nodes": len(api_rows),
+    }
 
     return {
         "generated_at": now_iso(),
@@ -182,6 +201,7 @@ def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any
         "run_state": run_state,
         "running_nodes": running_nodes,
         "totals": totals,
+        "api_runtime": api_runtime,
         "nodes": node_rows,
     }
 
@@ -238,6 +258,16 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
         f"progress={totals['progress_percent']}% "
         f"rough_eta={eta_text}"
     )
+    api = snapshot.get("api_runtime") or {}
+    if api.get("nodes"):
+        lines.append(
+            "api fibers: "
+            f"running={api.get('running', 0)} "
+            f"queued={api.get('queued', 0)} "
+            f"done_60s={api.get('completed_last_60_seconds', 0)} "
+            f"declared_capacity={api.get('declared_capacity', 0)} "
+            "aggregate_limit=none"
+        )
     lines.append(f"running nodes: {running_text}")
     lines.append("")
 
@@ -288,6 +318,7 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
     lines.append("")
     lines.append("ETA is a rough estimate from completed job durations; it is unknown until at least one job has finished.")
     lines.append("threads marked with * use a runtime override from 'mwf threads'.")
+    lines.append("API max_threads values are cooperative fiber counts; there is no workflow-wide aggregate API cap.")
     return "\n".join(lines)
 
 

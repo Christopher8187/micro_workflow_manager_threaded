@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-__version__ = "0.3.12"
+__version__ = "0.3.15"
 
 
 __all__ = [
@@ -27,6 +27,10 @@ __all__ = [
     "OutputFileSystem",
     "JobFileSystem",
     "NodeInputFileSystem",
+    "SharedHTTPTransport",
+    "shared_http_transport",
+    "configure_shared_http_transport",
+    "close_shared_http_transport",
 ]
 
 
@@ -43,6 +47,10 @@ _EXPORTS = {
     "OutputFileSystem": (".files", "OutputFileSystem"),
     "JobFileSystem": (".files", "JobFileSystem"),
     "NodeInputFileSystem": (".files", "NodeInputFileSystem"),
+    "SharedHTTPTransport": (".networking", "SharedHTTPTransport"),
+    "shared_http_transport": (".networking", "shared_http_transport"),
+    "configure_shared_http_transport": (".networking", "configure_shared_http_transport"),
+    "close_shared_http_transport": (".networking", "close_shared_http_transport"),
 }
 
 
@@ -64,3 +72,9 @@ def __getattr__(name: str):
 
 def __dir__():
     return sorted({*globals(), *__all__})
+
+
+# Install cooperative bridges once public imports are available.
+from .fibers import install_bridges as _install_fiber_bridges
+_install_fiber_bridges()
+del _install_fiber_bridges
