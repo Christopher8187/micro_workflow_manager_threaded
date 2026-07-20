@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.11
+# micro-workflow-manager 0.3.12
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,20 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.12
+
+- API-runner node pumps now refill from jobs committed after the pump starts. A
+  typed handler that begins with one routed job can grow toward its configured
+  concurrency while that first API request is still running, instead of waiting
+  for the initial static queue snapshot to finish.
+- Refreshable queued-job sources follow SQLite row insertion order, so concurrent
+  batch producers that reserve lower job IDs but commit after a higher range are
+  still discovered. Non-API runners retain the existing snapshot behavior and
+  deterministic job-ID ordering.
+- Added component and CLI `--monitor` regressions for gradual high-fanout routing,
+  including the former state where a handler displayed hundreds queued but only
+  one running.
 
 ## What changed in 0.3.11
 
@@ -1193,10 +1207,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.11 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.12 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.11-py3-none-any.whl
+micro_workflow_manager-0.3.12-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1216,22 +1230,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.11-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.12-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.11-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.12-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.11-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.12-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.11`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.12`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1246,7 +1260,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.11-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.12-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

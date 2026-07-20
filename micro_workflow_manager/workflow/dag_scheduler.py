@@ -130,10 +130,16 @@ class DagSchedulerMixin:
         self.storage.set_node_status(node_name, RUNNING)
         runner = self.make_runner(node)
 
+        job_source = (
+            self.storage.queued_job_source(node_name)
+            if getattr(runner, "supports_refreshable_job_source", False)
+            else self.storage.iter_queued_job_ids(node_name)
+        )
+
         try:
             result = runner.run_job_source(
                 node_name=node_name,
-                job_source=self.storage.iter_queued_job_ids(node_name),
+                job_source=job_source,
                 run_one=lambda job_id: self.run_job(
                     node_name=node_name,
                     job_id=job_id,

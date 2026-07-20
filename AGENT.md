@@ -284,3 +284,12 @@ The file must state:
 
 Do not use this file as a substitute for trying reasonable fixes. Return it only
 with all safe partial improvements and regression tests already completed.
+
+## Live API refill regression
+
+When testing a high-fanout Hoeflein component, do not only assert that a handler
+starts before its router finishes. Route jobs gradually, keep handler calls long
+enough that the first pump remains alive, and assert that the handler's in-flight
+count grows toward its configured API limit while routing is still in progress.
+This catches static queued-job snapshots that superficially look like live
+component pumping but leave hundreds of later jobs queued.

@@ -623,3 +623,15 @@ and provenance tests do not depend on external APIs.
 
 
 Monitor rows use actual per-node job counts for display state; component lifecycle state remains durable scheduler metadata.
+
+
+## Refreshable API node pumps (0.3.12)
+
+A component node pump remains unique per node, but API runners no longer treat
+the queue as a one-time snapshot. `RefreshableQueuedJobSource` follows SQLite
+row insertion order and exposes jobs committed after the pump starts. The API
+runner polls that source whenever its in-flight count is below the effective
+thread limit. Row insertion order is used rather than job ID order because
+concurrent batch producers may reserve lower IDs and commit them after a higher
+reserved range. Non-API runners retain the existing snapshot iterator and job-ID
+ordering.

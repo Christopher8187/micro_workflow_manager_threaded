@@ -17,6 +17,8 @@ class ApiRunner(BaseRunner):
     which is useful when most wall time is network wait rather than local CPU.
     """
 
+    supports_refreshable_job_source = True
+
     def __init__(
         self,
         max_threads: int,
@@ -45,7 +47,9 @@ class ApiRunner(BaseRunner):
         return value
 
     def _run_source(self, node_name: str, items: Iterable, run_one: Callable):
-        iterator = iter(items)
+        pull = getattr(items, "pull", None)
+        refreshable = callable(pull)
+        iterator = None if refreshable else iter(items)
         source_exhausted = False
         next_index = 0
         futures = {}
@@ -57,37 +61,63 @@ class ApiRunner(BaseRunner):
             max_workers=MAX_RUNTIME_THREADS,
             thread_name_prefix=f"mwf-api-{node_name}",
         ) as executor:
-            def fill() -> None:
-                nonlocal source_exhausted, next_index
+            def submit_item(item) -> None:
+                nonlocal next_index
+                index = next_index
+                next_index += 1
+
+                def run_with_cleanup(value=item):
+                    try:
+                        return run_one(value)
+                    finally:
+                        if self.worker_cleanup is not None:
+                            self.worker_cleanup()
+
+                futures[executor.submit(run_with_cleanup)] = index
+
+            def fill() -> int:
+                nonlocal source_exhausted
                 limit = self.effective_limit()
-                while not source_exhausted and len(futures) < limit:
+                capacity = max(0, limit - len(futures))
+                if capacity == 0:
+                    return 0
+
+                if refreshable:
+                    new_items = pull(capacity)
+                    for item in new_items:
+                        submit_item(item)
+                    return len(new_items)
+
+                added = 0
+                while not source_exhausted and added < capacity:
                     try:
                         item = next(iterator)
                     except StopIteration:
                         source_exhausted = True
-                        return
-                    index = next_index
-                    next_index += 1
-                    def run_with_cleanup(value=item):
-                        try:
-                            return run_one(value)
-                        finally:
-                            if self.worker_cleanup is not None:
-                                self.worker_cleanup()
+                        break
+                    submit_item(item)
+                    added += 1
+                return added
 
-                    futures[executor.submit(run_with_cleanup)] = index
+            while True:
+                fill()
+                if not futures:
+                    # A refreshable source is empty *now*. If a sibling node
+                    # publishes more work after this pump exits, the component
+                    # scheduler will start a new pump. While any API jobs remain
+                    # in flight, however, every poll refills from newly queued
+                    # rows so the node can grow to its configured concurrency.
+                    break
 
-            fill()
-            while futures:
                 done, _ = wait(
                     futures,
                     timeout=self.poll_interval,
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
-                    # Runtime max_threads changes are observed without waiting
-                    # for an API call to complete.
-                    fill()
+                    # Observe runtime max_threads changes and jobs appended after
+                    # this node pump started, without waiting for a long API call
+                    # to complete.
                     continue
                 for future in done:
                     index = futures.pop(future)
@@ -97,7 +127,6 @@ class ApiRunner(BaseRunner):
                         for pending in futures:
                             pending.cancel()
                         raise
-                fill()
 
         return [results[index] for index in sorted(results)]
 

@@ -10,6 +10,45 @@ from typing import Any
 from micro_workflow_manager.models import Job, QUEUED
 
 
+class RefreshableQueuedJobSource:
+    """Incrementally expose queued jobs that appear while a node pump is active.
+
+    The cursor follows SQLite insertion order rather than ``job_id`` order. Batch
+    producers reserve IDs before writing payloads and may commit those batches out
+    of ID order; ``rowid`` still advances in commit order, so no late lower-ID batch
+    is skipped. Existing jobs are included on the first pull, and newly inserted
+    queued jobs become visible to later pulls.
+    """
+
+    def __init__(self, storage, node_name: str):
+        self.storage = storage
+        self.node_name = storage.validate_node_name(node_name)
+        self.last_rowid = 0
+
+    def pull(self, max_items: int) -> list[int]:
+        if type(max_items) is not int or max_items < 0:
+            raise ValueError("max_items must be an integer >= 0")
+        if max_items == 0:
+            return []
+        rows = self.storage.db_connection().execute(
+            "SELECT rowid AS source_rowid, job_id FROM jobs "
+            "WHERE node_name=? AND status=? AND rowid>? "
+            "ORDER BY rowid LIMIT ?",
+            (self.node_name, QUEUED, self.last_rowid, max_items),
+        ).fetchall()
+        if not rows:
+            return []
+        self.last_rowid = max(int(row["source_rowid"]) for row in rows)
+        return [int(row["job_id"]) for row in rows]
+
+    def __iter__(self):
+        while True:
+            job_ids = self.pull(512)
+            if not job_ids:
+                return
+            yield from job_ids
+
+
 class JobFileStorageMixin:
     """Job metadata in SQLite; job inputs/outputs and returned files on disk."""
 
@@ -684,7 +723,13 @@ class JobFileStorageMixin:
     def iter_job_ids(self, node_name: str):
         yield from self.list_job_ids(node_name)
 
+    def queued_job_source(self, node_name: str) -> RefreshableQueuedJobSource:
+        return RefreshableQueuedJobSource(self, node_name)
+
     def iter_queued_job_ids(self, node_name: str):
+        # Preserve the public snapshot iterator and deterministic job-id order.
+        # Component API pumps use ``queued_job_source`` so they can refill from
+        # jobs inserted after the pump starts.
         rows = self.db_connection().execute(
             "SELECT job_id FROM jobs WHERE node_name=? AND status=? ORDER BY job_id",
             (node_name, QUEUED),
