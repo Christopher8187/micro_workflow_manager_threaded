@@ -210,6 +210,64 @@ class NodeFileStorageMixin:
             self.atomic_write_bytes(path, content)
             return path
 
+    def write_node_input_texts(
+        self,
+        node_name: str,
+        entries: list[tuple[str, str]],
+        *,
+        overwrite: bool = False,
+        encoding: str = "utf-8",
+    ) -> list[Path]:
+        """Write many node-input files with atomic per-file publication.
+
+        High-fanout producers should use this instead of calling
+        ``write_node_input_text`` once per record. Deterministic overwrite batches
+        do not need a global node lock; unique-name allocation for
+        ``overwrite=False`` acquires it once for the batch.
+        """
+        if not isinstance(entries, list):
+            raise TypeError("entries must be a list of (filename, content) pairs")
+        if not entries:
+            return []
+
+        normalized: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise TypeError("each entry must be a (filename, content) tuple")
+            filename, content = entry
+            if not isinstance(filename, str) or not filename:
+                raise ValueError("batch input filenames must be non-empty strings")
+            if not isinstance(content, str):
+                raise TypeError("batch input content must be text")
+            relative = filename.replace("\\", "/")
+            if relative in seen:
+                raise ValueError(f"duplicate batch input filename: {relative}")
+            seen.add(relative)
+            normalized.append((relative, content))
+
+        written: list[Path] = []
+
+        def write_all() -> None:
+            directory = self.node_input_dir(node_name)
+            for filename, content in normalized:
+                path = self.safe_join(directory, filename)
+                if path.exists() and not overwrite:
+                    path = self.unique_target(path.parent, path.name)
+                self.atomic_write_text(path, content, encoding=encoding)
+                written.append(path)
+
+        # overwrite=True is used for deterministic, disjoint record paths. Atomic
+        # replacement already makes same-path races safe, so a global node-input
+        # lock would only serialize unrelated sections. Keep the lock for the
+        # unique-name allocation required by overwrite=False.
+        if overwrite:
+            write_all()
+        else:
+            with self.interprocess_lock(f"node-{node_name}-input"):
+                write_all()
+        return written
+
     def copy_to_node_input(
         self,
         node_name: str,

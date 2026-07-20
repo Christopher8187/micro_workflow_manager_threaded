@@ -172,6 +172,32 @@ class NodeHandle(_ExecutionChecks):
             return transaction.stage_add(lambda key: perform(key), idempotency_key)
         return perform()
 
+    def add_many(
+        self,
+        params_list: list[dict[str, Any]],
+        *,
+        autostart: bool = False,
+        idempotency_keys: list[str | None] | None = None,
+    ) -> list[Job]:
+        """Create many jobs on one target node as one guarded batch.
+
+        This is intended for high-fanout producers. It preserves one job per
+        params object while paying execution-fence and node-lock overhead once.
+        """
+        transaction = self._transaction_getter()
+        if transaction is not None:
+            raise RuntimeError("add_many is not supported inside ctx.transaction()")
+        return self._guarded(
+            lambda: self.system.add_jobs(
+                from_node=self.from_node,
+                to_node=self.to_node,
+                params_list=params_list,
+                autostart=autostart,
+                _parent_job_id=self.from_job_id,
+                idempotency_keys=idempotency_keys,
+            )
+        )
+
     @property
     def input_dir(self) -> Path:
         return self._guarded(lambda: self.system.storage.node_input_dir(self.to_node))
@@ -190,6 +216,20 @@ class NodeHandle(_ExecutionChecks):
         return self._guarded(
             lambda: self.system.storage.write_node_input_bytes(
                 self.to_node, filename, content, overwrite=overwrite
+            )
+        )
+
+    def write_inputs(
+        self,
+        entries: list[tuple[str, str]],
+        *,
+        overwrite: bool = False,
+        encoding: str = "utf-8",
+    ) -> list[Path]:
+        """Write many text inputs to the target node under one execution guard."""
+        return self._guarded(
+            lambda: self.system.storage.write_node_input_texts(
+                self.to_node, entries, overwrite=overwrite, encoding=encoding
             )
         )
 

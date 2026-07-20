@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.9
+# micro-workflow-manager 0.3.10
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,27 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.10
+
+- Added a high-fanout batch API: `NodeHandle.add_many`,
+  `NodeInputFileSystem.add_jobs`, and `NodeInputFileSystem.write_jsons`. One
+  downstream job is still created per parameter object, but payload files and
+  SQLite metadata are registered in batches rather than through one global lock
+  and transaction sequence per object.
+- Added transactional per-node job-ID sequences. Existing 0.3.9 databases are
+  migrated in place by initializing each sequence to `MAX(job_id) + 1`; existing
+  jobs, statuses, events, and payload folders are preserved.
+- Batch registration reserves IDs briefly, prepares disjoint payload files
+  outside the database transaction, and commits jobs, creation events,
+  idempotency rows, and node status in one transaction. Concurrent producers are
+  safe and duplicate idempotency keys resolve to the existing jobs.
+- Deterministic `overwrite=True` node-input batches use atomic replacement
+  without a global advisory lock. `overwrite=False` retains locked unique-name
+  allocation.
+- Added separate-component high-fanout regressions proving that a producer can
+  queue hundreds of jobs for a downstream Hoeflein component without autostarting
+  it or merging the two components.
 
 ## What changed in 0.3.9
 
@@ -555,6 +576,23 @@ creation remains explicit, so preparing a file never silently invents work.
 `ctx.transaction()` and idempotency keys continue to work because
 `NodeInputFileSystem.add_job()` delegates to the same guarded `NodeHandle.add()`
 operation.
+
+For high fan-out, batch publication without coarsening the downstream jobs:
+
+```python
+records = [(f"items/{i}.json", value) for i, value in enumerate(values, 1)]
+TAGIFY_INPUT.write_jsons(ctx, records, overwrite=True)
+TAGIFY_INPUT.add_jobs(
+    ctx,
+    [{"record_file": filename} for filename, _ in records],
+    autostart=False,
+    idempotency_keys=[f"record:{filename}" for filename, _ in records],
+)
+```
+
+This still creates one `tagify` job per record. With `autostart=False`, the
+producer and consumer remain separate Hoeflein components; the optimization is
+only in file and SQLite registration.
 
 ## Deploying a filtered project copy
 
@@ -1131,10 +1169,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.9 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.10 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.9-py3-none-any.whl
+micro_workflow_manager-0.3.10-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1154,22 +1192,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.9-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.10-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.9-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.10-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.9-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.10-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.9`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.10`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1184,7 +1222,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.9-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.10-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

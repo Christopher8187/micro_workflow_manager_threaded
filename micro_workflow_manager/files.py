@@ -376,6 +376,40 @@ class NodeInputFileSystem(FileSystem):
     def add_job(self, ctx, **params):
         return self.handle(ctx).add(**params)
 
+    def add_jobs(
+        self,
+        ctx,
+        params_list: list[dict[str, Any]],
+        *,
+        autostart: bool = False,
+        idempotency_keys: list[str | None] | None = None,
+    ):
+        return self.handle(ctx).add_many(
+            params_list,
+            autostart=autostart,
+            idempotency_keys=idempotency_keys,
+        )
+
+    def write_jsons(
+        self,
+        ctx,
+        entries: list[tuple[str, Any]],
+        *,
+        overwrite: bool = False,
+    ) -> list[Path]:
+        texts = [
+            (
+                filename,
+                json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+            )
+            for filename, value in entries
+        ]
+        return self.handle(ctx).write_inputs(
+            texts,
+            overwrite=overwrite,
+            encoding=self.encoding,
+        )
+
     add = add_job
 
     def _resolve(self, ctx, parts: tuple[str, ...]) -> Path:

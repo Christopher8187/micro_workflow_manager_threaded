@@ -30,6 +30,12 @@
    authority deciding whether its result is correct.
 10. **Inspect the funnel before adding capacity.** `mwf inspect NODE filter`
     distinguishes a slow stage from a low-quality main attempt or fallback.
+11. **Batch high-fanout registration without changing job granularity.** When one
+    task emits many independent downstream objects, use
+    `NodeInputFileSystem.write_jsons(...)` followed by `add_jobs(...)`. Each object
+    remains a separate downstream job, while file and SQLite registration avoid
+    one global lock/transaction cycle per object. `autostart=False` keeps the
+    producer and consumer in separate Hoeflein components.
 
 ## The output contract: artifact plus provenance
 

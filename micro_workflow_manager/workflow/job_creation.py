@@ -176,7 +176,7 @@ class JobCreationMixin:
                         return existing
 
                 if job_id is None:
-                    job_id = self.storage.next_job_id(to_node)
+                    job_id = self.storage.reserve_job_ids(to_node, 1)[0]
 
                 parent = None
                 if from_node is not None:
@@ -218,3 +218,155 @@ class JobCreationMixin:
                 )
 
         return job
+
+    def add_jobs(
+        self,
+        from_node: str | None,
+        to_node: str,
+        params_list: list[dict[str, Any]],
+        *,
+        autostart: bool = False,
+        _parent_job_id: int | None = None,
+        idempotency_keys: list[str | None] | None = None,
+    ):
+        """Create a high-fanout batch while keeping one job per params object.
+
+        The batch path uses SQLite transactions directly instead of one advisory
+        lock per producer. IDs are reserved quickly, job payload files are written
+        concurrently, and one final transaction resolves idempotency races.
+        """
+        if not isinstance(params_list, list):
+            raise TypeError("params_list must be a list of dicts")
+        if not params_list:
+            return []
+        if any(not isinstance(params, dict) for params in params_list):
+            raise TypeError("each params_list entry must be a dict")
+        if _parent_job_id is not None:
+            self.storage.validate_job_id(_parent_job_id)
+
+        if idempotency_keys is None:
+            idempotency_keys = [None] * len(params_list)
+        if not isinstance(idempotency_keys, list) or len(idempotency_keys) != len(params_list):
+            raise ValueError("idempotency_keys must be a list matching params_list")
+        non_null_keys = [key for key in idempotency_keys if key is not None]
+        if len(non_null_keys) != len(set(non_null_keys)):
+            raise ValueError("idempotency_keys must be unique within a batch")
+
+        if from_node is not None:
+            self.validate_edge(from_node, to_node)
+            if autostart:
+                self.register_autostart_edge(from_node, to_node)
+
+        source_component = self.component_id(from_node) if from_node is not None else None
+        target_component = self.component_id(to_node)
+        same_component = source_component is not None and source_component == target_component
+        effective_autostart = bool(autostart or same_component)
+
+        if effective_autostart and self.allowed_run_nodes is not None and to_node not in self.allowed_run_nodes:
+            parent = f"{from_node}/{_parent_job_id}" if _parent_job_id is not None else str(from_node)
+            raise InvalidGraphError(
+                f"Autostart from {parent} to {to_node} was blocked because "
+                f"{to_node} is outside the approved run set. "
+                "Use mwf run/runfrom and approve detected autostarts, or include "
+                "the target node in the run set. Dynamic autostarts may not be "
+                "found by the static scanner."
+            )
+
+        node = self.ensure_node(to_node)
+        for params in params_list:
+            node.validate_params(params)
+
+        results: list[Job | None] = [None] * len(params_list)
+        existing_by_key = self.storage.lookup_idempotent_jobs_batch(
+            to_node, idempotency_keys
+        )
+        missing_indexes = [
+            index
+            for index, key in enumerate(idempotency_keys)
+            if key is None or key not in existing_by_key
+        ]
+        reserved_ids = (
+            self.storage.reserve_job_ids(to_node, len(missing_indexes))
+            if missing_indexes
+            else []
+        )
+        reserved_iter = iter(reserved_ids)
+        new_jobs: list[Job] = []
+        new_keys: list[str | None] = []
+        new_indexes: list[int] = []
+
+        for index, (params, key) in enumerate(zip(params_list, idempotency_keys)):
+            if key is not None and key in existing_by_key:
+                results[index] = existing_by_key[key]
+                continue
+            parent = None
+            if from_node is not None:
+                parent = {
+                    "from_node": from_node,
+                    "from_job_id": _parent_job_id,
+                }
+            job = Job(
+                job_id=next(reserved_iter),
+                node_name=to_node,
+                params=dict(params),
+                parent=parent,
+                producer_component=source_component,
+                job_kind=(
+                    "component"
+                    if same_component
+                    else ("dag" if from_node is not None else None)
+                ),
+            )
+            new_jobs.append(job)
+            new_keys.append(key)
+            new_indexes.append(index)
+
+        self.storage.prepare_jobs_batch(new_jobs)
+        try:
+            committed, raced_ids = (
+                self.storage.commit_prepared_jobs_batch_resolving_idempotency(
+                    new_jobs,
+                    idempotency_keys=new_keys,
+                )
+            )
+        except BaseException:
+            # The transaction did not commit, so every prepared directory is
+            # disposable. Never remove committed payloads during result loading.
+            self.storage.discard_prepared_jobs(new_jobs)
+            raise
+
+        committed_ids = {job.job_id for job in committed}
+        discard = [job for job in new_jobs if job.job_id not in committed_ids]
+        if discard:
+            self.storage.discard_prepared_jobs(discard)
+
+        committed_by_id = {job.job_id: job for job in committed}
+        for index, job, key in zip(new_indexes, new_jobs, new_keys):
+            if job.job_id in committed_by_id:
+                results[index] = job
+            elif key is not None and key in raced_ids:
+                results[index] = self.storage.load_job(to_node, raced_ids[key])
+            else:
+                raise RuntimeError("batch idempotency resolution lost a job")
+
+        created = [job for job in results if job is not None]
+        if len(created) != len(params_list):
+            raise RuntimeError("internal batch job creation result mismatch")
+
+        if effective_autostart and self.autostart_mode == "immediate":
+            current_node = getattr(self._job_context, "node_name", None)
+            same_component_spawn = (
+                current_node is not None
+                and self.component_id(current_node) == self.component_id(to_node)
+            )
+            if not same_component_spawn:
+                return [
+                    self.run_job(
+                        node_name=to_node,
+                        job_id=job.job_id,
+                        ignore_readiness=True,
+                    )
+                    for job in created
+                ]
+
+        return created

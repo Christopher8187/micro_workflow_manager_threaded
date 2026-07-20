@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,12 +40,90 @@ class JobFileStorageMixin:
                 (node_name, key_hash, key, job_id),
             )
 
+    def lookup_idempotent_jobs_batch(
+        self,
+        node_name: str,
+        keys: list[str | None],
+    ) -> dict[str, Job]:
+        """Resolve existing idempotent jobs with one targeted SQLite query."""
+        requested = {
+            self.idempotency_key_hash(key): key
+            for key in keys
+            if key is not None
+        }
+        if not requested:
+            return {}
+        hashes = list(requested)
+        placeholders = ",".join("?" for _ in hashes)
+        rows = self.db_connection().execute(
+            "SELECT i.key_hash, i.key_text, i.job_id "
+            "FROM idempotency AS i "
+            "JOIN jobs AS j ON j.node_name=i.node_name AND j.job_id=i.job_id "
+            f"WHERE i.node_name=? AND i.key_hash IN ({placeholders})",
+            [node_name, *hashes],
+        ).fetchall()
+        result: dict[str, Job] = {}
+        for row in rows:
+            key_hash = str(row["key_hash"])
+            requested_key = requested[key_hash]
+            if str(row["key_text"]) != requested_key:
+                raise RuntimeError(
+                    f"idempotency hash collision for node {node_name!r}"
+                )
+            result[requested_key] = self.load_job(node_name, int(row["job_id"]))
+        return result
+
     def next_job_id(self, node_name: str) -> int:
+        row = self.db_connection().execute(
+            "SELECT next_job_id FROM job_sequences WHERE node_name=?",
+            (node_name,),
+        ).fetchone()
+        if row is not None:
+            return int(row["next_job_id"])
         row = self.db_connection().execute(
             "SELECT COALESCE(MAX(job_id), 0) + 1 AS next_id FROM jobs WHERE node_name=?",
             (node_name,),
         ).fetchone()
         return int(row["next_id"])
+
+    def reserve_job_ids(self, node_name: str, count: int) -> list[int]:
+        if type(count) is not int or count < 1:
+            raise ValueError("count must be a positive integer")
+        node_name = self.validate_node_name(node_name)
+        with self.db_transaction() as connection:
+            row = connection.execute(
+                "SELECT next_job_id FROM job_sequences WHERE node_name=?",
+                (node_name,),
+            ).fetchone()
+            if row is None:
+                start = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(job_id), 0) + 1 FROM jobs WHERE node_name=?",
+                        (node_name,),
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, ?)",
+                    (node_name, start + count),
+                )
+            else:
+                start = int(row["next_job_id"])
+                connection.execute(
+                    "UPDATE job_sequences SET next_job_id=? WHERE node_name=?",
+                    (start + count, node_name),
+                )
+        return list(range(start, start + count))
+
+    def advance_job_sequence(self, node_name: str, next_job_id: int) -> None:
+        node_name = self.validate_node_name(node_name)
+        next_job_id = self.validate_job_id(next_job_id)
+        with self.db_transaction() as connection:
+            connection.execute(
+                "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET "
+                "next_job_id=MAX(job_sequences.next_job_id, excluded.next_job_id)",
+                (node_name, next_job_id),
+            )
 
     def job_exists(self, node_name: str, job_id: int) -> bool:
         job_id = self.validate_job_id(job_id)
@@ -164,6 +243,280 @@ class JobFileStorageMixin:
             producer_component=list(job.producer_component or ()),
             job_kind=job.job_kind,
         )
+        self.advance_job_sequence(job.node_name, job.job_id + 1)
+
+    def prepare_jobs_batch(self, jobs: list[Job]) -> list[Path]:
+        """Write job input payloads outside the global job-registration lock."""
+        if not jobs:
+            return []
+        node_names = {job.node_name for job in jobs}
+        if len(node_names) != 1:
+            raise ValueError("prepare_jobs_batch requires jobs for one node")
+        ids = [self.validate_job_id(job.job_id) for job in jobs]
+        if len(set(ids)) != len(ids):
+            raise ValueError("batch contains duplicate job ids")
+        for job in jobs:
+            self.json_text(Path("input.json"), job.params)
+
+        written_dirs: list[Path] = []
+        try:
+            for job in jobs:
+                job_dir = self.job_dir(job.node_name, job.job_id)
+                self.atomic_write_json(self.input_file(job.node_name, job.job_id), job.params)
+                written_dirs.append(job_dir)
+        except BaseException:
+            for job_dir in written_dirs:
+                shutil.rmtree(job_dir, ignore_errors=True)
+            raise
+        return written_dirs
+
+    def discard_prepared_jobs(self, jobs: list[Job]) -> None:
+        for job in jobs:
+            shutil.rmtree(self.job_base_dir(job.node_name, job.job_id), ignore_errors=True)
+
+    def commit_prepared_jobs_batch(
+        self,
+        jobs: list[Job],
+        *,
+        idempotency_keys: list[str | None] | None = None,
+    ) -> list[Job]:
+        """Commit prepared job payloads with one SQLite transaction."""
+        if not jobs:
+            return []
+        node_names = {job.node_name for job in jobs}
+        if len(node_names) != 1:
+            raise ValueError("commit_prepared_jobs_batch requires jobs for one node")
+        node_name = next(iter(node_names))
+        if idempotency_keys is None:
+            idempotency_keys = [None] * len(jobs)
+        if len(idempotency_keys) != len(jobs):
+            raise ValueError("idempotency_keys must match jobs length")
+
+        ids = [self.validate_job_id(job.job_id) for job in jobs]
+        if len(set(ids)) != len(ids):
+            raise ValueError("batch contains duplicate job ids")
+        existing = set(self.list_job_ids(node_name))
+        collisions = sorted(existing.intersection(ids))
+        if collisions:
+            raise ValueError(f"Job {node_name}/{collisions[0]} already exists")
+
+        idempotency_rows = []
+        seen_key_hashes: set[str] = set()
+        for job, key in zip(jobs, idempotency_keys):
+            if key is None:
+                continue
+            key_hash = self.idempotency_key_hash(key)
+            if key_hash in seen_key_hashes:
+                raise ValueError("batch contains duplicate idempotency keys")
+            seen_key_hashes.add(key_hash)
+            idempotency_rows.append((node_name, key_hash, key, job.job_id))
+
+        job_rows = []
+        event_rows = []
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+        for job in jobs:
+            stored_parent = dict(job.parent) if job.parent is not None else None
+            if stored_parent is not None and job.producer_component is not None:
+                stored_parent["_mwf_from_component"] = list(job.producer_component)
+                stored_parent["_mwf_job_kind"] = job.job_kind
+            parent_json = (
+                json.dumps(stored_parent, ensure_ascii=False)
+                if stored_parent is not None
+                else None
+            )
+            job_rows.append(
+                (job.node_name, job.job_id, parent_json, job.created_at, QUEUED)
+            )
+            event_rows.append(
+                (
+                    job.node_name,
+                    job.job_id,
+                    event_time,
+                    "created",
+                    json.dumps(
+                        {
+                            "status": QUEUED,
+                            "parent": job.parent,
+                            "producer_component": list(job.producer_component or ()),
+                            "job_kind": job.job_kind,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+
+        with self.db_transaction() as connection:
+            connection.executemany(
+                "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
+                "VALUES(?, ?, ?, ?, ?, '{}')",
+                job_rows,
+            )
+            connection.executemany(
+                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                "VALUES(?, ?, ?, ?, ?)",
+                event_rows,
+            )
+            if idempotency_rows:
+                connection.executemany(
+                    "INSERT INTO idempotency(node_name, key_hash, key_text, job_id) "
+                    "VALUES(?, ?, ?, ?) "
+                    "ON CONFLICT(node_name, key_hash) DO UPDATE SET "
+                    "key_text=excluded.key_text, job_id=excluded.job_id",
+                    idempotency_rows,
+                )
+            connection.execute(
+                "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
+                "updated_at=CURRENT_TIMESTAMP",
+                (node_name, QUEUED),
+            )
+        return jobs
+
+    def commit_prepared_jobs_batch_resolving_idempotency(
+        self,
+        jobs: list[Job],
+        *,
+        idempotency_keys: list[str | None] | None = None,
+    ) -> tuple[list[Job], dict[str, int]]:
+        """Atomically resolve idempotency races and commit the remaining jobs."""
+        if not jobs:
+            return [], {}
+        if idempotency_keys is None:
+            idempotency_keys = [None] * len(jobs)
+        if len(idempotency_keys) != len(jobs):
+            raise ValueError("idempotency_keys must match jobs length")
+        node_names = {job.node_name for job in jobs}
+        if len(node_names) != 1:
+            raise ValueError("batch commit requires jobs for one node")
+        node_name = next(iter(node_names))
+
+        requested: dict[str, str] = {}
+        for key in idempotency_keys:
+            if key is None:
+                continue
+            key_hash = self.idempotency_key_hash(key)
+            if key_hash in requested:
+                raise ValueError("batch contains duplicate idempotency keys")
+            requested[key_hash] = key
+
+        with self.db_transaction() as connection:
+            existing_by_key: dict[str, int] = {}
+            if requested:
+                hashes = list(requested)
+                placeholders = ",".join("?" for _ in hashes)
+                rows = connection.execute(
+                    "SELECT i.key_hash, i.key_text, i.job_id "
+                    "FROM idempotency AS i "
+                    "JOIN jobs AS j ON j.node_name=i.node_name AND j.job_id=i.job_id "
+                    f"WHERE i.node_name=? AND i.key_hash IN ({placeholders})",
+                    [node_name, *hashes],
+                ).fetchall()
+                for row in rows:
+                    key_hash = str(row["key_hash"])
+                    key = requested[key_hash]
+                    if str(row["key_text"]) != key:
+                        raise RuntimeError(
+                            f"idempotency hash collision for node {node_name!r}"
+                        )
+                    existing_by_key[key] = int(row["job_id"])
+
+            commit_jobs: list[Job] = []
+            commit_keys: list[str | None] = []
+            for job, key in zip(jobs, idempotency_keys):
+                if key is not None and key in existing_by_key:
+                    continue
+                commit_jobs.append(job)
+                commit_keys.append(key)
+
+            ids = [self.validate_job_id(job.job_id) for job in commit_jobs]
+            if len(set(ids)) != len(ids):
+                raise ValueError("batch contains duplicate job ids")
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                collision = connection.execute(
+                    f"SELECT job_id FROM jobs WHERE node_name=? AND job_id IN ({placeholders}) LIMIT 1",
+                    [node_name, *ids],
+                ).fetchone()
+                if collision is not None:
+                    raise ValueError(f"Job {node_name}/{int(collision['job_id'])} already exists")
+
+            event_time = datetime.now().isoformat(timespec="milliseconds")
+            job_rows = []
+            event_rows = []
+            idempotency_rows = []
+            for job, key in zip(commit_jobs, commit_keys):
+                stored_parent = dict(job.parent) if job.parent is not None else None
+                if stored_parent is not None and job.producer_component is not None:
+                    stored_parent["_mwf_from_component"] = list(job.producer_component)
+                    stored_parent["_mwf_job_kind"] = job.job_kind
+                parent_json = (
+                    json.dumps(stored_parent, ensure_ascii=False)
+                    if stored_parent is not None
+                    else None
+                )
+                job_rows.append((job.node_name, job.job_id, parent_json, job.created_at, QUEUED))
+                event_rows.append((
+                    job.node_name,
+                    job.job_id,
+                    event_time,
+                    "created",
+                    json.dumps(
+                        {
+                            "status": QUEUED,
+                            "parent": job.parent,
+                            "producer_component": list(job.producer_component or ()),
+                            "job_kind": job.job_kind,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                ))
+                if key is not None:
+                    idempotency_rows.append((
+                        node_name, self.idempotency_key_hash(key), key, job.job_id
+                    ))
+
+            if job_rows:
+                connection.executemany(
+                    "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
+                    "VALUES(?, ?, ?, ?, ?, '{}')",
+                    job_rows,
+                )
+                connection.executemany(
+                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    event_rows,
+                )
+                if idempotency_rows:
+                    connection.executemany(
+                        "INSERT INTO idempotency(node_name, key_hash, key_text, job_id) "
+                        "VALUES(?, ?, ?, ?)",
+                        idempotency_rows,
+                    )
+                connection.execute(
+                    "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
+                    "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (node_name, QUEUED),
+                )
+        return commit_jobs, existing_by_key
+
+    def create_jobs_batch(
+        self,
+        jobs: list[Job],
+        *,
+        idempotency_keys: list[str | None] | None = None,
+    ) -> list[Job]:
+        """Prepare and commit many jobs; callers may split the phases for concurrency."""
+        self.prepare_jobs_batch(jobs)
+        try:
+            return self.commit_prepared_jobs_batch(
+                jobs, idempotency_keys=idempotency_keys
+            )
+        except BaseException:
+            self.discard_prepared_jobs(jobs)
+            raise
 
     def ensure_job(self, job: Job) -> Job:
         self.validate_job_id(job.job_id)
@@ -358,6 +711,11 @@ class JobFileStorageMixin:
             connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
             connection.execute("DELETE FROM default_job_specs WHERE node_name=?", (node_name,))
             connection.execute("DELETE FROM jobs WHERE node_name=?", (node_name,))
+            connection.execute(
+                "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, 1) "
+                "ON CONFLICT(node_name) DO UPDATE SET next_job_id=1",
+                (node_name,),
+            )
         if remove_payload:
             shutil.rmtree(self.jobs_dir(node_name), ignore_errors=True)
             self.jobs_dir(node_name)

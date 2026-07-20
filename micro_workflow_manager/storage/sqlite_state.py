@@ -17,7 +17,7 @@ from micro_workflow_manager.paths import state_database_file
 from micro_workflow_manager.processes import process_is_alive
 
 
-DATABASE_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 2
 
 
 class SQLiteStateMixin:
@@ -192,6 +192,7 @@ class SQLiteStateMixin:
             "idempotency",
             "default_job_specs",
             "advisory_locks",
+            "job_sequences",
         }
         try:
             # WAL keeps monitor/inspect readers from blocking the scheduler's
@@ -301,7 +302,18 @@ class SQLiteStateMixin:
                         acquired_at REAL NOT NULL,
                         expires_at REAL NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS job_sequences (
+                        node_name TEXT PRIMARY KEY,
+                        next_job_id INTEGER NOT NULL
+                    );
                     """
+                )
+                connection.execute(
+                    "INSERT INTO job_sequences(node_name, next_job_id) "
+                    "SELECT node_name, COALESCE(MAX(job_id), 0) + 1 FROM jobs GROUP BY node_name "
+                    "ON CONFLICT(node_name) DO UPDATE SET "
+                    "next_job_id=MAX(job_sequences.next_job_id, excluded.next_job_id)"
                 )
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('database_schema_version', ?) "
@@ -679,6 +691,7 @@ class SQLiteStateMixin:
             connection.execute("DELETE FROM default_job_specs WHERE node_name=?", (node_name,))
             connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
             connection.execute("DELETE FROM jobs WHERE node_name=?", (node_name,))
+            connection.execute("DELETE FROM job_sequences WHERE node_name=?", (node_name,))
             connection.execute("DELETE FROM nodes WHERE node_name=?", (node_name,))
 
     def export_node_state(self, node_name: str, destination: Path) -> Path:
@@ -804,6 +817,12 @@ class SQLiteStateMixin:
                     (node_name, job_id, now(), json.dumps({"status": QUEUED})),
                 )
                 created += 1
+
+            connection.execute(
+                "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET next_job_id=excluded.next_job_id",
+                (node_name, max(payload_ids, default=0) + 1),
+            )
 
             running_ids = [job_id for job_id, status in existing.items() if job_id in payload_ids and status == RUNNING]
             for job_id in running_ids:
