@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.10
+# micro-workflow-manager 0.3.11
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,26 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.11
+
+- Hoeflein components now use live node pumps. While one member is still
+  processing its queue, the scheduler polls idle sibling queues and starts them
+  as soon as internal component jobs appear. A fast handler can drain and be
+  restarted repeatedly while a long-running router continues producing work.
+- Monitor rows now derive their display state from actual per-node job counts.
+  Queued component work is not reported as running before execution, idle
+  handlers remain queued while a router starts, and a handler with active jobs
+  is shown running even if a concurrent component refresh wrote a broader node
+  lifecycle state.
+- The adaptive threaded runner now exits after the first worker failure even
+  when its lazy source still contains unclaimed jobs. This fixes active runs
+  that remained stuck at `status=running`, `running=0`, with queued jobs left.
+- Windows safe-path validation now treats ordinary and extended-length
+  (`\\?\\`) spellings of the same resolved path as equivalent while retaining
+  the same descendant-only security check.
+- Fresh producer-scoped cleanup rewinds the quiescent target's job allocator so
+  deterministically recreated jobs keep their previous tail IDs.
 
 ## What changed in 0.3.10
 
@@ -115,7 +135,9 @@ manager, and a Pygame state machine.
   even when that particular `add(...)` call omits `autostart=True`.
 - A Hoeflein component is one lifecycle unit: its nodes enter running together,
   become done together when quiescent, and become failed together if any job
-  fails. The component pump stops launching new batches after the first failure.
+  fails. Live node pumps stop accepting newly discovered sibling work after the
+  first failure, and the component is published failed while active pumps wind
+  down.
 - Generated jobs retain their immediate parent node/job and also record a stable
   producer-component identity plus whether they are a `dag` or `component` job.
   Fresh runs remove only jobs produced by the selected Hoeflein components.
@@ -483,11 +505,13 @@ There is no reverse dependency from `{B,C}` to A. Running B or C selects the
 whole `{B,C}` component, but it is refused until A is complete.
 
 Within one Hoeflein component, every original directed edge behaves as
-component-autostart. Child work is queued and the component scheduler pumps all
-member nodes until quiescence; it is never executed recursively inside the
-parent handler. All member nodes are reported running, done, or failed together.
-A node that has no jobs is vacuously successful when the component's actual jobs
-all finish.
+component-autostart. Child work is queued and the component scheduler keeps one
+live pump per active member node. It polls idle sibling queues while other pumps
+are still running, so a newly routed handler job does not wait for the router's
+entire queue to drain. Work is never executed recursively inside the parent
+handler. Queued components remain queued before execution; once active, member
+nodes quiesce and fail as one lifecycle unit. A node that has no jobs is
+vacuously successful when the component's actual jobs all finish.
 
 A partial `runfrom` deliberately permits a later merge component to process the
 selected incoming branch while other incoming branches remain unfinished. That
@@ -1169,10 +1193,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.10 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.11 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.10-py3-none-any.whl
+micro_workflow_manager-0.3.11-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1192,22 +1216,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.10-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.11-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.10-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.11-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.10-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.11-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.10`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.11`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1222,7 +1246,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.10-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.11-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import ntpath
 import os
 import re
 import threading
@@ -16,6 +17,58 @@ from uuid import uuid4
 from micro_workflow_manager.models import VALID_STATUSES
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.paths import config_file, locks_dir, run_file
+
+
+def _strip_windows_extended_prefix(value: str) -> str:
+    """Return the ordinary spelling of a Windows extended-length path."""
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
+def _looks_like_windows_path(value: str) -> bool:
+    return (
+        value.startswith("\\\\")
+        or value.startswith("\\\\?\\")
+        or re.match(r"^[A-Za-z]:[\\/]", value) is not None
+    )
+
+
+def _resolved_path_is_within(base: Path, path: Path) -> bool:
+    """Compare resolved paths without rejecting Windows extended aliases.
+
+    On Windows, ``Path.resolve()`` may add the extended-length prefix only after
+    a path becomes sufficiently long. The base can therefore be spelled as
+    ``C:\\...`` while a legitimate deep descendant is spelled as
+    ``\\?\\C:\\...``. They identify the same tree, but ``Path.relative_to``
+    treats the anchors as different. Normalize only for containment checking;
+    the original resolved path is still returned for I/O.
+    """
+    base_text = os.fspath(base)
+    path_text = os.fspath(path)
+    if (
+        os.name == "nt"
+        or _looks_like_windows_path(base_text)
+        or _looks_like_windows_path(path_text)
+    ):
+        normalized_base = ntpath.normcase(
+            ntpath.normpath(_strip_windows_extended_prefix(base_text))
+        )
+        normalized_path = ntpath.normcase(
+            ntpath.normpath(_strip_windows_extended_prefix(path_text))
+        )
+        try:
+            return ntpath.commonpath([normalized_base, normalized_path]) == normalized_base
+        except ValueError:
+            return False
+
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return False
+    return True
 
 
 class FileStorageBase:
@@ -156,10 +209,8 @@ class FileStorageBase:
         base = base.resolve()
         path = base.joinpath(*parts).resolve()
 
-        try:
-            path.relative_to(base)
-        except ValueError as error:
-            raise ValueError(f"Unsafe path outside base directory: {path}") from error
+        if not _resolved_path_is_within(base, path):
+            raise ValueError(f"Unsafe path outside base directory: {path}")
 
         return path
 

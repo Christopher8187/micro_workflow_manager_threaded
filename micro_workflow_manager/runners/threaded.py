@@ -143,12 +143,18 @@ class ThreadedRunner(BaseRunner):
             for _ in range(initial_workers):
                 spawn_worker()
 
-            while workers or not source_exhausted:
+            while workers or (not source_exhausted and first_error is None):
                 condition.wait(self.poll_interval)
 
                 if first_error is not None:
                     stop = True
                     condition.notify_all()
+                    # A lazy source may still contain thousands of unclaimed
+                    # jobs when one worker fails. Once the remaining workers
+                    # have retired, do not wait forever for a source that no
+                    # worker is allowed to consume.
+                    if not workers:
+                        break
                     continue
 
                 desired = self.effective_limit()

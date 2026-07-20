@@ -7,6 +7,8 @@ from ..models import RUNNING
 
 
 class ComponentSchedulerMixin:
+    component_queue_poll_seconds = 0.10
+
     def execution_components(self, nodes: list[str] | None = None) -> list[tuple[str, ...]]:
         """Return Hoeflein execution units in quotient-DAG topological order."""
         selected = set(self.graph_obj.nodes if nodes is None else nodes)
@@ -64,30 +66,72 @@ class ComponentSchedulerMixin:
                     raise
                 continue
 
+            # A cyclic component is a live work graph, not a sequence of static
+            # batches. A node pump may exhaust the queue snapshot it saw while
+            # another still-running node is creating more jobs for it. Keep at
+            # most one pump active per node, and immediately resubmit a node as
+            # soon as its previous pump exits and new queued work is visible.
+            # This lets explode handlers continue alongside the explode router
+            # instead of waiting for the router's entire queue to drain.
             executor = ThreadPoolExecutor(
-                max_workers=max(1, len(queued_nodes)),
+                max_workers=max(1, len(component_nodes)),
                 thread_name_prefix="mwf-hoeflein-node",
             )
+
             def run_node_worker(node_name: str):
                 try:
                     return self.run_queued_node_jobs(node_name, True)
                 finally:
                     self.storage.close_thread_connection()
 
-            futures = {
-                executor.submit(run_node_worker, node_name): node_name
-                for node_name in queued_nodes
-            }
+            futures = {}
+            active_nodes: set[str] = set()
             first_error = None
             try:
-                while futures:
-                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                while True:
+                    for node_name in component_nodes:
+                        if (
+                            node_name not in active_nodes
+                            and self.storage.has_queued_jobs(node_name)
+                        ):
+                            future = executor.submit(run_node_worker, node_name)
+                            futures[future] = node_name
+                            active_nodes.add(node_name)
+
+                    if not futures:
+                        # Rescan after all completed workers have published their
+                        # downstream jobs. If no work remains, the component is
+                        # genuinely quiescent.
+                        if self.component_has_queued_jobs(component_set):
+                            continue
+                        self.refresh_component_status(
+                            component_set,
+                            allow_complete=True,
+                        )
+                        return ran
+
+                    done, _ = wait(
+                        futures,
+                        timeout=self.component_queue_poll_seconds,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        # A still-running node may have just created work for an
+                        # idle sibling. Poll the component queues while pumps are
+                        # active rather than waiting for one whole node pump to
+                        # finish before discovering that work.
+                        continue
                     for future in done:
                         node_name = futures.pop(future)
+                        active_nodes.discard(node_name)
                         try:
                             future.result()
                         except Exception as error:
                             first_error = error
+                            # Publish failure before waiting for already-running
+                            # sibling node pumps to wind down, so monitor cannot
+                            # keep presenting a dead component as running.
+                            self.mark_component_failed(component_set)
                             break
                         ran.append(node_name)
                     if first_error is not None:
@@ -96,8 +140,11 @@ class ComponentSchedulerMixin:
                 if first_error is not None:
                     for future in futures:
                         future.cancel()
-                    self.mark_component_failed(component_set)
                     executor.shutdown(wait=True, cancel_futures=True)
+                    # A sibling pump may have refreshed component state while
+                    # it was winding down. Reassert the terminal component
+                    # failure after every active pump has stopped.
+                    self.mark_component_failed(component_set)
                 else:
                     executor.shutdown(wait=True)
             if first_error is not None:

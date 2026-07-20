@@ -125,6 +125,30 @@ class JobFileStorageMixin:
                 (node_name, next_job_id),
             )
 
+    def rewind_job_sequence_to_available(self, node_name: str) -> int:
+        """Reset a quiescent node's allocator to its first available tail ID.
+
+        Fresh ``run``/``runfrom`` cleanup may deliberately delete jobs that will
+        be recreated immediately. The high-fanout sequence allocator introduced
+        in 0.3.10 otherwise keeps advancing and changes deterministic job IDs on
+        every fresh run. Call this only while the active-run slot is held and no
+        worker is registering jobs for the node.
+        """
+        node_name = self.validate_node_name(node_name)
+        with self.db_transaction() as connection:
+            next_id = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(job_id), 0) + 1 FROM jobs WHERE node_name=?",
+                    (node_name,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET next_job_id=excluded.next_job_id",
+                (node_name, next_id),
+            )
+        return next_id
+
     def job_exists(self, node_name: str, job_id: int) -> bool:
         job_id = self.validate_job_id(job_id)
         row = self.db_connection().execute(

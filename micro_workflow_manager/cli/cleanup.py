@@ -75,6 +75,11 @@ def delete_jobs_generated_by_components(workflow: MicroWorkflow, producer_compon
                 continue
             workflow.storage.delete_job(node_name, job_id, remove_payload=True)
             removed[node_name] = removed.get(node_name, 0) + 1
+    # Cleanup runs before workers start and owns the active-run slot, so it is
+    # safe to restore deterministic tail allocation for jobs that are about to
+    # be recreated by the same selected producer components.
+    for node_name in removed:
+        workflow.storage.rewind_job_sequence_to_available(node_name)
     return removed
 
 

@@ -103,9 +103,30 @@ def node_stats(workflow, node_name: str) -> dict[str, Any]:
 
     progress = (completed / total * 100.0) if total else 0.0
 
+    stored_status = workflow.storage.get_node_status(node_name) or "missing"
+    # Node-state files describe component lifecycle and can briefly be broader
+    # than the work actually executing in this node. For monitor display, job
+    # counts are the source of truth: queued work must not look running merely
+    # because a sibling pump is active, and a real running job must not be shown
+    # queued because of a concurrent component refresh.
+    if failed > 0 or stored_status == FAILED:
+        display_status = FAILED
+    elif counts.get(RUNNING, 0) > 0:
+        display_status = RUNNING
+    elif counts.get(QUEUED, 0) > 0:
+        display_status = QUEUED
+    elif total > 0 and counts.get(CANCELLED, 0) > 0:
+        display_status = CANCELLED
+    elif total > 0 and completed == total:
+        display_status = DONE
+    elif total == 0 and stored_status == RUNNING:
+        display_status = QUEUED
+    else:
+        display_status = stored_status
+
     return {
         "node": node_name,
-        "status": workflow.storage.get_node_status(node_name) or "missing",
+        "status": display_status,
         "total": total,
         "queued": counts.get(QUEUED, 0),
         "running": counts.get(RUNNING, 0),

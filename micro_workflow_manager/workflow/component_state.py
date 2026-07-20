@@ -141,16 +141,25 @@ class ComponentStateMixin:
             self.mark_component_failed(component)
             return
 
-        has_running_or_queued = any(
-            counts.get(RUNNING, 0) or counts.get(QUEUED, 0)
+        has_running = any(
+            counts.get(RUNNING, 0)
             for counts in counts_by_node.values()
         )
-        if has_running_or_queued:
-            # Once any part of a Hoeflein component is active, every node is
-            # presented as active. The component, not an individual node, is the
-            # scheduler-owned execution unit.
+        if has_running:
+            # Actual running jobs make the whole scheduler-owned component
+            # active. Queued work alone must not do this: before ``mwf run`` a
+            # ready component is queued, not already running.
             for node_name in component:
                 self.storage.set_node_status(node_name, RUNNING)
+            return
+
+        has_queued = any(
+            counts.get(QUEUED, 0)
+            for counts in counts_by_node.values()
+        )
+        if has_queued:
+            for node_name in component:
+                self.storage.set_node_status(node_name, QUEUED)
             return
 
         if total_jobs == 0:

@@ -153,6 +153,13 @@ start, quiesce, and fail together. Every original edge between members is
 implicitly component-autostart, so do not rely on a non-autostart internal edge
 to create a later DAG barrier. Put a real barrier between separate components.
 
+The component scheduler keeps at most one node pump active per member and polls
+idle member queues while other pumps are still running. This matters for router
+patterns: a long-running router can continue creating handler jobs while those
+handlers drain concurrently, and a handler whose current queue snapshot empties
+is restarted when more work arrives. Queued work alone does not make a component
+look active in `mwf monitor` before a run starts.
+
 Use explicit autostart only when the child belongs to the same communicating
 subsystem or must wake immediately as part of that subsystem. Keep ordinary
 cross-component edges for directed dependency flow. A useful review question is:
@@ -613,3 +620,6 @@ python -m pytest -q tests/test_033_filter_icons_design.py
 
 For large real projects, add a small deterministic fixture mode so architecture
 and provenance tests do not depend on external APIs.
+
+
+Monitor rows use actual per-node job counts for display state; component lifecycle state remains durable scheduler metadata.
