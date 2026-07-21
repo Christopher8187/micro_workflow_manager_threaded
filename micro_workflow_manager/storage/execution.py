@@ -4,10 +4,10 @@ import json
 import os
 import shutil
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from contextlib import contextmanager
 from datetime import datetime
-from threading import get_ident
+from threading import Thread, current_thread, get_ident
 from typing import Any, Callable, Iterator, TypeVar
 from uuid import uuid4
 
@@ -23,6 +23,10 @@ from micro_workflow_manager.models import (
 
 
 T = TypeVar("T")
+
+FINALIZE_BATCH_QUIET_SECONDS = 0.002
+FINALIZE_BATCH_MAX_SECONDS = 0.025
+FINALIZE_BATCH_IDLE_SECONDS = 0.25
 
 
 class JobExecutionStorageMixin:
@@ -333,37 +337,119 @@ class JobExecutionStorageMixin:
             dict(extra),
             future,
         )
-        with self._finalize_batch_lock:
+        now_value = time.monotonic()
+        with self._finalize_condition:
             batch = self._finalize_batches.get(key)
-            leader = batch is None
             if batch is None:
                 batch = []
                 self._finalize_batches[key] = batch
-            batch.append(request)
-
-        if leader:
-            time.sleep(0.001)
-            with self._finalize_batch_lock:
-                requests = self._finalize_batches.pop(key)
-            try:
-                outcomes = self._finalize_job_executions_batch(
-                    node_name,
-                    requests,
-                    priority=priority,
-                )
-            except BaseException as error:
-                for *_request, request_future in requests:
-                    request_future.set_exception(error)
+                first_at = now_value
             else:
-                for outcome, (*_request, request_future) in zip(
-                    outcomes,
-                    requests,
-                ):
-                    if outcome is None:
-                        request_future.set_result(None)
-                    else:
-                        request_future.set_exception(outcome)
+                first_at, _deadline = self._finalize_deadlines[key]
+            batch.append(request)
+            deadline = min(
+                first_at + FINALIZE_BATCH_MAX_SECONDS,
+                now_value + FINALIZE_BATCH_QUIET_SECONDS,
+            )
+            self._finalize_deadlines[key] = (first_at, deadline)
+            if self._finalize_thread is None or not self._finalize_thread.is_alive():
+                self._finalize_thread = Thread(
+                    target=self._finalize_batch_worker,
+                    name="mwf-finalize-batcher",
+                    daemon=True,
+                )
+                self._finalize_thread.start()
+            self._finalize_condition.notify_all()
         future.result()
+
+    def _complete_finalize_request(
+        self,
+        request_future: Future,
+        error: BaseException | None,
+    ) -> None:
+        try:
+            if error is None:
+                request_future.set_result(None)
+            else:
+                request_future.set_exception(error)
+        except InvalidStateError:
+            # A failed sibling fiber can cancel its wait after the terminal
+            # mutation is already queued. The durable update still commits; a
+            # cancelled local waiter must not break the shared batch callback.
+            pass
+
+    def _resolve_finalize_requests(
+        self,
+        mutation_future: Future,
+        requests: list[tuple],
+    ) -> None:
+        try:
+            outcomes = mutation_future.result()
+        except BaseException as error:
+            for *_request, request_future in requests:
+                self._complete_finalize_request(request_future, error)
+            return
+        for outcome, (*_request, request_future) in zip(outcomes, requests):
+            self._complete_finalize_request(request_future, outcome)
+
+    def _finalize_batch_worker(self) -> None:
+        try:
+            while True:
+                with self._finalize_condition:
+                    if not self._finalize_deadlines:
+                        self._finalize_condition.wait(FINALIZE_BATCH_IDLE_SECONDS)
+                        if not self._finalize_deadlines:
+                            if self._finalize_thread is current_thread():
+                                self._finalize_thread = None
+                            return
+
+                    now_value = time.monotonic()
+                    next_deadline = min(
+                        deadline
+                        for _first_at, deadline in self._finalize_deadlines.values()
+                    )
+                    if next_deadline > now_value:
+                        self._finalize_condition.wait(next_deadline - now_value)
+                        continue
+
+                    due: list[tuple[tuple[str, int], list[tuple]]] = []
+                    for batch_key, (_first_at, deadline) in list(
+                        self._finalize_deadlines.items()
+                    ):
+                        if deadline > now_value:
+                            continue
+                        self._finalize_deadlines.pop(batch_key, None)
+                        requests = self._finalize_batches.pop(batch_key, None)
+                        if requests:
+                            due.append((batch_key, requests))
+
+                # Enqueue every due node batch without waiting. The SQLite writer
+                # can then group terminal operations from many Hoeflein members in
+                # one priority-5 commit, while each job still receives its own
+                # lease-conditional outcome.
+                for batch_key, requests in due:
+                    node_name, priority = batch_key
+                    try:
+                        mutation_future = self._finalize_job_executions_batch(
+                            node_name,
+                            requests,
+                            priority=priority,
+                            wait=False,
+                        )
+                    except BaseException as error:
+                        for *_request, request_future in requests:
+                            self._complete_finalize_request(request_future, error)
+                    else:
+                        mutation_future.add_done_callback(
+                            lambda completed, requests=requests: (
+                                self._resolve_finalize_requests(completed, requests)
+                            )
+                        )
+        finally:
+            with self._finalize_condition:
+                if self._finalize_thread is current_thread():
+                    self._finalize_thread = None
+                self._finalize_condition.notify_all()
 
     def _finalize_job_executions_batch(
         self,
@@ -371,7 +457,8 @@ class JobExecutionStorageMixin:
         requests: list[tuple],
         *,
         priority: int,
-    ) -> list[BaseException | None]:
+        wait: bool = True,
+    ) -> list[BaseException | None] | Future[list[BaseException | None]]:
         event_time = datetime.now().isoformat(timespec="milliseconds")
 
         def finalize(connection):
@@ -460,7 +547,11 @@ class JobExecutionStorageMixin:
                 outcomes.append(None)
             return outcomes
 
-        return self.submit_db_mutation(finalize, priority=priority)
+        return self.submit_db_mutation(
+            finalize,
+            priority=priority,
+            wait=wait,
+        )
 
     def job_execution_is_current(
         self,

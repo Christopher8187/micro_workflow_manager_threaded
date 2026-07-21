@@ -367,3 +367,129 @@ def test_asymmetric_hoeflein_wave_admits_large_nodes_and_drains_cleanly(tmp_path
         assert summary["done"] == count
         assert summary["queued"] == 0
         assert summary["running"] == 0
+
+
+def test_dense_api_source_grows_admission_bursts_but_sparse_source_resets():
+    class DenseSource:
+        def __init__(self, count):
+            self.remaining = list(range(count))
+            self.requests = []
+            self.returned_counts = []
+
+        def pull(self, max_items):
+            self.requests.append(max_items)
+            result = self.remaining[:max_items]
+            del self.remaining[:max_items]
+            self.returned_counts.append(len(result))
+            return result
+
+    dense = DenseSource(2000)
+    results = ApiRunner(max_threads=2000, poll_interval=0.001).run_job_source(
+        "A",
+        dense,
+        lambda value: value,
+    )
+    assert results == list(range(2000))
+    assert dense.requests[:6] == [64, 128, 256, 512, 1024, 1024]
+    assert dense.returned_counts[:6] == [64, 128, 256, 512, 1024, 16]
+
+    class SparseSource:
+        def __init__(self):
+            self.calls = 0
+            self.requests = []
+
+        def pull(self, max_items):
+            self.requests.append(max_items)
+            self.calls += 1
+            if self.calls == 1:
+                return list(range(64))
+            if self.calls == 2:
+                return list(range(64, 67))
+            return []
+
+    sparse = SparseSource()
+    results = ApiRunner(max_threads=2000, poll_interval=0.001).run_job_source(
+        "A",
+        sparse,
+        lambda value: value,
+    )
+    assert results == list(range(67))
+    assert sparse.requests[:3] == [64, 128, 16]
+
+
+def test_terminal_registration_flushes_while_next_admission_pull_is_blocked(tmp_path):
+    """A finished job must not need the node fiber scheduler to run again."""
+    from micro_workflow_manager.models import DONE, Job, now
+    from micro_workflow_manager.storage import FileStorage
+
+    storage = FileStorage(tmp_path)
+    storage.create_job(Job(node_name="A", job_id=1, params={}))
+    generation, execution_id = storage.claim_job_executions_batch(
+        "A",
+        [1],
+        started_at=now(),
+    )[0]
+
+    second_pull_started = threading.Event()
+    release_second_pull = threading.Event()
+
+    class BlockingRefreshableSource:
+        def __init__(self):
+            self.calls = 0
+
+        def pull(self, max_items):
+            self.calls += 1
+            if self.calls == 1:
+                return [(generation, execution_id)]
+            second_pull_started.set()
+            assert release_second_pull.wait(2)
+            return []
+
+    def finish(item):
+        lease_generation, lease_execution_id = item
+        storage.finalize_job_execution(
+            "A",
+            1,
+            lease_generation,
+            lease_execution_id,
+            DONE,
+            started_at=now(),
+            finished_at=now(),
+            duration_seconds=0.0,
+            generation=lease_generation,
+            execution_id=lease_execution_id,
+        )
+        return 1
+
+    result = []
+    error = []
+
+    def run():
+        try:
+            result.extend(
+                ApiRunner(max_threads=2, poll_interval=0.001).run_job_source(
+                    "A",
+                    BlockingRefreshableSource(),
+                    finish,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            error.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert second_pull_started.wait(1)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            if storage.get_job_status("A", 1) == DONE:
+                break
+            time.sleep(0.005)
+        assert storage.get_job_status("A", 1) == DONE
+    finally:
+        release_second_pull.set()
+        worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert error == []
+    assert result == [1]

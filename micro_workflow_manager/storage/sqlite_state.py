@@ -59,7 +59,10 @@ class SQLiteStateMixin:
             list[tuple[int, str, Future[tuple[int, str]]]],
         ] = {}
         self._finalize_batch_lock = threading.Lock()
+        self._finalize_condition = threading.Condition(self._finalize_batch_lock)
         self._finalize_batches: dict[tuple[str, int], list[tuple]] = {}
+        self._finalize_deadlines: dict[tuple[str, int], tuple[float, float]] = {}
+        self._finalize_thread: threading.Thread | None = None
         self._mutation_queue: queue.PriorityQueue[
             tuple[int, int, Callable[[sqlite3.Connection], Any], Future]
         ] = queue.PriorityQueue()

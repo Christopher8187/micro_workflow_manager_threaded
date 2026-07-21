@@ -187,6 +187,10 @@ def install_bridges() -> None:
     _PATCHED = True
 
 
+MIN_ADMISSION_BURST = 16
+MAX_ADMISSION_BURST = 1024
+
+
 class FiberRuntime:
     """Cooperative runner for synchronous API job controllers.
 
@@ -457,6 +461,8 @@ class FiberRuntime:
                     break
             return values
 
+        admission_burst = self.start_burst
+
         while True:
             if self._first_error is not None:
                 for future in self._future_waiters:
@@ -468,8 +474,23 @@ class FiberRuntime:
             if type(limit) is not int or limit < 1:
                 raise ValueError("runtime API concurrency must be an integer >= 1")
             capacity = max(0, limit - active)
-            pulled = pull_items(min(capacity, self.start_burst))
+            requested = min(capacity, admission_burst)
+            pulled = pull_items(requested)
             added = len(pulled)
+            if requested > 0 and added == requested and active + added < limit:
+                # A full pull proves the queue is dense. Grow geometrically so a
+                # fixed high-fanout node does not pay one synchronous claim round
+                # trip for every 64 jobs. Dense queues may grow to 1024 jobs per
+                # claim transaction.
+                admission_burst = min(
+                    MAX_ADMISSION_BURST,
+                    max(MIN_ADMISSION_BURST, requested * 2),
+                )
+            elif added < requested:
+                # A partial or empty pull is evidence of a sparse/trickling queue.
+                # Keep the next database claim small so newly arriving jobs do not
+                # wait behind oversized empty or mostly-empty admission probes.
+                admission_burst = MIN_ADMISSION_BURST
             for position, item in enumerate(pulled):
                 state = self._new_state(next_index, item, run_one)
                 self._states[next_index] = state
@@ -513,9 +534,10 @@ class FiberRuntime:
                     # Completion callbacks can drain the last active fibers
                     # after this iteration's admission phase. Probe the live
                     # source once more before declaring the pump quiescent.
-                    refill = pull_items(min(limit, self.start_burst))
+                    refill = pull_items(min(limit, MIN_ADMISSION_BURST))
                     if not refill:
                         break
+                    admission_burst = MIN_ADMISSION_BURST
                     for position, item in enumerate(refill):
                         state = self._new_state(next_index, item, run_one)
                         self._states[next_index] = state
