@@ -8,11 +8,21 @@ from typing import Any, Iterator
 
 from .file_helpers import (
     _copy_file,
+    _mkdir,
     _relative_parts,
     _source_path,
     _write_bytes_file,
     _write_text_file,
 )
+
+
+def _is_node_input_filesystem(filesystem: Any) -> bool:
+    # Import lazily to avoid the file_systems -> file_entry module cycle.
+    # MWF 0.4.3 originally referenced NodeInputFileSystem here without binding
+    # the name, so every FileSystemEntry.mkdir/open write path raised NameError.
+    from .file_systems import NodeInputFileSystem
+
+    return isinstance(filesystem, NodeInputFileSystem)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +105,7 @@ class FileSystemEntry(os.PathLike[str]):
         if not self.filesystem.writable:
             raise PermissionError(f"{self.filesystem.label} is read-only")
         path = self.path
-        if isinstance(self.filesystem, NodeInputFileSystem):
+        if _is_node_input_filesystem(self.filesystem):
             return self.filesystem.handle(self.ctx)._guarded(
                 lambda: _mkdir(path, parents=parents, exist_ok=exist_ok)
             )
@@ -115,7 +125,7 @@ class FileSystemEntry(os.PathLike[str]):
         # method exists for Path-compatible libraries and performs a generation
         # check before opening.
         if writing:
-            if isinstance(self.filesystem, NodeInputFileSystem):
+            if _is_node_input_filesystem(self.filesystem):
                 self.filesystem.handle(self.ctx).checkpoint()
             else:
                 self.ctx.raise_if_cancelled()

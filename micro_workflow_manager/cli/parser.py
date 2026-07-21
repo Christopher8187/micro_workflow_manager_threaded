@@ -128,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset_cmd = commands.add_parser(
         "reset",
-        help="Reset whole Hoeflein-component output/status artifacts while keeping input files and jobs. Use '*' for all nodes.",
+        help="Reset one DAG node or the whole Hoeflein component containing the named node, while keeping inputs/jobs. Use '*' for all nodes.",
         description=COMMAND_HELP_DESCRIPTIONS["reset"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -136,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
         "nodes",
         nargs="+",
         metavar="node",
-        help="One or more node names; each selects its entire Hoeflein component, or '*' for all nodes.",
+        help="Each DAG node selects itself; a Hoeflein member selects its whole component; use '*' for all nodes.",
     )
     reset_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
 

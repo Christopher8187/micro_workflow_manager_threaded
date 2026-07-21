@@ -43,7 +43,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "inspect": "Inspect a node/job; list failed job IDs, show retry/fallback filter bottlenecks, or show node debug output.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
     "clean": "Delete jobs and output for selected Hoeflein components while keeping node input files.",
-    "reset": "Requeue every existing job for selected Hoeflein components while keeping job definitions and node input files.",
+    "reset": "Requeue every existing job for one selected DAG node or the selected node's whole Hoeflein component, while keeping job definitions and inputs.",
     "wipe": "Like component-level clean, but remove the selected components' input files as well.",
     "run": "Reset and run one ready node or selected jobs; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control that restarts running and failed/cancelled jobs in the selected active Hoeflein component; it never starts another scheduler.",
@@ -190,9 +190,10 @@ in node/make_number/input/. Use reset when you want to keep the same jobs.
 """,
     "reset": """
 Reset preserves each SQLite job identity and `input.json`, but clears status/result
-state and job-local returned files so every existing job becomes queued again.
-Naming any node resets its entire Hoeflein component, because component members are
-one scheduling and lifecycle unit. It also clears each member's node output.
+state and job-local returned files so every existing job becomes queued again. A
+normal quotient-DAG node resets only itself. Naming a member of a nontrivial
+Hoeflein component resets every member because that component is one scheduling
+and lifecycle unit. The reset is batched across the selected scope.
 
 Examples:
   mwf reset double_number --dry-run

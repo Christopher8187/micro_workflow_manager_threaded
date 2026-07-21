@@ -5,10 +5,12 @@ import sys
 from .cleanup import (
     clean_node,
     is_all_nodes_request,
-    reset_node_for_run,
+    reset_nodes_for_run,
     resolve_node_targets,
     resolve_component_targets,
+    resolve_reset_targets,
     selected_component_labels,
+    selected_reset_scope_labels,
 )
 from .describe import describe_command
 from .files import find_root, safe_node_name
@@ -134,8 +136,12 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.command in {"clean", "reset", "wipe"}:
-            nodes = resolve_component_targets(workflow, args.nodes)
-            components = selected_component_labels(workflow, nodes)
+            if args.command == "reset":
+                nodes = resolve_reset_targets(workflow, args.nodes)
+                scopes = selected_reset_scope_labels(workflow, nodes)
+            else:
+                nodes = resolve_component_targets(workflow, args.nodes)
+                scopes = selected_component_labels(workflow, nodes)
 
             if args.dry_run:
                 action = {
@@ -144,15 +150,20 @@ def main(argv: list[str] | None = None) -> int:
                     "wipe": "delete jobs, output, and input",
                 }[args.command]
                 print(f"Dry run for mwf {args.command}:")
-                print("  selected Hoeflein components: " + ", ".join(components))
+                if args.command == "reset" and all(scope.startswith("{") for scope in scopes):
+                    label = "selected Hoeflein components"
+                elif args.command == "reset":
+                    label = "selected reset scopes"
+                else:
+                    label = "selected Hoeflein components"
+                print(f"  {label}: " + ", ".join(scopes))
                 for item in nodes:
                     print(f"  {item}: would {action}")
                 print("  no files or statuses were changed")
                 return 0
 
             if args.command == "reset":
-                for node in nodes:
-                    reset_node_for_run(root, workflow, node)
+                reset_nodes_for_run(root, workflow, nodes)
                 verb = "Reset"
             else:
                 remove_input = args.command == "wipe"
@@ -162,8 +173,13 @@ def main(argv: list[str] | None = None) -> int:
 
             if is_all_nodes_request(args.nodes):
                 print(f"{verb} all nodes: {', '.join(nodes)}")
+            elif args.command == "reset":
+                if all(scope.startswith("{") for scope in scopes):
+                    print(f"Reset Hoeflein component(s) {', '.join(scopes)}: {', '.join(nodes)}")
+                else:
+                    print(f"Reset {', '.join(scopes)}: {', '.join(nodes)}")
             else:
-                print(f"{verb} Hoeflein component(s) {', '.join(components)}: {', '.join(nodes)}")
+                print(f"{verb} Hoeflein component(s) {', '.join(scopes)}: {', '.join(nodes)}")
             return 0
 
         node = safe_node_name(args.node)

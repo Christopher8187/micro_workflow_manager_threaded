@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -36,6 +37,39 @@ def resolve_node_targets(workflow: MicroWorkflow, requested: list[str]) -> list[
             seen.add(node)
             result.append(node)
     return result
+
+
+def resolve_reset_targets(workflow: MicroWorkflow, requested: list[str]) -> list[str]:
+    """Resolve the lifecycle scope used by ``mwf reset``.
+
+    A singleton quotient-DAG vertex is reset by itself.  Naming any member of a
+    nontrivial strongly connected (Hoeflein) component resets every member of
+    that component.
+    """
+    selected_nodes = resolve_node_targets(workflow, requested)
+    selected: set[str] = set()
+    for node in selected_nodes:
+        component = workflow.component_id(node)
+        if len(component) == 1:
+            selected.add(node)
+        else:
+            selected.update(component)
+    return component_topological_nodes(workflow, selected)
+
+
+def selected_reset_scope_labels(workflow: MicroWorkflow, nodes: list[str]) -> list[str]:
+    seen: set[tuple[str, ...]] = set()
+    labels: list[str] = []
+    for node in nodes:
+        component = workflow.component_id(node)
+        if component in seen:
+            continue
+        seen.add(component)
+        if len(component) == 1:
+            labels.append(f"DAG node {component[0]}")
+        else:
+            labels.append("{" + ", ".join(component) + "}")
+    return labels
 
 
 def resolve_component_targets(workflow: MicroWorkflow, requested: list[str]) -> list[str]:
@@ -142,6 +176,75 @@ def _remove_job_artifacts_batch(
         list(executor.map(remove_one, job_ids))
 
 
+def _remove_reset_artifacts_batch(
+    root: Path,
+    workflow: MicroWorkflow,
+    nodes: list[str],
+) -> None:
+    """Clear node and job result artifacts with one bounded filesystem sweep."""
+    output_dirs: list[Path] = []
+    job_dirs: list[Path] = []
+    for node in nodes:
+        node_dir = safe_node_dir(root, node)
+        output_dir = node_dir / "output"
+        if output_dir.exists() and not output_dir.is_dir():
+            raise ValueError(f"Expected directory: {output_dir}")
+        output_dirs.append(output_dir)
+        jobs_dir = workflow.storage.jobs_dir(node)
+        try:
+            with os.scandir(jobs_dir) as entries:
+                job_dirs.extend(
+                    Path(entry.path)
+                    for entry in entries
+                    if entry.name.isdigit() and entry.is_dir(follow_symlinks=False)
+                )
+        except FileNotFoundError:
+            pass
+
+    def clear_output_dir(path: Path) -> None:
+        shutil.rmtree(path, ignore_errors=True)
+
+    def clear_job_dir(path: Path) -> None:
+        remove_path(path / "output.json")
+        remove_path(path / "files")
+
+    tasks = [(clear_output_dir, path) for path in output_dirs]
+    tasks.extend((clear_job_dir, path) for path in job_dirs)
+    if len(tasks) < 8:
+        for operation, path in tasks:
+            operation(path)
+    else:
+        # Reset is filesystem-bound on Windows.  One shared executor for the
+        # entire selected scope avoids repeatedly constructing pools per node.
+        workers = min(64 if os.name == "nt" else 32, len(tasks))
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="mwf-reset-cleanup",
+        ) as executor:
+            futures = [executor.submit(operation, path) for operation, path in tasks]
+            for future in futures:
+                future.result()
+
+    for node in nodes:
+        workflow.storage.init_node_folders(node)
+
+
+def reset_nodes_for_run(
+    root: Path,
+    workflow: MicroWorkflow,
+    nodes: list[str],
+    *,
+    mark_queued: bool = True,
+) -> int:
+    """Reset a complete DAG-node/component scope without per-job round trips."""
+    unique_nodes = list(dict.fromkeys(nodes))
+    _remove_reset_artifacts_batch(root, workflow, unique_nodes)
+    return workflow.storage.reset_nodes_for_run_batch(
+        unique_nodes,
+        mark_nodes_queued=mark_queued,
+    )
+
+
 def reset_component_jobs_for_fresh_run(
     root: Path,
     workflow: MicroWorkflow,
@@ -202,21 +305,30 @@ def prepare_fresh_components(root: Path, workflow: MicroWorkflow, components: li
 
 
 def reset_node_for_run(root: Path, workflow: MicroWorkflow, node: str, *, remove_parented_jobs: bool = False, mark_queued: bool = True):
-    """Legacy reset helper retained for cleanup commands and selected-job APIs."""
+    """Reset one node, retaining the legacy parent-deletion option."""
+    if not remove_parented_jobs:
+        return reset_nodes_for_run(
+            root,
+            workflow,
+            [node],
+            mark_queued=mark_queued,
+        )
+
     node_dir = safe_node_dir(root, node)
     remove_dir(node_dir / "output")
-    for job_id in list(workflow.storage.list_job_ids(node)):
-        metadata = workflow.storage.read_job_metadata(node, job_id)
-        if remove_parented_jobs and metadata.get("parent") is not None:
+    retained_job_ids: list[int] = []
+    for metadata in workflow.storage.list_job_parent_metadata([node]):
+        job_id = metadata["job_id"]
+        if metadata.get("parent") is not None:
             workflow.storage.delete_job(node, job_id, remove_payload=True)
-            continue
-        job_dir = workflow.storage.job_base_dir(node, job_id)
-        remove_path(job_dir / "output.json")
-        remove_path(job_dir / "files")
-        workflow.storage.set_job_status(node, job_id, QUEUED)
+        else:
+            retained_job_ids.append(job_id)
+    _remove_job_artifacts_batch(workflow, node, retained_job_ids)
+    workflow.storage.reset_jobs_for_run_batch(node, retained_job_ids)
     workflow.storage.init_node_folders(node)
     if mark_queued:
         workflow.storage.set_node_status(node, QUEUED)
+    return len(retained_job_ids)
 
 
 def reset_job_for_run(root: Path, workflow: MicroWorkflow, node: str, job_id: int, *, mark_queued: bool = True):

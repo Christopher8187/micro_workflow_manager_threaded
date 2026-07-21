@@ -588,3 +588,50 @@ def test_cleanup_component_dry_run_lists_expanded_component(tmp_path, monkeypatc
     assert "  C: would preserve jobs/input" in out
     assert "  A:" not in out
     assert "  D:" not in out
+
+
+def test_reset_dag_node_does_not_reset_other_quotient_nodes(tmp_path, monkeypatch, capsys):
+    make_cleanup_component_project(tmp_path, monkeypatch)
+    for node in ["A", "B", "C", "D"]:
+        seed_dirty_node(tmp_path, node)
+    capsys.readouterr()
+
+    assert cli.main(["reset", "A"]) == 0
+    out = capsys.readouterr().out
+    assert "Reset DAG node A: A" in out
+
+    storage = FileStorage(tmp_path)
+    assert storage.get_job_status("A", 1) == "queued"
+    reset_event = storage.read_job_events("A", 1)[-1]
+    assert reset_event["event"] == "queued"
+    assert reset_event["previous_status"] == "done"
+    assert reset_event["status"] == "queued"
+    assert not (tmp_path / "node" / "A" / "output" / "remove.txt").exists()
+    for node in ["B", "C", "D"]:
+        assert storage.get_job_status(node, 1) == "done"
+        assert (tmp_path / "node" / node / "output" / "remove.txt").exists()
+
+
+def test_reset_component_uses_one_scope_wide_batch(tmp_path, monkeypatch, capsys):
+    make_cleanup_component_project(tmp_path, monkeypatch)
+    for node in ["B", "C"]:
+        seed_dirty_node(tmp_path, node)
+    capsys.readouterr()
+
+    calls = []
+    original = FileStorage.reset_nodes_for_run_batch
+
+    def record_batch(self, node_names, *, mark_nodes_queued=True):
+        names = tuple(node_names)
+        calls.append(names)
+        return original(self, names, mark_nodes_queued=mark_nodes_queued)
+
+    def reject_per_job_status(*args, **kwargs):
+        raise AssertionError("mwf reset must not issue one status mutation per job")
+
+    monkeypatch.setattr(FileStorage, "reset_nodes_for_run_batch", record_batch)
+    monkeypatch.setattr(FileStorage, "set_job_status", reject_per_job_status)
+
+    assert cli.main(["reset", "B"]) == 0
+    capsys.readouterr()
+    assert calls == [("B", "C")]

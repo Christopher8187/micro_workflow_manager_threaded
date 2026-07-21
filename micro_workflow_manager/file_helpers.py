@@ -62,3 +62,8 @@ def _write_bytes_file(storage, target: Path, content: bytes, *, overwrite: bool)
 def _copy_file(storage, source: Path, target: Path, *, overwrite: bool) -> Path:
     _ensure_overwrite(target, overwrite=overwrite)
     return storage.atomic_copy_file(source, target)
+
+
+def _mkdir(path: Path, *, parents: bool, exist_ok: bool) -> Path:
+    path.mkdir(parents=parents, exist_ok=exist_ok)
+    return path

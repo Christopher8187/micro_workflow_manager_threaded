@@ -108,6 +108,67 @@ class JobCleanupStorageMixin:
                 self.jobs_dir(node_name)
         return len(targets)
 
+    def reset_nodes_for_run_batch(
+        self,
+        node_names: Iterable[str],
+        *,
+        mark_nodes_queued: bool = True,
+    ) -> int:
+        """Requeue every retained job for several nodes in one transaction.
+
+        ``mwf reset`` always resets the full retained job set of each selected
+        DAG node or Hoeflein component.  Handling that shape directly avoids a
+        metadata read and a transaction per job, which dominated reset time for
+        large components.
+        """
+        normalized = sorted({self.validate_node_name(name) for name in node_names})
+        if not normalized:
+            return 0
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+        reset_count = 0
+
+        with self.db_transaction() as connection:
+            for offset in range(0, len(normalized), 400):
+                chunk = normalized[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                reset_count += int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM jobs WHERE node_name IN ({placeholders})",
+                        chunk,
+                    ).fetchone()[0]
+                )
+                # Preserve one ordinary queued event per job, but create all of
+                # them inside SQLite rather than materializing thousands of
+                # Python dictionaries and issuing one mutation per job.
+                connection.execute(
+                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                    f"SELECT node_name, job_id, ?, 'queued', "
+                    "'{\"previous_status\":\"' || status || "
+                    "'\",\"status\":\"queued\"}' "
+                    f"FROM jobs WHERE node_name IN ({placeholders})",
+                    [event_time, *chunk],
+                )
+                connection.execute(
+                    "UPDATE jobs SET status=?, status_json='{}', runtime_json=NULL, "
+                    "active_execution_id=NULL, active_pid=NULL, active_thread_id=NULL, "
+                    "active_started_at=NULL, restart_requested_at=NULL, "
+                    "restart_requested_by_pid=NULL, restart_reason=NULL "
+                    f"WHERE node_name IN ({placeholders})",
+                    [QUEUED, *chunk],
+                )
+
+            if mark_nodes_queued:
+                connection.executemany(
+                    "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
+                    "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE nodes.status IS NOT excluded.status",
+                    [(node_name, QUEUED) for node_name in normalized],
+                )
+
+        if reset_count:
+            self.notify_queue_change()
+        return reset_count
+
     def reset_jobs_for_run_batch(self, node_name: str, job_ids: list[int]) -> int:
         """Requeue retained jobs with one state/event transaction."""
         node_name = self.validate_node_name(node_name)
