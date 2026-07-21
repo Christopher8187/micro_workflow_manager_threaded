@@ -349,23 +349,10 @@ class JobExecutionMixin:
             daemon=True,
         ).start()
 
-        while not watch.wake_event.wait(self.restart_poll_interval_seconds):
-            if ctx.execution_id is not None and not self.storage.job_execution_is_current(
-                ctx.current_node,
-                ctx.job_id,
-                ctx.execution_generation,
-                ctx.execution_id,
-            ):
-                supervisor.cancel_execution(
-                    ctx.current_node,
-                    ctx.job_id,
-                    ctx.execution_generation,
-                    ctx.execution_id,
-                    reason=(
-                        f"Job {ctx.current_node}/{ctx.job_id} generation "
-                        f"{ctx.execution_generation} was restarted"
-                    ),
-                )
+        # The centralized supervisor checks all active execution leases with one
+        # SQLite query. Per-controller polling caused thousands of identical
+        # reads whenever a large API wave was in flight.
+        watch.wake_event.wait()
 
         restart_error = supervisor.execution_cancel_error(watch)
         if restart_error is not None:

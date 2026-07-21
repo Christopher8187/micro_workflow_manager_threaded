@@ -32,14 +32,21 @@ class JobExecutionStorageMixin:
             return {}
         return data if isinstance(data, dict) else {}
 
-    def write_job_runtime(self, node_name: str, job_id: int, data: dict[str, Any]):
+    def write_job_runtime(
+        self,
+        node_name: str,
+        job_id: int,
+        data: dict[str, Any],
+        *,
+        wait: bool = True,
+    ):
         job_id = self.validate_job_id(job_id)
         serialized = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
         # One atomic conditional UPDATE replaces the old advisory-lock acquire,
         # runtime UPDATE, and advisory-lock release. The WHERE clause preserves
         # terminal runtime state when a late checkpoint from the same handler
         # races with timeout/restart completion.
-        with self.db_transaction() as connection:
+        def update(connection):
             connection.execute(
                 "UPDATE jobs SET runtime_json=? WHERE node_name=? AND job_id=? "
                 "AND NOT ("
@@ -57,6 +64,8 @@ class JobExecutionStorageMixin:
                     data.get("watch_id"),
                 ),
             )
+
+        return self.submit_db_mutation(update, wait=wait)
 
     def job_execution_lock_name(self, node_name: str, job_id: int) -> str:
         self.validate_node_name(node_name)
@@ -87,48 +96,64 @@ class JobExecutionStorageMixin:
         return int(self.read_job_control(node_name, job_id)["generation"])
 
     def claim_job_execution(self, node_name: str, job_id: int, *, started_at: str) -> tuple[int, str]:
-        if not self.job_exists(node_name, job_id):
-            raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
-        with self.filesystem_interprocess_lock(
-            "execution-fences",
-            self.job_execution_lock_name(node_name, job_id),
-        ):
-            control = self.read_job_control(node_name, job_id)
-            generation = int(control["generation"])
-            execution_id = uuid4().hex
+        job_id = self.validate_job_id(job_id)
+        execution_id = uuid4().hex
+        pid = os.getpid()
+        thread_id = get_ident()
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+
+        def claim(connection):
+            row = connection.execute(
+                "SELECT generation, status FROM jobs WHERE node_name=? AND job_id=?",
+                (node_name, job_id),
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
+            generation = int(row["generation"])
+            previous_status = str(row["status"])
             status_extra = {
                 "started_at": started_at,
                 "generation": generation,
                 "execution_id": execution_id,
-                "pid": os.getpid(),
+                "pid": pid,
             }
-            with self.db_transaction() as connection:
-                connection.execute(
-                    "UPDATE jobs SET active_execution_id=?, active_pid=?, active_thread_id=?, "
-                    "active_started_at=?, restart_requested_at=NULL, restart_requested_by_pid=NULL, "
-                    "restart_reason=NULL, runtime_json=NULL, status=?, status_json=? "
-                    "WHERE node_name=? AND job_id=? AND generation=?",
-                    (
-                        execution_id,
-                        os.getpid(),
-                        get_ident(),
-                        started_at,
-                        RUNNING,
-                        json.dumps(status_extra, ensure_ascii=False, separators=(",", ":")),
-                        node_name,
-                        job_id,
-                        generation,
-                    ),
-                )
-            self.append_job_event(
-                node_name,
-                job_id,
-                "started",
-                previous_status=QUEUED,
-                status=RUNNING,
-                **status_extra,
+            connection.execute(
+                "UPDATE jobs SET active_execution_id=?, active_pid=?, active_thread_id=?, "
+                "active_started_at=?, restart_requested_at=NULL, restart_requested_by_pid=NULL, "
+                "restart_reason=NULL, runtime_json=NULL, status=?, status_json=? "
+                "WHERE node_name=? AND job_id=? AND generation=?",
+                (
+                    execution_id,
+                    pid,
+                    thread_id,
+                    started_at,
+                    RUNNING,
+                    json.dumps(status_extra, ensure_ascii=False, separators=(",", ":")),
+                    node_name,
+                    job_id,
+                    generation,
+                ),
+            )
+            event_data = json.dumps(
+                {
+                    "previous_status": previous_status,
+                    "status": RUNNING,
+                    **status_extra,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                "VALUES(?, ?, ?, 'started', ?)",
+                (node_name, job_id, event_time, event_data),
             )
             return generation, execution_id
+
+        # Claiming is itself an atomic database transition. The filesystem lock
+        # remains reserved for side effects/final publication, where a restart
+        # must fence an actual file mutation.
+        return self.submit_db_mutation(claim)
 
     def job_execution_is_current(
         self,
@@ -146,6 +171,20 @@ class JobExecutionStorageMixin:
         if execution_id is not None and row["active_execution_id"] != execution_id:
             return False
         return True
+
+    def active_job_executions(self) -> dict[tuple[str, int], tuple[int, str]]:
+        """Return all active execution leases with one indexed SQLite scan."""
+        rows = self.db_connection().execute(
+            "SELECT node_name, job_id, generation, active_execution_id FROM jobs "
+            "WHERE active_execution_id IS NOT NULL"
+        ).fetchall()
+        return {
+            (str(row["node_name"]), int(row["job_id"])): (
+                int(row["generation"]),
+                str(row["active_execution_id"]),
+            )
+            for row in rows
+        }
 
     @contextmanager
     def guard_job_execution(

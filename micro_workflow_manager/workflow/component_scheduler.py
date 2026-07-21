@@ -1,4 +1,5 @@
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import networkx as nx
 
@@ -7,7 +8,9 @@ from ..models import QUEUED, RUNNING, WAITING
 
 
 class ComponentSchedulerMixin:
-    component_queue_poll_seconds = 0.10
+    # Durable queue notifications wake the scheduler immediately. This timeout
+    # is only a defensive fallback for changes made by another process.
+    component_queue_poll_seconds = 1.0
 
     def execution_components(self, nodes: list[str] | None = None) -> list[tuple[str, ...]]:
         """Return Hoeflein execution units in quotient-DAG topological order."""
@@ -25,11 +28,8 @@ class ComponentSchedulerMixin:
         return any(self.storage.has_queued_jobs(node_name) for node_name in component)
 
     def _component_queued_nodes(self, component_nodes: list[str]) -> list[str]:
-        return [
-            node_name
-            for node_name in component_nodes
-            if self.storage.has_queued_jobs(node_name)
-        ]
+        queued = self.storage.queued_nodes(component_nodes)
+        return [node_name for node_name in component_nodes if node_name in queued]
 
     def _waiting_startable_nodes(
         self,
@@ -37,17 +37,24 @@ class ComponentSchedulerMixin:
         *,
         active_nodes: set[str] | None = None,
         forced_ready: set[str] | None = None,
+        queued_nodes: set[str] | None = None,
     ) -> list[str]:
         active = active_nodes or set()
         forced = forced_ready or set()
+        queued = queued_nodes
+        if queued is None:
+            queued = self.storage.queued_nodes(component_nodes)
         result: list[str] = []
+        waiting_statuses: dict[str, str] = {}
         for node_name in component_nodes:
-            if node_name in active or not self.storage.has_queued_jobs(node_name):
+            if node_name in active or node_name not in queued:
                 continue
-            if node_name in forced or self.node_waiting_ready(node_name):
+            blockers = self.waiting_dependencies(node_name).intersection(queued)
+            if node_name in forced or not blockers:
                 result.append(node_name)
             else:
-                self.storage.set_node_status(node_name, WAITING)
+                waiting_statuses[node_name] = WAITING
+        self.storage.set_node_statuses(waiting_statuses)
         return result
 
     def _waiting_cycle_breaker(
@@ -100,10 +107,11 @@ class ComponentSchedulerMixin:
                 self.refresh_component_status(component_set, allow_complete=True)
                 return ran
 
-            self.refresh_component_status(component_set, allow_complete=False)
-
             if self.runner == "direct":
-                startable = self._waiting_startable_nodes(component_nodes)
+                startable = self._waiting_startable_nodes(
+                    component_nodes,
+                    queued_nodes=set(queued_nodes),
+                )
                 if not startable:
                     startable = [self._waiting_cycle_breaker(component_nodes, queued_nodes)]
                 try:
@@ -135,22 +143,48 @@ class ComponentSchedulerMixin:
             active_nodes: set[str] = set()
             forced_ready: set[str] = set()
             first_error = None
+            wake_event = Event()
+            unsubscribe = self.storage.subscribe_queue_changes(wake_event.set)
             try:
                 while True:
+                    done = [future for future in futures if future.done()]
+                    for future in done:
+                        node_name = futures.pop(future)
+                        active_nodes.discard(node_name)
+                        try:
+                            future.result()
+                        except Exception as error:
+                            first_error = error
+                            self.mark_component_failed(component_set)
+                            break
+                        ran.append(node_name)
+                    if first_error is not None:
+                        break
+
+                    queued_set = self.storage.queued_nodes(component_nodes)
                     startable = self._waiting_startable_nodes(
                         component_nodes,
                         active_nodes=active_nodes,
                         forced_ready=forced_ready,
+                        queued_nodes=queued_set,
                     )
+                    if startable:
+                        self.storage.set_node_statuses({
+                            node_name: RUNNING for node_name in startable
+                        })
                     for node_name in startable:
                         future = executor.submit(run_node_worker, node_name)
                         futures[future] = node_name
                         active_nodes.add(node_name)
                         forced_ready.discard(node_name)
-                        self.storage.set_node_status(node_name, RUNNING)
+                        future.add_done_callback(lambda _future: wake_event.set())
 
                     if not futures:
-                        queued_nodes = self._component_queued_nodes(component_nodes)
+                        queued_nodes = [
+                            node_name
+                            for node_name in component_nodes
+                            if node_name in queued_set
+                        ]
                         if not queued_nodes:
                             self.refresh_component_status(
                                 component_set,
@@ -164,26 +198,17 @@ class ComponentSchedulerMixin:
                         )
                         continue
 
-                    done, _ = wait(
-                        futures,
-                        timeout=self.component_queue_poll_seconds,
-                        return_when=FIRST_COMPLETED,
-                    )
-                    if not done:
+                    wake_event.clear()
+                    # Close the clear/wait race: a completion or new queue row
+                    # observed after clear must loop without sleeping.
+                    if any(future.done() for future in futures):
                         continue
-                    for future in done:
-                        node_name = futures.pop(future)
-                        active_nodes.discard(node_name)
-                        try:
-                            future.result()
-                        except Exception as error:
-                            first_error = error
-                            self.mark_component_failed(component_set)
-                            break
-                        ran.append(node_name)
-                    if first_error is not None:
-                        break
+                    latest_queued = self.storage.queued_nodes(component_nodes)
+                    if latest_queued - active_nodes != queued_set - active_nodes:
+                        continue
+                    wake_event.wait(self.component_queue_poll_seconds)
             finally:
+                unsubscribe()
                 if first_error is not None:
                     for future in futures:
                         future.cancel()

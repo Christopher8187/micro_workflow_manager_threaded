@@ -11,7 +11,9 @@ class JobEventStorageMixin:
     def append_job_event(self, node_name: str, job_id: int, event: str, **data: Any):
         self.validate_job_id(job_id)
         event_time = datetime.now().isoformat(timespec="milliseconds")
-        with self.db_transaction() as connection:
+        data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+        def append(connection):
             connection.execute(
                 "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
                 "VALUES(?, ?, ?, ?, ?)",
@@ -20,9 +22,11 @@ class JobEventStorageMixin:
                     job_id,
                     event_time,
                     str(event),
-                    json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                    data_json,
                 ),
             )
+
+        self.submit_db_mutation(append)
 
     def read_job_events(self, node_name: str, job_id: int) -> list[dict[str, Any]]:
         rows = self.db_connection().execute(

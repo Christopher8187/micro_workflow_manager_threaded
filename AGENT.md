@@ -314,3 +314,19 @@ component pumping but leave hundreds of later jobs queued.
   pump cannot deadlock halfway through its queue.
 - Test restored mutual-wait states where both sides already have queued work and
   verify deterministic bootstrap plus eventual quiescence.
+
+
+## Queue and transport scaling checks (0.3.17)
+
+- Test live component handoff with the polling fallback deliberately set high;
+  the consumer must start from the queue-change notification while its producer
+  is still running.
+- Test progressive, not only simultaneous, future completions. The number of
+  completion probes must remain linear in the number of futures.
+- Keep job state and event history atomic inside grouped mutations. A failure in
+  one savepoint must not roll back unrelated valid mutations in the same batch.
+- Active restart polling must remain one lease snapshot per supervisor interval,
+  never one SQLite query per active controller or fiber.
+- Test HTTP sharding with an in-flight barrier. No client may exceed
+  `streams_per_connection`, enough clients must be created to carry the wave,
+  and node `max_threads` must remain the only concurrency ceiling.

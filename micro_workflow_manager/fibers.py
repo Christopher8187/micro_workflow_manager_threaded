@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import heapq
+import queue
 import threading
 import time as _time
-from concurrent.futures import FIRST_COMPLETED, Future, TimeoutError as FutureTimeoutError, wait
+from collections import deque
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -195,9 +197,17 @@ class FiberRuntime:
         self._future_waiters: dict[Future, list[tuple[_FiberState, int, float | None, Callable[[], None] | None]]] = {}
         self._sleepers: list[tuple[float, int, _FiberState, int, Callable[[], None] | None]] = []
         self._serial = 0
-        self._ready: list[tuple[_FiberState, _Resume]] = []
+        self._ready: deque[tuple[_FiberState, _Resume]] = deque()
+        self._completed_futures: queue.SimpleQueue[Future] = queue.SimpleQueue()
+        self._wake_event = threading.Event()
+        self._active_count = 0
         self._results: dict[int, Any] = {}
         self._first_error: BaseException | None = None
+
+    def _future_completed(self, future: Future) -> None:
+        """Wake the owning pump without rescanning every outstanding future."""
+        self._completed_futures.put(future)
+        self._wake_event.set()
 
     def _resume_state(self, state: _FiberState, resume: _Resume | None = None) -> None:
         if state.done:
@@ -206,18 +216,23 @@ class FiberRuntime:
             yielded = state.fiber.switch(resume or _Resume())
         except BaseException as error:
             state.done = True
+            self._active_count -= 1
             self._first_error = self._first_error or error
             return
 
         if state.fiber.dead:
             state.done = True
+            self._active_count -= 1
             self._results[state.index] = yielded
             return
         state.wait_token += 1
         wait_token = state.wait_token
         if isinstance(yielded, _FutureWait):
             state.pending_future = yielded.future
-            self._future_waiters.setdefault(yielded.future, []).append(
+            waiters = self._future_waiters.setdefault(yielded.future, [])
+            if not waiters:
+                yielded.future.add_done_callback(self._future_completed)
+            waiters.append(
                 (state, wait_token, yielded.deadline, yielded.cancellation_check)
             )
             return
@@ -226,6 +241,7 @@ class FiberRuntime:
             heapq.heappush(self._sleepers, (yielded.deadline, self._serial, state, wait_token, yielded.cancellation_check))
             return
         state.done = True
+        self._active_count -= 1
         self._first_error = self._first_error or RuntimeError(
             f"API fiber yielded unsupported value {type(yielded).__name__}"
         )
@@ -243,6 +259,7 @@ class FiberRuntime:
             return context.run(invoke)
 
         child = greenlet(entry, parent=self._parent)
+        self._active_count += 1
         return _FiberState(index=index, item=item, fiber=child)
 
     def _check_waiter(self, state: _FiberState, wait_token: int, check: Callable[[], None] | None) -> bool:
@@ -261,10 +278,14 @@ class FiberRuntime:
         return True
 
     def _process_futures(self) -> None:
-        for future in list(self._future_waiters):
-            if not future.done():
+        while True:
+            try:
+                future = self._completed_futures.get_nowait()
+            except queue.Empty:
+                break
+            waiters = self._future_waiters.pop(future, None)
+            if not waiters:
                 continue
-            waiters = self._future_waiters.pop(future)
             try:
                 value = _ORIGINAL_FUTURE_RESULT(future, timeout=0)
                 resume = _Resume(value=value)
@@ -275,6 +296,11 @@ class FiberRuntime:
                     continue
                 state.pending_future = None
                 self._ready.append((state, resume))
+        self._wake_event.clear()
+        # A callback can race with clear(). Preserve a wakeup if it completed
+        # in that narrow window.
+        if not self._completed_futures.empty():
+            self._wake_event.set()
 
     def _process_deadlines(self, now_value: float) -> None:
         while self._sleepers and self._sleepers[0][0] <= now_value:
@@ -384,7 +410,7 @@ class FiberRuntime:
                     future.cancel()
                 raise self._first_error
 
-            active = sum(1 for state in self._states.values() if not state.done)
+            active = self._active_count
             limit = limit_provider()
             if type(limit) is not int or limit < 1:
                 raise ValueError("runtime API concurrency must be an integer >= 1")
@@ -400,7 +426,7 @@ class FiberRuntime:
                     break
 
             while self._ready:
-                state, resume = self._ready.pop(0)
+                state, resume = self._ready.popleft()
                 self._resume_state(state, resume)
                 if self._first_error is not None:
                     break
@@ -409,17 +435,30 @@ class FiberRuntime:
             self._process_futures()
             self._process_deadlines(_time.monotonic())
             while self._ready:
-                state, resume = self._ready.pop(0)
+                state, resume = self._ready.popleft()
                 self._resume_state(state, resume)
                 if self._first_error is not None:
                     break
 
-            active = sum(1 for state in self._states.values() if not state.done)
+            active = self._active_count
             if self._first_error is not None:
                 continue
             if active == 0:
                 if refreshable and added == 0:
-                    break
+                    # Completion callbacks can drain the last active fibers
+                    # after this iteration's admission phase. Probe the live
+                    # source once more before declaring the pump quiescent.
+                    refill = pull_items(min(limit, self.start_burst))
+                    if not refill:
+                        break
+                    for item in refill:
+                        state = self._new_state(next_index, item, run_one)
+                        self._states[next_index] = state
+                        next_index += 1
+                        self._resume_state(state)
+                        if self._first_error is not None:
+                            break
+                    continue
                 if not refreshable and source_exhausted:
                     break
 
@@ -430,11 +469,7 @@ class FiberRuntime:
             if added > 0 and active < limit:
                 continue
 
-            futures = [future for future in self._future_waiters if not future.done()]
             timeout = self._next_wait_timeout()
-            if futures:
-                wait(futures, timeout=timeout, return_when=FIRST_COMPLETED)
-            else:
-                _ORIGINAL_SLEEP(timeout)
+            self._wake_event.wait(timeout)
 
         return [self._results[index] for index in sorted(self._results)]

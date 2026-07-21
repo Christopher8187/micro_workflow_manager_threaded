@@ -337,8 +337,24 @@ class NodeFileStorageMixin:
             connection.execute(
                 "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
                 "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
-                "updated_at=CURRENT_TIMESTAMP",
+                "updated_at=CURRENT_TIMESTAMP WHERE nodes.status IS NOT excluded.status",
                 (node_name, status),
+            )
+
+    def set_node_statuses(self, statuses: dict[str, str]) -> None:
+        """Persist a component status snapshot with one SQLite commit."""
+        if not statuses:
+            return
+        rows = [
+            (self.validate_node_name(node_name), self.validate_node_status(status))
+            for node_name, status in statuses.items()
+        ]
+        with self.db_transaction() as connection:
+            connection.executemany(
+                "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
+                "updated_at=CURRENT_TIMESTAMP WHERE nodes.status IS NOT excluded.status",
+                rows,
             )
 
     def get_node_status(self, node_name: str) -> str | None:

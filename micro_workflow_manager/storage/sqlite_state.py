@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
 import socket
 import sqlite3
 import threading
 import time
+from concurrent.futures import Future, InvalidStateError
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, TypeVar
 from uuid import uuid4
 
 from micro_workflow_manager.models import (
@@ -24,6 +26,7 @@ from micro_workflow_manager.processes import process_is_alive
 
 
 DATABASE_SCHEMA_VERSION = 2
+T = TypeVar("T")
 
 
 class SQLiteStateMixin:
@@ -45,9 +48,14 @@ class SQLiteStateMixin:
     _connection_registry_guard = threading.Lock()
     _advisory_owner_registry: set[str] = set()
     _advisory_owner_registry_guard = threading.Lock()
+    _queue_listeners: dict[Path, set[Callable[[], None]]] = {}
+    _queue_listeners_guard = threading.Lock()
 
     def _init_sqlite_state(self) -> None:
         self._advisory_local = threading.local()
+        self._mutation_queue: queue.Queue[tuple[Callable[[sqlite3.Connection], Any], Future]] = queue.Queue()
+        self._mutation_thread: threading.Thread | None = None
+        self._mutation_thread_guard = threading.Lock()
         path = self.state_database_path().resolve()
         with self._db_init_locks_guard:
             lock = self._db_init_locks.setdefault(path, threading.Lock())
@@ -56,6 +64,112 @@ class SQLiteStateMixin:
             if initialized_key not in self._initialized_databases or not path.is_file():
                 self.initialize_state_database()
                 self._initialized_databases.add(initialized_key)
+
+    def _mutation_worker(self) -> None:
+        """Coalesce concurrent high-churn state changes into short commits."""
+        try:
+            while True:
+                try:
+                    first = self._mutation_queue.get(timeout=0.25)
+                except queue.Empty:
+                    with self._mutation_thread_guard:
+                        if self._mutation_queue.empty():
+                            self._mutation_thread = None
+                            return
+                    continue
+
+                batch = [first]
+                deadline = time.monotonic() + 0.001
+                while len(batch) < 512:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        batch.append(self._mutation_queue.get(timeout=remaining))
+                    except queue.Empty:
+                        break
+
+                outcomes: list[tuple[bool, Any]] = []
+                try:
+                    with self.db_transaction() as connection:
+                        for index, (operation, _future) in enumerate(batch):
+                            savepoint = f"mwf_batch_{index}"
+                            connection.execute(f"SAVEPOINT {savepoint}")
+                            try:
+                                value = operation(connection)
+                            except BaseException as error:
+                                connection.execute(f"ROLLBACK TO {savepoint}")
+                                connection.execute(f"RELEASE {savepoint}")
+                                outcomes.append((False, error))
+                            else:
+                                connection.execute(f"RELEASE {savepoint}")
+                                outcomes.append((True, value))
+                except BaseException as error:
+                    outcomes = [(False, error) for _ in batch]
+                finally:
+                    # Do not retain an otherwise idle worker connection. This
+                    # keeps repeated runs from accumulating connection owners.
+                    self.close_thread_connection()
+
+                for (_operation, future), (succeeded, value) in zip(batch, outcomes):
+                    try:
+                        if succeeded:
+                            future.set_result(value)
+                        else:
+                            future.set_exception(value)
+                    except InvalidStateError:
+                        # The mutation is already committed. A cancelled API
+                        # fiber may no longer be waiting for its result, but it
+                        # must not terminate the shared writer lane.
+                        pass
+        finally:
+            self.close_thread_connection()
+            with self._mutation_thread_guard:
+                if self._mutation_thread is threading.current_thread():
+                    self._mutation_thread = None
+
+    def submit_db_mutation(
+        self,
+        operation: Callable[[sqlite3.Connection], T],
+        *,
+        wait: bool = True,
+    ) -> T | Future[T]:
+        """Run one mutation through the project-local group-commit lane."""
+        future: Future[T] = Future()
+        with self._mutation_thread_guard:
+            self._mutation_queue.put((operation, future))
+            if self._mutation_thread is None or not self._mutation_thread.is_alive():
+                self._mutation_thread = threading.Thread(
+                    target=self._mutation_worker,
+                    name="mwf-sqlite-group-commit",
+                    daemon=True,
+                )
+                self._mutation_thread.start()
+        return future.result() if wait else future
+
+    def subscribe_queue_changes(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Subscribe an in-process scheduler wakeup to durable queue changes."""
+        path = self.state_database_path().resolve()
+        with self._queue_listeners_guard:
+            self._queue_listeners.setdefault(path, set()).add(callback)
+
+        def unsubscribe() -> None:
+            with self._queue_listeners_guard:
+                listeners = self._queue_listeners.get(path)
+                if listeners is None:
+                    return
+                listeners.discard(callback)
+                if not listeners:
+                    self._queue_listeners.pop(path, None)
+
+        return unsubscribe
+
+    def notify_queue_change(self) -> None:
+        path = self.state_database_path().resolve()
+        with self._queue_listeners_guard:
+            listeners = tuple(self._queue_listeners.get(path, ()))
+        for callback in listeners:
+            callback()
 
     def state_database_path(self) -> Path:
         path = state_database_file(self.project_dir)

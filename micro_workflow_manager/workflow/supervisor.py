@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..errors import JobTimeoutError
+from ..fibers import in_fiber_runtime
 from ..monitor import now_iso
 
 
@@ -119,6 +120,8 @@ class SchedulerSupervisor:
         self._deadlines: list[tuple[float, int, str, str, int]] = []
         self._serial = 0
         self._run_heartbeat: dict[str, Any] | None = None
+        self._restart_poll_interval = 0.05
+        self._next_restart_poll = monotonic()
 
     # ------------------------------------------------------------------
     # Thread lifecycle and deadline scheduling
@@ -204,6 +207,7 @@ class SchedulerSupervisor:
         while True:
             expired: list[tuple[AttemptWatch, str]] = []
             heartbeat: dict[str, Any] | None = None
+            restart_watches: list[AttemptWatch] = []
 
             with self._condition:
                 now_value = monotonic()
@@ -253,11 +257,27 @@ class SchedulerSupervisor:
                     heartbeat = dict(run)
                     run["next_at"] = now_value + run["interval"]
 
-                if not expired and heartbeat is None:
+                restartable = [
+                    watch
+                    for watch in self._watches.values()
+                    if watch.execution_id is not None
+                    and watch.state in {"active", "handler_done"}
+                ]
+                if restartable and self._next_restart_poll <= now_value:
+                    restart_watches = restartable
+                    self._next_restart_poll = now_value + self._restart_poll_interval
+
+                if not expired and heartbeat is None and not restart_watches:
                     deadline = self._next_valid_deadline_locked()
                     if self._run_heartbeat is not None:
                         heartbeat_deadline = self._run_heartbeat["next_at"]
                         deadline = heartbeat_deadline if deadline is None else min(deadline, heartbeat_deadline)
+                    if restartable:
+                        deadline = (
+                            self._next_restart_poll
+                            if deadline is None
+                            else min(deadline, self._next_restart_poll)
+                        )
 
                     if deadline is None:
                         # No active deadline and no run heartbeat. End the idle
@@ -268,6 +288,28 @@ class SchedulerSupervisor:
 
                     self._condition.wait(max(0.0, deadline - monotonic()))
                     continue
+
+            if restart_watches:
+                try:
+                    current = self.storage.active_job_executions()
+                    for watch in restart_watches:
+                        lease = current.get((watch.node_name, watch.job_id))
+                        if lease == (watch.generation, watch.execution_id):
+                            continue
+                        self.cancel_execution(
+                            watch.node_name,
+                            watch.job_id,
+                            watch.generation,
+                            watch.execution_id,
+                            reason=(
+                                f"Job {watch.node_name}/{watch.job_id} generation "
+                                f"{watch.generation} was restarted"
+                            ),
+                        )
+                except Exception:
+                    # A transient read failure is retried on the next centralized
+                    # poll; individual job controllers never stampede SQLite.
+                    pass
 
             for watch, kind in expired:
                 try:
@@ -371,13 +413,25 @@ class SchedulerSupervisor:
 
         with self._condition:
             self._watches[watch.key] = watch
+        if watch.supervised:
+            self._persist_runtime(watch, state="running")
+            # Persistence is framework setup, not user-handler inactivity. At a
+            # large simultaneous start it may wait for a group commit, so begin
+            # the actual watchdog window only after that setup is durable.
+            watch.started_monotonic = monotonic()
+            if watch.total_timeout is not None:
+                watch.total_deadline = watch.started_monotonic + watch.total_timeout
+            if watch.checkpoint_timeout is not None:
+                watch.checkpoint_deadline = (
+                    watch.started_monotonic + watch.checkpoint_timeout
+                )
+        with self._condition:
             if watch.supervised:
                 self._schedule_watch_locked(watch)
                 self._compact_deadlines_locked()
+            if watch.supervised or watch.force_abandonable:
                 self._ensure_thread_locked()
                 self._condition.notify_all()
-        if watch.supervised:
-            self._persist_runtime(watch, state="running")
         return watch
 
     def report_checkpoint(
@@ -436,7 +490,14 @@ class SchedulerSupervisor:
                 self._ensure_thread_locked()
                 self._condition.notify_all()
 
-        self._persist_runtime(watch, state="running")
+        # A cooperative API fiber must not charge group-commit latency against
+        # a very short checkpoint deadline. Direct/thread/process callers keep
+        # synchronous checkpoint visibility for inspect and recovery.
+        self._persist_runtime(
+            watch,
+            state="running",
+            wait=not in_fiber_runtime(),
+        )
 
     def begin_external_wait(
         self,
@@ -641,9 +702,15 @@ class SchedulerSupervisor:
         *,
         state: str,
         error: str | None = None,
+        wait: bool = True,
     ):
         payload = self._runtime_payload(watch, state=state, error=error)
-        self.storage.write_job_runtime(watch.node_name, watch.job_id, payload)
+        self.storage.write_job_runtime(
+            watch.node_name,
+            watch.job_id,
+            payload,
+            wait=wait,
+        )
         watch.runtime_written = True
 
     def _persist_timeout(self, watch: AttemptWatch, kind: str):

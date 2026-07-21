@@ -184,8 +184,7 @@ class ComponentStateMixin:
         return self.storage.get_node_status(node_name) in NODE_COMPLETE_STATUSES
 
     def mark_component_failed(self, component: set[str]) -> None:
-        for node_name in component:
-            self.storage.set_node_status(node_name, FAILED)
+        self.storage.set_node_statuses({node_name: FAILED for node_name in component})
 
     def refresh_component_status(self, component: set[str], allow_complete: bool = False):
         """Refresh one Hoeflein component as an indivisible lifecycle unit."""
@@ -211,6 +210,7 @@ class ComponentStateMixin:
         if has_running:
             # Actual running jobs make the scheduler-owned component active, but
             # an idle waiting node with queued work keeps its own WAITING state.
+            statuses = {}
             for node_name in component:
                 counts = counts_by_node[node_name]
                 if counts.get(RUNNING, 0):
@@ -219,7 +219,8 @@ class ComponentStateMixin:
                     status = WAITING
                 else:
                     status = RUNNING
-                self.storage.set_node_status(node_name, status)
+                statuses[node_name] = status
+            self.storage.set_node_statuses(statuses)
             return
 
         has_queued = any(
@@ -227,9 +228,10 @@ class ComponentStateMixin:
             for counts in counts_by_node.values()
         )
         if has_queued:
-            for node_name in component:
-                status = WAITING if self.node_is_waiting(node_name) else QUEUED
-                self.storage.set_node_status(node_name, status)
+            self.storage.set_node_statuses({
+                node_name: WAITING if self.node_is_waiting(node_name) else QUEUED
+                for node_name in component
+            })
             return
 
         if total_jobs == 0:
@@ -239,8 +241,7 @@ class ComponentStateMixin:
             }
             if terminal and terminal.issubset({DONE, FAILED, CANCELLED, SKIPPED}):
                 return
-            for node_name in component:
-                self.storage.set_node_status(node_name, QUEUED)
+            self.storage.set_node_statuses({node_name: QUEUED for node_name in component})
             return
 
         successful_terminal = {DONE, SKIPPED}
@@ -252,12 +253,10 @@ class ComponentStateMixin:
 
         if all_terminal_success:
             status = DONE if allow_complete and self.component_ready(component) else QUEUED
-            for node_name in component:
-                self.storage.set_node_status(node_name, status)
+            self.storage.set_node_statuses({node_name: status for node_name in component})
             return
 
-        for node_name in component:
-            self.storage.set_node_status(node_name, QUEUED)
+        self.storage.set_node_statuses({node_name: QUEUED for node_name in component})
 
     def node_ready(self, node_name: str) -> bool:
         return self.component_ready(self.component_for(node_name))

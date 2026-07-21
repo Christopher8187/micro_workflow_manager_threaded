@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, TypeVar
 
 import httpx
@@ -58,22 +59,43 @@ def timeout_budget_seconds(timeout: TimeoutValue) -> float:
     return max(finite or [30.0])
 
 
+@dataclass(slots=True)
+class _ClientShard:
+    client: httpx.AsyncClient
+    in_flight: int = 0
+    peak_in_flight: int = 0
+
+
 class _AsyncHTTPRuntime:
-    """One process-wide asyncio loop and pooled ``httpx.AsyncClient``."""
+    """One process-wide asyncio loop and an elastic pool of HTTP clients."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._client: httpx.AsyncClient | None = None
+        self._clients: list[_ClientShard] = []
         self._client_kwargs: dict[str, Any] = {}
+        self._http2 = False
+        self._streams_per_connection = 100
 
-    def configure(self, **client_kwargs: Any) -> None:
+    def configure(
+        self,
+        *,
+        http2: bool = False,
+        streams_per_connection: int = 100,
+        **client_kwargs: Any,
+    ) -> None:
+        if type(http2) is not bool:
+            raise ValueError("http2 must be a bool")
+        if type(streams_per_connection) is not int or streams_per_connection < 1:
+            raise ValueError("streams_per_connection must be an integer >= 1")
         with self._lock:
-            if self._client is not None:
+            if self._clients:
                 raise RuntimeError("shared HTTP client is already active")
             self._client_kwargs = dict(client_kwargs)
+            self._http2 = http2
+            self._streams_per_connection = streams_per_connection
 
     def _thread_main(self) -> None:
         loop = asyncio.new_event_loop()
@@ -90,7 +112,7 @@ class _AsyncHTTPRuntime:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
             self._loop = None
-            self._client = None
+            self._clients = []
 
     def ensure_started(self) -> asyncio.AbstractEventLoop:
         with self._lock:
@@ -107,28 +129,90 @@ class _AsyncHTTPRuntime:
             raise RuntimeError("MWF HTTP runtime failed to start")
         return self._loop
 
-    async def client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            kwargs = {
-                "limits": httpx.Limits(
-                    max_connections=None,
-                    max_keepalive_connections=512,
-                    keepalive_expiry=30.0,
-                ),
-                "follow_redirects": True,
-            }
-            kwargs.update(self._client_kwargs)
-            self._client = httpx.AsyncClient(**kwargs)
-        return self._client
+    def _new_client_shard(self) -> _ClientShard:
+        kwargs = dict(self._client_kwargs)
+        kwargs.setdefault("follow_redirects", True)
+        kwargs.setdefault("http2", self._http2)
+        if "limits" not in kwargs:
+            if self._http2:
+                # One AsyncClient owns one HTTP/2 connection. The runtime opens
+                # another shard before assigning more than the configured stream
+                # count to this connection.
+                kwargs["limits"] = httpx.Limits(
+                    max_connections=1,
+                    max_keepalive_connections=1,
+                    keepalive_expiry=60.0,
+                )
+            else:
+                kwargs["limits"] = httpx.Limits(
+                    max_connections=self._streams_per_connection,
+                    max_keepalive_connections=self._streams_per_connection,
+                    keepalive_expiry=60.0,
+                )
+        shard = _ClientShard(httpx.AsyncClient(**kwargs))
+        self._clients.append(shard)
+        return shard
+
+    async def acquire_client(self) -> _ClientShard:
+        # All calls run on the one transport event loop, so allocation and
+        # counters do not need a cross-thread lock.
+        shard = next(
+            (
+                candidate
+                for candidate in self._clients
+                if candidate.in_flight < self._streams_per_connection
+            ),
+            None,
+        )
+        if shard is None:
+            shard = self._new_client_shard()
+        shard.in_flight += 1
+        shard.peak_in_flight = max(shard.peak_in_flight, shard.in_flight)
+        return shard
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        shard = await self.acquire_client()
+        try:
+            return await shard.client.request(method, url, **kwargs)
+        finally:
+            shard.in_flight -= 1
 
     def submit(self, coroutine: Coroutine[Any, Any, T]) -> Future[T]:
         return asyncio.run_coroutine_threadsafe(coroutine, self.ensure_started())
 
-    async def _close_client(self) -> None:
-        client = self._client
-        self._client = None
-        if client is not None:
-            await client.aclose()
+    async def _close_clients(self) -> None:
+        clients = [shard.client for shard in self._clients]
+        self._clients = []
+        if clients:
+            await asyncio.gather(
+                *(client.aclose() for client in clients),
+                return_exceptions=True,
+            )
+
+    async def _snapshot(self) -> dict[str, Any]:
+        return {
+            "http2": self._http2,
+            "streams_per_connection": self._streams_per_connection,
+            "client_count": len(self._clients),
+            "in_flight": sum(shard.in_flight for shard in self._clients),
+            "peak_in_flight_per_client": [
+                shard.peak_in_flight for shard in self._clients
+            ],
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            loop = self._loop
+            thread = self._thread
+            if loop is None or thread is None or not thread.is_alive():
+                return {
+                    "http2": self._http2,
+                    "streams_per_connection": self._streams_per_connection,
+                    "client_count": 0,
+                    "in_flight": 0,
+                    "peak_in_flight_per_client": [],
+                }
+        return self.submit(self._snapshot()).result(timeout=5)
 
     def close(self) -> None:
         with self._lock:
@@ -137,7 +221,7 @@ class _AsyncHTTPRuntime:
         if loop is None or thread is None or not thread.is_alive():
             return
         try:
-            self.submit(self._close_client()).result(timeout=5)
+            self.submit(self._close_clients()).result(timeout=5)
         except Exception:
             pass
         loop.call_soon_threadsafe(loop.stop)
@@ -154,16 +238,34 @@ def close_shared_http_transport() -> None:
     _RUNTIME.close()
 
 
-def configure_shared_http_transport(**client_kwargs: Any) -> None:
-    _RUNTIME.configure(**client_kwargs)
+def configure_shared_http_transport(
+    *,
+    http2: bool = False,
+    streams_per_connection: int = 100,
+    **client_kwargs: Any,
+) -> None:
+    """Configure connection sharding without imposing workflow concurrency.
+
+    ``max_threads`` on each API node remains the only job admission limit. This
+    setting merely starts another HTTP client/connection whenever all existing
+    clients already carry ``streams_per_connection`` in-flight requests.
+    """
+    _RUNTIME.configure(
+        http2=http2,
+        streams_per_connection=streams_per_connection,
+        **client_kwargs,
+    )
 
 
 class SharedHTTPTransport:
     """Framework-owned pooled httpx transport with watchdog-aware sync bridge."""
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        client = await _RUNTIME.client()
-        return await client.request(method, url, **kwargs)
+        return await _RUNTIME.request(method, url, **kwargs)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return transport configuration and current shard utilization."""
+        return _RUNTIME.snapshot()
 
     def request(
         self,

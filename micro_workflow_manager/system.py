@@ -60,7 +60,7 @@ class MicroWorkflow(
         # .mwf/threads.json. The cache is refreshed only when that one file's
         # stat signature changes, so active runners do not repeatedly parse JSON.
         self._thread_override_lock = RLock()
-        self._thread_override_signature: tuple[int, int] | None | object = object()
+        self._thread_override_signature: tuple[int, int, int, int] | None | object = object()
         self._thread_overrides: dict[str, int] = {}
 
         # CLI safety controls. Normal library use keeps immediate autostarts.
@@ -85,7 +85,12 @@ class MicroWorkflow(
         path = self.storage.thread_overrides_file()
         try:
             stat = path.stat()
-            signature: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+            signature: tuple[int, int, int, int] | None = (
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                stat.st_size,
+                stat.st_ino,
+            )
         except FileNotFoundError:
             signature = None
 
@@ -123,5 +128,4 @@ class MicroWorkflow(
     def invalidate_thread_override_cache(self) -> None:
         with self._thread_override_lock:
             self._thread_override_signature = object()
-
 

@@ -137,7 +137,7 @@ class NodeHandle(_ExecutionChecks):
     def checkpoint(self):
         """Raise if the parent job was restarted or this task timed out."""
         self._check_local_execution()
-        if self.execution_id is not None:
+        if self.execution_id is not None and self._cancellation_event is None:
             self.system.check_job_execution(
                 self.from_node,
                 self.from_job_id,
@@ -292,7 +292,10 @@ class JobContext(_ExecutionChecks):
             if timeout_error is not None:
                 raise timeout_error
         self._check_local_execution()
-        if self.execution_id is not None:
+        # Active attempts are polled in one batch by SchedulerSupervisor. A
+        # guarded mutation still verifies its exact lease under the per-job
+        # filesystem fence, so omitting a per-checkpoint SELECT is race-safe.
+        if self.execution_id is not None and self._attempt_watch is None:
             self.system.check_job_execution(
                 self.current_node,
                 self.job_id,

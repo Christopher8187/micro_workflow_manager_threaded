@@ -129,7 +129,8 @@ class JobFileStorageMixin:
         if type(count) is not int or count < 1:
             raise ValueError("count must be a positive integer")
         node_name = self.validate_node_name(node_name)
-        with self.db_transaction() as connection:
+
+        def reserve(connection):
             row = connection.execute(
                 "SELECT next_job_id FROM job_sequences WHERE node_name=?",
                 (node_name,),
@@ -151,7 +152,9 @@ class JobFileStorageMixin:
                     "UPDATE job_sequences SET next_job_id=? WHERE node_name=?",
                     (start + count, node_name),
                 )
-        return list(range(start, start + count))
+            return list(range(start, start + count))
+
+        return self.submit_db_mutation(reserve)
 
     def advance_job_sequence(self, node_name: str, next_job_id: int) -> None:
         node_name = self.validate_node_name(node_name)
@@ -307,6 +310,104 @@ class JobFileStorageMixin:
             job_kind=job.job_kind,
         )
         self.advance_job_sequence(job.node_name, job.job_id + 1)
+        self.notify_queue_change()
+
+    def commit_prepared_job_resolving_idempotency(
+        self,
+        job: Job,
+        *,
+        idempotency_key: str | None = None,
+    ) -> tuple[bool, int]:
+        """Publish one prepared job through the grouped queue-state writer.
+
+        ID reservation happens before payload I/O. This final transaction
+        combines job registration, the created event, idempotency, node queue
+        state, and sequence advancement. Concurrent producers therefore pay one
+        group commit instead of a chain of advisory-lock transactions.
+        """
+        job_id = self.validate_job_id(job.job_id)
+        key_hash = (
+            self.idempotency_key_hash(idempotency_key)
+            if idempotency_key is not None
+            else None
+        )
+        stored_parent = dict(job.parent) if job.parent is not None else None
+        if stored_parent is not None and job.producer_component is not None:
+            stored_parent["_mwf_from_component"] = list(job.producer_component)
+            stored_parent["_mwf_job_kind"] = job.job_kind
+        parent_json = (
+            json.dumps(stored_parent, ensure_ascii=False)
+            if stored_parent is not None
+            else None
+        )
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+        event_data = json.dumps(
+            {
+                "status": QUEUED,
+                "parent": job.parent,
+                "producer_component": list(job.producer_component or ()),
+                "job_kind": job.job_kind,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        def publish(connection):
+            if idempotency_key is not None:
+                row = connection.execute(
+                    "SELECT i.key_text, i.job_id FROM idempotency AS i "
+                    "JOIN jobs AS j ON j.node_name=i.node_name AND j.job_id=i.job_id "
+                    "WHERE i.node_name=? AND i.key_hash=?",
+                    (job.node_name, key_hash),
+                ).fetchone()
+                if row is not None:
+                    if str(row["key_text"]) != idempotency_key:
+                        raise RuntimeError(
+                            f"idempotency hash collision for node {job.node_name!r}"
+                        )
+                    return False, int(row["job_id"])
+
+            collision = connection.execute(
+                "SELECT 1 FROM jobs WHERE node_name=? AND job_id=?",
+                (job.node_name, job_id),
+            ).fetchone()
+            if collision is not None:
+                raise ValueError(f"Job {job.node_name}/{job_id} already exists")
+
+            connection.execute(
+                "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
+                "VALUES(?, ?, ?, ?, ?, '{}')",
+                (job.node_name, job_id, parent_json, job.created_at, QUEUED),
+            )
+            connection.execute(
+                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                "VALUES(?, ?, ?, 'created', ?)",
+                (job.node_name, job_id, event_time, event_data),
+            )
+            if idempotency_key is not None:
+                connection.execute(
+                    "INSERT INTO idempotency(node_name, key_hash, key_text, job_id) "
+                    "VALUES(?, ?, ?, ?)",
+                    (job.node_name, key_hash, idempotency_key, job_id),
+                )
+            connection.execute(
+                "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
+                "updated_at=CURRENT_TIMESTAMP WHERE nodes.status IS NOT excluded.status",
+                (job.node_name, QUEUED),
+            )
+            connection.execute(
+                "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET "
+                "next_job_id=MAX(job_sequences.next_job_id, excluded.next_job_id)",
+                (job.node_name, job_id + 1),
+            )
+            return True, job_id
+
+        result = self.submit_db_mutation(publish)
+        if result[0]:
+            self.notify_queue_change()
+        return result
 
     def prepare_jobs_batch(self, jobs: list[Job]) -> list[Path]:
         """Write job input payloads outside the global job-registration lock."""
@@ -434,6 +535,7 @@ class JobFileStorageMixin:
                 "updated_at=CURRENT_TIMESTAMP",
                 (node_name, QUEUED),
             )
+        self.notify_queue_change()
         return jobs
 
     def commit_prepared_jobs_batch_resolving_idempotency(
@@ -563,6 +665,8 @@ class JobFileStorageMixin:
                     "updated_at=CURRENT_TIMESTAMP",
                     (node_name, QUEUED),
                 )
+        if commit_jobs:
+            self.notify_queue_change()
         return commit_jobs, existing_by_key
 
     def create_jobs_batch(
@@ -640,12 +744,18 @@ class JobFileStorageMixin:
     def set_job_status(self, node_name: str, job_id: int, status: str, **extra):
         job_id = self.validate_job_id(job_id)
         status = self.validate_status(status)
-        old_data = self.read_job_status_data(node_name, job_id)
-        if not old_data:
-            raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
-        old_status = old_data.get("status", QUEUED)
         terminal = status in {"done", "failed", "cancelled", "skipped"}
-        with self.db_transaction() as connection:
+        status_json = json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+
+        def update(connection):
+            row = connection.execute(
+                "SELECT status FROM jobs WHERE node_name=? AND job_id=?",
+                (node_name, job_id),
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
+            old_status = str(row["status"])
             if terminal:
                 connection.execute(
                     "UPDATE jobs SET status=?, status_json=?, active_execution_id=NULL, "
@@ -653,7 +763,7 @@ class JobFileStorageMixin:
                     "WHERE node_name=? AND job_id=?",
                     (
                         status,
-                        json.dumps(extra, ensure_ascii=False, separators=(",", ":")),
+                        status_json,
                         node_name,
                         job_id,
                     ),
@@ -663,28 +773,34 @@ class JobFileStorageMixin:
                     "UPDATE jobs SET status=?, status_json=? WHERE node_name=? AND job_id=?",
                     (
                         status,
-                        json.dumps(extra, ensure_ascii=False, separators=(",", ":")),
+                        status_json,
                         node_name,
                         job_id,
                     ),
                 )
-        if old_status != status or extra:
-            event_name = {
-                "queued": "queued",
-                "running": "started",
-                "done": "done",
-                "failed": "failed",
-                "cancelled": "cancelled",
-                "skipped": "skipped",
-            }.get(status, "status_changed")
-            self.append_job_event(
-                node_name,
-                job_id,
-                event_name,
-                previous_status=old_status,
-                status=status,
-                **extra,
-            )
+            if old_status != status or extra:
+                event_name = {
+                    "queued": "queued",
+                    "running": "started",
+                    "done": "done",
+                    "failed": "failed",
+                    "cancelled": "cancelled",
+                    "skipped": "skipped",
+                }.get(status, "status_changed")
+                event_data = json.dumps(
+                    {"previous_status": old_status, "status": status, **extra},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                connection.execute(
+                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (node_name, job_id, event_time, event_name, event_data),
+                )
+
+        self.submit_db_mutation(update)
+        if status == QUEUED:
+            self.notify_queue_change()
 
     def get_job_status(self, node_name: str, job_id: int) -> str | None:
         row = self.db_connection().execute(
@@ -746,6 +862,19 @@ class JobFileStorageMixin:
             (node_name, QUEUED),
         ).fetchone()
         return row is not None
+
+    def queued_nodes(self, node_names: list[str] | tuple[str, ...]) -> set[str]:
+        """Return queued members of a component with one indexed query."""
+        normalized = [self.validate_node_name(name) for name in node_names]
+        if not normalized:
+            return set()
+        placeholders = ",".join("?" for _ in normalized)
+        rows = self.db_connection().execute(
+            f"SELECT DISTINCT node_name FROM jobs WHERE status=? "
+            f"AND node_name IN ({placeholders})",
+            [QUEUED, *normalized],
+        ).fetchall()
+        return {str(row["node_name"]) for row in rows}
 
     def queued_jobs(self, node_name: str) -> list[Job]:
         return [self.load_job(node_name, job_id) for job_id in self.iter_queued_job_ids(node_name)]

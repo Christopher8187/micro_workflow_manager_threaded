@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.16
+# micro-workflow-manager 0.3.17
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,46 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.17
+
+- Live Hoeflein components now wake on committed queue changes and completed
+  node pumps. The one-second poll is only a cross-process recovery fallback, so
+  a handler can start immediately when a running router creates work.
+- Single-job routing no longer acquires and releases a SQLite advisory lock for
+  every handoff. Auto-ID reservation and prepared-job publication use grouped
+  commits; publication combines the job row, creation event, idempotency row,
+  node status, and sequence advancement.
+- Job start, completion, event, and checkpoint mutations share the same short
+  group-commit lane. Bursts of completions no longer become one durable commit
+  per state field per job.
+- Active-restart detection moved from one SQLite query per waiting job per poll
+  to one supervisor query for all active leases. Exact side-effect and final
+  publication fences remain per job.
+- API fibers receive future-completion callbacks and O(1) ready-queue pops.
+  Progressive completion waves no longer rescan all outstanding futures or
+  shift a growing list on every resume.
+- The framework HTTP transport now supports elastic connection sharding with
+  `http2=` and `streams_per_connection=`. These settings choose a client for
+  each in-flight request; they never cap job admission. Per-node `max_threads`
+  remains the concurrency control.
+
+### HTTP/2 connection sharding
+
+```python
+from micro_workflow_manager import configure_shared_http_transport
+
+configure_shared_http_transport(
+    http2=True,
+    streams_per_connection=80,
+)
+```
+
+The first 80 simultaneous requests use the first HTTP/2 client/connection, the
+next 80 cause a second client to be created, and so on. Completed slots are
+reused. For HTTP/1.1, the same option controls the requests assigned to each
+client pool. It is a transport-shaping value, not a semaphore or workflow-wide
+limit.
 
 ## What changed in 0.3.16
 
@@ -91,8 +131,9 @@ payload = shared_http_transport.post_json(
 ```
 
 The transport uses `httpx` connection pooling and integrates directly with the
-scheduler watchdog. The checkpoint lease is suspended only while the bounded
-network operation is active.
+scheduler watchdog. In 0.3.17 it may own several automatically selected client
+shards. The checkpoint lease is suspended only while the bounded network
+operation is active.
 
 ## What changed in 0.3.12
 
@@ -1290,10 +1331,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.16 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.17 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.16-py3-none-any.whl
+micro_workflow_manager-0.3.17-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1313,22 +1354,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.16-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.17-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.16-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.17-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.16-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.17-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.16`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.17`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1343,7 +1384,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.16-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.17-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

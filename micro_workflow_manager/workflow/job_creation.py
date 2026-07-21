@@ -165,39 +165,67 @@ class JobCreationMixin:
             )
 
         node = self.ensure_node(to_node)
+        node.validate_params(params)
 
-        with self.storage.interprocess_lock(f"node-{to_node}-jobs"):
-            with node.lock:
-                node.validate_params(params)
+        if idempotency_key is not None:
+            existing = self.storage.lookup_idempotent_job(to_node, idempotency_key)
+            if existing is not None:
+                return existing
 
-                if idempotency_key is not None:
-                    existing = self.storage.lookup_idempotent_job(to_node, idempotency_key)
-                    if existing is not None:
-                        return existing
+        parent = None
+        if from_node is not None:
+            parent = {
+                "from_node": from_node,
+                "from_job_id": _parent_job_id,
+            }
 
-                if job_id is None:
-                    job_id = self.storage.reserve_job_ids(to_node, 1)[0]
-
-                parent = None
-                if from_node is not None:
-                    parent = {
-                        "from_node": from_node,
-                        "from_job_id": _parent_job_id,
-                    }
-
-                job = Job(
-                    job_id=job_id,
-                    node_name=to_node,
-                    params=params,
-                    parent=parent,
-                    producer_component=source_component,
-                    job_kind="component" if same_component else ("dag" if from_node is not None else None),
+        if job_id is not None:
+            # Explicit IDs retain the cross-process compatibility lock because
+            # their payload path is known before SQLite can reject a collision.
+            with self.storage.interprocess_lock(f"node-{to_node}-jobs"):
+                with node.lock:
+                    if self.storage.job_exists(to_node, job_id):
+                        raise ValueError(f"Job {to_node}/{job_id} already exists")
+                    job = Job(
+                        job_id=job_id,
+                        node_name=to_node,
+                        params=params,
+                        parent=parent,
+                        producer_component=source_component,
+                        job_kind="component" if same_component else ("dag" if from_node is not None else None),
+                    )
+                    self.storage.create_job(job)
+                    if idempotency_key is not None:
+                        self.storage.record_idempotent_job(to_node, idempotency_key, job_id)
+                    self.storage.set_node_status(to_node, QUEUED)
+        else:
+            # Auto-ID producers reserve atomically, write their independent
+            # payloads in parallel, then group-commit all queue metadata. There
+            # is no per-job SQLite advisory-lock acquire/release cycle.
+            job_id = self.storage.reserve_job_ids(to_node, 1)[0]
+            job = Job(
+                job_id=job_id,
+                node_name=to_node,
+                params=params,
+                parent=parent,
+                producer_component=source_component,
+                job_kind="component" if same_component else ("dag" if from_node is not None else None),
+            )
+            self.storage.prepare_jobs_batch([job])
+            try:
+                created, resolved_job_id = (
+                    self.storage.commit_prepared_job_resolving_idempotency(
+                        job,
+                        idempotency_key=idempotency_key,
+                    )
                 )
-
-                self.storage.create_job(job)
-                if idempotency_key is not None:
-                    self.storage.record_idempotent_job(to_node, idempotency_key, job_id)
-                self.storage.set_node_status(to_node, QUEUED)
+            except BaseException:
+                self.storage.discard_prepared_jobs([job])
+                raise
+            if not created:
+                self.storage.discard_prepared_jobs([job])
+                job = self.storage.load_job(to_node, resolved_job_id)
+                job_id = resolved_job_id
 
         if effective_autostart and self.autostart_mode == "immediate":
             # Outside a running task, preserve the old convenience behavior:

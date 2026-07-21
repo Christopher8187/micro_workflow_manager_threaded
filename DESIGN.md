@@ -644,7 +644,7 @@ ordering.
 API nodes are limited only by each node's effective `max_threads`, interpreted
 as a fiber count. The framework does not apply an aggregate admission ceiling.
 Each node pump hosts greenlet job controllers and one scheduler loop, while one
-process-wide asyncio thread owns a pooled `httpx.AsyncClient`.
+process-wide asyncio thread owns the framework HTTP client shards.
 
 A framework HTTP request registers an external-wait lease on its attempt watch.
 While that bounded lease is active, checkpoint-progress expiry is suspended;
@@ -679,3 +679,31 @@ status. Monitor computes `waiting_on` from current durable queues.
 Clean, reset, and wipe operate on component-expanded selections. This aligns
 destructive lifecycle changes with scheduling: no command may leave half of an
 SCC reset while its peers retain incompatible jobs or outputs.
+
+
+## Queue-state group commit and transport sharding (0.3.17)
+
+The scheduler has separate control and durability planes. In-process queue
+publication and node-pump completion emit wakeups to the component controller;
+SQLite remains authoritative and the fallback poll catches changes made by a
+different process. A wakeup never substitutes for a durable queue row.
+
+High-churn SQLite mutations enter one project-local group-commit lane. Each
+operation retains an independent savepoint, while simultaneous job starts,
+status transitions, events, checkpoint runtime updates, ID reservations, and
+single-job publications share commits. User payload files are still prepared
+before a job becomes visible. Restart-fenced file publication remains protected
+by its exact per-job execution lease.
+
+Restart observation is also split from fencing. The supervisor reads all active
+leases in one query per poll and wakes stale attempts; a side effect still checks
+its exact generation and execution ID while holding the per-job filesystem lock.
+This preserves second-terminal restart semantics without an O(active jobs)
+database-query loop.
+
+The network runtime is elastic, not an admission controller. With HTTP/2 enabled,
+one client owns one connection and accepts at most `streams_per_connection`
+in-flight assignments before another client is created. HTTP/1.1 uses the same
+assignment threshold with a connection pool per client. The scheduler neither
+counts nor limits transport shards: node `max_threads` continues to define how
+many jobs may be in flight.
