@@ -5,6 +5,7 @@ import textwrap
 import time
 
 from micro_workflow_manager import NodeInputFileSystem, cli
+from micro_workflow_manager.cli.cleanup import prepare_fresh_components
 from micro_workflow_manager.system import MicroWorkflow
 
 
@@ -255,3 +256,53 @@ def test_individual_job_deletion_does_not_reuse_reserved_batch_ids(tmp_path):
     assert workflow.storage.reserve_job_ids("explode", 3) == [2, 3, 4]
     assert workflow.storage.delete_job("explode", 1)
     assert workflow.storage.reserve_job_ids("explode", 1) == [5]
+
+
+def test_fresh_component_cleanup_uses_bulk_producer_snapshot(tmp_path, monkeypatch):
+    workflow = MicroWorkflow(tmp_path, runner="threaded")
+    workflow.graph([
+        ("preexplode", "explode"),
+        ("explode", "handler"),
+        ("handler", "explode"),
+    ])
+
+    @workflow.task("preexplode")
+    def preexplode(ctx):
+        return None
+
+    @workflow.task("explode")
+    def explode(ctx, value):
+        return value
+
+    @workflow.task("handler")
+    def handler(ctx, value):
+        return value
+
+    workflow.add_jobs(
+        "preexplode",
+        "explode",
+        [{"value": value} for value in range(100)],
+        _parent_job_id=1,
+    )
+    workflow.add_jobs(
+        "explode",
+        "handler",
+        [{"value": value} for value in range(200)],
+        _parent_job_id=1,
+    )
+
+    monkeypatch.setattr(
+        workflow.storage,
+        "read_job_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh cleanup must not query producer metadata per job")
+        ),
+    )
+
+    removed = prepare_fresh_components(
+        tmp_path,
+        workflow,
+        [workflow.component_for("explode")],
+    )
+    assert removed == {"handler": 200}
+    assert workflow.storage.job_status_counts("explode")["queued"] == 100

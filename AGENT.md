@@ -330,3 +330,32 @@ component pumping but leave hundreds of later jobs queued.
 - Test HTTP sharding with an in-flight barrier. No client may exceed
   `streams_per_connection`, enough clients must be created to carry the wave,
   and node `max_threads` must remain the only concurrency ceiling.
+
+
+## High-fanout component scaling checks (0.3.18)
+
+- Fresh component preparation must read parent/provenance metadata in one
+  SQLite snapshot and reset or delete selected jobs in batches. Never restore a
+  per-job metadata query or one transaction per retained/deleted job.
+- Fiber cancellation checks are fallback polling, not an admission-loop scan.
+  Keep callback-driven future completion and heap-backed wakeup deadlines so a
+  wave of thousands of API jobs remains linear.
+- Queue pumps must preload metadata with a bounded batch query. Do not restore
+  a `read_job_metadata` query between every queued ID and its execution claim.
+- Keep single-child publication atomic: stage the payload first, then allocate
+  its ID and publish payload/row/event/sequence in one priority mutation. Do not
+  expose a job row before its input exists.
+- Writer batches contain one priority class. Queue publication must not absorb
+  lower-priority API claim/checkpoint work simply because a transaction has
+  spare batch capacity.
+- Batched claims and terminal updates retain per-job generation/execution
+  checks. A stale entry must not roll back or suppress valid peers in its batch.
+- Never hold a per-job filesystem execution fence while yielding for grouped
+  SQLite persistence. Publish files under the fence, release its OS handle, and
+  then perform the conditional terminal mutation using the same execution ID.
+- `ctx.side_effects()` is for a short group of local publications that must be
+  restart-atomic. Do not hold it across HTTP requests, sleeps, or substantial
+  computation.
+- Add monitor-shaped regressions as well as small unit cases: thousands of jobs
+  distributed unevenly across one Hoeflein component must all reach execution,
+  and a simultaneous completion wave must not exhaust file descriptors.

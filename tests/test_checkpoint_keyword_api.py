@@ -20,7 +20,7 @@ def test_released_checkpoint_signature_supports_keywords():
     for name in ("timeout", "progress", "detail"):
         assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
         assert signature.parameters[name].default is None
-    assert __version__ == "0.3.17"
+    assert __version__ == "0.3.18"
 
 
 def test_checkpoint_keywords_persist_for_inspect(tmp_path: Path):

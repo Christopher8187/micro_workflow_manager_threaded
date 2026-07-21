@@ -1,9 +1,60 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
+from time import perf_counter
 from typing import Callable
 
 from ..errors import InvalidGraphError
-from ..models import FAILED, RUNNING
-from ..models import Job
+from ..models import FAILED, RUNNING, Job, now
+
+
+@dataclass(slots=True)
+class _ClaimedJob:
+    storage: object
+    job: Job
+    generation: int
+    execution_id: str
+    started_at: str
+    started_perf: float
+
+    def abandon_unstarted(self) -> None:
+        self.storage.release_unstarted_job_execution(
+            self.job.node_name,
+            self.job.job_id,
+            self.generation,
+            self.execution_id,
+        )
+
+
+class _ClaimedQueuedJobSource:
+    """Preload and claim each refreshable API admission burst atomically."""
+
+    def __init__(self, storage, node_name: str, source):
+        self.storage = storage
+        self.node_name = node_name
+        self.source = source
+
+    def pull(self, max_items: int) -> list[_ClaimedJob]:
+        jobs = self.source.pull(max_items)
+        if not jobs:
+            return []
+        started_at = now()
+        started_perf = perf_counter()
+        leases = self.storage.claim_job_executions_batch(
+            self.node_name,
+            [job.job_id for job in jobs],
+            started_at=started_at,
+        )
+        return [
+            _ClaimedJob(
+                storage=self.storage,
+                job=job,
+                generation=generation,
+                execution_id=execution_id,
+                started_at=started_at,
+                started_perf=started_perf,
+            )
+            for job, (generation, execution_id) in zip(jobs, leases)
+        ]
 
 
 class DagSchedulerMixin:
@@ -130,21 +181,62 @@ class DagSchedulerMixin:
         self.storage.set_node_status(node_name, RUNNING)
         runner = self.make_runner(node)
 
-        job_source = (
-            self.storage.queued_job_source(node_name)
-            if getattr(runner, "supports_refreshable_job_source", False)
-            else self.storage.iter_queued_job_ids(node_name)
+        refreshable = bool(
+            getattr(runner, "supports_refreshable_job_source", False)
         )
+        preloaded = bool(getattr(runner, "prefers_preloaded_jobs", False))
+        if preloaded:
+            job_source = self.storage.queued_job_object_source(
+                node_name,
+                refreshable=refreshable,
+            )
+            if (
+                refreshable
+                and self.active_job_restart_enabled
+                and getattr(runner, "preclaims_job_bursts", False)
+            ):
+                job_source = _ClaimedQueuedJobSource(
+                    self.storage,
+                    node_name,
+                    job_source,
+                )
+        elif refreshable:
+            job_source = self.storage.queued_job_source(node_name)
+        else:
+            job_source = self.storage.iter_queued_job_ids(node_name)
+
+        def run_source_item(item):
+            if isinstance(item, _ClaimedJob):
+                return self.run_job(
+                    node_name=item.job.node_name,
+                    job_id=item.job.job_id,
+                    ignore_readiness=True,
+                    _preloaded_job=item.job,
+                    _preclaimed_execution=(
+                        item.generation,
+                        item.execution_id,
+                        item.started_at,
+                        item.started_perf,
+                    ),
+                )
+            if isinstance(item, Job):
+                return self.run_job(
+                    node_name=item.node_name,
+                    job_id=item.job_id,
+                    ignore_readiness=True,
+                    _preloaded_job=item,
+                )
+            return self.run_job(
+                node_name=node_name,
+                job_id=item,
+                ignore_readiness=True,
+            )
 
         try:
             result = runner.run_job_source(
                 node_name=node_name,
                 job_source=job_source,
-                run_one=lambda job_id: self.run_job(
-                    node_name=node_name,
-                    job_id=job_id,
-                    ignore_readiness=True,
-                ),
+                run_one=run_source_item,
             )
 
         except Exception:
@@ -188,6 +280,7 @@ class DagSchedulerMixin:
                     node_name=job.node_name,
                     job_id=job.job_id,
                     ignore_readiness=True,
+                    _preloaded_job=job,
                 ),
             )
 

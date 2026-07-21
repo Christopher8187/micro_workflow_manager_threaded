@@ -707,3 +707,49 @@ in-flight assignments before another client is created. HTTP/1.1 uses the same
 assignment threshold with a connection pool per client. The scheduler neither
 counts nor limits transport shards: node `max_threads` continues to define how
 many jobs may be in flight.
+
+
+## High-fanout component admission and completion (0.3.18)
+
+Fresh `run` preparation operates on component-sized database snapshots. Parent
+and producer metadata is selected once, stale child jobs are deleted in grouped
+mutations, retained jobs are reset per node in one mutation, and artifact
+removal uses a bounded file-operation pool. This removes the previous
+query/transaction cost for every existing explode job without changing clean
+versus resume semantics.
+
+Threaded and API node pumps preload queued jobs in 64-item bursts. One SQLite
+metadata query replaces one query per job, and Windows reads the independent
+payload files with bounded parallelism. Claims remain individual restart
+leases, but arrive together at the grouped writer instead of being separated
+by synchronous input-file reads.
+
+Single-child publications stage their input before entering the writer. One
+priority mutation then allocates the durable ID, moves the unpublished payload
+to its final job directory, and inserts the job, event, idempotency, node, and
+sequence state. No ID is cached and no row is visible before its payload.
+
+The writer drains one priority class per commit. Queue publication outranks
+local threaded execution, which outranks API-consumer state churn. This prevents
+a live handler wave from consuming the producer's commit capacity while that
+producer is still filling the component. Within each node, simultaneously
+arriving claims and terminal outcomes use native batch operations; each entry
+still receives its own generation/execution lease and stale entries fail
+independently of valid peers.
+
+The fiber scheduler's hot path is event and deadline driven. Future callbacks
+enqueue completed waiters, sleeper and future deadlines live in heaps, and
+cancellation fallback polling occurs at its configured cadence rather than
+after every admission burst. Node `max_threads` still controls admission; these
+indexes only make large declared limits practical.
+
+Terminal publication is split into two restart-safe phases. Output files and
+the result store are published under the exact generation/execution filesystem
+fence. After releasing that OS lock handle, one conditional grouped database
+mutation records the terminal status and event only if the execution lease is
+still current. This prevents thousands of cooperative fibers from retaining
+thousands of lock-file descriptors while their grouped commits yield.
+
+Handlers that need several local publications to share one restart fence may
+use `JobContext.side_effects()`. The scope is intentionally synchronous and
+short; network waits and long computation remain outside it.

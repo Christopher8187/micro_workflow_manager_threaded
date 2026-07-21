@@ -53,7 +53,17 @@ class SQLiteStateMixin:
 
     def _init_sqlite_state(self) -> None:
         self._advisory_local = threading.local()
-        self._mutation_queue: queue.Queue[tuple[Callable[[sqlite3.Connection], Any], Future]] = queue.Queue()
+        self._claim_batch_lock = threading.Lock()
+        self._claim_batches: dict[
+            tuple[str, int],
+            list[tuple[int, str, Future[tuple[int, str]]]],
+        ] = {}
+        self._finalize_batch_lock = threading.Lock()
+        self._finalize_batches: dict[tuple[str, int], list[tuple]] = {}
+        self._mutation_queue: queue.PriorityQueue[
+            tuple[int, int, Callable[[sqlite3.Connection], Any], Future]
+        ] = queue.PriorityQueue()
+        self._mutation_serial = 0
         self._mutation_thread: threading.Thread | None = None
         self._mutation_thread_guard = threading.Lock()
         path = self.state_database_path().resolve()
@@ -79,20 +89,29 @@ class SQLiteStateMixin:
                     continue
 
                 batch = [first]
+                batch_priority = first[0]
                 deadline = time.monotonic() + 0.001
                 while len(batch) < 512:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
                     try:
-                        batch.append(self._mutation_queue.get(timeout=remaining))
+                        candidate = self._mutation_queue.get(timeout=remaining)
                     except queue.Empty:
                         break
+                    if candidate[0] != batch_priority:
+                        # Commit one priority class at a time. Otherwise a
+                        # queue-publication batch would still absorb every
+                        # waiting consumer claim and lose its scheduling
+                        # advantage merely because the transaction has room.
+                        self._mutation_queue.put(candidate)
+                        break
+                    batch.append(candidate)
 
                 outcomes: list[tuple[bool, Any]] = []
                 try:
                     with self.db_transaction() as connection:
-                        for index, (operation, _future) in enumerate(batch):
+                        for index, (_priority, _serial, operation, _future) in enumerate(batch):
                             savepoint = f"mwf_batch_{index}"
                             connection.execute(f"SAVEPOINT {savepoint}")
                             try:
@@ -106,12 +125,12 @@ class SQLiteStateMixin:
                                 outcomes.append((True, value))
                 except BaseException as error:
                     outcomes = [(False, error) for _ in batch]
-                finally:
-                    # Do not retain an otherwise idle worker connection. This
-                    # keeps repeated runs from accumulating connection owners.
-                    self.close_thread_connection()
-
-                for (_operation, future), (succeeded, value) in zip(batch, outcomes):
+                for (
+                    _priority,
+                    _serial,
+                    _operation,
+                    future,
+                ), (succeeded, value) in zip(batch, outcomes):
                     try:
                         if succeeded:
                             future.set_result(value)
@@ -122,6 +141,11 @@ class SQLiteStateMixin:
                         # fiber may no longer be waiting for its result, but it
                         # must not terminate the shared writer lane.
                         pass
+                if self._mutation_queue.empty():
+                    # Keep one connection across a sustained write wave, but
+                    # release it as soon as the lane drains so repeated runs do
+                    # not retain an idle worker connection.
+                    self.close_thread_connection()
         finally:
             self.close_thread_connection()
             with self._mutation_thread_guard:
@@ -133,11 +157,17 @@ class SQLiteStateMixin:
         operation: Callable[[sqlite3.Connection], T],
         *,
         wait: bool = True,
+        priority: int = 10,
     ) -> T | Future[T]:
         """Run one mutation through the project-local group-commit lane."""
+        if type(priority) is not int:
+            raise TypeError("priority must be an integer")
         future: Future[T] = Future()
         with self._mutation_thread_guard:
-            self._mutation_queue.put((operation, future))
+            self._mutation_serial += 1
+            self._mutation_queue.put(
+                (priority, self._mutation_serial, operation, future)
+            )
             if self._mutation_thread is None or not self._mutation_thread.is_alive():
                 self._mutation_thread = threading.Thread(
                     target=self._mutation_worker,

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from uuid import uuid4
 
 from micro_workflow_manager.models import Job, QUEUED
 
@@ -47,6 +50,47 @@ class RefreshableQueuedJobSource:
             if not job_ids:
                 return
             yield from job_ids
+
+
+class QueuedJobObjectSource:
+    """Load a snapshot of queued job payloads in database-sized bursts."""
+
+    def __init__(self, storage, node_name: str, job_ids: Iterable[int]):
+        self.storage = storage
+        self.node_name = storage.validate_node_name(node_name)
+        self.job_ids = iter(job_ids)
+
+    def __iter__(self):
+        while True:
+            batch = []
+            for _ in range(64):
+                try:
+                    batch.append(next(self.job_ids))
+                except StopIteration:
+                    break
+            if not batch:
+                return
+            yield from self.storage.load_jobs_batch(self.node_name, batch)
+
+
+class RefreshableQueuedJobObjectSource:
+    """Refreshable queue cursor that preloads each admission burst."""
+
+    def __init__(self, storage, node_name: str):
+        self.storage = storage
+        self.node_name = storage.validate_node_name(node_name)
+        self.job_ids = RefreshableQueuedJobSource(storage, self.node_name)
+
+    def pull(self, max_items: int) -> list[Job]:
+        job_ids = self.job_ids.pull(max_items)
+        return self.storage.load_jobs_batch(self.node_name, job_ids)
+
+    def __iter__(self):
+        while True:
+            jobs = self.pull(512)
+            if not jobs:
+                return
+            yield from jobs
 
 
 class JobFileStorageMixin:
@@ -154,7 +198,10 @@ class JobFileStorageMixin:
                 )
             return list(range(start, start + count))
 
-        return self.submit_db_mutation(reserve)
+        # Queue publication outranks claims/checkpoints while a live router is
+        # still handing work to its component peers. This prevents consumer
+        # startup from throttling the producer that is feeding it.
+        return self.submit_db_mutation(reserve, priority=0)
 
     def advance_job_sequence(self, node_name: str, next_job_id: int) -> None:
         node_name = self.validate_node_name(node_name)
@@ -404,13 +451,177 @@ class JobFileStorageMixin:
             )
             return True, job_id
 
-        result = self.submit_db_mutation(publish)
+        result = self.submit_db_mutation(publish, priority=0)
         if result[0]:
             self.notify_queue_change()
         return result
 
+    def create_auto_id_job(
+        self,
+        *,
+        node_name: str,
+        params: dict[str, Any],
+        parent: dict[str, Any] | None,
+        producer_component: tuple[str, ...] | None,
+        job_kind: str | None,
+        idempotency_key: str | None = None,
+    ) -> Job:
+        """Prepare one payload, then allocate and publish it in one mutation.
+
+        A single-child router previously waited for an ID reservation mutation,
+        wrote ``input.json``, then waited for a publication mutation. Staging the
+        unpublished payload first lets the priority queue writer allocate its ID,
+        move the file, insert the job/event, and advance the sequence together.
+        """
+        node_name = self.validate_node_name(node_name)
+        provisional = Job(
+            job_id=1,
+            node_name=node_name,
+            params=dict(params),
+            parent=dict(parent) if parent is not None else None,
+            producer_component=producer_component,
+            job_kind=job_kind,
+        )
+        input_text = self.json_text(Path("input.json"), provisional.params)
+        staging_dir = self.project_dir / ".mwf" / "staged-jobs" / uuid4().hex
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        staging_input = staging_dir / "input.json"
+        with staging_input.open("x", encoding="utf-8") as file:
+            file.write(input_text)
+
+        key_hash = (
+            self.idempotency_key_hash(idempotency_key)
+            if idempotency_key is not None
+            else None
+        )
+        stored_parent = (
+            dict(provisional.parent) if provisional.parent is not None else None
+        )
+        if stored_parent is not None and producer_component is not None:
+            stored_parent["_mwf_from_component"] = list(producer_component)
+            stored_parent["_mwf_job_kind"] = job_kind
+        parent_json = (
+            json.dumps(stored_parent, ensure_ascii=False)
+            if stored_parent is not None
+            else None
+        )
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+        event_data = json.dumps(
+            {
+                "status": QUEUED,
+                "parent": provisional.parent,
+                "producer_component": list(producer_component or ()),
+                "job_kind": job_kind,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        published_dir: list[Path] = []
+
+        def publish(connection):
+            if idempotency_key is not None:
+                row = connection.execute(
+                    "SELECT i.key_text, i.job_id FROM idempotency AS i "
+                    "JOIN jobs AS j ON j.node_name=i.node_name AND j.job_id=i.job_id "
+                    "WHERE i.node_name=? AND i.key_hash=?",
+                    (node_name, key_hash),
+                ).fetchone()
+                if row is not None:
+                    if str(row["key_text"]) != idempotency_key:
+                        raise RuntimeError(
+                            f"idempotency hash collision for node {node_name!r}"
+                        )
+                    return False, int(row["job_id"])
+
+            sequence = connection.execute(
+                "SELECT next_job_id FROM job_sequences WHERE node_name=?",
+                (node_name,),
+            ).fetchone()
+            if sequence is None:
+                job_id = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(job_id), 0) + 1 FROM jobs "
+                        "WHERE node_name=?",
+                        (node_name,),
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, ?)",
+                    (node_name, job_id + 1),
+                )
+            else:
+                job_id = int(sequence["next_job_id"])
+                connection.execute(
+                    "UPDATE job_sequences SET next_job_id=? WHERE node_name=?",
+                    (job_id + 1, node_name),
+                )
+
+            final_dir = self.job_dir(node_name, job_id)
+            final_input = self.input_file(node_name, job_id)
+            self.retry_fs(lambda: os.replace(staging_input, final_input))
+            published_dir.append(final_dir)
+
+            connection.execute(
+                "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
+                "VALUES(?, ?, ?, ?, ?, '{}')",
+                (
+                    node_name,
+                    job_id,
+                    parent_json,
+                    provisional.created_at,
+                    QUEUED,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                "VALUES(?, ?, ?, 'created', ?)",
+                (node_name, job_id, event_time, event_data),
+            )
+            if idempotency_key is not None:
+                connection.execute(
+                    "INSERT INTO idempotency(node_name, key_hash, key_text, job_id) "
+                    "VALUES(?, ?, ?, ?)",
+                    (node_name, key_hash, idempotency_key, job_id),
+                )
+            connection.execute(
+                "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
+                "updated_at=CURRENT_TIMESTAMP",
+                (node_name, QUEUED),
+            )
+            return True, job_id
+
+        try:
+            created, job_id = self.submit_db_mutation(publish, priority=0)
+        except BaseException:
+            if published_dir:
+                shutil.rmtree(published_dir[0], ignore_errors=True)
+            raise
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        if created:
+            self.notify_queue_change()
+            return Job(
+                job_id=job_id,
+                node_name=node_name,
+                params=provisional.params,
+                parent=provisional.parent,
+                producer_component=producer_component,
+                job_kind=job_kind,
+                created_at=provisional.created_at,
+            )
+        return self.load_job(node_name, job_id)
+
     def prepare_jobs_batch(self, jobs: list[Job]) -> list[Path]:
-        """Write job input payloads outside the global job-registration lock."""
+        """Write unpublished job inputs outside the registration lock.
+
+        Reserved auto IDs are unique and the jobs are not query-visible until
+        the later SQLite commit. Their first ``input.json`` therefore does not
+        need the temporary-file-plus-replace sequence used when overwriting a
+        visible file. A direct exclusive create removes one open and one rename
+        from every routed job, which is significant on Windows.
+        """
         if not jobs:
             return []
         node_names = {job.node_name for job in jobs}
@@ -426,8 +637,15 @@ class JobFileStorageMixin:
         try:
             for job in jobs:
                 job_dir = self.job_dir(job.node_name, job.job_id)
-                self.atomic_write_json(self.input_file(job.node_name, job.job_id), job.params)
                 written_dirs.append(job_dir)
+                input_path = self.input_file(job.node_name, job.job_id)
+                input_text = self.json_text(input_path, job.params)
+
+                def write_new_payload():
+                    with input_path.open("x", encoding="utf-8") as file:
+                        file.write(input_text)
+
+                self.retry_fs(write_new_payload)
         except BaseException:
             for job_dir in written_dirs:
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -721,6 +939,85 @@ class JobFileStorageMixin:
             created_at=metadata["created_at"],
         )
 
+    def load_jobs_batch(self, node_name: str, job_ids: list[int]) -> list[Job]:
+        """Load one admission burst without per-job metadata queries.
+
+        API admission used to alternate one filesystem read with one execution
+        claim. On Windows that spacing prevented the group-commit lane from
+        seeing a useful claim burst. Loading metadata and payloads first keeps
+        queue semantics unchanged while allowing following claims to coalesce.
+        """
+        node_name = self.validate_node_name(node_name)
+        normalized = [self.validate_job_id(job_id) for job_id in job_ids]
+        if not normalized:
+            return []
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("job_ids contains duplicates")
+
+        rows = []
+        connection = self.db_connection()
+        for offset in range(0, len(normalized), 500):
+            chunk = normalized[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                connection.execute(
+                    "SELECT job_id, node_name, parent_json, created_at FROM jobs "
+                    f"WHERE node_name=? AND job_id IN ({placeholders})",
+                    [node_name, *chunk],
+                ).fetchall()
+            )
+        rows_by_id = {int(row["job_id"]): row for row in rows}
+        missing = [job_id for job_id in normalized if job_id not in rows_by_id]
+        if missing:
+            raise FileNotFoundError(f"Job does not exist: {node_name}/{missing[0]}")
+
+        def load_params(job_id: int) -> dict[str, Any]:
+            return self.read_json(self.input_file(node_name, job_id), default={})
+
+        if os.name == "nt" and len(normalized) >= 8:
+            with ThreadPoolExecutor(
+                max_workers=min(32, len(normalized)),
+                thread_name_prefix="mwf-job-prefetch",
+            ) as executor:
+                params_list = list(executor.map(load_params, normalized))
+        else:
+            params_list = [load_params(job_id) for job_id in normalized]
+
+        jobs: list[Job] = []
+        for job_id, params in zip(normalized, params_list):
+            row = rows_by_id[job_id]
+            raw_parent = json.loads(row["parent_json"]) if row["parent_json"] else None
+            producer_component = None
+            job_kind = None
+            parent = raw_parent
+            if isinstance(raw_parent, dict):
+                parent = dict(raw_parent)
+                producer_component = parent.pop(
+                    "_mwf_from_component",
+                    parent.pop("from_component", None),
+                )
+                job_kind = parent.pop(
+                    "_mwf_job_kind",
+                    parent.pop("job_kind", None),
+                )
+                parent = parent or None
+            jobs.append(
+                Job(
+                    job_id=job_id,
+                    node_name=str(row["node_name"]),
+                    params=params,
+                    parent=parent,
+                    producer_component=(
+                        tuple(producer_component)
+                        if isinstance(producer_component, list)
+                        else None
+                    ),
+                    job_kind=job_kind,
+                    created_at=str(row["created_at"]),
+                )
+            )
+        return jobs
+
     def read_job_status_data(self, node_name: str, job_id: int) -> dict[str, Any]:
         row = self.db_connection().execute(
             "SELECT status, status_json FROM jobs WHERE node_name=? AND job_id=?",
@@ -833,6 +1130,49 @@ class JobFileStorageMixin:
             })
         return result
 
+    def list_job_parent_metadata(
+        self,
+        node_names: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read producer metadata for many jobs with one SQLite snapshot."""
+        args: list[Any] = []
+        sql = "SELECT node_name, job_id, parent_json FROM jobs"
+        if node_names is not None:
+            normalized = [self.validate_node_name(name) for name in node_names]
+            if not normalized:
+                return []
+            placeholders = ",".join("?" for _ in normalized)
+            sql += f" WHERE node_name IN ({placeholders})"
+            args.extend(normalized)
+        sql += " ORDER BY node_name, job_id"
+        rows = self.db_connection().execute(sql, args).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            raw_parent = json.loads(row["parent_json"]) if row["parent_json"] else None
+            producer_component = None
+            parent = raw_parent
+            if isinstance(raw_parent, dict):
+                parent = dict(raw_parent)
+                producer_component = parent.pop(
+                    "_mwf_from_component",
+                    parent.pop("from_component", None),
+                )
+                parent.pop("_mwf_job_kind", parent.pop("job_kind", None))
+                parent = parent or None
+            result.append(
+                {
+                    "node_name": str(row["node_name"]),
+                    "job_id": int(row["job_id"]),
+                    "parent": parent,
+                    "producer_component": (
+                        tuple(producer_component)
+                        if isinstance(producer_component, list)
+                        else None
+                    ),
+                }
+            )
+        return result
+
     def job_is_queued(self, node_name: str, job_id: int) -> bool:
         return self.get_job_status(node_name, job_id) == QUEUED
 
@@ -841,6 +1181,20 @@ class JobFileStorageMixin:
 
     def queued_job_source(self, node_name: str) -> RefreshableQueuedJobSource:
         return RefreshableQueuedJobSource(self, node_name)
+
+    def queued_job_object_source(
+        self,
+        node_name: str,
+        *,
+        refreshable: bool,
+    ) -> QueuedJobObjectSource | RefreshableQueuedJobObjectSource:
+        if refreshable:
+            return RefreshableQueuedJobObjectSource(self, node_name)
+        return QueuedJobObjectSource(
+            self,
+            node_name,
+            self.iter_queued_job_ids(node_name),
+        )
 
     def iter_queued_job_ids(self, node_name: str):
         # Preserve the public snapshot iterator and deterministic job-id order.
@@ -901,6 +1255,133 @@ class JobFileStorageMixin:
         if remove_payload:
             shutil.rmtree(self.job_base_dir(node_name, job_id), ignore_errors=True)
         return existed
+
+    def delete_jobs_batch(
+        self,
+        node_name: str,
+        job_ids: list[int],
+        *,
+        remove_payload: bool = True,
+    ) -> int:
+        """Delete selected jobs with one transaction and bulk directory removal."""
+        node_name = self.validate_node_name(node_name)
+        normalized = sorted({self.validate_job_id(job_id) for job_id in job_ids})
+        if not normalized:
+            return 0
+        existing_ids = self.list_job_ids(node_name)
+        targets = sorted(set(existing_ids).intersection(normalized))
+        if not targets:
+            return 0
+        remove_whole_jobs_dir = targets == existing_ids
+
+        with self.db_transaction() as connection:
+            if remove_whole_jobs_dir:
+                connection.execute("DELETE FROM idempotency WHERE node_name=?", (node_name,))
+                connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
+                connection.execute("DELETE FROM jobs WHERE node_name=?", (node_name,))
+            else:
+                for offset in range(0, len(targets), 500):
+                    chunk = targets[offset:offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    args = [node_name, *chunk]
+                    connection.execute(
+                        f"DELETE FROM idempotency WHERE node_name=? AND job_id IN ({placeholders})",
+                        args,
+                    )
+                    connection.execute(
+                        f"DELETE FROM job_events WHERE node_name=? AND job_id IN ({placeholders})",
+                        args,
+                    )
+                    connection.execute(
+                        f"DELETE FROM jobs WHERE node_name=? AND job_id IN ({placeholders})",
+                        args,
+                    )
+
+        if remove_payload:
+            jobs_dir = self.jobs_dir(node_name)
+
+            def remove_job_payload(job_id: int) -> None:
+                shutil.rmtree(
+                    self.safe_join(jobs_dir, str(job_id)),
+                    ignore_errors=True,
+                )
+
+            # Windows directory removal is disproportionately expensive and was
+            # still serial after the SQLite deletion became batched. Job payload
+            # trees are independent, so remove a bounded number concurrently.
+            if os.name != "nt" or len(targets) < 8:
+                for job_id in targets:
+                    remove_job_payload(job_id)
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=min(32, len(targets)),
+                    thread_name_prefix="mwf-job-cleanup",
+                ) as executor:
+                    list(executor.map(remove_job_payload, targets))
+            if remove_whole_jobs_dir:
+                # Clear abandoned unpublished payloads too, then recreate the
+                # conventional directory expected by filesystem integrations.
+                shutil.rmtree(jobs_dir, ignore_errors=True)
+                self.jobs_dir(node_name)
+        return len(targets)
+
+    def reset_jobs_for_run_batch(self, node_name: str, job_ids: list[int]) -> int:
+        """Requeue retained jobs with one state/event transaction."""
+        node_name = self.validate_node_name(node_name)
+        normalized = sorted({self.validate_job_id(job_id) for job_id in job_ids})
+        if not normalized:
+            return 0
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+
+        with self.db_transaction() as connection:
+            rows = []
+            for offset in range(0, len(normalized), 500):
+                chunk = normalized[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        f"SELECT job_id, status FROM jobs WHERE node_name=? "
+                        f"AND job_id IN ({placeholders})",
+                        [node_name, *chunk],
+                    ).fetchall()
+                )
+            if not rows:
+                return 0
+            existing = [int(row["job_id"]) for row in rows]
+            for offset in range(0, len(existing), 500):
+                chunk = existing[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                connection.execute(
+                    "UPDATE jobs SET status=?, status_json='{}', runtime_json=NULL, "
+                    "active_execution_id=NULL, active_pid=NULL, active_thread_id=NULL, "
+                    "active_started_at=NULL, restart_requested_at=NULL, "
+                    "restart_requested_by_pid=NULL, restart_reason=NULL "
+                    f"WHERE node_name=? AND job_id IN ({placeholders})",
+                    [QUEUED, node_name, *chunk],
+                )
+            previous = {int(row["job_id"]): str(row["status"]) for row in rows}
+            connection.executemany(
+                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                "VALUES(?, ?, ?, 'queued', ?)",
+                [
+                    (
+                        node_name,
+                        job_id,
+                        event_time,
+                        json.dumps(
+                            {
+                                "previous_status": previous[job_id],
+                                "status": QUEUED,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                    for job_id in existing
+                ],
+            )
+        self.notify_queue_change()
+        return len(existing)
 
     def delete_node_jobs(self, node_name: str, *, remove_payload: bool = True) -> int:
         ids = self.list_job_ids(node_name)

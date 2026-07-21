@@ -14,6 +14,8 @@ class ApiRunner(BaseRunner):
     """
 
     supports_refreshable_job_source = True
+    prefers_preloaded_jobs = True
+    preclaims_job_bursts = True
 
     def __init__(
         self,

@@ -128,4 +128,3 @@ class MicroWorkflow(
     def invalidate_thread_override_cache(self) -> None:
         with self._thread_override_lock:
             self._thread_override_signature = object()
-

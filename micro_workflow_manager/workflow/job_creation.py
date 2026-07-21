@@ -199,33 +199,17 @@ class JobCreationMixin:
                         self.storage.record_idempotent_job(to_node, idempotency_key, job_id)
                     self.storage.set_node_status(to_node, QUEUED)
         else:
-            # Auto-ID producers reserve atomically, write their independent
-            # payloads in parallel, then group-commit all queue metadata. There
-            # is no per-job SQLite advisory-lock acquire/release cycle.
-            job_id = self.storage.reserve_job_ids(to_node, 1)[0]
-            job = Job(
-                job_id=job_id,
+            # Stage the unpublished input first, then allocate its ID and
+            # publish the payload/row/event in one priority queue mutation.
+            job = self.storage.create_auto_id_job(
                 node_name=to_node,
                 params=params,
                 parent=parent,
                 producer_component=source_component,
                 job_kind="component" if same_component else ("dag" if from_node is not None else None),
+                idempotency_key=idempotency_key,
             )
-            self.storage.prepare_jobs_batch([job])
-            try:
-                created, resolved_job_id = (
-                    self.storage.commit_prepared_job_resolving_idempotency(
-                        job,
-                        idempotency_key=idempotency_key,
-                    )
-                )
-            except BaseException:
-                self.storage.discard_prepared_jobs([job])
-                raise
-            if not created:
-                self.storage.discard_prepared_jobs([job])
-                job = self.storage.load_job(to_node, resolved_job_id)
-                job_id = resolved_job_id
+            job_id = job.job_id
 
         if effective_autostart and self.autostart_mode == "immediate":
             # Outside a running task, preserve the old convenience behavior:

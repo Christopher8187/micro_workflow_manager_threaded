@@ -25,6 +25,8 @@ class ThreadedRunner(BaseRunner):
     future per job or one empty worker per very large declared limit.
     """
 
+    prefers_preloaded_jobs = True
+
     def __init__(
         self,
         max_threads: int,

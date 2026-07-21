@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.17
+# micro-workflow-manager 0.3.18
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,38 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.3.18
+
+- Fresh Hoeflein cleanup now reads producer provenance in one SQLite snapshot,
+  deletes selected-producer jobs in node-sized batches, requeues retained jobs
+  in one transaction per node, and removes independent job artifacts with
+  bounded parallelism on Windows. Large components begin pumping instead of
+  spending tens of seconds in per-job preparation.
+- API fiber admission no longer scans every outstanding future and sleeper after
+  each 64-job burst. Future deadlines use a heap, while restart/cancellation
+  checks run at the configured polling cadence. Large typed nodes therefore
+  progress through claim, watchdog setup, and HTTP dispatch at the same rate as
+  small nodes.
+- Threaded and API queue pumps load one metadata snapshot per 64-job burst and
+  prefetch the independent payload files before execution claims. The grouped
+  writer now receives dense claim bursts instead of claims separated by
+  per-job metadata queries and file reads.
+- A one-child route stages its tiny input before entering SQLite, then allocates
+  the ID and publishes the payload, row, event, and node state in one mutation.
+  Queue publication, local threaded execution, and API execution use separate
+  writer priorities, and one commit never absorbs lower-priority consumer work.
+- Concurrent execution claims and terminal updates coalesce by node. This keeps
+  live API startup and large completion waves from paying one savepoint and one
+  scheduler round trip per job while preserving an independent restart lease
+  and outcome for every job.
+- Terminal job publication releases the generation fence before waiting for the
+  grouped SQLite commit, then uses a lease-conditional terminal update. A large
+  completion wave no longer retains one lock-file handle per yielding fiber.
+- Newly reserved, unpublished job inputs use a direct exclusive create instead
+  of a temporary file plus rename. Short local routers can also group several
+  file/queue mutations under `with ctx.side_effects():` to reuse one restart
+  fence without holding it across a network request.
 
 ## What changed in 0.3.17
 
@@ -1331,10 +1363,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.17 the expected filename is:
+The wheel is written to `dist/`. For version 0.3.18 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.17-py3-none-any.whl
+micro_workflow_manager-0.3.18-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1354,22 +1386,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.17-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.18-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.17-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.18-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.17-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.18-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.17`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.3.18`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1384,7 +1416,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.17-py3-none-any.whl
+./vendor/micro_workflow_manager-0.3.18-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

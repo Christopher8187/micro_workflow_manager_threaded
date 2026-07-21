@@ -66,6 +66,8 @@ class JobExecutionMixin:
         self,
         node_name: str,
         job_id: int,
+        *,
+        preloaded_job: Job | None = None,
     ):
         """Run a job through the original low-overhead execution path.
 
@@ -73,7 +75,7 @@ class JobExecutionMixin:
         enables the generation-fenced supervisor only while it owns an active
         run/runfrom sequence.
         """
-        job = self.storage.load_job(node_name, job_id)
+        job = preloaded_job or self.storage.load_job(node_name, job_id)
         started_at = now()
         started_perf = perf_counter()
         self.storage.set_job_status(node_name, job_id, RUNNING, started_at=started_at)
@@ -148,6 +150,9 @@ class JobExecutionMixin:
         node_name: str,
         job_id: int,
         ignore_readiness: bool = False,
+        *,
+        _preloaded_job: Job | None = None,
+        _preclaimed_execution: tuple[int, str, str, float] | None = None,
     ):
         if not ignore_readiness and not self.node_ready(node_name):
             raise InvalidGraphError(f"Node {node_name} is not ready yet")
@@ -157,20 +162,44 @@ class JobExecutionMixin:
             raise InvalidJobError(f"Node {node_name} has no mounted task")
 
         if not self.active_job_restart_enabled:
-            return self._run_job_unfenced(node_name, job_id)
+            return self._run_job_unfenced(
+                node_name,
+                job_id,
+                preloaded_job=_preloaded_job,
+            )
 
         # The runner worker is now the attempt controller. It invokes the
         # fallback/retry pipeline synchronously and creates only one extra
         # abandonable thread for the currently executing user handler. A
         # restart wakes this controller, which immediately loops into the new
         # generation while the stale handler remains fenced.
+        preloaded_job = _preloaded_job
+        preclaimed_execution = _preclaimed_execution
+        execution_priority = (
+            5 if (node.runner_override or self.runner) == "threaded" else 10
+        )
         while True:
-            job = self.storage.load_job(node_name, job_id)
-            started_at = now()
-            started_perf = perf_counter()
-            generation, execution_id = self.storage.claim_job_execution(
-                node_name, job_id, started_at=started_at
-            )
+            job = preloaded_job or self.storage.load_job(node_name, job_id)
+            # A restarted generation must reread the durable payload. The
+            # preloaded object belongs only to this initial queued admission.
+            preloaded_job = None
+            if preclaimed_execution is None:
+                started_at = now()
+                started_perf = perf_counter()
+                generation, execution_id = self.storage.claim_job_execution(
+                    node_name,
+                    job_id,
+                    started_at=started_at,
+                    priority=execution_priority,
+                )
+            else:
+                (
+                    generation,
+                    execution_id,
+                    started_at,
+                    started_perf,
+                ) = preclaimed_execution
+                preclaimed_execution = None
 
             try:
                 result = self.execute_with_fallbacks(
@@ -197,10 +226,10 @@ class JobExecutionMixin:
                 outcome_kind, payload = "error", error
 
             try:
-                with self.storage.guard_job_execution(
-                    node_name, job_id, generation, execution_id
-                ):
-                    if outcome_kind == "result":
+                if outcome_kind == "result":
+                    with self.storage.guard_job_execution(
+                        node_name, job_id, generation, execution_id
+                    ):
                         result = payload
                         stored_files = self.storage.store_returned_files(
                             node_name, job_id, result
@@ -216,19 +245,25 @@ class JobExecutionMixin:
                                 "generation": generation,
                             },
                         )
-                        self.storage.set_job_status(
-                            node_name,
-                            job_id,
-                            DONE,
-                            started_at=started_at,
-                            finished_at=now(),
-                            duration_seconds=round(perf_counter() - started_perf, 6),
-                            generation=generation,
-                            execution_id=execution_id,
-                        )
-                    else:
-                        error = payload
-                        self.storage.write_debug(node_name, f"job {job_id} failed: {error}")
+                    self.storage.finalize_job_execution(
+                        node_name,
+                        job_id,
+                        generation,
+                        execution_id,
+                        DONE,
+                        priority=execution_priority,
+                        started_at=started_at,
+                        finished_at=now(),
+                        duration_seconds=round(perf_counter() - started_perf, 6),
+                        generation=generation,
+                        execution_id=execution_id,
+                    )
+                else:
+                    error = payload
+                    self.storage.write_debug(node_name, f"job {job_id} failed: {error}")
+                    with self.storage.guard_job_execution(
+                        node_name, job_id, generation, execution_id
+                    ):
                         self.storage.write_output(
                             node_name,
                             job_id,
@@ -238,16 +273,19 @@ class JobExecutionMixin:
                                 "generation": generation,
                             },
                         )
-                        self.storage.set_job_status(
-                            node_name,
-                            job_id,
-                            FAILED,
-                            started_at=started_at,
-                            finished_at=now(),
-                            duration_seconds=round(perf_counter() - started_perf, 6),
-                            generation=generation,
-                            execution_id=execution_id,
-                        )
+                    self.storage.finalize_job_execution(
+                        node_name,
+                        job_id,
+                        generation,
+                        execution_id,
+                        FAILED,
+                        priority=execution_priority,
+                        started_at=started_at,
+                        finished_at=now(),
+                        duration_seconds=round(perf_counter() - started_perf, 6),
+                        generation=generation,
+                        execution_id=execution_id,
+                    )
             except JobRestartedError:
                 self.storage.write_debug(
                     node_name,

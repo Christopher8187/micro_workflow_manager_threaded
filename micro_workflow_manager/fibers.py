@@ -66,6 +66,15 @@ class _SleepWait:
 
 
 @dataclass(slots=True)
+class _FutureWaiter:
+    state: "_FiberState"
+    wait_token: int
+    deadline: float | None
+    cancellation_check: Callable[[], None] | None
+    active: bool = True
+
+
+@dataclass(slots=True)
 class _Resume:
     value: Any = None
     error: BaseException | None = None
@@ -194,7 +203,10 @@ class FiberRuntime:
         self.start_burst = start_burst
         self._parent = getcurrent()
         self._states: dict[int, _FiberState] = {}
-        self._future_waiters: dict[Future, list[tuple[_FiberState, int, float | None, Callable[[], None] | None]]] = {}
+        self._future_waiters: dict[Future, list[_FutureWaiter]] = {}
+        self._future_deadlines: list[
+            tuple[float, int, Future, _FutureWaiter]
+        ] = []
         self._sleepers: list[tuple[float, int, _FiberState, int, Callable[[], None] | None]] = []
         self._serial = 0
         self._ready: deque[tuple[_FiberState, _Resume]] = deque()
@@ -203,6 +215,7 @@ class FiberRuntime:
         self._active_count = 0
         self._results: dict[int, Any] = {}
         self._first_error: BaseException | None = None
+        self._next_cancellation_poll = _time.monotonic() + self.poll_interval
 
     def _future_completed(self, future: Future) -> None:
         """Wake the owning pump without rescanning every outstanding future."""
@@ -229,12 +242,24 @@ class FiberRuntime:
         wait_token = state.wait_token
         if isinstance(yielded, _FutureWait):
             state.pending_future = yielded.future
-            waiters = self._future_waiters.setdefault(yielded.future, [])
-            if not waiters:
+            waiters = self._future_waiters.get(yielded.future)
+            if waiters is None:
+                waiters = []
+                self._future_waiters[yielded.future] = waiters
                 yielded.future.add_done_callback(self._future_completed)
-            waiters.append(
-                (state, wait_token, yielded.deadline, yielded.cancellation_check)
+            waiter = _FutureWaiter(
+                state=state,
+                wait_token=wait_token,
+                deadline=yielded.deadline,
+                cancellation_check=yielded.cancellation_check,
             )
+            waiters.append(waiter)
+            if yielded.deadline is not None:
+                self._serial += 1
+                heapq.heappush(
+                    self._future_deadlines,
+                    (yielded.deadline, self._serial, yielded.future, waiter),
+                )
             return
         if isinstance(yielded, _SleepWait):
             self._serial += 1
@@ -291,8 +316,14 @@ class FiberRuntime:
                 resume = _Resume(value=value)
             except BaseException as error:
                 resume = _Resume(error=error)
-            for state, wait_token, _deadline, _check in waiters:
-                if state.done or state.wait_token != wait_token:
+            for waiter in waiters:
+                waiter.active = False
+                state = waiter.state
+                if (
+                    state.done
+                    or state.wait_token != waiter.wait_token
+                    or state.pending_future is not future
+                ):
                     continue
                 state.pending_future = None
                 self._ready.append((state, resume))
@@ -315,35 +346,48 @@ class FiberRuntime:
                     continue
             self._ready.append((state, _Resume()))
 
-        for future, waiters in list(self._future_waiters.items()):
-            keep = []
-            for state, wait_token, deadline, check in waiters:
-                if state.done or state.wait_token != wait_token:
-                    continue
-                if deadline is not None and deadline <= now_value:
-                    state.pending_future = None
-                    self._ready.append((state, _Resume(error=FutureTimeoutError())))
-                else:
-                    keep.append((state, wait_token, deadline, check))
-            if keep:
-                self._future_waiters[future] = keep
-            else:
-                self._future_waiters.pop(future, None)
+        while self._future_deadlines and self._future_deadlines[0][0] <= now_value:
+            _deadline, _serial, future, waiter = heapq.heappop(
+                self._future_deadlines
+            )
+            if not waiter.active:
+                continue
+            state = waiter.state
+            if (
+                state.done
+                or state.wait_token != waiter.wait_token
+                or state.pending_future is not future
+            ):
+                waiter.active = False
+                continue
+            waiter.active = False
+            state.pending_future = None
+            self._ready.append((state, _Resume(error=FutureTimeoutError())))
 
     def _poll_cancellation(self) -> None:
         for future, waiters in list(self._future_waiters.items()):
-            keep = []
-            for state, wait_token, deadline, check in waiters:
-                if state.done or state.wait_token != wait_token:
+            keep: list[_FutureWaiter] = []
+            for waiter in waiters:
+                if not waiter.active:
                     continue
+                state = waiter.state
+                if (
+                    state.done
+                    or state.wait_token != waiter.wait_token
+                    or state.pending_future is not future
+                ):
+                    waiter.active = False
+                    continue
+                check = waiter.cancellation_check
                 if check is not None:
                     try:
                         check()
                     except BaseException as error:
+                        waiter.active = False
                         state.pending_future = None
                         self._ready.append((state, _Resume(error=error)))
                         continue
-                keep.append((state, wait_token, deadline, check))
+                keep.append(waiter)
             if keep:
                 self._future_waiters[future] = keep
             else:
@@ -366,13 +410,22 @@ class FiberRuntime:
 
     def _next_wait_timeout(self) -> float:
         now_value = _time.monotonic()
-        timeout = self.poll_interval
+        timeout = max(0.0, self._next_cancellation_poll - now_value)
         if self._sleepers:
             timeout = min(timeout, max(0.0, self._sleepers[0][0] - now_value))
-        for waiters in self._future_waiters.values():
-            for _state, _token, deadline, _check in waiters:
-                if deadline is not None:
-                    timeout = min(timeout, max(0.0, deadline - now_value))
+        while self._future_deadlines:
+            deadline, _serial, future, waiter = self._future_deadlines[0]
+            state = waiter.state
+            if (
+                not waiter.active
+                or state.done
+                or state.wait_token != waiter.wait_token
+                or state.pending_future is not future
+            ):
+                heapq.heappop(self._future_deadlines)
+                continue
+            timeout = min(timeout, max(0.0, deadline - now_value))
+            break
         return timeout
 
     def run_source(
@@ -417,12 +470,21 @@ class FiberRuntime:
             capacity = max(0, limit - active)
             pulled = pull_items(min(capacity, self.start_burst))
             added = len(pulled)
-            for item in pulled:
+            for position, item in enumerate(pulled):
                 state = self._new_state(next_index, item, run_one)
                 self._states[next_index] = state
                 next_index += 1
                 self._resume_state(state)
                 if self._first_error is not None:
+                    for unstarted in pulled[position + 1:]:
+                        abandon = getattr(unstarted, "abandon_unstarted", None)
+                        if callable(abandon):
+                            try:
+                                abandon()
+                            except BaseException:
+                                # Preserve the original handler failure. The
+                                # conditional release is best-effort recovery.
+                                pass
                     break
 
             while self._ready:
@@ -431,9 +493,12 @@ class FiberRuntime:
                 if self._first_error is not None:
                     break
 
-            self._poll_cancellation()
             self._process_futures()
-            self._process_deadlines(_time.monotonic())
+            now_value = _time.monotonic()
+            self._process_deadlines(now_value)
+            if now_value >= self._next_cancellation_poll:
+                self._poll_cancellation()
+                self._next_cancellation_poll = now_value + self.poll_interval
             while self._ready:
                 state, resume = self._ready.popleft()
                 self._resume_state(state, resume)
@@ -451,12 +516,23 @@ class FiberRuntime:
                     refill = pull_items(min(limit, self.start_burst))
                     if not refill:
                         break
-                    for item in refill:
+                    for position, item in enumerate(refill):
                         state = self._new_state(next_index, item, run_one)
                         self._states[next_index] = state
                         next_index += 1
                         self._resume_state(state)
                         if self._first_error is not None:
+                            for unstarted in refill[position + 1:]:
+                                abandon = getattr(
+                                    unstarted,
+                                    "abandon_unstarted",
+                                    None,
+                                )
+                                if callable(abandon):
+                                    try:
+                                        abandon()
+                                    except BaseException:
+                                        pass
                             break
                     continue
                 if not refreshable and source_exhausted:

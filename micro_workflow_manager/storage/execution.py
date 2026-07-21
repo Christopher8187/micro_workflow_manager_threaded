@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from datetime import datetime
 from threading import get_ident
@@ -10,7 +12,14 @@ from typing import Any, Callable, Iterator, TypeVar
 from uuid import uuid4
 
 from micro_workflow_manager.errors import JobRestartedError
-from micro_workflow_manager.models import QUEUED, RUNNING
+from micro_workflow_manager.models import (
+    CANCELLED,
+    DONE,
+    FAILED,
+    QUEUED,
+    RUNNING,
+    SKIPPED,
+)
 
 
 T = TypeVar("T")
@@ -95,65 +104,361 @@ class JobExecutionStorageMixin:
     def current_job_generation(self, node_name: str, job_id: int) -> int:
         return int(self.read_job_control(node_name, job_id)["generation"])
 
-    def claim_job_execution(self, node_name: str, job_id: int, *, started_at: str) -> tuple[int, str]:
+    def claim_job_execution(
+        self,
+        node_name: str,
+        job_id: int,
+        *,
+        started_at: str,
+        priority: int = 10,
+    ) -> tuple[int, str]:
+        node_name = self.validate_node_name(node_name)
         job_id = self.validate_job_id(job_id)
-        execution_id = uuid4().hex
+        future: Future[tuple[int, str]] = Future()
+        key = (node_name, priority)
+        with self._claim_batch_lock:
+            batch = self._claim_batches.get(key)
+            leader = batch is None
+            if batch is None:
+                batch = []
+                self._claim_batches[key] = batch
+            batch.append((job_id, started_at, future))
+
+        if leader:
+            # Preloaded threaded workers reach this point together. A tiny
+            # collection window turns their individual restart leases into one
+            # SQL update/event batch without preclaiming beyond max_threads.
+            time.sleep(0.001)
+            with self._claim_batch_lock:
+                requests = self._claim_batches.pop(key)
+            try:
+                leases = self.claim_job_executions_batch(
+                    node_name,
+                    [request[0] for request in requests],
+                    started_at=requests[0][1],
+                    priority=priority,
+                )
+            except BaseException as error:
+                for _job_id, _started_at, request_future in requests:
+                    request_future.set_exception(error)
+            else:
+                for lease, (_job_id, _started_at, request_future) in zip(
+                    leases,
+                    requests,
+                ):
+                    request_future.set_result(lease)
+        return future.result()
+
+    def claim_job_executions_batch(
+        self,
+        node_name: str,
+        job_ids: list[int],
+        *,
+        started_at: str,
+        priority: int = 10,
+    ) -> list[tuple[int, str]]:
+        """Claim one preloaded API admission burst in one state mutation."""
+        node_name = self.validate_node_name(node_name)
+        normalized = [self.validate_job_id(job_id) for job_id in job_ids]
+        if not normalized:
+            return []
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("job_ids contains duplicates")
+        execution_ids = [uuid4().hex for _ in normalized]
         pid = os.getpid()
         thread_id = get_ident()
         event_time = datetime.now().isoformat(timespec="milliseconds")
 
         def claim(connection):
-            row = connection.execute(
-                "SELECT generation, status FROM jobs WHERE node_name=? AND job_id=?",
-                (node_name, job_id),
-            ).fetchone()
-            if row is None:
-                raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
-            generation = int(row["generation"])
-            previous_status = str(row["status"])
-            status_extra = {
-                "started_at": started_at,
-                "generation": generation,
-                "execution_id": execution_id,
-                "pid": pid,
-            }
-            connection.execute(
-                "UPDATE jobs SET active_execution_id=?, active_pid=?, active_thread_id=?, "
-                "active_started_at=?, restart_requested_at=NULL, restart_requested_by_pid=NULL, "
+            rows = []
+            for offset in range(0, len(normalized), 500):
+                chunk = normalized[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        "SELECT job_id, generation, status FROM jobs "
+                        f"WHERE node_name=? AND job_id IN ({placeholders})",
+                        [node_name, *chunk],
+                    ).fetchall()
+                )
+            rows_by_id = {int(row["job_id"]): row for row in rows}
+            missing = [job_id for job_id in normalized if job_id not in rows_by_id]
+            if missing:
+                raise FileNotFoundError(
+                    f"Job does not exist: {node_name}/{missing[0]}"
+                )
+
+            updates = []
+            events = []
+            results = []
+            for job_id, execution_id in zip(normalized, execution_ids):
+                row = rows_by_id[job_id]
+                generation = int(row["generation"])
+                previous_status = str(row["status"])
+                status_extra = {
+                    "started_at": started_at,
+                    "generation": generation,
+                    "execution_id": execution_id,
+                    "pid": pid,
+                }
+                updates.append(
+                    (
+                        execution_id,
+                        pid,
+                        thread_id,
+                        started_at,
+                        RUNNING,
+                        json.dumps(
+                            status_extra,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        node_name,
+                        job_id,
+                        generation,
+                    )
+                )
+                events.append(
+                    (
+                        node_name,
+                        job_id,
+                        event_time,
+                        json.dumps(
+                            {
+                                "previous_status": previous_status,
+                                "status": RUNNING,
+                                **status_extra,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
+                results.append((generation, execution_id))
+
+            connection.executemany(
+                "UPDATE jobs SET active_execution_id=?, active_pid=?, "
+                "active_thread_id=?, active_started_at=?, "
+                "restart_requested_at=NULL, restart_requested_by_pid=NULL, "
                 "restart_reason=NULL, runtime_json=NULL, status=?, status_json=? "
                 "WHERE node_name=? AND job_id=? AND generation=?",
-                (
-                    execution_id,
-                    pid,
-                    thread_id,
-                    started_at,
-                    RUNNING,
-                    json.dumps(status_extra, ensure_ascii=False, separators=(",", ":")),
-                    node_name,
-                    job_id,
-                    generation,
-                ),
+                updates,
             )
-            event_data = json.dumps(
-                {
-                    "previous_status": previous_status,
-                    "status": RUNNING,
-                    **status_extra,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            connection.execute(
+            connection.executemany(
                 "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
                 "VALUES(?, ?, ?, 'started', ?)",
-                (node_name, job_id, event_time, event_data),
+                events,
             )
-            return generation, execution_id
+            return results
 
-        # Claiming is itself an atomic database transition. The filesystem lock
-        # remains reserved for side effects/final publication, where a restart
-        # must fence an actual file mutation.
-        return self.submit_db_mutation(claim)
+        return self.submit_db_mutation(claim, priority=priority)
+
+    def release_unstarted_job_execution(
+        self,
+        node_name: str,
+        job_id: int,
+        generation: int,
+        execution_id: str,
+    ) -> None:
+        """Requeue a preclaimed item that a failed burst never started."""
+        job_id = self.validate_job_id(job_id)
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+
+        def release(connection):
+            changed = connection.execute(
+                "UPDATE jobs SET status=?, status_json='{}', "
+                "active_execution_id=NULL, active_pid=NULL, "
+                "active_thread_id=NULL, active_started_at=NULL "
+                "WHERE node_name=? AND job_id=? AND generation=? "
+                "AND active_execution_id=?",
+                (QUEUED, node_name, job_id, generation, execution_id),
+            ).rowcount
+            if changed:
+                connection.execute(
+                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                    "VALUES(?, ?, ?, 'queued', ?)",
+                    (
+                        node_name,
+                        job_id,
+                        event_time,
+                        json.dumps(
+                            {
+                                "previous_status": RUNNING,
+                                "status": QUEUED,
+                                "reason": "preclaimed burst was not started",
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+            return bool(changed)
+
+        changed = self.submit_db_mutation(release, priority=0)
+        if changed:
+            self.notify_queue_change()
+
+    def finalize_job_execution(
+        self,
+        node_name: str,
+        job_id: int,
+        lease_generation: int,
+        lease_execution_id: str,
+        status: str,
+        priority: int = 10,
+        **extra,
+    ) -> None:
+        """Publish a terminal outcome only while its execution lease is current.
+
+        Filesystem output is fenced before this call. The grouped database write
+        happens after that file fence is released because an API fiber may yield
+        while the commit lane is busy. Keeping the fence open across that yield
+        otherwise retains one OS file handle per completing job and can exhaust
+        handles during a large completion wave.
+        """
+        node_name = self.validate_node_name(node_name)
+        job_id = self.validate_job_id(job_id)
+        status = self.validate_status(status)
+        if status not in {DONE, FAILED, CANCELLED, SKIPPED}:
+            raise ValueError("finalize_job_execution requires a terminal status")
+        future: Future[None] = Future()
+        key = (node_name, priority)
+        request = (
+            job_id,
+            int(lease_generation),
+            lease_execution_id,
+            status,
+            dict(extra),
+            future,
+        )
+        with self._finalize_batch_lock:
+            batch = self._finalize_batches.get(key)
+            leader = batch is None
+            if batch is None:
+                batch = []
+                self._finalize_batches[key] = batch
+            batch.append(request)
+
+        if leader:
+            time.sleep(0.001)
+            with self._finalize_batch_lock:
+                requests = self._finalize_batches.pop(key)
+            try:
+                outcomes = self._finalize_job_executions_batch(
+                    node_name,
+                    requests,
+                    priority=priority,
+                )
+            except BaseException as error:
+                for *_request, request_future in requests:
+                    request_future.set_exception(error)
+            else:
+                for outcome, (*_request, request_future) in zip(
+                    outcomes,
+                    requests,
+                ):
+                    if outcome is None:
+                        request_future.set_result(None)
+                    else:
+                        request_future.set_exception(outcome)
+        future.result()
+
+    def _finalize_job_executions_batch(
+        self,
+        node_name: str,
+        requests: list[tuple],
+        *,
+        priority: int,
+    ) -> list[BaseException | None]:
+        event_time = datetime.now().isoformat(timespec="milliseconds")
+
+        def finalize(connection):
+            ids = [request[0] for request in requests]
+            rows = []
+            for offset in range(0, len(ids), 500):
+                chunk = ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        "SELECT job_id, status, generation, active_execution_id "
+                        "FROM jobs WHERE node_name=? "
+                        f"AND job_id IN ({placeholders})",
+                        [node_name, *chunk],
+                    ).fetchall()
+                )
+            rows_by_id = {int(row["job_id"]): row for row in rows}
+            outcomes: list[BaseException | None] = []
+            for (
+                job_id,
+                lease_generation,
+                lease_execution_id,
+                status,
+                extra,
+                _future,
+            ) in requests:
+                row = rows_by_id.get(job_id)
+                if (
+                    row is None
+                    or int(row["generation"]) != lease_generation
+                    or row["active_execution_id"] != lease_execution_id
+                ):
+                    outcomes.append(
+                        JobRestartedError(
+                            f"Job {node_name}/{job_id} generation "
+                            f"{lease_generation} was restarted"
+                        )
+                    )
+                    continue
+                previous_status = str(row["status"])
+                connection.execute(
+                    "UPDATE jobs SET status=?, status_json=?, "
+                    "active_execution_id=NULL, active_pid=NULL, "
+                    "active_thread_id=NULL, active_started_at=NULL "
+                    "WHERE node_name=? AND job_id=? AND generation=? "
+                    "AND active_execution_id=?",
+                    (
+                        status,
+                        json.dumps(
+                            extra,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        node_name,
+                        job_id,
+                        lease_generation,
+                        lease_execution_id,
+                    ),
+                )
+                event_name = {
+                    DONE: "done",
+                    FAILED: "failed",
+                    CANCELLED: "cancelled",
+                    SKIPPED: "skipped",
+                }[status]
+                event_data = json.dumps(
+                    {
+                        "previous_status": previous_status,
+                        "status": status,
+                        **extra,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                connection.execute(
+                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (
+                        node_name,
+                        job_id,
+                        event_time,
+                        event_name,
+                        event_data,
+                    ),
+                )
+                outcomes.append(None)
+            return outcomes
+
+        return self.submit_db_mutation(finalize, priority=priority)
 
     def job_execution_is_current(
         self,

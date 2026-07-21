@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from shutil import copy2
 from threading import Lock, RLock
@@ -17,6 +18,12 @@ from uuid import uuid4
 from micro_workflow_manager.models import JOB_VALID_STATUSES, NODE_VALID_STATUSES
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.paths import config_file, locks_dir, run_file
+
+
+_HELD_FILESYSTEM_LOCKS: ContextVar[frozenset[str]] = ContextVar(
+    "mwf_held_filesystem_locks",
+    default=frozenset(),
+)
 
 
 def _strip_windows_extended_prefix(value: str) -> str:
@@ -275,10 +282,19 @@ class FileStorageBase:
         ``mwf restart`` command in a second process with the running job.
         """
         path = self.filesystem_lock_file(namespace, name)
+        lock_key = os.fspath(path.resolve())
+        held = _HELD_FILESYSTEM_LOCKS.get()
+        if lock_key in held:
+            # ContextVar state follows the current API fiber. This makes an
+            # explicit outer side-effect fence genuinely reentrant without
+            # treating unrelated greenlets on the same OS thread as owners.
+            yield
+            return
         thread_lock = self.thread_lock_for(path)
 
         with thread_lock:
             file = self.retry_fs(lambda: path.open("a+b"), attempts=60)
+            held_token = _HELD_FILESYSTEM_LOCKS.set(held | {lock_key})
             try:
                 if os.name == "nt":
                     import msvcrt
@@ -314,6 +330,7 @@ class FileStorageBase:
                             attempts=20,
                         )
             finally:
+                _HELD_FILESYSTEM_LOCKS.reset(held_token)
                 file.close()
 
     @contextmanager

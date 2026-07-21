@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import shutil
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from micro_workflow_manager.models import QUEUED
@@ -91,20 +92,54 @@ def delete_jobs_generated_by_components(workflow: MicroWorkflow, producer_compon
     downstream DAG jobs produced by the fresh run set while preserving jobs
     produced by components outside that set.
     """
+    selected_by_node: dict[str, list[int]] = {}
+    # One SQLite snapshot replaces one metadata query per project job. This is
+    # especially important before a large Hoeflein rerun, where cleanup happens
+    # before the first component pump is allowed to start.
+    for metadata in workflow.storage.list_job_parent_metadata():
+        if job_producer_component(workflow, metadata) not in producer_components:
+            continue
+        selected_by_node.setdefault(metadata["node_name"], []).append(
+            metadata["job_id"]
+        )
+
     removed: dict[str, int] = {}
-    for node_name in workflow.graph_obj.nodes:
-        for job_id in list(workflow.storage.list_job_ids(node_name)):
-            metadata = workflow.storage.read_job_metadata(node_name, job_id)
-            if job_producer_component(workflow, metadata) not in producer_components:
-                continue
-            workflow.storage.delete_job(node_name, job_id, remove_payload=True)
-            removed[node_name] = removed.get(node_name, 0) + 1
+    for node_name, job_ids in selected_by_node.items():
+        count = workflow.storage.delete_jobs_batch(
+            node_name,
+            job_ids,
+            remove_payload=True,
+        )
+        if count:
+            removed[node_name] = count
     # Cleanup runs before workers start and owns the active-run slot, so it is
     # safe to restore deterministic tail allocation for jobs that are about to
     # be recreated by the same selected producer components.
     for node_name in removed:
         workflow.storage.rewind_job_sequence_to_available(node_name)
     return removed
+
+
+def _remove_job_artifacts_batch(
+    workflow: MicroWorkflow,
+    node: str,
+    job_ids: list[int],
+) -> None:
+    """Remove independent per-job outputs concurrently on slow filesystems."""
+    def remove_one(job_id: int) -> None:
+        job_dir = workflow.storage.job_base_dir(node, job_id)
+        remove_path(job_dir / "output.json")
+        remove_path(job_dir / "files")
+
+    if os.name != "nt" or len(job_ids) < 8:
+        for job_id in job_ids:
+            remove_one(job_id)
+        return
+    with ThreadPoolExecutor(
+        max_workers=min(32, len(job_ids)),
+        thread_name_prefix="mwf-fresh-cleanup",
+    ) as executor:
+        list(executor.map(remove_one, job_ids))
 
 
 def reset_component_jobs_for_fresh_run(
@@ -125,16 +160,17 @@ def reset_component_jobs_for_fresh_run(
     for node in component:
         node_dir = safe_node_dir(root, node)
         has_preserved_parent_jobs = False
-        for job_id in list(workflow.storage.list_job_ids(node)):
-            metadata = workflow.storage.read_job_metadata(node, job_id)
+        reset_job_ids: list[int] = []
+        for metadata in workflow.storage.list_job_parent_metadata([node]):
+            job_id = metadata["job_id"]
             producer = job_producer_component(workflow, metadata)
             if preserve_external_parent_jobs and producer is not None:
                 has_preserved_parent_jobs = True
                 continue
-            job_dir = workflow.storage.job_base_dir(node, job_id)
-            remove_path(job_dir / "output.json")
-            remove_path(job_dir / "files")
-            workflow.storage.set_job_status(node, job_id, QUEUED)
+            reset_job_ids.append(job_id)
+
+        _remove_job_artifacts_batch(workflow, node, reset_job_ids)
+        workflow.storage.reset_jobs_for_run_batch(node, reset_job_ids)
 
         # A start component is fully reset, so its aggregate output must also be
         # cleared. A descendant merge may still contain completed jobs from an

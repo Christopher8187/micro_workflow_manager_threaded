@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import Future
 
 import httpx
+import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeRouter
+from micro_workflow_manager.fibers import cancellation_scope
 from micro_workflow_manager.networking import (
     close_shared_http_transport,
     configure_shared_http_transport,
@@ -22,6 +25,33 @@ class CountingFuture(Future):
     def done(self):
         type(self).done_calls += 1
         return super().done()
+
+
+@pytest.mark.parametrize("runner", ["api", "threaded"])
+def test_queue_pumps_preload_job_metadata_in_batches(tmp_path, monkeypatch, runner):
+    workflow = MicroWorkflow(tmp_path, runner=runner)
+    workflow.graph([("A", "sink")])
+
+    @workflow.task("A", runner=runner, max_threads=32)
+    def run_a(ctx, value):
+        return value
+
+    @workflow.task("sink")
+    def sink(ctx):
+        return None
+
+    count = 100
+    workflow.add_jobs(None, "A", [{"value": value} for value in range(count)])
+    monkeypatch.setattr(
+        workflow.storage,
+        "read_job_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("queue admission must not query metadata per job")
+        ),
+    )
+
+    workflow.run_node("A", ignore_readiness=True)
+    assert workflow.storage.job_status_counts("A")["done"] == count
 
 
 def test_fiber_completions_are_callback_driven_not_full_map_scans():
@@ -141,3 +171,160 @@ def test_transport_sharding_does_not_cap_node_concurrency():
     )
     assert result == list(range(50))
     assert peak == 50
+
+
+def test_api_admission_does_not_rescan_every_waiter_after_each_burst():
+    count = 2000
+    release: Future[None] = Future()
+    entered = 0
+    cancellation_checks = 0
+
+    def check_cancelled():
+        nonlocal cancellation_checks
+        cancellation_checks += 1
+
+    def run_one(value):
+        nonlocal entered
+        entered += 1
+        if entered == count:
+            release.set_result(None)
+        with cancellation_scope(check_cancelled):
+            release.result()
+        return value
+
+    result = ApiRunner(max_threads=count, poll_interval=0.05).run_jobs(
+        "A",
+        list(range(count)),
+        run_one,
+    )
+    assert result == list(range(count))
+    assert cancellation_checks < count * 6
+
+
+def test_supervised_completion_wave_releases_file_fence_before_group_commit(
+    tmp_path,
+    monkeypatch,
+):
+    count = 400
+    workflow = MicroWorkflow(tmp_path, runner="api")
+    workflow.graph([("A", "sink")])
+    release: Future[None] = Future()
+    all_entered = threading.Event()
+    entered = 0
+
+    @workflow.task("A", runner="api", max_threads=count, timeout=30)
+    def run_a(ctx, value):
+        nonlocal entered
+        entered += 1
+        if entered == count:
+            all_entered.set()
+        release.result()
+        return value
+
+    @workflow.task("sink")
+    def sink(ctx):
+        return None
+
+    workflow.add_jobs(None, "A", [{"value": value} for value in range(count)])
+    workflow.active_job_restart_enabled = True
+
+    active_fences = 0
+    peak_fences = 0
+    original = workflow.storage.filesystem_interprocess_lock
+
+    @contextmanager
+    def counted_fence(namespace, name):
+        nonlocal active_fences, peak_fences
+        with original(namespace, name):
+            if namespace == "execution-fences":
+                active_fences += 1
+                peak_fences = max(peak_fences, active_fences)
+            try:
+                yield
+            finally:
+                if namespace == "execution-fences":
+                    active_fences -= 1
+
+    monkeypatch.setattr(
+        workflow.storage,
+        "filesystem_interprocess_lock",
+        counted_fence,
+    )
+
+    worker = threading.Thread(
+        target=lambda: workflow.run_node("A", ignore_readiness=True)
+    )
+    worker.start()
+    assert all_entered.wait(10)
+    release.set_result(None)
+    worker.join(timeout=20)
+
+    assert not worker.is_alive()
+    assert workflow.storage.job_status_counts("A")["done"] == count
+    assert peak_fences < 10
+
+
+def test_asymmetric_hoeflein_wave_admits_large_nodes_and_drains_cleanly(tmp_path):
+    """A large component member must not starve behind smaller peer nodes."""
+    workflow = MicroWorkflow(tmp_path, runner="api")
+    workflow.active_job_restart_enabled = True
+    workflow.graph([
+        ("hub", "small"),
+        ("small", "hub"),
+        ("hub", "medium"),
+        ("medium", "hub"),
+        ("hub", "large"),
+        ("large", "hub"),
+    ])
+
+    distribution = {
+        "hub": 10,
+        "small": 40,
+        "medium": 80,
+        "large": 120,
+    }
+    total = sum(distribution.values())
+    release: Future[None] = Future()
+    all_entered = threading.Event()
+    entered = 0
+    entered_lock = threading.Lock()
+
+    def run(ctx, value):
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered == total:
+                all_entered.set()
+        release.result()
+        return value
+
+    routers = []
+    for node_name, count in distribution.items():
+        router = NodeRouter(node_name, runner="api", max_threads=total)
+        routers.append(router)
+        router.task(run)
+        workflow.include_router(router)
+        workflow.add_jobs(
+            None,
+            node_name,
+            [{"value": value} for value in range(count)],
+        )
+
+    worker = threading.Thread(
+        target=lambda: workflow.run_node("hub", ignore_readiness=True)
+    )
+    worker.start()
+    try:
+        assert all_entered.wait(10), (
+            f"only {entered}/{total} component jobs reached their handlers"
+        )
+    finally:
+        release.set_result(None)
+        worker.join(timeout=20)
+
+    assert not worker.is_alive()
+    for node_name, count in distribution.items():
+        summary = workflow.storage.node_job_summary(node_name)["counts"]
+        assert summary["done"] == count
+        assert summary["queued"] == 0
+        assert summary["running"] == 0

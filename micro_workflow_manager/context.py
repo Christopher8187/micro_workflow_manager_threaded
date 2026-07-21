@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -389,6 +389,29 @@ class JobContext(_ExecutionChecks):
     def transaction(self) -> JobTransaction:
         """Stage downstream ``ctx.node(...).add(...)`` calls until block success."""
         return JobTransaction(self)
+
+    @contextmanager
+    def side_effects(self):
+        """Group several restart-fenced file/queue mutations under one fence.
+
+        This is useful for short local routing handlers that publish multiple
+        files and one downstream job. Do not keep the context open across a
+        network request or a long computation: the fence intentionally delays a
+        second-terminal restart until the block exits.
+        """
+        self._check_execution()
+        if self.execution_id is None:
+            yield self
+            return
+        with self.system.storage.guard_job_execution(
+            self.current_node,
+            self.job_id,
+            self.execution_generation,
+            self.execution_id,
+        ):
+            self._check_execution()
+            yield self
+            self._check_execution()
 
     @property
     def job_id(self) -> int:
