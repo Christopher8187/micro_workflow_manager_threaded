@@ -753,3 +753,33 @@ thousands of lock-file descriptors while their grouped commits yield.
 Handlers that need several local publications to share one restart fence may
 use `JobContext.side_effects()`. The scope is intentionally synchronous and
 short; network waits and long computation remain outside it.
+
+
+## Adaptive API admission (0.4.1)
+
+Refreshable API sources use an adaptive claim window rather than a permanently
+fixed burst. The first probe remains 64 jobs. A full pull doubles the next
+window up to 1024, reducing synchronous SQLite claim transactions for large,
+fixed queues. A partial or empty pull drops the next probe to 16, keeping sparse
+and trickling Hoeflein producers responsive without repeatedly issuing large
+mostly-empty claims.
+
+Admission sizing is independent of terminal persistence. Finished handlers send
+their conditional terminal mutations through the dedicated finalization
+coordinator, so a node that continues to claim new work cannot prevent `done`
+updates from reaching the higher-priority SQLite writer lane.
+
+## Monitor-visible terminal persistence (0.4.0)
+
+Output publication and scheduler-state publication are separate restart-safe
+phases. The output file remains protected by the exact execution fence, then a
+conditional SQLite mutation publishes the terminal job status and event. Since
+`mwf monitor` reads the SQLite job index, that second phase must not be starved
+by a large node that is still claiming API work.
+
+The mutation lane therefore orders durable queue publication first, terminal
+status and local threaded execution second, and API admission/checkpoint churn
+last. Terminal updates remain batched by node and independently validate each
+generation/execution lease. This ordering changes only state visibility and
+writer fairness; node `max_threads`, transport sharding, output durability, and
+restart fencing are unchanged.

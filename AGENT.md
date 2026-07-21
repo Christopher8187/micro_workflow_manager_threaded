@@ -359,3 +359,25 @@ component pumping but leave hundreds of later jobs queued.
 - Add monitor-shaped regressions as well as small unit cases: thousands of jobs
   distributed unevenly across one Hoeflein component must all reach execution,
   and a simultaneous completion wave must not exhaust file descriptors.
+
+
+## Adaptive API admission checks (0.4.1)
+
+- Keep the initial refreshable-source admission probe at 64, the sparse floor at
+  16, and the dense ceiling at 1024 unless benchmarks justify changing all three.
+- A full pull may grow the next window geometrically. A partial or empty pull
+  must return the next probe to 16 so trickling producers are not polled through
+  oversized claim transactions.
+- Admission tuning must not reuse the terminal finalization coordinator or lower
+  terminal mutation priority. Output-backed completions must become visible even
+  while the next admission pull is blocked or dense claims continue.
+
+## Monitor terminal-state checks (0.4.0)
+
+- Keep API claim/checkpoint mutations below terminal status mutations in the
+  grouped writer. A large node that is still starting jobs must not make its
+  completed output appear permanently `running` to `mwf monitor`.
+- Keep durable queue publication above both terminal and consumer state churn so
+  monitor visibility does not regress live Hoeflein producer throughput.
+- Test the priorities through the real supervised API execution path and assert
+  the final monitor snapshot has exact done/queued/running counts.

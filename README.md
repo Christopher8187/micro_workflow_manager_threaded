@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.3.18
+# micro-workflow-manager 0.4.1
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,33 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.4.1
+
+- Refreshable API admission now adapts across a wider range. It starts at 64,
+  drops to 16 after a partial or empty pull for sparse/trickling queues, and
+  grows geometrically to 1024 while pulls remain full for dense fixed queues.
+- A 2,000-job dense queue now reaches its final partial pull in six admission
+  rounds (`64, 128, 256, 512, 1024, 16`) instead of repeatedly claiming fixed
+  groups of 64.
+- Terminal completion batching remains independent of the API fiber scheduler,
+  so adaptive claims cannot prevent output-backed `done` updates from entering
+  the higher-priority SQLite mutation lane.
+
+## What changed in 0.4.0
+
+- Terminal job status and event commits now use the writer's local-execution
+  priority. They continue to remain below durable queue publication, but run
+  ahead of API admission and checkpoint churn. A large API node can therefore
+  keep starting jobs without hiding already-published completions from
+  `mwf monitor`.
+- Claim priority and terminal priority are now independent. API claims remain
+  deliberately lower priority so live Hoeflein producers keep their commit
+  capacity; finished output still becomes monitor-visible promptly instead of
+  waiting behind the rest of a high-fanout start wave.
+- A monitor-shaped regression verifies that a large supervised API node reports
+  every completion from SQLite and leaves no queued/running residue while its
+  claims use the lower-priority admission lane.
 
 ## What changed in 0.3.18
 
@@ -1363,10 +1390,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.3.18 the expected filename is:
+The wheel is written to `dist/`. For version 0.4.1 the expected filename is:
 
 ```text
-micro_workflow_manager-0.3.18-py3-none-any.whl
+micro_workflow_manager-0.4.1-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1386,22 +1413,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.3.18-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.4.1-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.3.18-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.4.1-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.3.18-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.4.1-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.3.18`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.4.1`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1416,7 +1443,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.3.18-py3-none-any.whl
+./vendor/micro_workflow_manager-0.4.1-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project
