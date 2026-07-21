@@ -175,7 +175,7 @@ class JobExecutionMixin:
         # generation while the stale handler remains fenced.
         preloaded_job = _preloaded_job
         preclaimed_execution = _preclaimed_execution
-        execution_priority = (
+        claim_priority = (
             5 if (node.runner_override or self.runner) == "threaded" else 10
         )
         while True:
@@ -190,7 +190,7 @@ class JobExecutionMixin:
                     node_name,
                     job_id,
                     started_at=started_at,
-                    priority=execution_priority,
+                    priority=claim_priority,
                 )
             else:
                 (
@@ -251,7 +251,6 @@ class JobExecutionMixin:
                         generation,
                         execution_id,
                         DONE,
-                        priority=execution_priority,
                         started_at=started_at,
                         finished_at=now(),
                         duration_seconds=round(perf_counter() - started_perf, 6),
@@ -279,7 +278,6 @@ class JobExecutionMixin:
                         generation,
                         execution_id,
                         FAILED,
-                        priority=execution_priority,
                         started_at=started_at,
                         finished_at=now(),
                         duration_seconds=round(perf_counter() - started_perf, 6),

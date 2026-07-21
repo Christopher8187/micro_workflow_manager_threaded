@@ -305,7 +305,7 @@ class JobExecutionStorageMixin:
         lease_generation: int,
         lease_execution_id: str,
         status: str,
-        priority: int = 10,
+        priority: int = 5,
         **extra,
     ) -> None:
         """Publish a terminal outcome only while its execution lease is current.
@@ -314,7 +314,9 @@ class JobExecutionStorageMixin:
         happens after that file fence is released because an API fiber may yield
         while the commit lane is busy. Keeping the fence open across that yield
         otherwise retains one OS file handle per completing job and can exhaust
-        handles during a large completion wave.
+        handles during a large completion wave. Terminal mutations default to
+        the local-execution priority so monitor-visible completion cannot remain
+        behind a large node's lower-priority API admission/checkpoint backlog.
         """
         node_name = self.validate_node_name(node_name)
         job_id = self.validate_job_id(job_id)

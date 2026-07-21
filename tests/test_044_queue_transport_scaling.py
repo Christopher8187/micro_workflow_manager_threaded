@@ -11,6 +11,7 @@ import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeRouter
 from micro_workflow_manager.fibers import cancellation_scope
+from micro_workflow_manager.monitor import workflow_snapshot
 from micro_workflow_manager.networking import (
     close_shared_http_transport,
     configure_shared_http_transport,
@@ -262,6 +263,44 @@ def test_supervised_completion_wave_releases_file_fence_before_group_commit(
     assert not worker.is_alive()
     assert workflow.storage.job_status_counts("A")["done"] == count
     assert peak_fences < 10
+
+
+def test_api_terminal_commits_outrank_admission_and_reach_monitor(tmp_path, monkeypatch):
+    count = 200
+    workflow = MicroWorkflow(tmp_path, runner="api")
+    workflow.graph([("A", "sink")])
+
+    @workflow.task("A", runner="api", max_threads=count, timeout=30)
+    def run_a(ctx, value):
+        return value
+
+    @workflow.task("sink")
+    def sink(ctx):
+        return None
+
+    workflow.add_jobs(None, "A", [{"value": value} for value in range(count)])
+    workflow.active_job_restart_enabled = True
+
+    priorities = {"claim": set(), "finalize": set()}
+    original = workflow.storage.submit_db_mutation
+
+    def record_priority(operation, *, wait=True, priority=10):
+        name = getattr(operation, "__name__", "")
+        if name in priorities:
+            priorities[name].add(priority)
+        return original(operation, wait=wait, priority=priority)
+
+    monkeypatch.setattr(workflow.storage, "submit_db_mutation", record_priority)
+    workflow.run_node("A", ignore_readiness=True)
+
+    row = next(
+        row for row in workflow_snapshot(workflow)["nodes"] if row["node"] == "A"
+    )
+    assert priorities["claim"] == {10}
+    assert priorities["finalize"] == {5}
+    assert row["done"] == count
+    assert row["running"] == 0
+    assert row["queued"] == 0
 
 
 def test_asymmetric_hoeflein_wave_admits_large_nodes_and_drains_cleanly(tmp_path):
