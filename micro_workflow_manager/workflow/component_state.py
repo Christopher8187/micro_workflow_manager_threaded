@@ -148,12 +148,12 @@ class ComponentStateMixin:
         return set(node.wait_for)
 
     def waiting_blockers(self, node_name: str) -> set[str]:
-        """Peers whose durable queues still block a later pump for node_name."""
-        return {
-            peer
-            for peer in self.waiting_dependencies(node_name)
-            if self.storage.has_queued_jobs(peer)
-        }
+        """Peers with queued, running, or failed work that block this node."""
+        dependencies = self.waiting_dependencies(node_name)
+        return self.storage.nodes_with_job_statuses(
+            dependencies,
+            {QUEUED, RUNNING, FAILED},
+        )
 
     def node_is_waiting(self, node_name: str) -> bool:
         if not self.storage.has_queued_jobs(node_name):

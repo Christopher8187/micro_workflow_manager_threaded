@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.4.1
+# micro-workflow-manager 0.4.3
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,46 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.4.3
+
+- Terminal job publication now enters the existing priority SQLite writer
+  directly. The writer groups related terminal records for at most 5 ms and
+  applies one bulk lease-fenced update/event operation; the redundant terminal
+  daemon queue has been removed.
+- A node or Hoeflein-component failure stops new admission but waits for every
+  already-started threaded, process, or API job to reach its terminal boundary.
+  Failure handling no longer scans output files or performs a special terminal
+  drain before marking the component failed.
+- `mwf resume NODE` and `mwf resumefrom START` first reconcile terminal
+  `output.json` files against stale `running` rows, cross the SQLite durability
+  barrier, and only then generation-fence and requeue the remaining unsuccessful
+  work. This preserves handlers that finished before a process interruption.
+- `mwf restart NODE` restarts every live-running and failed/cancelled job in the
+  node's active Hoeflein component (a DAG node is a singleton component).
+  `mwf restart NODE failed` limits that component-wide selection to
+  failed/cancelled jobs. The explicit `job` and `jobs` forms remain available.
+- A waiting node now requires every selected peer to have zero queued, running,
+  and failed jobs. The old queued-only cycle bootstrap has been removed, so the
+  declared gate is never bypassed.
+
+## What changed in 0.4.2
+
+- SQLite state handling is separated into connection/mutation, schema,
+  advisory-lock, and transfer modules. Job creation, batching, querying,
+  cleanup, execution claims, terminal publication, and restart recovery are
+  likewise isolated behind the existing `FileStorage` facade.
+- Terminal job updates are published by a dedicated fixed-cadence coordinator
+  and use batched conditional SQL updates/events. Hoeflein components also
+  reconcile terminal `output.json` files every 250 ms, recovering a completed
+  handler if its final SQLite mutation was interrupted.
+- A node failure urgently flushes all already-written terminal outcomes before
+  the shared Hoeflein stop signal is raised. Sibling queue admission stops at
+  that point, and API jobs preclaimed but not started are returned to `queued`
+  for a safe `mwf resume`.
+- Multi-concern production modules over 500 lines were split into focused
+  facades and implementation files. The remaining file above 500 lines is the
+  cohesive cooperative fiber runtime.
 
 ## What changed in 0.4.1
 
@@ -122,16 +162,17 @@ limit.
   that component; DAG nodes remain singleton components.
 - Nodes may declare an intra-component waiting gate with `waiting=True` and
   `wait_for=...`. Queued jobs remain durably queued, but the node displays as
-  `waiting` and no new node pump starts until the selected peers have no queued
-  jobs left. A pump that already started continues normally.
+  `waiting` and no new node pump starts until every selected peer has zero
+  queued, running, and failed jobs. A pump that already started continues
+  normally.
 - `wait_for=None` with `waiting=True` means all other vertices in the component.
   A list selects a subset. Waiting targets outside the component are rejected.
 - Waiting on a singleton DAG component is allowed but has no effect; CLI loading
   prints a reminder that ordinary DAG predecessor readiness is the available
   queue-independent mechanism.
-- Mutual waiting cycles use a deterministic one-pump bootstrap only when a
-  resumed component has queued work on every side and no active pump can change
-  the queues. Normal waiting gates resume immediately after that bootstrap.
+- Waiting declarations are strict. A mutually waiting set with blocked work on
+  every side remains waiting until a restart, resume, or producer action clears
+  the declared queued/running/failed conditions.
 
 ### Waiting-node example
 
@@ -1258,68 +1299,43 @@ policy, test-code stalls, and scheduler defects.
 
 ## Restart inside an active sequence
 
-When an individual job is hung inside an active `mwf run`, `runfrom`, `resume`,
-or `resumefrom` sequence, keep the original terminal running and use the
-dedicated restart command from a second terminal:
+Keep the original `mwf run`, `runfrom`, `resume`, or `resumefrom` terminal
+running and issue restart controls from a second terminal. Naming a node selects
+its whole active Hoeflein component; an ordinary DAG node selects only itself.
 
 ```bash
+# Restart every live-running and failed/cancelled job in the component.
+mwf restart <node-name>
+
+# Restart failed/cancelled jobs only.
+mwf restart <node-name> failed
+
+# Retain precise job selection when needed.
 mwf restart <node-name> job 42
-```
-
-Several currently running jobs may be selected with IDs and ranges:
-
-```bash
 mwf restart <node-name> jobs 42 57 80-82
 ```
 
-`mwf restart` does not start another scheduler and does not replace the active
-`.mwf/run.json` record. It atomically advances the selected job's execution
-generation before clearing job-local `output.json` and `files/`. The scheduler
-that already owns the larger run sees the new generation and immediately starts
-the replacement attempt. The node remains active throughout this handoff, so it
-cannot be finalized merely because the abandoned attempt stopped being current.
-The job row in SQLite and the original `input.json` are preserved.
+Restart never launches a second scheduler. For each selected job it advances the
+execution generation, clears job-local `output.json` and generated files, and
+leaves the existing run in control. A stale generation cannot commit framework
+status, files, output, or downstream jobs. Already queued, done, and skipped jobs
+are not reset by the component-wide forms.
 
-An older generation is fenced from committing its final status, returned files,
-`ctx.write(...)`, `ctx.write_output(...)`, and `ctx.node(...).add(...)` effects.
-If it finishes while the restart command is preparing the replacement, its stale
-completion is discarded. A live `running` attempt must belong to the active run
-and have a live execution lease; MWF refuses rather than creating an orphan
-queued job when the attempt has already completed. Ordinary `mwf run` and
-`mwf runfrom` commands also refuse to start a competing sequence while another
-one owns the project.
+The active run record stores component membership, so the second-terminal command
+does not need to import project graph or handler code. Run records from older
+versions fall back to singleton-node scope.
 
-`mwf restart` requires that the owning workflow sequence is still live. It may
-also requeue a job that has already reached `failed` or `cancelled` while that
-sequence remains active, but it never creates an offline queued retry after the
-run record becomes terminal.
-
-After a partial run has ended, continue directly with:
+After the owning sequence has ended, use:
 
 ```bash
 mwf resume <node-name>
 mwf resumefrom <start-node>
 ```
 
-Those commands automatically advance the generation and clear old result/files
-for failed, cancelled, or abandoned-running jobs while preserving `done` and
-`skipped` jobs.
-
-Python cannot safely force-kill an arbitrary thread that is blocked inside a
-third-party HTTP request or native library. From MWF's point of view the old
-generation is invalid immediately and the replacement begins, but the underlying
-old call may continue until its own timeout or return. External side effects and
-direct filesystem writes performed outside MWF's context helpers cannot be
-rolled back. Long custom loops may call `ctx.checkpoint()` between expensive
-operations to exit promptly after a restart. Process-runner attempts are fenced
-in the same way; an abandoned daemon thread disappears when its worker process
-returns.
-
-Use ordinary selected-job rerun syntax after the larger workflow has ended:
-
-```bash
-mwf run <node-name> job 42
-```
+Resume first registers output-backed terminal jobs that were still recorded as
+`running`, waits for those SQLite mutations to become durable, and only then
+requeues failed, cancelled, or genuinely abandoned-running work. Done and
+skipped work remains untouched.
 
 ## Large-node performance and SQLite state
 
@@ -1390,10 +1406,10 @@ python -m pip install --upgrade build
 python -m build --wheel
 ```
 
-The wheel is written to `dist/`. For version 0.4.1 the expected filename is:
+The wheel is written to `dist/`. For version 0.4.3 the expected filename is:
 
 ```text
-micro_workflow_manager-0.4.1-py3-none-any.whl
+micro_workflow_manager-0.4.3-py3-none-any.whl
 ```
 
 `py3-none-any` means the package is pure Python, supports Python 3, and does not
@@ -1413,22 +1429,22 @@ Install the wheel by giving pip its actual file path. From the framework source
 directory after building:
 
 ```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.4.1-py3-none-any.whl
+python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.4.3-py3-none-any.whl
 ```
 
 From Linux or WSL:
 
 ```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.4.1-py3-none-any.whl
+python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.4.3-py3-none-any.whl
 ```
 
 If the wheel is in Downloads or another directory, use its full path:
 
 ```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.4.1-py3-none-any.whl"
+python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.4.3-py3-none-any.whl"
 ```
 
-Do not write `.micro-workflow-manager==0.4.1`; that is interpreted as a malformed
+Do not write `.micro-workflow-manager==0.4.3`; that is interpreted as a malformed
 package requirement rather than a file path. On PowerShell, a file in the
 current directory begins with `.\`, and the wheel filename uses underscores.
 
@@ -1443,7 +1459,7 @@ A project can bundle the wheel in a directory such as `vendor/` and reference it
 from `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.4.1-py3-none-any.whl
+./vendor/micro_workflow_manager-0.4.3-py3-none-any.whl
 ```
 
 Then users can install the project and its framework together from the project

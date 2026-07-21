@@ -25,3 +25,4 @@ class FileStorage(
     def __init__(self, project_dir):
         super().__init__(project_dir)
         self._init_sqlite_state()
+        self._init_job_execution_state()

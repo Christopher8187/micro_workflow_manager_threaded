@@ -110,7 +110,7 @@ class NodeRouter:
         )
 
     def wait_for_nodes(self, *node_names: str) -> "NodeRouter":
-        """Make this node wait for the selected peers' queued work to drain.
+        """Wait until selected peers have no queued, running, or failed jobs.
 
         Waiting only applies inside the node's Hoeflein component. Once this
         node's pump starts it keeps running normally; the gate is checked again

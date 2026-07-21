@@ -66,7 +66,7 @@ def test_monitor_reports_waiting_instead_of_queued(tmp_path):
     first_a_started = threading.Event()
     release_a = threading.Event()
 
-    a = NodeRouter("A", max_threads=1, runner="threaded", wait_for=["B"])
+    a = NodeRouter("A", max_threads=1, runner="threaded")
     a.create_job(number=2)
 
     @a.task

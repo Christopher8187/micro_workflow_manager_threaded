@@ -461,74 +461,74 @@ class FiberRuntime:
                     break
             return values
 
-        admission_burst = self.start_burst
+        def abandon_unstarted(values: list[Any]) -> None:
+            for item in values:
+                abandon = getattr(item, "abandon_unstarted", None)
+                if callable(abandon):
+                    try:
+                        abandon()
+                    except BaseException:
+                        # Preserve the original handler failure. Conditional
+                        # release is best-effort recovery for preclaimed work.
+                        pass
 
-        while True:
-            if self._first_error is not None:
-                for future in self._future_waiters:
-                    future.cancel()
-                raise self._first_error
-
-            active = self._active_count
-            limit = limit_provider()
-            if type(limit) is not int or limit < 1:
-                raise ValueError("runtime API concurrency must be an integer >= 1")
-            capacity = max(0, limit - active)
-            requested = min(capacity, admission_burst)
-            pulled = pull_items(requested)
-            added = len(pulled)
-            if requested > 0 and added == requested and active + added < limit:
-                # A full pull proves the queue is dense. Grow geometrically so a
-                # fixed high-fanout node does not pay one synchronous claim round
-                # trip for every 64 jobs. Dense queues may grow to 1024 jobs per
-                # claim transaction.
-                admission_burst = min(
-                    MAX_ADMISSION_BURST,
-                    max(MIN_ADMISSION_BURST, requested * 2),
-                )
-            elif added < requested:
-                # A partial or empty pull is evidence of a sparse/trickling queue.
-                # Keep the next database claim small so newly arriving jobs do not
-                # wait behind oversized empty or mostly-empty admission probes.
-                admission_burst = MIN_ADMISSION_BURST
-            for position, item in enumerate(pulled):
-                state = self._new_state(next_index, item, run_one)
-                self._states[next_index] = state
-                next_index += 1
-                self._resume_state(state)
-                if self._first_error is not None:
-                    for unstarted in pulled[position + 1:]:
-                        abandon = getattr(unstarted, "abandon_unstarted", None)
-                        if callable(abandon):
-                            try:
-                                abandon()
-                            except BaseException:
-                                # Preserve the original handler failure. The
-                                # conditional release is best-effort recovery.
-                                pass
-                    break
-
+        def resume_ready() -> None:
             while self._ready:
                 state, resume = self._ready.popleft()
                 self._resume_state(state, resume)
-                if self._first_error is not None:
-                    break
 
+        admission_burst = self.start_burst
+
+        while True:
+            added = 0
+            if self._first_error is None:
+                active = self._active_count
+                limit = limit_provider()
+                if type(limit) is not int or limit < 1:
+                    raise ValueError("runtime API concurrency must be an integer >= 1")
+                capacity = max(0, limit - active)
+                requested = min(capacity, admission_burst)
+                pulled = pull_items(requested)
+                added = len(pulled)
+                if requested > 0 and added == requested and active + added < limit:
+                    # A full pull proves the queue is dense. Grow geometrically
+                    # while retaining a bounded claim transaction.
+                    admission_burst = min(
+                        MAX_ADMISSION_BURST,
+                        max(MIN_ADMISSION_BURST, requested * 2),
+                    )
+                elif added < requested:
+                    # Sparse and trickling sources return to a small probe.
+                    admission_burst = MIN_ADMISSION_BURST
+
+                for position, item in enumerate(pulled):
+                    state = self._new_state(next_index, item, run_one)
+                    self._states[next_index] = state
+                    next_index += 1
+                    self._resume_state(state)
+                    if self._first_error is not None:
+                        abandon_unstarted(pulled[position + 1:])
+                        break
+
+            # A failure stops admission, not fibers that have already started.
+            # Continue servicing their futures, sleeps, cancellation checks,
+            # and terminal publication until every active fiber has exited.
+            resume_ready()
             self._process_futures()
             now_value = _time.monotonic()
             self._process_deadlines(now_value)
             if now_value >= self._next_cancellation_poll:
                 self._poll_cancellation()
                 self._next_cancellation_poll = now_value + self.poll_interval
-            while self._ready:
-                state, resume = self._ready.popleft()
-                self._resume_state(state, resume)
-                if self._first_error is not None:
-                    break
+            resume_ready()
 
             active = self._active_count
             if self._first_error is not None:
+                if active == 0:
+                    raise self._first_error
+                self._wake_event.wait(self._next_wait_timeout())
                 continue
+
             if active == 0:
                 if refreshable and added == 0:
                     # Completion callbacks can drain the last active fibers
@@ -544,30 +544,17 @@ class FiberRuntime:
                         next_index += 1
                         self._resume_state(state)
                         if self._first_error is not None:
-                            for unstarted in refill[position + 1:]:
-                                abandon = getattr(
-                                    unstarted,
-                                    "abandon_unstarted",
-                                    None,
-                                )
-                                if callable(abandon):
-                                    try:
-                                        abandon()
-                                    except BaseException:
-                                        pass
+                            abandon_unstarted(refill[position + 1:])
                             break
                     continue
                 if not refreshable and source_exhausted:
                     break
 
-            # Keep admitting in bounded bursts without blocking while capacity
-            # remains, but service futures, sleepers, cancellation, and watchdog
-            # deadlines between bursts. This prevents a thousand-job startup from
-            # starving the earliest fibers for an entire checkpoint window.
+            # Keep admitting in bounded bursts while capacity remains, but
+            # service active fibers between every burst.
             if added > 0 and active < limit:
                 continue
 
-            timeout = self._next_wait_timeout()
-            self._wake_event.wait(timeout)
+            self._wake_event.wait(self._next_wait_timeout())
 
         return [self._results[index] for index in sorted(self._results)]

@@ -661,16 +661,15 @@ starvation when thousands of jobs are claimed at once.
 
 A waiting declaration is an admission gate for a node pump inside one Hoeflein
 component. `waiting=True, wait_for=None` resolves to all other component
-vertices; an explicit list resolves to that subset. The scheduler checks only
-durable queued counts, matching the public contract: a dependency is drained
-when it has no queued jobs left. Running jobs do not count as queued.
+vertices; an explicit list resolves to that subset. A dependency is drained
+only when its durable queued, running, and failed job counts are all zero. Done,
+skipped, and cancelled rows do not block the gate.
 
 The gate is checked only before a pump starts. Once admitted, a pump continues
 to refill and drain its live source even if a waited-for peer later receives
-new work. This gives cyclic router/worker graphs stable phases without cancelling
-or pausing active jobs. If a restored state has a complete mutual-wait cycle and
-no active pump, stable component order releases one pump once, avoiding permanent
-deadlock; later admissions obey the declarations normally.
+new work. Waiting declarations are strict: the scheduler does not bootstrap or
+bypass a mutually blocked cycle. A restart, resume, or producer action must
+clear the declared conditions before another pump is admitted.
 
 Node status `waiting` is lifecycle metadata. Individual job rows remain `queued`,
 so cleanup, resume, restart, and provenance semantics do not acquire a new job
@@ -755,6 +754,58 @@ use `JobContext.side_effects()`. The scope is intentionally synchronous and
 short; network waits and long computation remain outside it.
 
 
+## Single-writer terminal publication and resume recovery (0.4.3)
+
+Terminal status records enter the same project-local priority mutation writer as
+all other SQLite changes. Related records for one node use a 5 ms bounded
+collection window and one bulk lease-fenced operation. The writer owns grouping,
+transaction boundaries, ordering, and durability barriers; no terminal-specific
+daemon queue sits in front of it.
+
+A handler still writes `output.json` under its exact execution fence before
+submitting the terminal row/event mutation. Normal finalization waits for that
+writer result. If a process exits between those phases, recovery is explicit:
+`mwf resume` and `mwf resumefrom` first reconcile matching terminal outputs,
+wait at the writer barrier, and only then restart genuinely unsuccessful or
+abandoned work. Active failure handling never scans output files.
+
+The first job failure stops new component admission. Threaded, process, and API
+runners join jobs that already entered their handlers; API fibers continue
+servicing futures and sleeps until all started fibers finish. The component is
+marked failed only after those active jobs have reached their terminal boundary.
+
+Active run records persist Hoeflein-component membership. `mwf restart NODE`
+therefore fences all running and failed/cancelled jobs in the selected active
+component without importing graph code. `mwf restart NODE failed` limits the
+selection to failed/cancelled jobs, while explicit job IDs remain supported.
+
+## Terminal recovery and storage boundaries (0.4.2, historical)
+
+The failure-time coordinator and periodic reconciliation described in this
+section were 0.4.2 behavior and are superseded by the 0.4.3 design above.
+
+SQLite has one project-local mutation writer with explicit priorities, while
+read connections remain thread-local. Schema management, advisory locking,
+state transfer, queued-job storage, execution claims, terminal publication,
+and restart recovery live in separate modules behind the stable `FileStorage`
+facade. This keeps transaction policy centralized without turning one storage
+module into a collection of unrelated APIs.
+
+Successful and failed handlers first publish their durable `output.json` under
+the execution fence. A dedicated terminal coordinator then groups conditional
+status/event mutations on a fixed cadence. While a Hoeflein component is live,
+its scheduler also scans active leases every 250 ms and reconciles terminal
+outputs whose SQLite publication was interrupted. Reconciliation is idempotent:
+a later ordinary finalizer for the same generation and terminal status is
+accepted.
+
+On the first node failure, the failed terminal update is urgent. The coordinator
+flushes it together with any pending successful completions, then the node pump
+sets the component stop event before unwinding. Sibling pumps stop taking new
+items; API items that were claimed in a burst but have not started are released
+back to `queued`. Already-running handlers are allowed to reach their fenced
+terminal boundary, after which `mwf resume` sees durable, non-running state.
+
 ## Adaptive API admission (0.4.1)
 
 Refreshable API sources use an adaptive claim window rather than a permanently
@@ -765,9 +816,9 @@ and trickling Hoeflein producers responsive without repeatedly issuing large
 mostly-empty claims.
 
 Admission sizing is independent of terminal persistence. Finished handlers send
-their conditional terminal mutations through the dedicated finalization
-coordinator, so a node that continues to claim new work cannot prevent `done`
-updates from reaching the higher-priority SQLite writer lane.
+their grouped conditional mutations directly to the higher-priority SQLite
+writer lane, so a node that continues to claim new work cannot hide `done`
+updates behind admission transactions.
 
 ## Monitor-visible terminal persistence (0.4.0)
 

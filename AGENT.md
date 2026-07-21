@@ -361,6 +361,40 @@ component pumping but leave hundreds of later jobs queued.
   and a simultaneous completion wave must not exhaust file descriptors.
 
 
+## Single-writer failure/resume checks (0.4.3)
+
+- Terminal publication must use `SQLiteMutationWriter.submit_grouped`; do not
+  reintroduce a terminal daemon, timer thread, or second in-memory queue. Keep
+  the terminal collection window bounded and the lease check per job.
+- Failure stops admission but must not cancel handlers that already started.
+  Verify threaded, process, and API runners join active jobs before component
+  failure becomes terminal. Failure paths must not call output reconciliation.
+- Resume must reconcile matching terminal outputs and cross the writer barrier
+  before it decides which `running`, `failed`, or `cancelled` rows to restart.
+- Component-wide restart scope comes from the active run record. Default scope
+  includes running and failed/cancelled jobs; the `failed` selector excludes
+  running attempts. Queued, done, and skipped jobs remain untouched.
+- Waiting gates are strict: every selected peer must have queued=running=failed=0.
+  Do not add a cycle bootstrap that bypasses the declared condition.
+
+## Terminal recovery and module-boundary checks (0.4.2, historical)
+
+The 0.4.2 failure-time flush/reconciliation policy below is retained only as
+release history and is superseded by the 0.4.3 single-writer/resume rules above.
+
+- Keep SQLite connection/writer policy in `storage/sqlite/`; storage feature
+  modules should submit operations rather than open independent write paths.
+- Finished output is the recovery source of truth only when its generation
+  matches the active lease and its status is terminal. Reconciliation must stay
+  conditional and idempotent.
+- Historical 0.4.2 behavior flushed pending terminal updates on component
+  failure. Do not restore that path: 0.4.3 stops admission, joins started work,
+  and leaves interrupted output reconciliation to `mwf resume`. Preclaimed but
+  unstarted API work must still be released to `queued`, never left `running`.
+- Review production files above 500 lines for mixed responsibilities. Do not
+  split a cohesive algorithm solely to satisfy a line-count target; keep public
+  imports stable through thin facades when a split is justified.
+
 ## Adaptive API admission checks (0.4.1)
 
 - Keep the initial refreshable-source admission probe at 64, the sparse floor at
@@ -368,9 +402,10 @@ component pumping but leave hundreds of later jobs queued.
 - A full pull may grow the next window geometrically. A partial or empty pull
   must return the next probe to 16 so trickling producers are not polled through
   oversized claim transactions.
-- Admission tuning must not reuse the terminal finalization coordinator or lower
-  terminal mutation priority. Output-backed completions must become visible even
-  while the next admission pull is blocked or dense claims continue.
+- Admission tuning must not lower terminal mutation priority. Terminal records
+  use the same SQLite writer with their own bounded grouped operation and must
+  become visible even while the next admission pull is blocked or dense claims
+  continue.
 
 ## Monitor terminal-state checks (0.4.0)
 

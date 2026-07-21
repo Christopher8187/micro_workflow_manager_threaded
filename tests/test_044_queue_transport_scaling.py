@@ -283,6 +283,7 @@ def test_api_terminal_commits_outrank_admission_and_reach_monitor(tmp_path, monk
 
     priorities = {"claim": set(), "finalize": set()}
     original = workflow.storage.submit_db_mutation
+    original_grouped = workflow.storage.submit_grouped_db_mutation
 
     def record_priority(operation, *, wait=True, priority=10):
         name = getattr(operation, "__name__", "")
@@ -290,7 +291,26 @@ def test_api_terminal_commits_outrank_admission_and_reach_monitor(tmp_path, monk
             priorities[name].add(priority)
         return original(operation, wait=wait, priority=priority)
 
+    def record_grouped(
+        group_key, item, operation, *, wait=True, priority=10, collect_seconds=0.001
+    ):
+        if isinstance(group_key, tuple) and group_key[:1] == ("terminal",):
+            priorities["finalize"].add(priority)
+        return original_grouped(
+            group_key,
+            item,
+            operation,
+            wait=wait,
+            priority=priority,
+            collect_seconds=collect_seconds,
+        )
+
     monkeypatch.setattr(workflow.storage, "submit_db_mutation", record_priority)
+    monkeypatch.setattr(
+        workflow.storage,
+        "submit_grouped_db_mutation",
+        record_grouped,
+    )
     workflow.run_node("A", ignore_readiness=True)
 
     row = next(

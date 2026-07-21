@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+from typing import Callable
+
+from micro_workflow_manager.models import DONE, FAILED, QUEUED, RUNNING, SKIPPED
+from micro_workflow_manager.system import MicroWorkflow
+
+from .graph_utils import ready_for_run_set
+from .run_session import active_workflow_run
+
+
+def run_nodes(
+    workflow: MicroWorkflow,
+    nodes: list[str],
+    start_node: str,
+    ignore_external: bool = False,
+    *,
+    command: str = "run",
+    stats: bool = False,
+    stats_interval: float = 5.0,
+    monitor: bool = False,
+    monitor_interval: float = 2.0,
+    prepare: Callable[[], None] | None = None,
+    require_start_queued: bool = True,
+) -> int:
+    run_set = set(nodes)
+    previous_allowed_run_nodes = workflow.allowed_run_nodes
+    previous_autostart_mode = workflow.autostart_mode
+    previous_restart_enabled = workflow.active_job_restart_enabled
+
+    workflow.allowed_run_nodes = run_set
+    workflow.autostart_mode = "queue"
+    workflow.active_job_restart_enabled = True
+
+    try:
+        with active_workflow_run(
+            workflow,
+            command=command,
+            start_node=start_node,
+            nodes=nodes,
+            stats=stats,
+            stats_interval=stats_interval,
+            monitor=monitor,
+            monitor_interval=monitor_interval,
+        ) as finish_run:
+            if prepare is not None:
+                prepare()
+
+            has_any_queued = any(workflow.storage.has_queued_jobs(item) for item in nodes)
+            if not has_any_queued:
+                if require_start_queued:
+                    workflow.storage.set_node_status(start_node, QUEUED)
+                    print(
+                        f"No queued jobs for {start_node}. "
+                        f"Create default jobs in node_behavior/{start_node}.py with "
+                        "router.create_job(number=..., params={...})."
+                    )
+                else:
+                    print("No failed, cancelled, stale-running, or queued jobs remain in the resume set.")
+                finish_run("done")
+                return 0
+
+            if workflow.runner in {"threaded", "api", "process"}:
+                ran = workflow.run_concurrently(
+                    nodes=nodes,
+                    ready_check=lambda item: ready_for_run_set(
+                        workflow,
+                        item,
+                        run_set,
+                        ignore_external,
+                    ),
+                )
+            else:
+                ran = []
+                units = workflow.execution_components(nodes)
+
+                while True:
+                    ready_units = [
+                        unit
+                        for unit in units
+                        if any(workflow.storage.has_queued_jobs(node) for node in unit)
+                        and all(
+                            ready_for_run_set(workflow, node, run_set, ignore_external)
+                            for node in unit
+                        )
+                    ]
+
+                    if not ready_units:
+                        break
+
+                    for unit in ready_units:
+                        ran.extend(workflow.run_component(set(unit), ignore_readiness=True))
+
+            workflow.finalize_ready_nodes()
+            if ignore_external:
+                # A partial runfrom may intentionally process one incoming branch
+                # of a later component before its other predecessors run. Mark a
+                # selected component complete for this branch when all jobs that
+                # currently exist are successful and quiescent. Future producers
+                # will queue new jobs and reactivate it.
+                for unit in workflow.execution_components(nodes):
+                    counts = [workflow.storage.job_status_counts(name) for name in unit]
+                    total = sum(sum(item.values()) for item in counts)
+                    failed = any(item.get(FAILED, 0) for item in counts)
+                    active = any(item.get(RUNNING, 0) or item.get(QUEUED, 0) for item in counts)
+                    successful = sum(item.get(DONE, 0) + item.get(SKIPPED, 0) for item in counts)
+                    if total > 0 and successful == total and not failed and not active:
+                        for name in unit:
+                            workflow.storage.set_node_status(name, "done")
+
+            blocked = [node for node in nodes if workflow.storage.has_queued_jobs(node)]
+
+            if blocked:
+                finish_run("blocked")
+                print("Stopped before these queued nodes became ready:")
+                for node in blocked:
+                    status = workflow.storage.get_node_status(node) or "missing"
+                    print(f"  {node}: {status}")
+                return 1
+
+            unfinished = [node for node in nodes if not workflow.node_complete(node)]
+
+            if unfinished:
+                finish_run("incomplete")
+                print("These nodes did not complete:")
+                for node in unfinished:
+                    status = workflow.storage.get_node_status(node) or "missing"
+                    job_count = len(workflow.storage.list_jobs(node))
+                    queued_count = len(workflow.storage.queued_job_ids(node))
+                    print(f"  {node}: {status}, jobs={job_count}, queued={queued_count}")
+                print("This usually means an upstream task did not create the expected downstream jobs.")
+                return 1
+
+            finish_run("done")
+            print("Ran:")
+            for node in ran:
+                print(f"  {node}")
+
+            return 0
+
+    finally:
+        workflow.allowed_run_nodes = previous_allowed_run_nodes
+        workflow.autostart_mode = previous_autostart_mode
+        workflow.active_job_restart_enabled = previous_restart_enabled

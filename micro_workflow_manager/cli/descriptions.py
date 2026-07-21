@@ -16,6 +16,8 @@ Common flow:
   mwf migrate --dry-run
   mwf run A --plan
   mwf run A --monitor
+  mwf restart <node-name>
+  mwf restart <node-name> failed
   mwf restart <node-name> job 42
   mwf threads <node-name> +2
   mwf deploy setup
@@ -44,10 +46,10 @@ COMMAND_HELP_DESCRIPTIONS = {
     "reset": "Requeue every existing job for selected Hoeflein components while keeping job definitions and node input files.",
     "wipe": "Like component-level clean, but remove the selected components' input files as well.",
     "run": "Reset and run one ready node or selected jobs; --monitor prints the full timestamped dashboard in the same terminal.",
-    "restart": "Second-terminal control for a running or failed/cancelled job inside the active workflow sequence; it never starts another scheduler.",
+    "restart": "Second-terminal control that restarts running and failed/cancelled jobs in the selected active Hoeflein component; it never starts another scheduler.",
     "threads": "View or change run-scoped per-node max_threads overrides. API values are cooperative fiber counts with no aggregate framework cap; active nodes scale live.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
-    "resume": "Continue unsuccessful or queued work for one node without resetting jobs that are already done or skipped.",
+    "resume": "Register output-backed finished jobs, then continue unsuccessful or queued work for one node without resetting done or skipped jobs.",
     "runfrom": "Reset and run one node and its descendants; --monitor retains a timestamped dashboard timeline in the same terminal.",
     "resumefrom": "Continue unsuccessful or queued work from one node through its descendants without resetting completed jobs.",
     "monitor": "Show live or one-shot node/job statistics without running task code; completed sequences report active run: none.",
@@ -236,26 +238,29 @@ another CLI sequence already owns the project. To preserve completed work after
 a failure, use resume rather than run.
 """,
     "restart": """
-Restart is exclusively a second-terminal control for the workflow sequence that
-is currently active. It accepts a running attempt or a failed/cancelled job that
-still belongs to that active sequence. It does not import graph.py and does not
-launch another scheduler. Instead, it atomically advances the job's execution
-generation, clears that job's local result/files, and leaves the existing
-scheduler in control.
+Restart is a second-terminal control for the workflow sequence that is currently
+active. Naming a node selects its persisted active Hoeflein component; a DAG node
+is a singleton component. The command never launches another scheduler.
 
 Examples:
-  mwf restart <node-name> job 4 --dry-run
+  mwf restart <node-name> --dry-run
+  mwf restart <node-name>
+  mwf restart <node-name> failed
   mwf restart <node-name> job 4
   mwf restart <node-name> jobs 4 7-8
 
+The default form advances the generation of every live-running and
+failed/cancelled job in the component. The `failed` form leaves running attempts
+alone. Explicit job/job ranges remain available. Already queued, done, and
+skipped work is not reset. The active scheduler remains in control and observes
+the replacement generations through the normal durable queue.
+
 A Python thread blocked in an outside library cannot always be force-killed, but
 its old generation immediately loses permission to commit MWF-managed status,
-files, or downstream jobs. Cooperative code can call ctx.raise_if_cancelled();
-progress-aware code can call ctx.checkpoint("section", progress=0.5). Configured
-checkpoint deadlines are watched by the same centralized scheduler supervisor.
-After the active sequence has ended, do not use restart: `mwf resume NODE` or
-`mwf resumefrom START` automatically resets failed/cancelled jobs while preserving
-done/skipped work.
+files, or downstream jobs. After the active sequence has ended, use `mwf resume
+NODE` or `mwf resumefrom START`; resume first registers terminal output files
+that were still recorded as running, then requeues the remaining unsuccessful
+work.
 """,
     "threads": """
 Threads is a lightweight second-terminal control for testing node concurrency.
@@ -303,19 +308,20 @@ paths are overwritten, while unrelated remote files are left alone. Review
 .env files, API keys, large node outputs, or local credentials.
 """,
     "resume": """
-Resume continues one node without erasing successful work. Failed, cancelled,
-and stale-running jobs are fenced and requeued; already queued jobs remain queued;
-done and skipped jobs, their output records, and their files remain untouched.
-The command then schedules whatever work is still needed.
+Resume continues one node without erasing successful work. Before selecting any
+retries, it reconciles terminal `output.json` files for the selected Hoeflein
+component and waits for those SQLite updates to become durable. It then fences
+and requeues failed, cancelled, or genuinely stale-running jobs; already queued
+jobs remain queued, while done and skipped jobs and their files remain untouched.
 
 Examples:
   mwf resume double_number --plan
   mwf resume double_number
 
-Suppose double_number has jobs 1 and 2 done and job 3 failed. Resume runs job 3
-only. This differs from mwf run double_number, which is a fresh node rerun. The
-append-only event history records the resume transition so inspect can explain
-what happened later.
+Suppose double_number has jobs 1 and 2 done, job 3 failed, and job 4 wrote a done
+output just before the previous process exited. Resume registers job 4 first and
+runs only job 3. This differs from `mwf run double_number`, which is a fresh node
+rerun.
 """,
     "runfrom": """
 Runfrom is the fresh-run form for one Hoeflein component and its quotient-DAG

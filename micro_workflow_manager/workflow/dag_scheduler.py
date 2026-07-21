@@ -1,6 +1,7 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from time import perf_counter
+from threading import Event
 from typing import Callable
 
 from ..errors import InvalidGraphError
@@ -55,6 +56,30 @@ class _ClaimedQueuedJobSource:
             )
             for job, (generation, execution_id) in zip(jobs, leases)
         ]
+
+
+
+
+class _StoppingJobSource:
+    """Stop a node pump from admitting more jobs after a component failure."""
+
+    def __init__(self, source, stop_event: Event):
+        self.source = source
+        self.stop_event = stop_event
+
+    def pull(self, max_items: int):
+        if self.stop_event.is_set():
+            return []
+        pull = getattr(self.source, "pull", None)
+        if not callable(pull):
+            raise TypeError("wrapped source does not support pull")
+        return pull(max_items)
+
+    def __iter__(self):
+        for item in self.source:
+            if self.stop_event.is_set():
+                return
+            yield item
 
 
 class DagSchedulerMixin:
@@ -167,6 +192,8 @@ class DagSchedulerMixin:
         self,
         node_name: str,
         ignore_readiness: bool = False,
+        *,
+        _stop_event: Event | None = None,
     ):
         """Run all currently queued jobs for one node using a lazy job source."""
         if not ignore_readiness and not self.node_ready(node_name):
@@ -205,32 +232,52 @@ class DagSchedulerMixin:
         else:
             job_source = self.storage.iter_queued_job_ids(node_name)
 
+        if _stop_event is not None:
+            job_source = _StoppingJobSource(job_source, _stop_event)
+
         def run_source_item(item):
-            if isinstance(item, _ClaimedJob):
+            # A sibling node may fail after this item was pulled but before its
+            # handler starts. Leave ordinary items queued and release API jobs
+            # that were preclaimed as part of an admission burst.
+            if _stop_event is not None and _stop_event.is_set():
+                abandon = getattr(item, "abandon_unstarted", None)
+                if callable(abandon):
+                    abandon()
+                return None
+
+            try:
+                if isinstance(item, _ClaimedJob):
+                    return self.run_job(
+                        node_name=item.job.node_name,
+                        job_id=item.job.job_id,
+                        ignore_readiness=True,
+                        _preloaded_job=item.job,
+                        _preclaimed_execution=(
+                            item.generation,
+                            item.execution_id,
+                            item.started_at,
+                            item.started_perf,
+                        ),
+                    )
+                if isinstance(item, Job):
+                    return self.run_job(
+                        node_name=item.node_name,
+                        job_id=item.job_id,
+                        ignore_readiness=True,
+                        _preloaded_job=item,
+                    )
                 return self.run_job(
-                    node_name=item.job.node_name,
-                    job_id=item.job.job_id,
+                    node_name=node_name,
+                    job_id=item,
                     ignore_readiness=True,
-                    _preloaded_job=item.job,
-                    _preclaimed_execution=(
-                        item.generation,
-                        item.execution_id,
-                        item.started_at,
-                        item.started_perf,
-                    ),
                 )
-            if isinstance(item, Job):
-                return self.run_job(
-                    node_name=item.node_name,
-                    job_id=item.job_id,
-                    ignore_readiness=True,
-                    _preloaded_job=item,
-                )
-            return self.run_job(
-                node_name=node_name,
-                job_id=item,
-                ignore_readiness=True,
-            )
+            except BaseException:
+                # The failed job has already published its terminal state.
+                # Stop sibling admission before this node pump unwinds to the
+                # component scheduler.
+                if _stop_event is not None:
+                    _stop_event.set()
+                raise
 
         try:
             result = runner.run_job_source(
@@ -238,8 +285,12 @@ class DagSchedulerMixin:
                 job_source=job_source,
                 run_one=run_source_item,
             )
-
         except Exception:
+            if _stop_event is not None:
+                _stop_event.set()
+            # Do not perform crash-recovery scans here. Already-started jobs are
+            # joined by their runner and publish through the normal SQLite lane;
+            # output-backed recovery is an explicit first step of mwf resume.
             self.storage.set_node_status(node_name, FAILED)
             raise
 

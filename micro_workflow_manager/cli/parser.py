@@ -197,17 +197,23 @@ def build_parser() -> argparse.ArgumentParser:
         description=COMMAND_HELP_DESCRIPTIONS["restart"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    restart_cmd.add_argument("node", help="Node containing the running or failed job in the active sequence.")
+    restart_cmd.add_argument("node", help="Node selecting the active Hoeflein component.")
     restart_cmd.add_argument(
         "job_mode",
-        metavar="job",
-        help="Literal 'job' or 'jobs'.",
+        nargs="?",
+        choices=("failed", "job", "jobs"),
+        metavar="failed|job|jobs",
+        help=(
+            "Omit to restart running plus failed/cancelled jobs in the active "
+            "component; use failed for failed/cancelled jobs only, or job/jobs "
+            "to select explicit IDs."
+        ),
     )
     restart_cmd.add_argument(
         "job_specs",
-        nargs="+",
+        nargs="*",
         metavar="id|start-end",
-        help="Running or failed job IDs and ranges, for example: 1 3 8-10.",
+        help="Explicit job IDs and ranges after job/jobs, for example: 1 3 8-10.",
     )
     restart_cmd.add_argument("--dry-run", action="store_true", help="Validate and show restart targets without fencing them.")
 

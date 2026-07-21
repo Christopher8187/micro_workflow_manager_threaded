@@ -91,7 +91,7 @@ def refuse_competing_run(storage_or_workflow):
     pid = active.get("pid", "?")
     raise RuntimeError(
         f"A {command} sequence is already active (run {run_id}, process {pid}). "
-        "Do not start a competing run from a second terminal. To restart one "
-        "currently running or failed job inside that sequence, use: "
-        "mwf restart <node> job <id>"
+        "Do not start a competing run from a second terminal. To restart the "
+        "running and failed work in one active component, use: mwf restart <node>. "
+        "The explicit mwf restart <node> job <id> form is also available."
     )

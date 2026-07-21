@@ -23,7 +23,7 @@ from .monitoring import monitor_command
 from .planning import print_run_plan
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
-from .restart import restart_active_jobs
+from .restart import restart_active_jobs, restart_active_scope
 from .threads import threads_command, update_declared_threads
 from .deploy import deploy_command
 from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs
@@ -80,13 +80,22 @@ def main(argv: list[str] | None = None) -> int:
         # command never starts or replaces a workflow scheduler.
         if args.command == "restart":
             node = safe_node_name(args.node)
-            job_ids = selected_job_ids_from_args(
-                args.job_mode,
-                args.job_specs,
-                command="restart",
+            if args.job_mode in {"job", "jobs"}:
+                job_ids = selected_job_ids_from_args(
+                    args.job_mode,
+                    args.job_specs,
+                    command="restart",
+                )
+                assert job_ids is not None
+                return restart_active_jobs(root, node, job_ids, dry_run=args.dry_run)
+            if args.job_specs:
+                raise RuntimeError("Job IDs require the literal job or jobs mode.")
+            return restart_active_scope(
+                root,
+                node,
+                failed_only=args.job_mode == "failed",
+                dry_run=args.dry_run,
             )
-            assert job_ids is not None
-            return restart_active_jobs(root, node, job_ids, dry_run=args.dry_run)
 
         if args.command == "doctor":
             return doctor_command(root)

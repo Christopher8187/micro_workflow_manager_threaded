@@ -4,9 +4,10 @@ from threading import Event
 import networkx as nx
 
 from ..errors import InvalidGraphError
-from ..models import QUEUED, RUNNING, WAITING
+from ..models import FAILED, QUEUED, RUNNING, WAITING
 
 
+WAIT_BLOCKING_JOB_STATUSES = {QUEUED, RUNNING, FAILED}
 class ComponentSchedulerMixin:
     # Durable queue notifications wake the scheduler immediately. This timeout
     # is only a defensive fallback for changes made by another process.
@@ -31,55 +32,40 @@ class ComponentSchedulerMixin:
         queued = self.storage.queued_nodes(component_nodes)
         return [node_name for node_name in component_nodes if node_name in queued]
 
+    def _component_wait_blockers(self, component_nodes: list[str]) -> set[str]:
+        return self.storage.nodes_with_job_statuses(
+            component_nodes,
+            WAIT_BLOCKING_JOB_STATUSES,
+        )
+
     def _waiting_startable_nodes(
         self,
         component_nodes: list[str],
         *,
         active_nodes: set[str] | None = None,
-        forced_ready: set[str] | None = None,
         queued_nodes: set[str] | None = None,
+        blocking_nodes: set[str] | None = None,
     ) -> list[str]:
         active = active_nodes or set()
-        forced = forced_ready or set()
         queued = queued_nodes
         if queued is None:
             queued = self.storage.queued_nodes(component_nodes)
+        blocked = blocking_nodes
+        if blocked is None:
+            blocked = self._component_wait_blockers(component_nodes)
+
         result: list[str] = []
         waiting_statuses: dict[str, str] = {}
         for node_name in component_nodes:
             if node_name in active or node_name not in queued:
                 continue
-            blockers = self.waiting_dependencies(node_name).intersection(queued)
-            if node_name in forced or not blockers:
+            blockers = self.waiting_dependencies(node_name).intersection(blocked)
+            if not blockers:
                 result.append(node_name)
             else:
                 waiting_statuses[node_name] = WAITING
         self.storage.set_node_statuses(waiting_statuses)
         return result
-
-    def _waiting_cycle_breaker(
-        self,
-        component_nodes: list[str],
-        queued_nodes: list[str],
-    ) -> str:
-        """Choose a deterministic phase leader when waiting gates form a cycle.
-
-        Mutual waiting is intentionally useful for router/worker phase barriers.
-        A resumed project may contain queued work on both sides before any pump
-        is active. In that state every gate can be true simultaneously. Release
-        the first queued vertex in stable component order for one pump; once it
-        starts, normal waiting rules resume. This avoids an inert component while
-        keeping at most one side of the waiting cycle newly admitted.
-        """
-        queued = set(queued_nodes)
-        chosen = next(node for node in component_nodes if node in queued)
-        blockers = sorted(self.waiting_blockers(chosen))
-        self.storage.write_debug(
-            chosen,
-            "waiting-cycle bootstrap: released one pump while blocked by "
-            + (", ".join(blockers) if blockers else "an empty waiting cycle"),
-        )
-        return chosen
 
     def run_component(
         self,
@@ -88,9 +74,9 @@ class ComponentSchedulerMixin:
     ) -> list[str]:
         """Pump one Hoeflein component until it is quiescent.
 
-        A waiting node is admitted only after its selected peers have no queued
-        jobs left. The gate is checked before a node pump starts; a pump that is
-        already active continues normally until it exhausts its own live queue.
+        A waiting node is admitted only after every selected peer has no queued,
+        running, or failed jobs. A pump that has already started is allowed to
+        finish its current jobs; waiting is checked again before later admission.
         """
         component_set = set(component)
         if not component_set:
@@ -108,12 +94,15 @@ class ComponentSchedulerMixin:
                 return ran
 
             if self.runner == "direct":
+                blocking_nodes = self._component_wait_blockers(component_nodes)
                 startable = self._waiting_startable_nodes(
                     component_nodes,
                     queued_nodes=set(queued_nodes),
+                    blocking_nodes=blocking_nodes,
                 )
                 if not startable:
-                    startable = [self._waiting_cycle_breaker(component_nodes, queued_nodes)]
+                    self.refresh_component_status(component_set)
+                    return ran
                 try:
                     for node_name in startable:
                         self.storage.set_node_status(node_name, RUNNING)
@@ -124,24 +113,27 @@ class ComponentSchedulerMixin:
                     raise
                 continue
 
-            # A Hoeflein component is a live work graph. Keep at most one pump
-            # active per node and discover newly queued sibling work while other
-            # pumps remain active. Waiting gates affect only admission of a new
-            # pump, never a pump that is already running.
+            # Keep at most one node pump active per component member. A failure
+            # stops new admission, but already-started node pumps and jobs are
+            # joined before the component is marked failed.
             executor = ThreadPoolExecutor(
                 max_workers=max(1, len(component_nodes)),
                 thread_name_prefix="mwf-hoeflein-node",
             )
+            stop_event = Event()
 
             def run_node_worker(node_name: str):
                 try:
-                    return self.run_queued_node_jobs(node_name, True)
+                    return self.run_queued_node_jobs(
+                        node_name,
+                        True,
+                        _stop_event=stop_event,
+                    )
                 finally:
                     self.storage.close_thread_connection()
 
             futures = {}
             active_nodes: set[str] = set()
-            forced_ready: set[str] = set()
             first_error = None
             wake_event = Event()
             unsubscribe = self.storage.subscribe_queue_changes(wake_event.set)
@@ -154,19 +146,21 @@ class ComponentSchedulerMixin:
                         try:
                             future.result()
                         except Exception as error:
-                            first_error = error
-                            self.mark_component_failed(component_set)
+                            if first_error is None:
+                                first_error = error
+                            stop_event.set()
                             break
                         ran.append(node_name)
                     if first_error is not None:
                         break
 
                     queued_set = self.storage.queued_nodes(component_nodes)
+                    blocking_nodes = self._component_wait_blockers(component_nodes)
                     startable = self._waiting_startable_nodes(
                         component_nodes,
                         active_nodes=active_nodes,
-                        forced_ready=forced_ready,
                         queued_nodes=queued_set,
+                        blocking_nodes=blocking_nodes,
                     )
                     if startable:
                         self.storage.set_node_statuses({
@@ -176,7 +170,6 @@ class ComponentSchedulerMixin:
                         future = executor.submit(run_node_worker, node_name)
                         futures[future] = node_name
                         active_nodes.add(node_name)
-                        forced_ready.discard(node_name)
                         future.add_done_callback(lambda _future: wake_event.set())
 
                     if not futures:
@@ -191,16 +184,12 @@ class ComponentSchedulerMixin:
                                 allow_complete=True,
                             )
                             return ran
-                        # No active pump can change queue state, so all queued
-                        # nodes are mutually waiting. Bootstrap one stable phase.
-                        forced_ready.add(
-                            self._waiting_cycle_breaker(component_nodes, queued_nodes)
-                        )
-                        continue
+                        self.refresh_component_status(component_set)
+                        return ran
 
                     wake_event.clear()
-                    # Close the clear/wait race: a completion or new queue row
-                    # observed after clear must loop without sleeping.
+                    # Close the clear/wait race: a completion or a durable queue
+                    # change observed after clear must loop without sleeping.
                     if any(future.done() for future in futures):
                         continue
                     latest_queued = self.storage.queued_nodes(component_nodes)
@@ -210,6 +199,7 @@ class ComponentSchedulerMixin:
             finally:
                 unsubscribe()
                 if first_error is not None:
+                    stop_event.set()
                     for future in futures:
                         future.cancel()
                     executor.shutdown(wait=True, cancel_futures=True)
