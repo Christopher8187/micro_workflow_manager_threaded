@@ -41,6 +41,7 @@ class RunnerFactoryMixin:
                 max_threads=node.max_threads,
                 limit_provider=lambda: self.effective_max_threads(node.name),
                 worker_cleanup=self.storage.close_thread_connection,
+                admission_pressure_provider=self.storage.urgent_state_mutation_pending,
             )
 
         if effective_runner == "process":

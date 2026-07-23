@@ -296,6 +296,8 @@ def test_api_terminal_commits_outrank_admission_and_reach_monitor(tmp_path, monk
     ):
         if isinstance(group_key, tuple) and group_key[:1] == ("terminal",):
             priorities["finalize"].add(priority)
+        if isinstance(group_key, tuple) and group_key[:1] == ("execution-claims",):
+            priorities["claim"].add(priority)
         return original_grouped(
             group_key,
             item,
@@ -389,7 +391,7 @@ def test_asymmetric_hoeflein_wave_admits_large_nodes_and_drains_cleanly(tmp_path
         assert summary["running"] == 0
 
 
-def test_dense_api_source_grows_admission_bursts_but_sparse_source_resets():
+def test_dense_api_source_uses_bounded_admission_slices_and_sparse_source_resets():
     class DenseSource:
         def __init__(self, count):
             self.remaining = list(range(count))
@@ -410,8 +412,8 @@ def test_dense_api_source_grows_admission_bursts_but_sparse_source_resets():
         lambda value: value,
     )
     assert results == list(range(2000))
-    assert dense.requests[:6] == [64, 128, 256, 512, 1024, 1024]
-    assert dense.returned_counts[:6] == [64, 128, 256, 512, 1024, 16]
+    assert dense.requests == [64, 128, 256, 512, 512, 512, 512, 16, 16]
+    assert dense.returned_counts == [64, 128, 256, 512, 512, 512, 16, 0, 0]
 
     class SparseSource:
         def __init__(self):
@@ -434,7 +436,38 @@ def test_dense_api_source_grows_admission_bursts_but_sparse_source_resets():
         lambda value: value,
     )
     assert results == list(range(67))
-    assert sparse.requests[:3] == [64, 128, 16]
+    assert sparse.requests[:4] == [64, 128, 16, 16]
+
+
+def test_completed_api_futures_are_serviced_during_dense_admission():
+    count = 512
+    futures = [Future() for _ in range(count)]
+    entered = 0
+    first_completion_observed_at = None
+
+    def run_one(index):
+        nonlocal entered, first_completion_observed_at
+        entered += 1
+        if entered == 16:
+            for future in futures[:16]:
+                future.set_result(None)
+        if entered == count:
+            for future in futures[16:]:
+                future.set_result(None)
+        futures[index].result()
+        if index < 16 and first_completion_observed_at is None:
+            first_completion_observed_at = entered
+        return index
+
+    results = ApiRunner(max_threads=count, poll_interval=0.001).run_jobs(
+        "A",
+        list(range(count)),
+        run_one,
+    )
+
+    assert results == list(range(count))
+    assert first_completion_observed_at is not None
+    assert first_completion_observed_at <= 64
 
 
 def test_terminal_registration_flushes_while_next_admission_pull_is_blocked(tmp_path):

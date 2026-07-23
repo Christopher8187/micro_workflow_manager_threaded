@@ -8,9 +8,11 @@ from .jobs import JobFileStorageMixin
 from .nodes import NodeFileStorageMixin
 from .runtime_config import RuntimeConfigStorageMixin
 from .sqlite_state import SQLiteStateMixin
+from .state_events import StateEventStorageMixin
 
 
 class FileStorage(
+    StateEventStorageMixin,
     RuntimeConfigStorageMixin,
     JobEventStorageMixin,
     JobExecutionStorageMixin,
@@ -24,5 +26,6 @@ class FileStorage(
 
     def __init__(self, project_dir):
         super().__init__(project_dir)
+        self._init_state_event_broker()
         self._init_sqlite_state()
         self._init_job_execution_state()

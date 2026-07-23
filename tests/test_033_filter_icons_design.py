@@ -48,7 +48,7 @@ def finished(ctx):
     )
 
 
-def test_inspect_filter_reconstructs_retry_and_fallback_funnel(
+def test_filter_command_reconstructs_funnel_and_stage_boundaries(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -61,7 +61,7 @@ def test_inspect_filter_reconstructs_retry_and_fallback_funnel(
 
     assert cli.main(["run", "filter_numbers"]) == 1
     capsys.readouterr()
-    assert cli.main(["inspect", "filter_numbers", "filter"]) == 0
+    assert cli.main(["filter", "filter_numbers"]) == 0
     output = capsys.readouterr().out
 
     assert "Filter funnel for node filter_numbers" in output
@@ -74,9 +74,26 @@ def test_inspect_filter_reconstructs_retry_and_fallback_funnel(
     assert "attempt 2/2" in output and "       6        3        3" in output
     assert "       3        1        2" in output
     assert "       2        1        1" in output
-    assert output.rstrip().endswith(
+    assert "Failed jobs" not in output
+    assert "10: ValueError('fallback rejected 10 on attempt 2')" not in output
+
+    assert cli.main(["filter", "filter_numbers", "stage", "1"]) == 0
+    stage_one = capsys.readouterr().out
+    assert "Filter stage 1/4" in stage_one
+    assert "5: ValueError('main rejected 5 on attempt 1')" in stage_one
+    assert "6: ValueError('main rejected 6 on attempt 1')" in stage_one
+    assert "7: ValueError('main rejected 7 on attempt 1')" in stage_one
+    assert "8:" not in stage_one
+
+    assert cli.main(["filter", "filter_numbers", "stage", "4"]) == 0
+    final_stage = capsys.readouterr().out
+    assert "Filter stage 4/4" in final_stage
+    assert final_stage.rstrip().endswith(
         "10: ValueError('fallback rejected 10 on attempt 2')"
     )
+
+    assert cli.main(["inspect", "filter_numbers", "filter"]) == 1
+    assert "Use: mwf inspect" in capsys.readouterr().err
 
 
 def test_init_gitignore_and_material_icons_cover_runtime_structure(
@@ -128,7 +145,7 @@ def test_readme_links_design_and_requires_output_provenance():
     root = Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     design = (root / "DESIGN.md").read_text(encoding="utf-8")
-    assert "# micro-workflow-manager 0.4.4" in readme
+    assert "# micro-workflow-manager 0.4.7" in readme
     assert "[DESIGN.md](DESIGN.md)" in readme
     assert "provenance" in readme.lower()
     assert "## Advice first" in design

@@ -7,6 +7,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -17,6 +18,35 @@ from .job_sources import (
     RefreshableQueuedJobObjectSource,
     RefreshableQueuedJobSource,
 )
+
+
+_PAYLOAD_EXECUTOR: ThreadPoolExecutor | None = None
+_PAYLOAD_EXECUTOR_LOCK = Lock()
+
+
+def _shared_payload_executor() -> ThreadPoolExecutor:
+    global _PAYLOAD_EXECUTOR
+    with _PAYLOAD_EXECUTOR_LOCK:
+        if _PAYLOAD_EXECUTOR is None:
+            configured = os.environ.get("MWF_JOB_PAYLOAD_READ_WORKERS")
+            if configured is None:
+                workers = min(64, max(8, (os.cpu_count() or 4) * 4))
+            else:
+                try:
+                    workers = int(configured)
+                except ValueError as error:
+                    raise ValueError(
+                        "MWF_JOB_PAYLOAD_READ_WORKERS must be an integer >= 1"
+                    ) from error
+                if workers < 1:
+                    raise ValueError(
+                        "MWF_JOB_PAYLOAD_READ_WORKERS must be an integer >= 1"
+                    )
+            _PAYLOAD_EXECUTOR = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="mwf-job-payload",
+            )
+        return _PAYLOAD_EXECUTOR
 
 
 class JobQueryStorageMixin:
@@ -72,12 +102,14 @@ class JobQueryStorageMixin:
         def load_params(job_id: int) -> dict[str, Any]:
             return self.read_json(self.input_file(node_name, job_id), default={})
 
-        if os.name == "nt" and len(normalized) >= 8:
-            with ThreadPoolExecutor(
-                max_workers=min(32, len(normalized)),
-                thread_name_prefix="mwf-job-prefetch",
-            ) as executor:
-                params_list = list(executor.map(load_params, normalized))
+        parallel_reads = os.name == "nt" or os.environ.get(
+            "MWF_PARALLEL_JOB_PAYLOAD_READS", "0"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if parallel_reads and len(normalized) >= 8:
+            # A project-wide pool avoids repeatedly creating 32 threads for
+            # every 64/96-job admission plateau on Windows. Concurrent Hoeflein
+            # members share a bounded reader pool instead of multiplying pools.
+            params_list = list(_shared_payload_executor().map(load_params, normalized))
         else:
             params_list = [load_params(job_id) for job_id in normalized]
 

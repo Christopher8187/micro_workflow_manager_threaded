@@ -28,7 +28,7 @@
    database mutations, uploads, and publication need stable keys or transactions.
 9. **Validate independently from generation.** A generator should not be the only
    authority deciding whether its result is correct.
-10. **Inspect the funnel before adding capacity.** `mwf inspect NODE filter`
+10. **Inspect the funnel before adding capacity.** `mwf filter NODE`
     distinguishes a slow stage from a low-quality main attempt or fallback.
 11. **Batch high-fanout registration without changing job granularity.** When one
     task emits many independent downstream objects, use
@@ -218,7 +218,7 @@ mwf run START --plan
 mwf runfrom START
 mwf monitor --once
 mwf inspect NODE
-mwf inspect NODE filter
+mwf filter NODE
 mwf inspect NODE failed
 mwf inspect NODE job 1
 mwf restart NODE job 1
@@ -301,7 +301,7 @@ mwf init
 mwf graph src/graph.py
 mwf runfrom discover_sources
 mwf monitor --once
-mwf inspect normalize_sections filter
+mwf filter normalize_sections
 mwf inspect publish_records job 1
 ```
 
@@ -328,7 +328,7 @@ cd examples/geometry_solver_lab
 mwf init
 mwf graph src/graph.py
 mwf runfrom parse_construction
-mwf inspect solve_coordinates filter
+mwf filter solve_coordinates
 mwf inspect validate_solution job 1
 mwf inspect format_coordinates job 1
 ```
@@ -395,7 +395,7 @@ mwf init
 mwf graph src/graph.py
 mwf runfrom classify_request
 mwf inspect classify_request job 1
-mwf inspect answer_with_specialist filter
+mwf filter answer_with_specialist
 mwf inspect answer_with_specialist job 1
 ```
 
@@ -425,7 +425,7 @@ mwf init
 mwf graph src/graph.py
 mwf runfrom fan_out
 mwf monitor --once
-mwf inspect collect_facts filter
+mwf filter collect_facts
 mwf inspect synthesize_answer job 1
 ```
 
@@ -443,7 +443,7 @@ plan_work -> execute_work_item (many jobs) -> assemble_report
 The orchestrator produces an explicit plan and dynamically creates worker jobs.
 `execute_work_item` uses `max_threads=3`; each worker writes a section named by a
 stable index. The assembly job sorts by that index, not completion time. Worker
-retries are visible in `mwf inspect execute_work_item filter`.
+retries are visible in `mwf filter execute_work_item`.
 
 ```bash
 cd examples/agent_orchestrator_workers
@@ -451,7 +451,7 @@ mwf init
 mwf graph src/graph.py
 mwf runfrom plan_work
 mwf inspect plan_work job 1
-mwf inspect execute_work_item filter
+mwf filter execute_work_item
 mwf inspect assemble_report job 1
 ```
 
@@ -593,7 +593,7 @@ publication inside a fallback.
 A useful post-failure workflow is:
 
 ```bash
-mwf inspect NODE filter
+mwf filter NODE
 mwf inspect NODE failed
 mwf inspect NODE job 42
 mwf resume NODE
@@ -792,12 +792,11 @@ facade. This keeps transaction policy centralized without turning one storage
 module into a collection of unrelated APIs.
 
 Successful and failed handlers first publish their durable `output.json` under
-the execution fence. A dedicated terminal coordinator then groups conditional
-status/event mutations on a fixed cadence. While a Hoeflein component is live,
-its scheduler also scans active leases every 250 ms and reconciles terminal
-outputs whose SQLite publication was interrupted. Reconciliation is idempotent:
-a later ordinary finalizer for the same generation and terminal status is
-accepted.
+the execution fence, then submit a grouped conditional status/event mutation to
+the project SQLite writer. Normal execution does not scan output directories.
+`mwf resume` and `mwf resumefrom` explicitly reconcile terminal outputs before
+requeueing stale work; reconciliation is idempotent with a late ordinary
+finalizer for the same generation and terminal status.
 
 On the first node failure, the failed terminal update is urgent. The coordinator
 flushes it together with any pending successful completions, then the node pump
@@ -806,19 +805,76 @@ items; API items that were claimed in a burst but have not started are released
 back to `queued`. Already-running handlers are allowed to reach their fenced
 terminal boundary, after which `mwf resume` sees durable, non-running state.
 
-## Adaptive API admission (0.4.1)
+## Source-aware dual-window API admission (0.4.7)
 
-Refreshable API sources use an adaptive claim window rather than a permanently
-fixed burst. The first probe remains 64 jobs. A full pull doubles the next
-window up to 1024, reducing synchronous SQLite claim transactions for large,
-fixed queues. A partial or empty pull drops the next probe to 16, keeping sparse
-and trickling Hoeflein producers responsive without repeatedly issuing large
-mostly-empty claims.
+Fixed geometric admission ladders are a poor fit for uneven Hoeflein members:
+a 53-job node, a 1,192-job node, and a 3,600-job node should not all pay the same
+64-job probe cadence. The production `balanced` strategy therefore uses one
+window below 128 queued jobs and two coordinated windows above it. The initial
+window is derived from the source's remaining-row hint and a four-turn target,
+with a 512-job per-window ceiling. Small tails are drained immediately, while a
+dense node can overlap payload reads and claims without creating an unbounded
+number of startup controllers.
 
-Admission sizing is independent of terminal persistence. Finished handlers send
-their grouped conditional mutations directly to the higher-priority SQLite
-writer lane, so a node that continues to claim new work cannot hide `done`
-updates behind admission transactions.
+The SQLite mutation writer limits ordinary claim transactions by **row weight**,
+not only queued request count. At most 192 claimed jobs enter one non-preemptible
+ordinary transaction. This is the durability backpressure boundary: terminal
+updates retain higher priority and can take the writer after a bounded claim
+slice, preserving monitor visibility even when several Hoeflein members claim
+thousands of jobs together.
+
+Simultaneous per-node claim requests share one grouped operation, reducing
+transaction/savepoint overhead without merging them into an unlimited write.
+Refreshable sources protect only row-ID reservation; payload loading and claim
+submission can overlap. On Windows those payload reads use one bounded shared
+pool rather than constructing a new pool for each burst.
+
+Evaluate admission changes with `benchmarks/compare_job_loading_models.py`.
+Include both the observed uneven explode shape and profiles with several nodes
+above 3,000 jobs and several below 500. Reject any candidate with a missing
+monitor row, queued/running residue, output-to-terminal p95 above 100 ms, or max
+above 750 ms. Faster admission alone is not sufficient.
+
+## Event-driven state and startup diagnostics (0.4.6)
+
+`job_events` is both the durable audit journal and the cursor-based state stream.
+A SQLite commit emits a coalescible local or loopback wakeup; consumers then read
+all rows after their last `event_id`. Wakeups may merge or be lost without losing
+state because the cursor, not the datagram, defines progress. Component scheduling,
+active restart detection, and `mwf top` therefore react to commits immediately,
+with a slow timeout retained only for defensive recovery.
+
+API startup must remain bounded and terminal-aware. The default `balanced` strategy
+uses one cooperative pump per node, begins with a 64-job probe, grows only to a
+96-job dense claim slice, and alternates at most 12 ready completions with the next
+admission turn. It pauses only while the SQLite writer's urgent terminal signal is
+set. Do not replace this with more
+startup lanes solely to reduce claim time: the explode benchmark showed that
+lanes can admit more provider work while increasing output-to-terminal visibility
+lag. Evaluate alternatives with `benchmarks/compare_startup_strategies.py` and
+require zero missing monitor rows, zero queued/running residue, and bounded exact
+terminal publication p95 before considering throughput.
+
+`mwf top` is the generic diagnostic surface for that evaluation. In addition to
+job counts and rates, it reads a throttled heartbeat from the active process's
+mutation writer so a second terminal sees the real queue, active priority/batch,
+and durability backlog rather than the observer process's empty writer.
+
+## Fair API admission and monitor visibility (0.4.5)
+
+Refreshable API sources start with a 64-job probe and never admit more than 64
+new jobs in one scheduler slice. Within that slice the runtime services future
+callbacks every 16 starts. A partial or empty pull drops the next probe to 16,
+keeping sparse and trickling Hoeflein producers responsive. The bounded dense
+slice is deliberate: geometric 256/512/1024 pulls reduced claim count but could
+starve already-completed provider futures, creating a long interval where a
+result existed while `mwf monitor` had not yet observed terminal state.
+
+API attempt-runtime observations use low-priority grouped, generation-fenced
+writes. Terminal job status remains higher priority and is the monitor source of
+truth. The scheduler also polls one restart revision row and scans active leases
+only when that revision changes, so normal high-concurrency runs do not perform
+a component-wide lease comparison every 50 ms.
 
 ## Monitor-visible terminal persistence (0.4.0)
 

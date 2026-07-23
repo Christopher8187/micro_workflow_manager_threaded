@@ -60,6 +60,64 @@ def test_checkpoint_runtime_is_one_database_write_without_advisory_lock(tmp_path
     assert storage.read_job_runtime("merge", 1)["state"] == "timed_out"
 
 
+def test_async_runtime_completion_can_follow_terminal_publication(tmp_path):
+    storage = FileStorage(tmp_path)
+    storage.create_job(Job(job_id=1, node_name="merge", params={}))
+    generation, execution_id = storage.claim_job_execution(
+        "merge", 1, started_at="2026-07-21T12:00:00"
+    )
+
+    storage.write_job_runtime(
+        "merge",
+        1,
+        {
+            "watch_id": "watch-1",
+            "state": "running",
+            "generation": generation,
+            "execution_id": execution_id,
+        },
+        wait=False,
+        priority=20,
+    )
+    storage.finalize_job_execution(
+        "merge",
+        1,
+        generation,
+        execution_id,
+        "done",
+        generation=generation,
+        execution_id=execution_id,
+    )
+    storage.write_job_runtime(
+        "merge",
+        1,
+        {
+            "watch_id": "watch-1",
+            "state": "completed",
+            "generation": generation,
+            "execution_id": execution_id,
+        },
+        wait=False,
+        priority=20,
+    )
+    storage.db_mutation_barrier()
+
+    assert storage.get_job_status("merge", 1) == "done"
+    assert storage.read_job_runtime("merge", 1)["state"] == "completed"
+
+    storage.write_job_runtime(
+        "merge",
+        1,
+        {
+            "watch_id": "watch-1",
+            "state": "running",
+            "generation": generation,
+            "execution_id": execution_id,
+        },
+    )
+    assert storage.read_job_runtime("merge", 1)["state"] == "completed"
+
+
 def test_execution_fence_uses_filesystem_lock_not_sqlite_advisory_rows(tmp_path, monkeypatch):
     storage = FileStorage(tmp_path)
     storage.create_job(Job(job_id=1, node_name="merge", params={}))

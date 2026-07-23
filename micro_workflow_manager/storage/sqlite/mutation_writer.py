@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+import os
 import queue
 import sqlite3
+import time
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass
-from threading import Condition, Lock, Thread, current_thread
+from threading import Condition, Event, Lock, Thread, current_thread
 from time import monotonic
+from pathlib import Path
 from typing import Any, Callable, Hashable, TypeVar
 
 
@@ -20,6 +24,7 @@ class _MutationRequest:
     priority: int
     future: Future
     collect_seconds: float
+    weight: int = 1
     operation: Callable[[sqlite3.Connection], Any] | None = None
     group_key: Hashable | None = None
     group_item: Any = None
@@ -50,6 +55,17 @@ class SQLiteMutationWriter:
         self.storage = storage
         self.max_batch = int(max_batch)
         self.collect_seconds = float(collect_seconds)
+        configured_claim_rows = os.environ.get("MWF_SQLITE_CLAIM_TRANSACTION_ROWS", "192")
+        try:
+            self.claim_transaction_rows = int(configured_claim_rows)
+        except ValueError as error:
+            raise ValueError(
+                "MWF_SQLITE_CLAIM_TRANSACTION_ROWS must be an integer between 32 and 1024"
+            ) from error
+        if not 32 <= self.claim_transaction_rows <= 1024:
+            raise ValueError(
+                "MWF_SQLITE_CLAIM_TRANSACTION_ROWS must be an integer between 32 and 1024"
+            )
         self._queue: queue.PriorityQueue[tuple[int, int, _MutationRequest]] = (
             queue.PriorityQueue()
         )
@@ -59,6 +75,12 @@ class SQLiteMutationWriter:
         self._progress = Condition(self._guard)
         self._completed_through = 0
         self._completed_out_of_order: set[int] = set()
+        self._urgent_pending = Event()
+        self._diagnostic_path = self.storage.project_dir / ".mwf" / "mutation_writer.json"
+        self._diagnostic_last_write = 0.0
+        self._active_priority: int | None = None
+        self._active_batch_size = 0
+        self._last_batch_seconds: float | None = None
 
     def submit(
         self,
@@ -67,10 +89,12 @@ class SQLiteMutationWriter:
         wait: bool,
         priority: int,
         collect_seconds: float | None = None,
+        weight: int = 1,
     ) -> T | Future[T]:
         request = self._new_request(
             priority=priority,
             collect_seconds=collect_seconds,
+            weight=weight,
             operation=operation,
         )
         self._enqueue(request)
@@ -85,6 +109,7 @@ class SQLiteMutationWriter:
         wait: bool,
         priority: int,
         collect_seconds: float,
+        weight: int = 1,
     ) -> Any | Future:
         """Submit one item that may be applied with related queued items."""
         if group_key is None:
@@ -92,6 +117,7 @@ class SQLiteMutationWriter:
         request = self._new_request(
             priority=priority,
             collect_seconds=collect_seconds,
+            weight=weight,
             group_key=group_key,
             group_item=item,
             group_operation=operation,
@@ -104,6 +130,7 @@ class SQLiteMutationWriter:
         *,
         priority: int,
         collect_seconds: float | None,
+        weight: int,
         operation: Callable[[sqlite3.Connection], Any] | None = None,
         group_key: Hashable | None = None,
         group_item: Any = None,
@@ -111,6 +138,8 @@ class SQLiteMutationWriter:
     ) -> _MutationRequest:
         if type(priority) is not int:
             raise TypeError("priority must be an integer")
+        if type(weight) is not int or weight < 1:
+            raise ValueError("mutation weight must be an integer >= 1")
         window = self.collect_seconds if collect_seconds is None else collect_seconds
         if window < 0:
             raise ValueError("collect_seconds must be non-negative")
@@ -122,6 +151,7 @@ class SQLiteMutationWriter:
             priority=priority,
             future=Future(),
             collect_seconds=float(window),
+            weight=weight,
             operation=operation,
             group_key=group_key,
             group_item=group_item,
@@ -129,6 +159,8 @@ class SQLiteMutationWriter:
         )
 
     def _enqueue(self, request: _MutationRequest) -> None:
+        if request.priority <= 5:
+            self._urgent_pending.set()
         with self._guard:
             self._queue.put((request.priority, request.serial, request))
             if self._thread is None or not self._thread.is_alive():
@@ -138,6 +170,77 @@ class SQLiteMutationWriter:
                     daemon=True,
                 )
                 self._thread.start()
+
+    def urgent_state_pending(self) -> bool:
+        """Cheap event-driven admission signal for terminal publication."""
+        return self._urgent_pending.is_set()
+
+    def _refresh_urgent_signal(self) -> None:
+        with self._queue.mutex:
+            pending = any(item[0] <= 5 for item in self._queue.queue)
+        if not pending:
+            self._urgent_pending.clear()
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return a lock-safe local snapshot for ``mwf top``."""
+        # Keep the writer lock order consistent with enqueue and idle exit:
+        # _guard first, then the PriorityQueue mutex. ``mwf top`` may call this
+        # from another thread while the writer is transitioning to idle.
+        with self._guard:
+            with self._queue.mutex:
+                queued = list(self._queue.queue)
+            submitted = self._serial
+            completed = self._completed_through
+            writer_alive = bool(self._thread is not None and self._thread.is_alive())
+            active_priority = self._active_priority
+            active_batch_size = self._active_batch_size
+            last_batch_seconds = self._last_batch_seconds
+        priorities = sorted({item[0] for item in queued})
+        return {
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+            "queued": len(queued),
+            "urgent": sum(1 for item in queued if item[0] <= 5),
+            "queued_by_priority": {
+                str(priority): sum(1 for item in queued if item[0] == priority)
+                for priority in priorities
+            },
+            "submitted_serial": submitted,
+            "completed_through": completed,
+            "durability_backlog": max(0, submitted - completed),
+            "writer_alive": writer_alive,
+            "active_priority": active_priority,
+            "active_batch_size": active_batch_size,
+            "last_batch_seconds": last_batch_seconds,
+            "max_batch": self.max_batch,
+            "claim_transaction_rows": self.claim_transaction_rows,
+        }
+
+    def persisted_diagnostics(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self._diagnostic_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _publish_diagnostics(self, *, force: bool = False) -> None:
+        now_value = time.monotonic()
+        if not force and now_value - self._diagnostic_last_write < 0.05:
+            return
+        self._diagnostic_last_write = now_value
+        payload = self.diagnostics()
+        path: Path = self._diagnostic_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError:
+            # Diagnostics are advisory and must never affect workflow durability.
+            pass
 
     def barrier(self, serial: int | None = None) -> None:
         """Wait until every mutation submitted through ``serial`` is durable."""
@@ -156,8 +259,27 @@ class SQLiteMutationWriter:
     ) -> list[tuple[int, int, _MutationRequest]]:
         batch = [first]
         priority = first[0]
+        # Priority affects admission into a transaction, but SQLite cannot
+        # preempt a transaction already executing. Bound lower-priority runtime
+        # and ordinary mutation slices so terminal updates can take over within
+        # a small amount of work instead of waiting behind 1,024 metadata rows.
+        if priority >= 20:
+            batch_limit = min(self.max_batch, 128)
+            weight_limit = 128
+        elif priority > 5:
+            batch_limit = min(self.max_batch, 256)
+            # Claims can represent hundreds of job rows in one request. Bound
+            # the non-preemptible transaction by work, not only request count.
+            weight_limit = self.claim_transaction_rows
+        else:
+            # Terminal publication remains highly batched, but a bounded slice
+            # prevents one completion wave from monopolizing visibility for the
+            # next wave.
+            batch_limit = min(self.max_batch, 128)
+            weight_limit = 128
         deadline = monotonic() + first[2].collect_seconds
-        while len(batch) < self.max_batch:
+        batch_weight = first[2].weight
+        while len(batch) < batch_limit:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
@@ -168,7 +290,12 @@ class SQLiteMutationWriter:
             if candidate[0] != priority:
                 self._queue.put(candidate)
                 break
+            candidate_weight = candidate[2].weight
+            if batch_weight + candidate_weight > weight_limit:
+                self._queue.put(candidate)
+                break
             batch.append(candidate)
+            batch_weight += candidate_weight
         return batch
 
     @staticmethod
@@ -273,6 +400,13 @@ class SQLiteMutationWriter:
                 try:
                     first = self._queue.get(timeout=0.25)
                 except queue.Empty:
+                    # Publish the final heartbeat before making the writer
+                    # discoverably idle. A request racing with diagnostics is
+                    # observed by the guarded recheck and handled by this same
+                    # thread; a request arriving after ``_thread=None`` starts a
+                    # new writer. This also prevents temp-project cleanup from
+                    # racing a late mutation_writer.json write.
+                    self._publish_diagnostics(force=True)
                     with self._guard:
                         if self._queue.empty():
                             self._thread = None
@@ -281,6 +415,11 @@ class SQLiteMutationWriter:
 
                 queued_batch = self._collect_batch(first)
                 requests = [item[2] for item in queued_batch]
+                with self._guard:
+                    self._active_priority = first[0]
+                    self._active_batch_size = len(requests)
+                self._publish_diagnostics()
+                batch_started = monotonic()
                 try:
                     with self.storage.db_transaction() as connection:
                         outcomes = self._execute_batch(connection, requests)
@@ -289,10 +428,25 @@ class SQLiteMutationWriter:
                         request.serial: (False, error)
                         for request in requests
                     }
-                self._finish_batch(requests, outcomes)
-
-                if self._queue.empty():
+                batch_seconds = monotonic() - batch_started
+                # A waiter may return as soon as its Future is resolved. Close
+                # the writer connection first when this transaction drained the
+                # queue so a completed workflow does not retain a transient
+                # second SQLite connection merely because writer bookkeeping is
+                # still finishing. A request racing in afterwards simply opens
+                # a fresh connection on the next loop.
+                queue_empty = self._queue.empty()
+                if queue_empty:
                     self.storage.close_thread_connection()
+                self._finish_batch(requests, outcomes)
+                with self._guard:
+                    self._active_priority = None
+                    self._active_batch_size = 0
+                    self._last_batch_seconds = batch_seconds
+                if first[0] <= 5:
+                    self._refresh_urgent_signal()
+
+                self._publish_diagnostics()
         finally:
             self.storage.close_thread_connection()
             with self._progress:

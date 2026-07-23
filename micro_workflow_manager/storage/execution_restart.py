@@ -17,6 +17,32 @@ T = TypeVar("T")
 class JobRestartStorageMixin:
     """Execution fencing and manual restart operations."""
 
+    def job_restart_revision(self) -> int:
+        """Return the project-wide generation-change revision.
+
+        The scheduler polls this one metadata row instead of materializing every
+        active execution lease on every 50 ms tick. A full lease comparison is
+        only needed after an actual restart request changes the revision.
+        """
+        row = self.db_connection().execute(
+            "SELECT value FROM metadata WHERE key='job_restart_revision'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return max(0, int(row[0]))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _increment_job_restart_revision(connection) -> None:
+        connection.execute(
+            "INSERT INTO metadata(key, value) "
+            "VALUES('job_restart_revision', '1') "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=CAST(metadata.value AS INTEGER) + 1"
+        )
+
     def job_execution_is_current(
         self,
         node_name: str,
@@ -133,6 +159,7 @@ class JobRestartStorageMixin:
                     job_id,
                 ),
             )
+            self._increment_job_restart_revision(connection)
         self.append_job_event(
             node_name,
             job_id,

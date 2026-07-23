@@ -40,7 +40,8 @@ COMMAND_HELP_DESCRIPTIONS = {
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
     "migrate": "Upgrade MWF-owned JSON and SQLite state schemas. User inputs, outputs, returned files, and provenance are never rewritten.",
-    "inspect": "Inspect a node/job; list failed job IDs, show retry/fallback filter bottlenecks, or show node debug output.",
+    "inspect": "Inspect a node/job, list failed job IDs, or show node debug output.",
+    "filter": "Show the retry/fallback funnel, or list jobs at one stage boundary.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
     "clean": "Delete jobs and output for selected Hoeflein components while keeping node input files.",
     "reset": "Requeue every existing job for one selected DAG node or the selected node's whole Hoeflein component, while keeping job definitions and inputs.",
@@ -53,6 +54,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "runfrom": "Reset and run one node and its descendants; --monitor retains a timestamped dashboard timeline in the same terminal.",
     "resumefrom": "Continue unsuccessful or queued work from one node through its descendants without resetting completed jobs.",
     "monitor": "Show live or one-shot node/job statistics without running task code; completed sequences report active run: none.",
+    "top": "Show event-driven htop-style scheduler, latency, process, database, and mutation-writer diagnostics.",
 }
 
 COMMAND_DESCRIPTIONS = {
@@ -134,18 +136,33 @@ execution generation, and chronological lifecycle events stored in SQLite.
 
 Examples:
   mwf inspect process_number
-  mwf inspect process_number filter
   mwf inspect process_number failed
   mwf inspect process_number job 3
   mwf inspect process_number debug
 
 A simple process_number task might report checkpoint "number chosen" with
 progress 50%, then call ctx.sleep(1) before doubling the number. The job view
-displays that live progress from SQLite without executing or retrying anything. The filter view reconstructs the current execution funnel from each job's append-only event rows, showing how many jobs entered, resolved at, and
-remained after every main retry and fallback retry. The failed view gives
-copyable failed job IDs and concise errors. If the checkpoint
+displays that live progress from SQLite without executing or retrying anything.
+The failed view gives copyable failed job IDs and concise errors. Retry/fallback
+funnel inspection is a separate command: `mwf filter process_number`, with
+`mwf filter process_number stage 2` for one stage boundary. If the checkpoint
 deadline expires, inspect shows the timeout reason and the event history shows
 which fallback ran afterward.
+""",
+    "filter": """
+Filter reconstructs the current execution funnel from each job's append-only
+lifecycle events. It shows how many jobs entered, succeeded at, and remained
+after every main retry and fallback retry without adding scheduler hot-path
+writes or a separate provenance manifest.
+
+Examples:
+  mwf filter process_number
+  mwf filter process_number stage 1
+
+The plain command prints only the funnel and current terminal counts. For a
+non-final stage, `stage X` lists jobs that failed at X and then completed
+successfully at X+1. For the final stage, it lists terminally failed jobs. Both
+stage forms use compact `job_id: error` rows.
 """,
     "recover": """
 Recover is for an interrupted command whose owning process is definitely gone.
@@ -356,6 +373,23 @@ For A -> B -> C:
 If A is done, one B job failed, and C has not run yet, resumefrom preserves A,
 reruns the failed B job, and then allows C to continue when B completes. It does not perform producer-component cleanup and therefore preserves every
 existing successful descendant job.
+""",
+    "top": """
+Top is an event-driven, htop-style diagnostic view for a running or completed
+workflow. Durable SQLite commits wake the display immediately; --interval is a
+maximum redraw and defensive fallback cadence, not the normal state-discovery
+mechanism.
+
+It displays per-node queue/running/terminal counts, effective concurrency,
+starts and finishes per second, queue wait and terminal publication p95, recent
+lifecycle events, process RSS/thread count, SQLite/WAL size, and the active
+process's mutation-writer queue, active batch, and durability backlog.
+
+Examples:
+  mwf top
+  mwf top explodeclaim explodecontext
+  mwf top --once
+  mwf top --once --json
 """,
     "monitor": """
 Monitor is a read-only live view over SQLite node/job summaries plus the

@@ -12,7 +12,16 @@ class NodeFileStorageMixin:
 
     def node_dir(self, node_name: str) -> Path:
         node_name = self.validate_node_name(node_name)
-        path = self.safe_join(self.project_dir / "node", node_name)
+        with self.lock:
+            path = self._node_dir_cache.get(node_name)
+            if path is None:
+                # Validation rejects separators and traversal, so a direct child
+                # join is safe and avoids a realpath walk on every job operation.
+                path = self.project_dir / "node" / node_name
+                self._node_dir_cache[node_name] = path
+        # Clean/wipe operations may remove a previously cached directory while
+        # the FileStorage object remains alive. Recreate the cached location
+        # without repeating canonical path resolution.
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -27,19 +36,24 @@ class NodeFileStorageMixin:
         return path
 
     def jobs_dir(self, node_name: str) -> Path:
-        path = self.node_dir(node_name) / "jobs"
+        node_name = self.validate_node_name(node_name)
+        with self.lock:
+            path = self._jobs_dir_cache.get(node_name)
+            if path is None:
+                path = self.node_dir(node_name) / "jobs"
+                self._jobs_dir_cache[node_name] = path
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     def job_dir(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
-        path = self.safe_join(self.jobs_dir(node_name), str(job_id))
+        path = self.jobs_dir(node_name) / str(job_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     def files_dir(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
-        path = self.safe_join(self.jobs_dir(node_name), str(job_id), "files")
+        path = self.jobs_dir(node_name) / str(job_id) / "files"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -78,7 +92,7 @@ class NodeFileStorageMixin:
 
     def job_base_dir(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
-        return self.safe_join(self.jobs_dir(node_name), str(job_id))
+        return self.jobs_dir(node_name) / str(job_id)
 
     def job_file(self, node_name: str, job_id: int) -> Path:
         return self.job_base_dir(node_name, job_id) / "job.json"

@@ -93,9 +93,15 @@ class FileStorageBase:
         self.project_dir = Path(project_dir).resolve()
         self.lock = RLock()
         self.project_dir.mkdir(parents=True, exist_ok=True)
+        self._node_dir_cache: dict[str, Path] = {}
+        self._jobs_dir_cache: dict[str, Path] = {}
+        self._filesystem_lock_dir_cache: dict[str, Path] = {}
 
     def thread_lock_for(cls, path: Path) -> RLock:
-        path = Path(path).resolve()
+        # Lock identity does not require filesystem canonicalization. ``absolute``
+        # avoids the repeated stat/realpath walk that dominated high-concurrency
+        # output publication while retaining one stable key per absolute path.
+        path = Path(path).absolute()
         with cls._thread_locks_guard:
             lock = cls._thread_locks.get(path)
             if lock is None:
@@ -269,7 +275,12 @@ class FileStorageBase:
         safe_namespace = re.sub(r"[^A-Za-z0-9_.-]+", "_", namespace).strip("._")
         safe_namespace = safe_namespace or "locks"
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "lock"
-        directory = self.project_dir / ".mwf" / safe_namespace
+        with self.lock:
+            directory = self._filesystem_lock_dir_cache.get(safe_namespace)
+            if directory is None:
+                directory = self.project_dir / ".mwf" / safe_namespace
+                self._filesystem_lock_dir_cache[safe_namespace] = directory
+        # A live storage object may survive a clean/wipe that removed .mwf.
         directory.mkdir(parents=True, exist_ok=True)
         return directory / f"{safe_name}.lock"
 
@@ -282,7 +293,7 @@ class FileStorageBase:
         ``mwf restart`` command in a second process with the running job.
         """
         path = self.filesystem_lock_file(namespace, name)
-        lock_key = os.fspath(path.resolve())
+        lock_key = os.fspath(path.absolute())
         held = _HELD_FILESYSTEM_LOCKS.get()
         if lock_key in held:
             # ContextVar state follows the current API fiber. This makes an

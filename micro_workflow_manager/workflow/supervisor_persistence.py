@@ -70,6 +70,7 @@ class SupervisorPersistenceMixin:
         state: str,
         error: str | None = None,
         wait: bool = True,
+        priority: int = 10,
     ):
         payload = self._runtime_payload(watch, state=state, error=error)
         self.storage.write_job_runtime(
@@ -77,6 +78,7 @@ class SupervisorPersistenceMixin:
             watch.job_id,
             payload,
             wait=wait,
+            priority=priority,
         )
         watch.runtime_written = True
 

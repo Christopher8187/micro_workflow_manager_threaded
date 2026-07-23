@@ -7,6 +7,7 @@ from .job_identity import JobIdentityStorageMixin
 from .job_payloads import JobPayloadStorageMixin
 from .job_queries import JobQueryStorageMixin
 from .job_sources import (
+    PrefetchingQueuedJobObjectSource,
     QueuedJobObjectSource,
     RefreshableQueuedJobObjectSource,
     RefreshableQueuedJobSource,
@@ -26,6 +27,7 @@ class JobFileStorageMixin(
 
 __all__ = [
     "JobFileStorageMixin",
+    "PrefetchingQueuedJobObjectSource",
     "QueuedJobObjectSource",
     "RefreshableQueuedJobObjectSource",
     "RefreshableQueuedJobSource",

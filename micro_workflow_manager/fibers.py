@@ -188,7 +188,8 @@ def install_bridges() -> None:
 
 
 MIN_ADMISSION_BURST = 16
-MAX_ADMISSION_BURST = 1024
+MAX_ADMISSION_BURST = 64
+ADMISSION_SERVICE_INTERVAL = 16
 
 
 class FiberRuntime:
@@ -198,13 +199,38 @@ class FiberRuntime:
     greenlet, allowing thousands of controllers to share one node-pump thread.
     """
 
-    def __init__(self, *, poll_interval: float = 0.05, start_burst: int = 64):
+    def __init__(
+        self,
+        *,
+        poll_interval: float = 0.05,
+        start_burst: int = 64,
+        max_admission_burst: int = MAX_ADMISSION_BURST,
+        service_interval: int = ADMISSION_SERVICE_INTERVAL,
+        state_writer_service_interval: int = 1,
+        admission_pressure_provider: Callable[[], bool] | None = None,
+        admission_pressure_wait: float = 0.005,
+    ):
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
         if type(start_burst) is not int or start_burst < 1:
             raise ValueError("start_burst must be an integer >= 1")
+        if type(max_admission_burst) is not int or max_admission_burst < 1:
+            raise ValueError("max_admission_burst must be an integer >= 1")
+        if type(service_interval) is not int or service_interval < 1:
+            raise ValueError("service_interval must be an integer >= 1")
+        if type(state_writer_service_interval) is not int or state_writer_service_interval < 1:
+            raise ValueError("state_writer_service_interval must be an integer >= 1")
+        if admission_pressure_provider is not None and not callable(admission_pressure_provider):
+            raise TypeError("admission_pressure_provider must be callable or None")
+        if admission_pressure_wait < 0:
+            raise ValueError("admission_pressure_wait must be >= 0")
         self.poll_interval = float(poll_interval)
-        self.start_burst = start_burst
+        self.start_burst = min(start_burst, max_admission_burst)
+        self.max_admission_burst = max_admission_burst
+        self.service_interval = service_interval
+        self.state_writer_service_interval = state_writer_service_interval
+        self.admission_pressure_provider = admission_pressure_provider
+        self.admission_pressure_wait = float(admission_pressure_wait)
         self._parent = getcurrent()
         self._states: dict[int, _FiberState] = {}
         self._future_waiters: dict[Future, list[_FutureWaiter]] = {}
@@ -432,6 +458,17 @@ class FiberRuntime:
             break
         return timeout
 
+    def _yield_to_state_writer(self) -> None:
+        provider = self.admission_pressure_provider
+        if provider is None or not provider():
+            return
+        deadline = _time.monotonic() + self.admission_pressure_wait
+        # This is driven by the mutation writer's urgent Event, not a database
+        # status poll. Releasing the GIL here lets the terminal writer complete
+        # and clear the event before more synchronous job setup is admitted.
+        while provider() and _time.monotonic() < deadline:
+            _ORIGINAL_SLEEP(0.0005)
+
     def run_source(
         self,
         node_name: str,
@@ -472,34 +509,58 @@ class FiberRuntime:
                         # release is best-effort recovery for preclaimed work.
                         pass
 
-        def resume_ready() -> None:
-            while self._ready:
+        def resume_ready(max_states: int | None = None) -> int:
+            serviced = 0
+            while self._ready and (max_states is None or serviced < max_states):
                 state, resume = self._ready.popleft()
                 self._resume_state(state, resume)
+                serviced += 1
+                # A resumed completion writes its output and queues its durable
+                # terminal event before returning here. Yield on that urgent
+                # event in tiny groups, but do not drain an unbounded response
+                # wave before the next admission slice.
+                if serviced % self.state_writer_service_interval == 0:
+                    self._yield_to_state_writer()
+            if serviced % self.state_writer_service_interval:
+                self._yield_to_state_writer()
+            return serviced
 
         admission_burst = self.start_burst
 
         while True:
+            # Provider callbacks may arrive between admission bursts. Drain them
+            # before the next potentially expensive payload-load/claim pull so a
+            # completed request can retire promptly instead of becoming a ghost
+            # behind the next dense queue slice.
+            self._process_futures()
+            now_value = _time.monotonic()
+            self._process_deadlines(now_value)
+            if now_value >= self._next_cancellation_poll:
+                self._poll_cancellation()
+                self._next_cancellation_poll = now_value + self.poll_interval
+            resume_ready(self.service_interval)
+
             added = 0
             if self._first_error is None:
+                self._yield_to_state_writer()
                 active = self._active_count
                 limit = limit_provider()
-                if type(limit) is not int or limit < 1:
-                    raise ValueError("runtime API concurrency must be an integer >= 1")
+                if type(limit) is not int or limit < 0:
+                    raise ValueError("runtime API lane concurrency must be an integer >= 0")
                 capacity = max(0, limit - active)
                 requested = min(capacity, admission_burst)
                 pulled = pull_items(requested)
                 added = len(pulled)
                 if requested > 0 and added == requested and active + added < limit:
-                    # A full pull proves the queue is dense. Grow geometrically
-                    # while retaining a bounded claim transaction.
+                    # A full pull proves the queue is dense. Keep the next
+                    # scheduler slice at the bounded dense ceiling.
                     admission_burst = min(
-                        MAX_ADMISSION_BURST,
-                        max(MIN_ADMISSION_BURST, requested * 2),
+                        self.max_admission_burst,
+                        max(min(MIN_ADMISSION_BURST, self.max_admission_burst), requested * 2),
                     )
                 elif added < requested:
                     # Sparse and trickling sources return to a small probe.
-                    admission_burst = MIN_ADMISSION_BURST
+                    admission_burst = min(MIN_ADMISSION_BURST, self.max_admission_burst)
 
                 for position, item in enumerate(pulled):
                     state = self._new_state(next_index, item, run_one)
@@ -510,17 +571,34 @@ class FiberRuntime:
                         abandon_unstarted(pulled[position + 1:])
                         break
 
+                    # Service completed provider futures within each bounded
+                    # admission slice so fast responses can publish output and
+                    # terminal state instead of waiting behind every start.
+                    if (position + 1) % self.service_interval == 0:
+                        self._process_futures()
+                        now_value = _time.monotonic()
+                        self._process_deadlines(now_value)
+                        if now_value >= self._next_cancellation_poll:
+                            self._poll_cancellation()
+                            self._next_cancellation_poll = (
+                                now_value + self.poll_interval
+                            )
+                        resume_ready(self.service_interval)
+                        if self._first_error is not None:
+                            abandon_unstarted(pulled[position + 1:])
+                            break
+
             # A failure stops admission, not fibers that have already started.
             # Continue servicing their futures, sleeps, cancellation checks,
             # and terminal publication until every active fiber has exited.
-            resume_ready()
+            resume_ready(self.service_interval)
             self._process_futures()
             now_value = _time.monotonic()
             self._process_deadlines(now_value)
             if now_value >= self._next_cancellation_poll:
                 self._poll_cancellation()
                 self._next_cancellation_poll = now_value + self.poll_interval
-            resume_ready()
+            resume_ready(self.service_interval)
 
             active = self._active_count
             if self._first_error is not None:
@@ -530,14 +608,16 @@ class FiberRuntime:
                 continue
 
             if active == 0:
+                if limit == 0:
+                    break
                 if refreshable and added == 0:
                     # Completion callbacks can drain the last active fibers
                     # after this iteration's admission phase. Probe the live
                     # source once more before declaring the pump quiescent.
-                    refill = pull_items(min(limit, MIN_ADMISSION_BURST))
+                    refill = pull_items(min(limit, MIN_ADMISSION_BURST, self.max_admission_burst))
                     if not refill:
                         break
-                    admission_burst = MIN_ADMISSION_BURST
+                    admission_burst = min(MIN_ADMISSION_BURST, self.max_admission_burst)
                     for position, item in enumerate(refill):
                         state = self._new_state(next_index, item, run_one)
                         self._states[next_index] = state
@@ -549,6 +629,12 @@ class FiberRuntime:
                     continue
                 if not refreshable and source_exhausted:
                     break
+
+            # Ready completions are in-memory events and must never wait for the
+            # defensive timer. Alternate another bounded completion/admission
+            # turn immediately.
+            if self._ready:
+                continue
 
             # Keep admitting in bounded bursts while capacity remains, but
             # service active fibers between every burst.

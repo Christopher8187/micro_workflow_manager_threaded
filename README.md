@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.4.3
+# micro-workflow-manager 0.4.7
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,68 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.4.7
+
+- Dense API nodes use a source-aware **balanced dual-window** loader. Queues
+  below 128 jobs use one pump; larger queues use two coordinated pumps. Each
+  pump sizes its first window from the actual remaining jobs and a four-turn
+  target, capped at 512, instead of climbing through fixed 64/128/256 plateaus.
+- Simultaneous Hoeflein claim bursts are combined into one grouped SQLite
+  operation. The mutation writer also caps ordinary claim transactions at 192
+  job rows, so a multi-thousand-job admission wave cannot trap urgent terminal
+  publication behind one non-preemptible transaction.
+- Refreshable job sources reserve row IDs under a short lock while payload reads
+  and claims overlap. Windows share a bounded payload-read pool on Windows,
+  avoiding a fresh thread pool for every node and every admission slice.
+- `benchmarks/compare_job_loading_models.py` compares fixed ladders, source-aware
+  windows, elastic loading, and two/three/four-lane models on the supplied
+  explode shape plus uneven 11k–12k-job graphs. A model is eligible only with no
+  missing monitor rows, no final residue, and bounded output-to-terminal p95/max.
+- A bounded regression test now samples SQLite during uneven high-concurrency
+  execution and verifies exact output-write to durable-terminal latency. A
+  separate 27-job-tail test prevents a small final queue from waiting for the
+  next admission plateau.
+
+## What changed in 0.4.6
+
+- Durable `job_events` are now the workflow state stream. In-process schedulers
+  receive commit callbacks immediately, while second-terminal commands and
+  restart control use coalesced loopback wakeups plus an `event_id` cursor. A
+  five-second timeout remains only as a defensive fallback; normal lifecycle
+  progress is no longer discovered by frequent status polling.
+- `mwf top` adds an event-driven htop-style dashboard with per-node queue/run
+  counts, effective limits, starts/finishes per second, queue and terminal p95
+  latency, recent lifecycle events, process RSS/thread data, SQLite/WAL size,
+  and the active process's mutation-writer backlog and batch diagnostics.
+- The production API startup strategy was changed to `balanced`, with bounded
+  completion/admission turns and terminal-pressure priority. Version 0.4.7
+  replaces its fixed 64/96 admission ladder with source-aware dual windows.
+- Retry/fallback inspection moved from `mwf inspect NODE filter` to
+  `mwf filter NODE`; `mwf filter NODE stage X` shows terminal failures at the
+  final stage or failures at X that succeeded at X+1.
+
+## What changed in 0.4.5
+
+- Dense API sources now admit at most 64 jobs per scheduler slice and service
+  completed futures every 16 starts. Fast provider responses can therefore
+  publish output and terminal state while a large Hoeflein component is still
+  filling, instead of waiting behind a 256/512/1024 start wave.
+- Supervised API attempt metadata is generation/execution fenced, grouped by
+  node, deduplicated within each writer batch, and written asynchronously below
+  terminal priority. Startup inspection writes no longer serialize every job,
+  and terminal rows remain the monitor source of truth.
+- Active-restart supervision polls one project revision row. It materializes
+  live execution leases only after an actual restart request, rather than
+  rereading every active job every 50 ms at high concurrency.
+- Hot filesystem and SQLite paths cache canonical project/node directories and
+  avoid repeated path resolution for validated node names and integer job IDs.
+  This removes substantial per-job queueing overhead without weakening path
+  traversal validation or generation fences.
+- `benchmarks/reproduce_explode_ghost.py` copies the ten-handler
+  `pdftostructureddata` explode component and uses a variable-latency mock HTTP
+  provider to measure provider completion, durable output, and monitor-visible
+  terminal state separately.
 
 ## What changed in 0.4.3
 
@@ -56,12 +118,12 @@ manager, and a Pygame state machine.
   facades and implementation files. The remaining file above 500 lines is the
   cohesive cooperative fiber runtime.
 
-## What changed in 0.4.1
+## What changed in 0.4.1 (historical; dense growth superseded in 0.4.5)
 
-- Refreshable API admission now adapts across a wider range. It starts at 64,
+- Refreshable API admission then adapted across a wider range. It starts at 64,
   drops to 16 after a partial or empty pull for sparse/trickling queues, and
   grows geometrically to 1024 while pulls remain full for dense fixed queues.
-- A 2,000-job dense queue now reaches its final partial pull in six admission
+- At that release, a 2,000-job dense queue reached its final partial pull in six admission
   rounds (`64, 128, 256, 512, 1024, 16`) instead of repeatedly claiming fixed
   groups of 64.
 - Terminal completion batching remains independent of the API fiber scheduler,
@@ -1054,16 +1116,18 @@ Use `inspect` when you need an explanation rather than a raw directory listing:
 
 ```bash
 mwf inspect A
-mwf inspect A filter
+mwf filter A
 mwf inspect A failed
 mwf inspect A job 3
 ```
 
-`mwf inspect A filter` shows how many jobs entered, passed, and remained after
+`mwf filter A` shows how many jobs entered, passed, and remained after
 each main retry and fallback retry. It derives the funnel on demand from the
 latest execution segment in each job's append-only events, so it adds no shared
-provenance manifest or scheduler hot-path writes. The final section lists the
-jobs that still failed.
+provenance manifest or scheduler hot-path writes. It intentionally does not
+append failed-job details. `mwf filter A stage 2` lists jobs that failed stage 2
+and then completed successfully at stage 3; selecting the final stage lists the
+terminally failed jobs in the same compact `job_id: error` format.
 
 Node inspection explains readiness, blockers, status counts, Hoeflein-component
 membership, runner, total timeout, checkpoint timeout, and fallbacks.
@@ -1285,7 +1349,21 @@ mwf monitor --json --once   # machine-readable snapshot
 `mwf monitor` reads SQLite job/node summaries plus the low-churn run record. It
 shows running nodes, queued/running/done/failed counts, jobs left, progress,
 running job IDs, effective concurrency, average completed duration, and rough
-ETA without calling task code. Compact same-terminal lines remain available:
+ETA without calling task code. For scheduler and startup debugging, use the
+event-driven htop-style view:
+
+```bash
+mwf top
+mwf top --once
+mwf top explodeclaim explodecontext
+mwf top --once --json
+```
+
+`mwf top` wakes on durable lifecycle commits rather than waiting for the redraw
+interval. It adds starts/finishes per second, queue/terminal p95 latency, recent
+events, active-process RSS and thread count, SQLite/WAL size, and the mutation
+writer's active batch and durability backlog. The interval is only a maximum
+redraw/fallback cadence. Compact same-terminal lines remain available:
 
 ```bash
 mwf runfrom start_node --stats

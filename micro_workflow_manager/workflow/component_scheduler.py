@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Event
 
 import networkx as nx
@@ -9,9 +9,10 @@ from ..models import FAILED, QUEUED, RUNNING, WAITING
 
 WAIT_BLOCKING_JOB_STATUSES = {QUEUED, RUNNING, FAILED}
 class ComponentSchedulerMixin:
-    # Durable queue notifications wake the scheduler immediately. This timeout
-    # is only a defensive fallback for changes made by another process.
-    component_queue_poll_seconds = 1.0
+    # Durable lifecycle commits wake the scheduler immediately. The timeout is
+    # only a defensive cross-process fallback if an external writer cannot use
+    # the project event broker.
+    component_queue_poll_seconds = 5.0
 
     def execution_components(self, nodes: list[str] | None = None) -> list[tuple[str, ...]]:
         """Return Hoeflein execution units in quotient-DAG topological order."""
@@ -136,7 +137,7 @@ class ComponentSchedulerMixin:
             active_nodes: set[str] = set()
             first_error = None
             wake_event = Event()
-            unsubscribe = self.storage.subscribe_queue_changes(wake_event.set)
+            unsubscribe = self.storage.subscribe_state_changes(wake_event.set)
             try:
                 while True:
                     done = [future for future in futures if future.done()]
@@ -186,6 +187,17 @@ class ComponentSchedulerMixin:
                             return ran
                         self.refresh_component_status(component_set)
                         return ran
+
+                    # Once every component member already owns a live pump, no
+                    # durable job transition can make another node startable. Do
+                    # not turn thousands of per-job state events into redundant
+                    # component-wide queue scans; the next scheduler decision is
+                    # needed only when one pump exits. This is still event-driven
+                    # (the worker Future is the event) and removes the largest
+                    # high-concurrency startup reader storm.
+                    if len(active_nodes) == len(component_nodes):
+                        wait(tuple(futures), return_when=FIRST_COMPLETED)
+                        continue
 
                     wake_event.clear()
                     # Close the clear/wait race: a completion or a durable queue

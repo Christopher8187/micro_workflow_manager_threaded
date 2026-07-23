@@ -83,7 +83,8 @@ def test_inspect_help_advertises_failed_mode(capsys):
         cli.main(["inspect", "--help"])
     assert exit_info.value.code == 0
     out = capsys.readouterr().out
-    assert "job|filter|failed|debug" in out
+    assert "job|failed|debug" in out
+    assert "filter" not in out.split("positional arguments:", 1)[-1].split("options:", 1)[0]
     assert "list failed job IDs" in out
 
 

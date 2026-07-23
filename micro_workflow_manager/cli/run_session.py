@@ -44,6 +44,17 @@ def active_workflow_run(
         "pid": os.getpid(),
         "hostname": socket.gethostname(),
         "mwf_version": __version__,
+        "api_startup_strategy": os.environ.get("MWF_API_STARTUP_STRATEGY", "balanced"),
+        "api_event_drain_seconds": os.environ.get("MWF_API_EVENT_DRAIN_SECONDS", "0.010"),
+        "api_terminal_microbatch": os.environ.get("MWF_API_TERMINAL_MICROBATCH", "1"),
+        "api_max_admission_burst": os.environ.get("MWF_API_MAX_ADMISSION_BURST", "512"),
+        "api_completion_service_batch": "12",
+        "api_admission_target_rounds": os.environ.get("MWF_API_ADMISSION_TARGET_ROUNDS", "4"),
+        "api_startup_windows": "auto:1-2",
+        "api_claim_transaction_rows": os.environ.get(
+            "MWF_SQLITE_CLAIM_TRANSACTION_ROWS", "192"
+        ),
+        "api_prefetch": os.environ.get("MWF_API_PREFETCH", "0"),
     }
 
     # Claim the project run slot atomically. This prevents two terminals from

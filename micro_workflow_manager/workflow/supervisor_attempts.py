@@ -58,11 +58,22 @@ class SupervisorAttemptMixin:
 
         with self._condition:
             self._watches[watch.key] = watch
+            if watch.execution_id is not None:
+                self._restartable_keys.add(watch.key)
+                self._ensure_restart_event_subscription_locked()
         if watch.supervised:
-            self._persist_runtime(watch, state="running")
-            # Persistence is framework setup, not user-handler inactivity. At a
-            # large simultaneous start it may wait for a group commit, so begin
-            # the actual watchdog window only after that setup is durable.
+            # API controllers share one cooperative pump. Waiting synchronously
+            # for one runtime-row write per job serializes admission and lets
+            # already-completed provider responses become invisible "ghosts"
+            # until an entire legacy dense admission wave has started. Runtime metadata is
+            # generation-fenced in storage, so API writes can be grouped and
+            # asynchronous while direct/thread/process inspection stays durable.
+            self._persist_runtime(
+                watch,
+                state="running",
+                wait=not in_fiber_runtime(),
+                priority=20 if in_fiber_runtime() else 10,
+            )
             watch.started_monotonic = monotonic()
             if watch.total_timeout is not None:
                 watch.total_deadline = watch.started_monotonic + watch.total_timeout
@@ -142,6 +153,7 @@ class SupervisorAttemptMixin:
             watch,
             state="running",
             wait=not in_fiber_runtime(),
+            priority=20 if in_fiber_runtime() else 10,
         )
 
     def begin_external_wait(
@@ -226,6 +238,8 @@ class SupervisorAttemptMixin:
     ):
         with self._condition:
             self._watches.pop(watch.key, None)
+            self._restartable_keys.discard(watch.key)
+            self._stop_restart_event_subscription_locked()
             if watch.state not in {"timed_out", "superseded"}:
                 watch.state = state
             watch.revision += 1
@@ -233,7 +247,11 @@ class SupervisorAttemptMixin:
 
         if watch.state == "superseded":
             return
-        if (watch.runtime_written or watch.supervised) and watch.execution_id is not None:
+        if (
+            (watch.runtime_written or watch.supervised)
+            and watch.execution_id is not None
+            and not in_fiber_runtime()
+        ):
             if not self.storage.job_execution_is_current(
                 watch.node_name,
                 watch.job_id,
@@ -242,10 +260,20 @@ class SupervisorAttemptMixin:
             ):
                 return
         if watch.runtime_written or watch.supervised:
+            # A cooperative API attempt publishes a durable terminal job event
+            # immediately after this method returns. Writing an additional
+            # completed/failed runtime snapshot for every job only creates a
+            # low-priority backlog that can hold the SQLite writer inside a large
+            # non-preemptible transaction. Running/checkpoint/timeout metadata is
+            # still persisted; terminal status_json and job_events are authoritative.
+            if in_fiber_runtime() and watch.state in {"completed", "failed"}:
+                return
             self._persist_runtime(
                 watch,
                 state=watch.state,
                 error=repr(error) if error is not None else None,
+                wait=not in_fiber_runtime(),
+                priority=20 if in_fiber_runtime() else 10,
             )
 
     def cancel_execution(
@@ -269,10 +297,12 @@ class SupervisorAttemptMixin:
                 ):
                     continue
                 watch.state = "superseded"
+                self._restartable_keys.discard(watch.key)
                 watch.cancel_message = reason
                 watch.cancellation_event.set()
                 watch.revision += 1
                 watch.wake_event.set()
+            self._stop_restart_event_subscription_locked()
             self._condition.notify_all()
 
     def execution_cancel_error(self, watch: AttemptWatch):

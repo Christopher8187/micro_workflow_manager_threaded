@@ -9,7 +9,7 @@ from micro_workflow_manager.errors import JobRestartedError
 from micro_workflow_manager.models import CANCELLED, DONE, FAILED, RUNNING, SKIPPED
 
 
-TERMINAL_REFRESH_SECONDS = 0.005
+TERMINAL_REFRESH_SECONDS = 0.001
 TERMINAL_PRIORITY = 5
 
 
@@ -38,7 +38,7 @@ class JobTerminalStorageMixin:
     ) -> None:
         """Publish one terminal update through the single SQLite writer.
 
-        The writer groups related terminal records for at most five milliseconds,
+        The writer groups related terminal records for at most one millisecond,
         then applies them with one bulk operation in its existing transaction.
         There is no intermediate terminal-status queue.
         """
@@ -56,7 +56,7 @@ class JobTerminalStorageMixin:
             extra=dict(extra),
         )
         self.submit_grouped_db_mutation(
-            ("terminal", node_name),
+            ("terminal",),
             update,
             self._apply_terminal_updates,
             priority=priority,
@@ -77,24 +77,27 @@ class JobTerminalStorageMixin:
     def _apply_terminal_updates(self, connection, updates: list[TerminalUpdate]):
         if not updates:
             return []
-        node_name = updates[0].node_name
-        if any(update.node_name != node_name for update in updates):
-            raise RuntimeError("terminal mutation group contains multiple nodes")
 
-        ids = [update.job_id for update in updates]
+        requested_by_node: dict[str, list[int]] = {}
+        for update in updates:
+            requested_by_node.setdefault(update.node_name, []).append(update.job_id)
         rows = []
-        for offset in range(0, len(ids), 500):
-            chunk = ids[offset:offset + 500]
-            placeholders = ",".join("?" for _ in chunk)
-            rows.extend(
-                connection.execute(
-                    "SELECT job_id, status, generation, active_execution_id "
-                    "FROM jobs WHERE node_name=? "
-                    f"AND job_id IN ({placeholders})",
-                    [node_name, *chunk],
-                ).fetchall()
-            )
-        rows_by_id = {int(row["job_id"]): row for row in rows}
+        for node_name, job_ids in requested_by_node.items():
+            for offset in range(0, len(job_ids), 500):
+                chunk = job_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        "SELECT node_name, job_id, status, generation, active_execution_id "
+                        "FROM jobs "
+                        f"WHERE node_name=? AND job_id IN ({placeholders})",
+                        [node_name, *chunk],
+                    ).fetchall()
+                )
+        rows_by_key = {
+            (str(row["node_name"]), int(row["job_id"])): row
+            for row in rows
+        }
         event_time = datetime.now().isoformat(timespec="milliseconds")
         event_names = {
             DONE: "done",
@@ -107,16 +110,13 @@ class JobTerminalStorageMixin:
         events = []
 
         for update in updates:
-            row = rows_by_id.get(update.job_id)
+            row = rows_by_key.get((update.node_name, update.job_id))
             if row is None or int(row["generation"]) != update.generation:
                 outcomes.append((False, self._terminal_restart_error(update)))
                 continue
 
             active_execution_id = row["active_execution_id"]
             if active_execution_id is None and str(row["status"]) == update.status:
-                # Resume-time recovery and a late ordinary finalizer may race.
-                # Publishing the same terminal state for the same generation is
-                # idempotent and should not fail the surviving handler.
                 outcomes.append((True, None))
                 continue
             if active_execution_id != update.execution_id:
@@ -124,37 +124,29 @@ class JobTerminalStorageMixin:
                 continue
 
             previous_status = str(row["status"])
-            status_updates.append(
-                (
-                    update.status,
-                    json.dumps(
-                        update.extra,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                    node_name,
-                    update.job_id,
-                    update.generation,
-                    update.execution_id,
-                )
-            )
-            events.append(
-                (
-                    node_name,
-                    update.job_id,
-                    event_time,
-                    event_names[update.status],
-                    json.dumps(
-                        {
-                            "previous_status": previous_status,
-                            "status": update.status,
-                            **update.extra,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                )
-            )
+            status_updates.append((
+                update.status,
+                json.dumps(update.extra, ensure_ascii=False, separators=(",", ":")),
+                update.node_name,
+                update.job_id,
+                update.generation,
+                update.execution_id,
+            ))
+            events.append((
+                update.node_name,
+                update.job_id,
+                event_time,
+                event_names[update.status],
+                json.dumps(
+                    {
+                        "previous_status": previous_status,
+                        "status": update.status,
+                        **update.extra,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            ))
             outcomes.append((True, None))
 
         if status_updates:
@@ -185,7 +177,7 @@ class JobTerminalStorageMixin:
         node_name = self.validate_node_name(node_name)
         futures = [
             self.submit_grouped_db_mutation(
-                ("terminal", node_name),
+                ("terminal",),
                 update,
                 self._apply_terminal_updates,
                 priority=priority,

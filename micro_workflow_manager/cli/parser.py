@@ -93,17 +93,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_cmd = commands.add_parser(
         "inspect",
-        help="Explain a node/job, show retry/fallback filters, list failed job IDs, or show debug output.",
+        help="Explain a node/job, list failed job IDs, or show debug output.",
         description=COMMAND_HELP_DESCRIPTIONS["inspect"],
     )
     inspect_cmd.add_argument("node", help="Node name to inspect.")
     inspect_cmd.add_argument(
         "mode",
         nargs="?",
-        metavar="job|filter|failed|debug",
-        help="Optional literal job, filter, failed, or debug.",
+        metavar="job|failed|debug",
+        help="Optional literal job, failed, or debug.",
     )
     inspect_cmd.add_argument("job_id", nargs="?", type=int, metavar="id", help="Job ID when mode is job.")
+
+
+    filter_cmd = commands.add_parser(
+        "filter",
+        help="Show a node's retry/fallback funnel or inspect one stage boundary.",
+        description=COMMAND_HELP_DESCRIPTIONS["filter"],
+    )
+    filter_cmd.add_argument("node", help="Node name whose retry/fallback funnel should be shown.")
+    filter_cmd.add_argument(
+        "stage_mode",
+        nargs="?",
+        choices=("stage",),
+        metavar="stage",
+        help="Optional literal stage followed by a one-based stage number.",
+    )
+    filter_cmd.add_argument(
+        "stage",
+        nargs="?",
+        type=int,
+        metavar="x",
+        help="One-based stage number when stage mode is selected.",
+    )
 
     recover_cmd = commands.add_parser(
         "recover",
@@ -325,6 +347,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not clear the terminal between watch snapshots.",
     )
+
+    top_cmd = commands.add_parser(
+        "top",
+        help="Event-driven htop-style workflow diagnostics and startup/terminal rates.",
+        description=COMMAND_HELP_DESCRIPTIONS["top"],
+    )
+    top_cmd.add_argument(
+        "nodes",
+        nargs="*",
+        metavar="node",
+        help="Optional nodes to display. Omit to display every graph node.",
+    )
+    top_cmd.add_argument("--interval", type=positive_float, default=0.5, help="Maximum redraw/fallback interval. Default: 0.5.")
+    top_cmd.add_argument("--window", type=positive_float, default=5.0, help="Rate and latency window in seconds. Default: 5.")
+    top_cmd.add_argument("--events", type=int, default=8, help="Number of recent lifecycle events to display. Default: 8.")
+    top_cmd.add_argument("--once", action="store_true", help="Print one snapshot and exit.")
+    top_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    top_cmd.add_argument("--no-clear", action="store_true", help="Do not clear the terminal between redraws.")
 
     return parser
 

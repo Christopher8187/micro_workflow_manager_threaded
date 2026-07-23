@@ -6,6 +6,7 @@ from typing import Callable
 
 from ..errors import InvalidGraphError
 from ..models import FAILED, RUNNING, Job, now
+from ..storage.job_sources import PrefetchingQueuedJobObjectSource
 
 
 @dataclass(slots=True)
@@ -57,7 +58,14 @@ class _ClaimedQueuedJobSource:
             for job, (generation, execution_id) in zip(jobs, leases)
         ]
 
+    def close(self):
+        close = getattr(self.source, "close", None)
+        if callable(close):
+            close()
 
+    def remaining_hint(self):
+        hint = getattr(self.source, "remaining_hint", None)
+        return None if not callable(hint) else hint()
 
 
 class _StoppingJobSource:
@@ -80,6 +88,17 @@ class _StoppingJobSource:
             if self.stop_event.is_set():
                 return
             yield item
+
+    def close(self):
+        close = getattr(self.source, "close", None)
+        if callable(close):
+            close()
+
+    def remaining_hint(self):
+        if self.stop_event.is_set():
+            return 0
+        hint = getattr(self.source, "remaining_hint", None)
+        return None if not callable(hint) else hint()
 
 
 class DagSchedulerMixin:
@@ -219,6 +238,15 @@ class DagSchedulerMixin:
             )
             if (
                 refreshable
+                and getattr(runner, "prefetches_job_bursts", False)
+                and getattr(runner, "startup_lanes", lambda: 1)() == 1
+            ):
+                job_source = PrefetchingQueuedJobObjectSource(
+                    self.storage,
+                    job_source,
+                )
+            if (
+                refreshable
                 and self.active_job_restart_enabled
                 and getattr(runner, "preclaims_job_bursts", False)
             ):
@@ -293,6 +321,10 @@ class DagSchedulerMixin:
             # output-backed recovery is an explicit first step of mwf resume.
             self.storage.set_node_status(node_name, FAILED)
             raise
+        finally:
+            close_source = getattr(job_source, "close", None)
+            if callable(close_source):
+                close_source()
 
         self.refresh_node_status(node_name, allow_complete=True)
 

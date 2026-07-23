@@ -4,7 +4,7 @@ from typing import Any, Callable
 
 
 def now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="milliseconds")
 
 
 @dataclass

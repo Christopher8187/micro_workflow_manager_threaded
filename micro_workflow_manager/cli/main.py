@@ -15,6 +15,7 @@ from .cleanup import (
 from .describe import describe_command
 from .files import find_root, safe_node_name
 from .doctor import doctor_command
+from .filter import inspect_filter
 from .inspect import inspect_command
 from .layout import ensure_runtime_layout
 from .migration import migrate_command
@@ -22,6 +23,7 @@ from .recovery import recover_command
 from .graph_utils import component_topological_nodes
 from .jobs import selected_job_ids_from_args
 from .monitoring import monitor_command
+from .top import top_command
 from .planning import print_run_plan
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
@@ -116,13 +118,21 @@ def main(argv: list[str] | None = None) -> int:
                 return inspect_command(workflow, node, debug=True)
             if args.mode == "failed" and args.job_id is None:
                 return inspect_command(workflow, node, failed=True)
-            if args.mode == "filter" and args.job_id is None:
-                return inspect_command(workflow, node, filter_funnel=True)
             if args.mode != "job" or args.job_id is None or args.job_id < 1:
                 raise RuntimeError(
-                    "Use: mwf inspect <node> [filter | failed | debug | job <id>]"
+                    "Use: mwf inspect <node> [failed | debug | job <id>]"
                 )
             return inspect_command(workflow, node, args.job_id)
+
+
+        if args.command == "filter":
+            node = safe_node_name(args.node)
+            require_node(workflow, node)
+            if args.stage_mode is None and args.stage is None:
+                return inspect_filter(workflow, node)
+            if args.stage_mode != "stage" or args.stage is None:
+                raise RuntimeError("Use: mwf filter <node> [stage <x>]")
+            return inspect_filter(workflow, node, stage_number=args.stage)
 
         if args.command == "monitor":
             nodes = resolve_node_targets(workflow, args.nodes) if args.nodes else component_topological_nodes(workflow)
@@ -133,6 +143,21 @@ def main(argv: list[str] | None = None) -> int:
                 once=args.once,
                 json_output=args.json,
                 no_clear=args.no_clear,
+            )
+
+        if args.command == "top":
+            if args.events < 0:
+                raise RuntimeError("--events must be an integer >= 0")
+            nodes = resolve_node_targets(workflow, args.nodes) if args.nodes else component_topological_nodes(workflow)
+            return top_command(
+                workflow,
+                nodes,
+                interval=args.interval,
+                once=args.once,
+                json_output=args.json,
+                no_clear=args.no_clear,
+                window_seconds=args.window,
+                recent_events=args.events,
             )
 
         if args.command in {"clean", "reset", "wipe"}:

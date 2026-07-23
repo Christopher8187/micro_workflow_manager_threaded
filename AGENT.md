@@ -132,7 +132,7 @@ important:
 mwf monitor --once
 mwf monitor --json --once
 mwf inspect NODE
-mwf inspect NODE filter
+mwf filter NODE
 mwf inspect NODE failed
 mwf inspect NODE job ID
 ```
@@ -395,17 +395,52 @@ release history and is superseded by the 0.4.3 single-writer/resume rules above.
   split a cohesive algorithm solely to satisfy a line-count target; keep public
   imports stable through thin facades when a split is justified.
 
-## Adaptive API admission checks (0.4.1)
+## Source-aware admission checks (0.4.7)
 
-- Keep the initial refreshable-source admission probe at 64, the sparse floor at
-  16, and the dense ceiling at 1024 unless benchmarks justify changing all three.
-- A full pull may grow the next window geometrically. A partial or empty pull
-  must return the next probe to 16 so trickling producers are not polled through
-  oversized claim transactions.
-- Admission tuning must not lower terminal mutation priority. Terminal records
-  use the same SQLite writer with their own bounded grouped operation and must
-  become visible even while the next admission pull is blocked or dense claims
-  continue.
+- Keep `balanced` at one startup window for queues below 128 jobs and two for
+  dense queues. Do not increase the default lane count unless repeated uneven
+  3k+ job profiles pass the same terminal-visibility gate; three lanes have
+  reproduced complete admission stalls in the benchmark harness.
+- Size admission from the source's actual remaining hint, a four-turn target,
+  and a 512-job ceiling. Never reintroduce a global 64/128/256 staircase that
+  makes small tails wait for another probe.
+- Keep ordinary SQLite claim transactions weight-bounded at 192 jobs. Grouping
+  Hoeflein claims is an overhead optimization, not permission to create one
+  multi-thousand-row non-preemptible transaction.
+- Run `tests/test_048_ghost_free_admission.py` after scheduler or storage
+  changes. It must finish without a stress environment, report no missing rows,
+  and keep exact output-to-terminal publication inside its p95/max gates.
+
+## Event-driven state and `mwf top` checks (0.4.6)
+
+- Treat `job_events.event_id` as the durable state cursor. Local callbacks and
+  loopback wakeups are hints to read the cursor; never make correctness depend
+  on receiving every wakeup. Keep a defensive fallback timeout, but do not
+  restore high-frequency status or active-lease polling.
+- Use `mwf top` while reproducing startup or ghost-output reports. Record first
+  provider/output/terminal times, all-jobs-admitted time, terminal p95/max, and
+  mutation-writer backlog. A faster strategy is unacceptable if exact
+  output-to-terminal lag or monitor residue regresses.
+- Keep the default API strategy `balanced`, event-driven, and single-pump per
+  node unless the copied explode benchmark proves another strategy satisfies the same terminal
+  visibility gate. Payload prefetch is opt-in because one extra prefetch thread
+  per component member delayed first provider starts in the reproduced graph.
+- Use `mwf filter NODE` for the retry/fallback funnel. Use
+  `mwf filter NODE stage X` for compact stage-boundary failures; the final stage
+  is the terminal failure list.
+
+## Fair API admission checks (0.4.5)
+
+- The 0.4.5 baseline used a 64-job dense slice. The 0.4.6 production setting is
+  a 64-job probe, a 96-job dense ceiling, a sparse floor of 16, and a 12-item
+  ready-completion turn. Change those only with an explode benchmark that keeps
+  output-to-terminal latency and final monitor residue within the same gate.
+- Do not restore geometric 256/512/1024 admission pulls. They can starve ready
+  futures and recreate provider/output results that are not yet terminal-visible
+  in `mwf monitor`.
+- API runtime observations must remain grouped, generation/execution fenced,
+  and below terminal mutation priority. Restart detection should poll the global
+  revision and scan active leases only after an actual revision change.
 
 ## Monitor terminal-state checks (0.4.0)
 

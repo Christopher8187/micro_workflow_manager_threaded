@@ -28,11 +28,59 @@ class SchedulerSupervisor(
         self._condition = Condition()
         self._thread: Thread | None = None
         self._watches: dict[str, AttemptWatch] = {}
+        self._restartable_keys: set[str] = set()
         self._deadlines: list[tuple[float, int, str, str, int]] = []
         self._serial = 0
         self._run_heartbeat: dict[str, Any] | None = None
-        self._restart_poll_interval = 0.05
-        self._next_restart_poll = monotonic()
+        self._restart_fallback_interval = 5.0
+        self._next_restart_fallback = monotonic() + self._restart_fallback_interval
+        self._restart_event_pending = False
+        self._restart_revision = self.storage.job_restart_revision()
+        # Cross-process wakeups are installed lazily only while restartable
+        # executions exist. Programmatic workflows with no active jobs therefore
+        # do not retain an idle socket/thread merely because a supervisor object
+        # was constructed.
+        self._unsubscribe_restart_events = None
+        self._restart_unsubscribe_at: float | None = None
+        self._restart_listener_idle_seconds = 0.5
+
+    def _ensure_restart_event_subscription_locked(self) -> None:
+        # Dense API waves can momentarily have zero watches between a completion
+        # and the next admission. Cancel a pending idle shutdown instead of
+        # creating one UDP listener thread per job.
+        self._restart_unsubscribe_at = None
+        if self._unsubscribe_restart_events is not None:
+            return
+        self._unsubscribe_restart_events = self.storage.subscribe_state_changes(
+            self._on_external_state_change,
+            local=False,
+            cross_process=True,
+        )
+
+    def _stop_restart_event_subscription_locked(self) -> None:
+        if self._restartable_keys or self._unsubscribe_restart_events is None:
+            return
+        if self._restart_unsubscribe_at is None:
+            self._restart_unsubscribe_at = monotonic() + self._restart_listener_idle_seconds
+        self._condition.notify_all()
+
+    def _finalize_restart_event_subscription_locked(self, now_value: float) -> None:
+        if (
+            self._restartable_keys
+            or self._unsubscribe_restart_events is None
+            or self._restart_unsubscribe_at is None
+            or now_value < self._restart_unsubscribe_at
+        ):
+            return
+        unsubscribe = self._unsubscribe_restart_events
+        self._unsubscribe_restart_events = None
+        self._restart_unsubscribe_at = None
+        unsubscribe()
+
+    def _on_external_state_change(self) -> None:
+        with self._condition:
+            self._restart_event_pending = True
+            self._condition.notify_all()
 
     def _ensure_thread_locked(self):
         if self._thread is not None and self._thread.is_alive():
@@ -115,7 +163,7 @@ class SchedulerSupervisor(
         while True:
             expired: list[tuple[AttemptWatch, str]] = []
             heartbeat: dict[str, Any] | None = None
-            restart_watches: list[AttemptWatch] = []
+            check_restart_revision = False
 
             with self._condition:
                 now_value = monotonic()
@@ -126,16 +174,24 @@ class SchedulerSupervisor(
                         break
                     heapq.heappop(self._deadlines)
                     watch = self._watches.get(key)
-                    if watch is None or watch.state != "active" or watch.revision != revision:
+                    if (
+                        watch is None
+                        or watch.state != "active"
+                        or watch.revision != revision
+                    ):
                         continue
                     current = (
-                watch.total_deadline if kind == "total"
-                else watch.external_wait_deadline if kind == "external"
-                else watch.checkpoint_deadline
-            )
+                        watch.total_deadline
+                        if kind == "total"
+                        else watch.external_wait_deadline
+                        if kind == "external"
+                        else watch.checkpoint_deadline
+                    )
                     if current is None or abs(current - deadline) > 1e-9:
                         continue
                     watch.state = "timed_out"
+                    self._restartable_keys.discard(watch.key)
+                    self._stop_restart_event_subscription_locked()
                     watch.timeout_kind = kind
                     if kind == "checkpoint":
                         seconds = watch.checkpoint_timeout
@@ -146,15 +202,19 @@ class SchedulerSupervisor(
                         )
                     elif kind == "external":
                         seconds = watch.external_wait_timeout
-                        operation = watch.external_wait_name or "framework-managed network request"
+                        operation = (
+                            watch.external_wait_name
+                            or "framework-managed network request"
+                        )
                         watch.timeout_message = (
-                            f"{watch.node_name}.{watch.task_name} network wait {operation!r} "
-                            f"exceeded its {seconds:g}s transport lease"
+                            f"{watch.node_name}.{watch.task_name} network wait "
+                            f"{operation!r} exceeded its {seconds:g}s transport lease"
                         )
                     else:
                         seconds = watch.total_timeout
                         watch.timeout_message = (
-                            f"{watch.node_name}.{watch.task_name} exceeded timeout={seconds:g}s"
+                            f"{watch.node_name}.{watch.task_name} exceeded "
+                            f"timeout={seconds:g}s"
                         )
                     watch.cancellation_event.set()
                     watch.revision += 1
@@ -165,26 +225,38 @@ class SchedulerSupervisor(
                     heartbeat = dict(run)
                     run["next_at"] = now_value + run["interval"]
 
-                restartable = [
-                    watch
-                    for watch in self._watches.values()
-                    if watch.execution_id is not None
-                    and watch.state in {"active", "handler_done"}
-                ]
-                if restartable and self._next_restart_poll <= now_value:
-                    restart_watches = restartable
-                    self._next_restart_poll = now_value + self._restart_poll_interval
+                self._finalize_restart_event_subscription_locked(now_value)
+                has_restartable = bool(self._restartable_keys)
+                if has_restartable and (
+                    self._restart_event_pending
+                    or self._next_restart_fallback <= now_value
+                ):
+                    check_restart_revision = True
+                    self._restart_event_pending = False
+                    self._next_restart_fallback = (
+                        now_value + self._restart_fallback_interval
+                    )
 
-                if not expired and heartbeat is None and not restart_watches:
+                if not expired and heartbeat is None and not check_restart_revision:
                     deadline = self._next_valid_deadline_locked()
                     if self._run_heartbeat is not None:
                         heartbeat_deadline = self._run_heartbeat["next_at"]
-                        deadline = heartbeat_deadline if deadline is None else min(deadline, heartbeat_deadline)
-                    if restartable:
                         deadline = (
-                            self._next_restart_poll
+                            heartbeat_deadline
                             if deadline is None
-                            else min(deadline, self._next_restart_poll)
+                            else min(deadline, heartbeat_deadline)
+                        )
+                    if has_restartable:
+                        deadline = (
+                            self._next_restart_fallback
+                            if deadline is None
+                            else min(deadline, self._next_restart_fallback)
+                        )
+                    if self._restart_unsubscribe_at is not None:
+                        deadline = (
+                            self._restart_unsubscribe_at
+                            if deadline is None
+                            else min(deadline, self._restart_unsubscribe_at)
                         )
 
                     if deadline is None:
@@ -197,26 +269,37 @@ class SchedulerSupervisor(
                     self._condition.wait(max(0.0, deadline - monotonic()))
                     continue
 
-            if restart_watches:
+            if check_restart_revision:
                 try:
-                    current = self.storage.active_job_executions()
-                    for watch in restart_watches:
-                        lease = current.get((watch.node_name, watch.job_id))
-                        if lease == (watch.generation, watch.execution_id):
-                            continue
-                        self.cancel_execution(
-                            watch.node_name,
-                            watch.job_id,
-                            watch.generation,
-                            watch.execution_id,
-                            reason=(
-                                f"Job {watch.node_name}/{watch.job_id} generation "
-                                f"{watch.generation} was restarted"
-                            ),
-                        )
+                    current_revision = self.storage.job_restart_revision()
+                    if current_revision != self._restart_revision:
+                        self._restart_revision = current_revision
+                        with self._condition:
+                            restart_watches = [
+                                watch
+                                for key in tuple(self._restartable_keys)
+                                if (watch := self._watches.get(key)) is not None
+                                and watch.state in {"active", "handler_done"}
+                            ]
+                        current = self.storage.active_job_executions()
+                        for watch in restart_watches:
+                            lease = current.get((watch.node_name, watch.job_id))
+                            if lease == (watch.generation, watch.execution_id):
+                                continue
+                            self.cancel_execution(
+                                watch.node_name,
+                                watch.job_id,
+                                watch.generation,
+                                watch.execution_id,
+                                reason=(
+                                    f"Job {watch.node_name}/{watch.job_id} generation "
+                                    f"{watch.generation} was restarted"
+                                ),
+                            )
                 except Exception:
                     # A transient read failure is retried on the next centralized
-                    # poll; individual job controllers never stampede SQLite.
+                    # poll. The common no-restart path reads one metadata row;
+                    # active leases are materialized only after the revision moves.
                     pass
 
             for watch, kind in expired:
