@@ -41,6 +41,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
     "migrate": "Upgrade MWF-owned JSON and SQLite state schemas. User inputs, outputs, returned files, and provenance are never rewritten.",
     "inspect": "Inspect a node/job, list failed job IDs, or show node debug output.",
+    "trace": "Render one job's chronological origin, task/fallback starts, ctx.trace objects, outputs, forwarded inputs, downstream jobs, and terminal state.",
     "filter": "Show the retry/fallback funnel, or list jobs at one stage boundary.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
     "clean": "Delete jobs and output for selected Hoeflein components while keeping node input files.",
@@ -148,6 +149,21 @@ funnel inspection is a separate command: `mwf filter process_number`, with
 `mwf filter process_number stage 2` for one stage boundary. If the checkpoint
 deadline expires, inspect shows the timeout reason and the event history shows
 which fallback ran afterward.
+""",
+    "trace": """
+Trace renders the append-only event journal for one job as a chronological,
+human-readable execution transcript. Node code can append arbitrary structured
+records with `ctx.trace(name, content=..., input=..., output=..., status=...)`.
+MWF automatically records task and fallback starts, framework-aware output
+writes, forwarded node inputs, downstream job creation, and terminal state.
+
+Example:
+  mwf trace classify_document job 17
+
+Trace values are serialized defensively, and displayed file contents are
+truncated so a diagnostic command cannot flood the terminal. Event ordering is
+the order in which the task called each operation; there is no fixed section
+ordering for output, forwarding, job creation, and custom traces.
 """,
     "filter": """
 Filter reconstructs the current execution funnel from each job's append-only

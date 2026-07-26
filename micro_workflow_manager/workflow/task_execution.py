@@ -145,6 +145,7 @@ class MountedTaskExecutionMixin:
                 node.main_task,
                 execution_generation=execution_generation,
                 execution_id=execution_id,
+                task_role="main",
             )
 
         except JobRestartedError:
@@ -184,6 +185,7 @@ class MountedTaskExecutionMixin:
                         previous_error=main_error,
                         execution_generation=execution_generation,
                         execution_id=execution_id,
+                        task_role="fallback",
                     )
 
                 except JobRestartedError:
@@ -213,6 +215,7 @@ class MountedTaskExecutionMixin:
         *,
         execution_generation: int,
         execution_id: str | None,
+        task_role: str = "main",
     ):
         attempts = mounted.retries + 1
         all_results = []
@@ -269,6 +272,17 @@ class MountedTaskExecutionMixin:
                         execution_id=execution_id,
                         cancellation_event=cancellation_event,
                         attempt_watch=watch,
+                        task_role=task_role,
+                    )
+                    self.storage.append_job_event(
+                        job.node_name,
+                        job.job_id,
+                        "task_started",
+                        task=mounted.name,
+                        task_role=task_role,
+                        attempt=attempt,
+                        repeat_index=repeat_index,
+                        previous_error=repr(previous_error) if previous_error is not None else None,
                     )
 
                     result = self._invoke_handler_with_timeout(

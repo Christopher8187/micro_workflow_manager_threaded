@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.4.7
+# micro-workflow-manager 0.4.8
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -16,7 +16,7 @@ command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
 
-## What changed in 0.4.7
+## What changed in 0.4.8
 
 - Dense API nodes use a source-aware **balanced dual-window** loader. Queues
   below 128 jobs use one pump; larger queues use two coordinated pumps. Each
@@ -50,7 +50,7 @@ manager, and a Pygame state machine.
   latency, recent lifecycle events, process RSS/thread data, SQLite/WAL size,
   and the active process's mutation-writer backlog and batch diagnostics.
 - The production API startup strategy was changed to `balanced`, with bounded
-  completion/admission turns and terminal-pressure priority. Version 0.4.7
+  completion/admission turns and terminal-pressure priority. Version 0.4.8
   replaces its fixed 64/96 admission ladder with source-aware dual windows.
 - Retry/fallback inspection moved from `mwf inspect NODE filter` to
   `mwf filter NODE`; `mwf filter NODE stage X` shows terminal failures at the
@@ -1690,3 +1690,25 @@ This reloads the synchronized node behavior files and updates their declared con
 whole Hoeflein component. Use `--dry-run` to see the expanded component before
 anything changes. Selecting several members of one component does not duplicate
 work. `*` still selects every graph node.
+
+
+## Ordered job traces (0.4.8)
+
+Inside a task or fallback, append structured trace objects with:
+
+```python
+ctx.trace("model request", input=payload, output=reply, model=model)
+ctx.trace("validator", status="warning", content={"mismatches": mismatches})
+```
+
+Render the complete chronological transcript with:
+
+```text
+mwf trace <node> job <id>
+```
+
+The transcript includes origin, main/fallback starts, custom traces, MWF-aware
+output writes, forwarded inputs, downstream job creation, and the terminal state.
+MWF supplies the canonical event timestamp and execution provenance automatically;
+reserved keys supplied by user code, such as `time`, are retained under a
+`trace_` prefix instead of replacing framework metadata.

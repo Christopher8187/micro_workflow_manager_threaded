@@ -106,6 +106,16 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_cmd.add_argument("job_id", nargs="?", type=int, metavar="id", help="Job ID when mode is job.")
 
 
+    trace_cmd = commands.add_parser(
+        "trace",
+        help="Show one job's ordered task, trace, file, routing, and terminal history.",
+        description=COMMAND_HELP_DESCRIPTIONS["trace"],
+    )
+    trace_cmd.add_argument("node", help="Node name containing the job.")
+    trace_cmd.add_argument("job_mode", choices=("job",), metavar="job", help="Literal job.")
+    trace_cmd.add_argument("job_id", type=int, metavar="id", help="Job ID to trace.")
+
+
     filter_cmd = commands.add_parser(
         "filter",
         help="Show a node's retry/fallback funnel or inspect one stage boundary.",

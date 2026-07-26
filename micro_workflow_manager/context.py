@@ -3,12 +3,48 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import json
 from threading import Event
 from time import monotonic
 from typing import Any, Callable, TypeVar
 
 from .errors import JobRestartedError, JobTimeoutError
 from .models import Job
+
+
+def _event_value(value: Any, *, depth: int = 0) -> Any:
+    """Convert trace/event payloads to durable JSON without surprising callers."""
+    if depth > 8:
+        return repr(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return {"type": "bytes", "size": len(value), "preview": value[:256].hex()}
+    if isinstance(value, BaseException):
+        return {"type": type(value).__name__, "message": str(value), "repr": repr(value)}
+    if isinstance(value, dict):
+        return {str(key): _event_value(item, depth=depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_event_value(item, depth=depth + 1) for item in value]
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return repr(value)
+    return value
+
+
+def _content_preview(content: Any, *, limit: int = 4000) -> dict[str, Any]:
+    if isinstance(content, bytes):
+        return {"content_type": "bytes", "size": len(content), "preview": content[:256].hex()}
+    text = str(content)
+    return {
+        "content_type": "text",
+        "size": len(text),
+        "preview": text if len(text) <= limit else text[:limit] + "...",
+        "truncated": len(text) > limit,
+    }
 
 
 T = TypeVar("T")
@@ -112,6 +148,10 @@ class NodeHandle(_ExecutionChecks):
         *,
         cancellation_event: Event | None = None,
         transaction_getter: Callable[[], JobTransaction | None] | None = None,
+        task_name: str | None = None,
+        task_role: str = "main",
+        attempt: int | None = None,
+        repeat_index: int | None = None,
     ):
         super().__init__(cancellation_event=cancellation_event)
         self.system = system
@@ -121,6 +161,10 @@ class NodeHandle(_ExecutionChecks):
         self.execution_generation = execution_generation
         self.execution_id = execution_id
         self._transaction_getter = transaction_getter or (lambda: None)
+        self.task_name = task_name
+        self.task_role = task_role
+        self.attempt = attempt
+        self.repeat_index = repeat_index
 
     def _guarded(self, action: Callable[[], T]) -> T:
         self.checkpoint()
@@ -132,6 +176,25 @@ class NodeHandle(_ExecutionChecks):
             self.execution_generation,
             self.execution_id,
             action,
+        )
+
+    def _event_fields(self) -> dict[str, Any]:
+        return {
+            "task": self.task_name,
+            "task_role": self.task_role,
+            "attempt": self.attempt,
+            "repeat_index": self.repeat_index,
+        }
+
+    def _record_event(self, event: str, **data: Any) -> None:
+        self._guarded(
+            lambda: self.system.storage.append_job_event(
+                self.from_node,
+                self.from_job_id,
+                event,
+                **self._event_fields(),
+                **{key: _event_value(value) for key, value in data.items()},
+            )
         )
 
     def checkpoint(self):
@@ -155,7 +218,7 @@ class NodeHandle(_ExecutionChecks):
         **params,
     ):
         def perform(key: str | None = idempotency_key):
-            return self._guarded(
+            result = self._guarded(
                 lambda: self.system.add_job(
                     from_node=self.from_node,
                     to_node=self.to_node,
@@ -166,6 +229,12 @@ class NodeHandle(_ExecutionChecks):
                     **params,
                 )
             )
+            created_job_id = getattr(result, "job_id", job_id)
+            self._record_event(
+                "jobs_created",
+                jobs=[{"node": self.to_node, "job_id": created_job_id, "params": params}],
+            )
+            return result
 
         transaction = self._transaction_getter()
         if transaction is not None:
@@ -187,7 +256,7 @@ class NodeHandle(_ExecutionChecks):
         transaction = self._transaction_getter()
         if transaction is not None:
             raise RuntimeError("add_many is not supported inside ctx.transaction()")
-        return self._guarded(
+        results = self._guarded(
             lambda: self.system.add_jobs(
                 from_node=self.from_node,
                 to_node=self.to_node,
@@ -197,6 +266,14 @@ class NodeHandle(_ExecutionChecks):
                 idempotency_keys=idempotency_keys,
             )
         )
+        self._record_event(
+            "jobs_created",
+            jobs=[
+                {"node": self.to_node, "job_id": result.job_id, "params": params}
+                for result, params in zip(results, params_list)
+            ],
+        )
+        return results
 
     @property
     def input_dir(self) -> Path:
@@ -206,18 +283,30 @@ class NodeHandle(_ExecutionChecks):
         return self._guarded(lambda: self.system.storage.input_path(self.to_node, *parts))
 
     def write_input(self, filename: str, content: str, *, overwrite: bool = False) -> Path:
-        return self._guarded(
+        path = self._guarded(
             lambda: self.system.storage.write_node_input_text(
                 self.to_node, filename, content, overwrite=overwrite
             )
         )
+        self._record_event(
+            "input_forwarded", target_node=self.to_node,
+            path=f"{self.to_node}/input/{path.relative_to(self.system.storage.node_input_dir(self.to_node)).as_posix()}",
+            **_content_preview(content),
+        )
+        return path
 
     def write_input_bytes(self, filename: str, content: bytes, *, overwrite: bool = False) -> Path:
-        return self._guarded(
+        path = self._guarded(
             lambda: self.system.storage.write_node_input_bytes(
                 self.to_node, filename, content, overwrite=overwrite
             )
         )
+        self._record_event(
+            "input_forwarded", target_node=self.to_node,
+            path=f"{self.to_node}/input/{path.relative_to(self.system.storage.node_input_dir(self.to_node)).as_posix()}",
+            **_content_preview(content),
+        )
+        return path
 
     def write_inputs(
         self,
@@ -227,11 +316,19 @@ class NodeHandle(_ExecutionChecks):
         encoding: str = "utf-8",
     ) -> list[Path]:
         """Write many text inputs to the target node under one execution guard."""
-        return self._guarded(
+        paths = self._guarded(
             lambda: self.system.storage.write_node_input_texts(
                 self.to_node, entries, overwrite=overwrite, encoding=encoding
             )
         )
+        root = self.system.storage.node_input_dir(self.to_node)
+        for path, (_filename, content) in zip(paths, entries):
+            self._record_event(
+                "input_forwarded", target_node=self.to_node,
+                path=f"{self.to_node}/input/{path.relative_to(root).as_posix()}",
+                **_content_preview(content),
+            )
+        return paths
 
     def add_input_file(
         self,
@@ -240,11 +337,18 @@ class NodeHandle(_ExecutionChecks):
         *,
         overwrite: bool = False,
     ) -> Path:
-        return self._guarded(
+        path = self._guarded(
             lambda: self.system.storage.copy_to_node_input(
                 self.to_node, source, filename=filename, overwrite=overwrite
             )
         )
+        root = self.system.storage.node_input_dir(self.to_node)
+        self._record_event(
+            "input_forwarded", target_node=self.to_node,
+            path=f"{self.to_node}/input/{path.relative_to(root).as_posix()}",
+            source=str(source), content_type="file", size=path.stat().st_size if path.exists() else None,
+        )
+        return path
 
     def add_input_files(self, sources, *, overwrite: bool = False) -> list[Path]:
         return [self.add_input_file(source, overwrite=overwrite) for source in sources]
@@ -268,6 +372,7 @@ class JobContext(_ExecutionChecks):
         execution_id: str | None,
         cancellation_event: Event | None = None,
         attempt_watch=None,
+        task_role: str = "main",
     ):
         super().__init__(cancellation_event=cancellation_event)
         self.system = system
@@ -281,6 +386,7 @@ class JobContext(_ExecutionChecks):
         self.execution_id = execution_id
         self._attempt_watch = attempt_watch
         self._transaction: JobTransaction | None = None
+        self.task_role = task_role
 
     def _check_execution(self):
         """Validate cancellation/restart without reporting progress."""
@@ -314,6 +420,59 @@ class JobContext(_ExecutionChecks):
             self.execution_id,
             action,
         )
+
+    def _event_fields(self) -> dict[str, Any]:
+        return {
+            "task": self.current_task,
+            "task_role": self.task_role,
+            "attempt": self.attempt,
+            "repeat_index": self.repeat_index,
+        }
+
+    def _record_event(self, event: str, **data: Any) -> None:
+        self._guarded(
+            lambda: self.system.storage.append_job_event(
+                self.current_node,
+                self.job_id,
+                event,
+                **self._event_fields(),
+                **{key: _event_value(value) for key, value in data.items()},
+            )
+        )
+
+    def trace(self, name: str | dict[str, Any] | None = None, content: Any = None, **details: Any) -> None:
+        """Append one user-defined trace object to this job's ordered event journal.
+
+        Supported forms include ``ctx.trace("llm", input=..., output=...)``,
+        ``ctx.trace(name="validator", status="warning", content=...)``, and
+        ``ctx.trace({"name": "request", "input": ..., "output": ...})``.
+        The framework timestamp and task/fallback provenance are added
+        automatically. Values that are not directly JSON serializable are
+        represented safely rather than breaking the running job.
+        """
+        if isinstance(name, dict):
+            if content is not None:
+                raise TypeError("content cannot be supplied when the first trace argument is a dict")
+            payload = dict(name)
+            trace_name = payload.pop("name", None)
+            payload.update(details)
+        else:
+            trace_name = name or details.pop("name", None)
+            payload = dict(details)
+            if content is not None:
+                payload["content"] = content
+        trace_name = str(trace_name or "trace").strip() or "trace"
+        for reserved in ("time", "event", "task", "task_role", "attempt", "repeat_index"):
+            if reserved in payload:
+                payload[f"trace_{reserved}"] = payload.pop(reserved)
+        self._record_event("trace", name=trace_name, **payload)
+
+    def _record_output(self, path: Path, content: Any, *, scope: str = "output") -> None:
+        if scope == "job_files":
+            display_path = f"output/jobs/{self.job_id}/files/{path.relative_to(self.files_dir).as_posix()}"
+        else:
+            display_path = f"output/{path.relative_to(self.output_dir).as_posix()}"
+        self._record_event("output_written", path=display_path, **_content_preview(content))
 
     def checkpoint(
         self,
@@ -459,24 +618,32 @@ class JobContext(_ExecutionChecks):
         )
 
     def write(self, filename: str, content: str) -> Path:
-        return self._guarded(
+        path = self._guarded(
             lambda: self.system.storage.write_text(self.current_node, self.job_id, filename, content)
         )
+        self._record_output(path, content, scope="job_files")
+        return path
 
     def write_bytes(self, filename: str, content: bytes) -> Path:
-        return self._guarded(
+        path = self._guarded(
             lambda: self.system.storage.write_bytes(self.current_node, self.job_id, filename, content)
         )
+        self._record_output(path, content, scope="job_files")
+        return path
 
     def write_output(self, filename: str, content: str) -> Path:
-        return self._guarded(
+        path = self._guarded(
             lambda: self.system.storage.write_node_output_text(self.current_node, filename, content)
         )
+        self._record_output(path, content)
+        return path
 
     def write_output_bytes(self, filename: str, content: bytes) -> Path:
-        return self._guarded(
+        path = self._guarded(
             lambda: self.system.storage.write_node_output_bytes(self.current_node, filename, content)
         )
+        self._record_output(path, content)
+        return path
 
     def debug(self, message: str):
         self._guarded(lambda: self.system.storage.write_debug(self.current_node, message))
@@ -493,4 +660,8 @@ class JobContext(_ExecutionChecks):
             execution_id=self.execution_id,
             cancellation_event=self._cancellation_event,
             transaction_getter=lambda: self._transaction,
+            task_name=self.current_task,
+            task_role=self.task_role,
+            attempt=self.attempt,
+            repeat_index=self.repeat_index,
         )

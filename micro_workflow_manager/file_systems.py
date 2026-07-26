@@ -189,33 +189,50 @@ class OutputFileSystem(FileSystem):
         encoding: str,
     ) -> Path:
         target = ctx.system.storage.output_path(ctx.current_node, relative)
-        return ctx._guarded(
+        path = ctx._guarded(
             lambda: _write_text_file(
                 ctx.system.storage, target, content, encoding=encoding, overwrite=overwrite
             )
         )
+        ctx._record_output(path, content, scope=self.scope)
+        return path
 
     def _write_bytes(self, ctx, relative: str, content: bytes, *, overwrite: bool) -> Path:
         target = ctx.system.storage.output_path(ctx.current_node, relative)
-        return ctx._guarded(
+        path = ctx._guarded(
             lambda: _write_bytes_file(
                 ctx.system.storage, target, content, overwrite=overwrite
             )
         )
+        ctx._record_output(path, content, scope=self.scope)
+        return path
 
     def _copy_from(self, ctx, relative: str, source: Path, *, overwrite: bool) -> Path:
         target = ctx.system.storage.output_path(ctx.current_node, relative)
-        return ctx._guarded(
+        path = ctx._guarded(
             lambda: _copy_file(
                 ctx.system.storage, source, target, overwrite=overwrite
             )
         )
+        ctx._record_event(
+            "output_written",
+            path=(
+                f"output/jobs/{ctx.job_id}/files/{path.relative_to(ctx.files_dir).as_posix()}"
+                if self.scope == "job_files"
+                else f"output/{path.relative_to(ctx.output_dir).as_posix()}"
+            ),
+            content_type="file", source=str(source),
+            size=path.stat().st_size if path.exists() else None,
+        )
+        return path
 
     def _append_text(self, ctx, relative: str, content: str, *, encoding: str) -> Path:
         target = ctx.system.storage.output_path(ctx.current_node, relative)
-        return ctx._guarded(
+        path = ctx._guarded(
             lambda: ctx.system.storage.append_text(target, content, encoding=encoding)
         )
+        ctx._record_output(path, content, scope=self.scope)
+        return path
 
     def _delete(self, ctx, relative: str, *, missing_ok: bool) -> None:
         target = ctx.system.storage.output_path(ctx.current_node, relative)
@@ -261,39 +278,56 @@ class JobFileSystem(FileSystem):
         target = ctx.system.storage.safe_join(
             ctx.system.storage.files_dir(ctx.current_node, ctx.job_id), relative
         )
-        return ctx._guarded(
+        path = ctx._guarded(
             lambda: _write_text_file(
                 ctx.system.storage, target, content, encoding=encoding, overwrite=overwrite
             )
         )
+        ctx._record_output(path, content, scope=self.scope)
+        return path
 
     def _write_bytes(self, ctx, relative: str, content: bytes, *, overwrite: bool) -> Path:
         target = ctx.system.storage.safe_join(
             ctx.system.storage.files_dir(ctx.current_node, ctx.job_id), relative
         )
-        return ctx._guarded(
+        path = ctx._guarded(
             lambda: _write_bytes_file(
                 ctx.system.storage, target, content, overwrite=overwrite
             )
         )
+        ctx._record_output(path, content, scope=self.scope)
+        return path
 
     def _copy_from(self, ctx, relative: str, source: Path, *, overwrite: bool) -> Path:
         target = ctx.system.storage.safe_join(
             ctx.system.storage.files_dir(ctx.current_node, ctx.job_id), relative
         )
-        return ctx._guarded(
+        path = ctx._guarded(
             lambda: _copy_file(
                 ctx.system.storage, source, target, overwrite=overwrite
             )
         )
+        ctx._record_event(
+            "output_written",
+            path=(
+                f"output/jobs/{ctx.job_id}/files/{path.relative_to(ctx.files_dir).as_posix()}"
+                if self.scope == "job_files"
+                else f"output/{path.relative_to(ctx.output_dir).as_posix()}"
+            ),
+            content_type="file", source=str(source),
+            size=path.stat().st_size if path.exists() else None,
+        )
+        return path
 
     def _append_text(self, ctx, relative: str, content: str, *, encoding: str) -> Path:
         target = ctx.system.storage.safe_join(
             ctx.system.storage.files_dir(ctx.current_node, ctx.job_id), relative
         )
-        return ctx._guarded(
+        path = ctx._guarded(
             lambda: ctx.system.storage.append_text(target, content, encoding=encoding)
         )
+        ctx._record_output(path, content, scope=self.scope)
+        return path
 
     def _delete(self, ctx, relative: str, *, missing_ok: bool) -> None:
         target = ctx.system.storage.safe_join(

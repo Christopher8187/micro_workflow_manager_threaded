@@ -17,6 +17,7 @@ from .files import find_root, safe_node_name
 from .doctor import doctor_command
 from .filter import inspect_filter
 from .inspect import inspect_command
+from .trace import trace_command
 from .layout import ensure_runtime_layout
 from .migration import migrate_command
 from .recovery import recover_command
@@ -123,6 +124,14 @@ def main(argv: list[str] | None = None) -> int:
                     "Use: mwf inspect <node> [failed | debug | job <id>]"
                 )
             return inspect_command(workflow, node, args.job_id)
+
+
+        if args.command == "trace":
+            node = safe_node_name(args.node)
+            require_node(workflow, node)
+            if args.job_mode != "job" or args.job_id < 1:
+                raise RuntimeError("Use: mwf trace <node> job <id>")
+            return trace_command(workflow, node, args.job_id)
 
 
         if args.command == "filter":
