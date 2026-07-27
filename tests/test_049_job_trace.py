@@ -14,7 +14,13 @@ def _make_trace_workflow(tmp_path):
 
     @source.task
     def run(ctx):
-        ctx.trace("primary llm", input={"prompt": "hello"}, output={"reply": "bad"})
+        ctx.trace(
+            "primary llm",
+            input={"prompt": "hello"},
+            output={"reply": "bad"},
+            node_name="user node label",
+            job_id="user job label",
+        )
         ctx.trace("validator", status="error", content="bad response")
         ctx.write("main.txt", "main diagnostic")
         raise ValueError("main failed")
@@ -45,6 +51,9 @@ def test_trace_events_and_renderer_are_chronological(tmp_path, capsys):
     workflow.run_node("source", ignore_readiness=True)
 
     events = workflow.storage.read_job_events("source", 1)
+    primary = next(event for event in events if event.get("name") == "primary llm")
+    assert primary["trace_node_name"] == "user node label"
+    assert primary["trace_job_id"] == "user job label"
     kinds = [event["event"] for event in events]
     required = [
         "task_started",

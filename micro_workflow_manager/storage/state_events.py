@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from ..processes import process_is_alive
+
 
 class StateEventStorageMixin:
     """Durable lifecycle-event reads plus local/cross-process wakeups.
@@ -146,17 +148,11 @@ class StateEventStorageMixin:
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
+        # ``os.kill(pid, 0)`` is a POSIX liveness probe, but on Windows signal
+        # value 0 is CTRL_C_EVENT. Using it there can interrupt every process
+        # attached to the console, including the parent scheduler and sibling
+        # ProcessPoolExecutor workers. Keep all platform handling centralized.
+        return process_is_alive(pid)
 
     def _ensure_state_listener_locked(self) -> None:
         thread = self._state_listener_thread

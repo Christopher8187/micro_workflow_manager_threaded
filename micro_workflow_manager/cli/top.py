@@ -12,6 +12,7 @@ from threading import Event
 from typing import Any
 
 from micro_workflow_manager.models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED
+from micro_workflow_manager.processes import process_is_alive
 
 
 TERMINAL_EVENTS = {"done", "failed", "cancelled", "skipped"}
@@ -42,11 +43,7 @@ def _pid_snapshot(pid: Any) -> dict[str, Any]:
         normalized = int(pid)
     except (TypeError, ValueError):
         return {"pid": None, "alive": False}
-    alive = True
-    try:
-        os.kill(normalized, 0)
-    except OSError:
-        alive = False
+    alive = process_is_alive(normalized)
     result: dict[str, Any] = {"pid": normalized, "alive": alive}
     status_path = Path(f"/proc/{normalized}/status")
     if alive and status_path.is_file():

@@ -462,7 +462,10 @@ class JobContext(_ExecutionChecks):
             if content is not None:
                 payload["content"] = content
         trace_name = str(trace_name or "trace").strip() or "trace"
-        for reserved in ("time", "event", "task", "task_role", "attempt", "repeat_index"):
+        for reserved in (
+            "time", "event", "node_name", "job_id",
+            "task", "task_role", "attempt", "repeat_index",
+        ):
             if reserved in payload:
                 payload[f"trace_{reserved}"] = payload.pop(reserved)
         self._record_event("trace", name=trace_name, **payload)
