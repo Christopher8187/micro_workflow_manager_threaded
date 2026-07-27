@@ -164,3 +164,24 @@ def test_filesystem_files_convenience_encoding_and_declaration(tmp_path: Path):
         "encoding": "utf-16",
         "writable": True,
     }
+
+
+def test_output_and_job_filesystem_copy_from_use_atomic_copy(tmp_path: Path):
+    """Regression: 0.5.0 file_systems.py forgot to import _copy_file."""
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    output = OutputFileSystem("copied output")
+    job_files = JobFileSystem("copied job files")
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"post-api-payload")
+
+    @workflow.task("organize")
+    def organize(ctx):
+        output.file(ctx, "images", "page.jpg").copy_from(source, overwrite=True)
+        job_files.file(ctx, "debug", "response.bin").copy_from(source, overwrite=True)
+        return "copied"
+
+    workflow.start("organize")
+    assert workflow.run_job("organize", 1, ignore_readiness=True) == "copied"
+    assert (tmp_path / "node" / "organize" / "output" / "images" / "page.jpg").read_bytes() == b"post-api-payload"
+    assert (tmp_path / "node" / "organize" / "jobs" / "1" / "files" / "debug" / "response.bin").read_bytes() == b"post-api-payload"

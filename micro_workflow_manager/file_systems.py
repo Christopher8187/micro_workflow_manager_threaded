@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .file_entry import FileSystemEntry
 from .file_helpers import (
+    _copy_file,
     _format_template,
     _relative_parts,
     _write_bytes_file,
