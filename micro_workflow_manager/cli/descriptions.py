@@ -52,8 +52,8 @@ COMMAND_HELP_DESCRIPTIONS = {
     "threads": "View or change run-scoped per-node max_threads overrides. API values are cooperative fiber counts with no aggregate framework cap; active nodes scale live.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Register output-backed finished jobs, then continue unsuccessful or queued work for one node without resetting done or skipped jobs.",
-    "runfrom": "Reset and run one node and its descendants; --monitor retains a timestamped dashboard timeline in the same terminal.",
-    "resumefrom": "Continue unsuccessful or queued work from one node through its descendants without resetting completed jobs.",
+    "runfrom": "Reset and run one node and its descendants; optional refuseafter stops later component admission without shrinking the reset scope.",
+    "resumefrom": "Continue unsuccessful or queued work from one node through its descendants; the start trace is preserved and descendant traces clear unless --keeptrace is used.",
     "monitor": "Show live or one-shot node/job statistics without running task code; completed sequences report active run: none.",
     "top": "Show event-driven htop-style scheduler, latency, process, database, and mutation-writer diagnostics.",
 }
@@ -219,7 +219,8 @@ Examples:
 
 If make_number previously created five random-number jobs, clean removes those
 five job records. It does not run the function and does not delete files you put
-in node/make_number/input/. Use reset when you want to keep the same jobs.
+in node/make_number/input/. Existing trace journals are cleared unless
+`--keeptrace` is supplied. Use reset when you want to keep the same jobs.
 """,
     "reset": """
 Reset preserves each SQLite job identity and `input.json`, but clears status/result
@@ -235,6 +236,8 @@ Examples:
 
 If jobs 1 and 2 were done, both are requeued. If you only want to continue the
 failed job while preserving the done one, use mwf resume double_number instead.
+Reset clears the affected trace journals by default; add `--keeptrace` to retain
+the prior transcript while requeueing the jobs.
 """,
     "wipe": """
 Wipe performs the same component-level cleanup as clean and also recreates every
@@ -249,6 +252,8 @@ Examples:
 
 A node function is not executed by wipe. Because input files are removed, use
 this command only when those files can be recreated or are no longer needed.
+`--keeptrace` preserves the SQLite trace journal even though the jobs and input
+payloads themselves are removed.
 """,
     "run": """
 Run deliberately starts fresh work for one node. In normal node mode it resets
@@ -260,6 +265,7 @@ Examples:
   mwf run make_number --monitor
   mwf run double_number job 2 --monitor
   mwf run process_number jobs 1 3-5
+  mwf run process_number --keeptrace
 
 `--monitor` prints the full timestamped dashboard in this terminal without
 clearing prior task output. `--monitor-interval` controls the cadence. The final
@@ -269,7 +275,8 @@ snapshot is emitted after the run record becomes terminal, so it reports
 A basic task might choose a random integer, double it, or call ctx.sleep(1). Run
 uses the configured threaded, API, process, or direct runner and refuses to start if
 another CLI sequence already owns the project. To preserve completed work after
-a failure, use resume rather than run.
+a failure, use resume rather than run. Fresh runs clear affected trace journals
+unless `--keeptrace` is supplied.
 """,
     "restart": """
 Restart is a second-terminal control for the workflow sequence that is currently
@@ -355,7 +362,8 @@ Examples:
 Suppose double_number has jobs 1 and 2 done, job 3 failed, and job 4 wrote a done
 output just before the previous process exited. Resume registers job 4 first and
 runs only job 3. This differs from `mwf run double_number`, which is a fresh node
-rerun.
+rerun. Resume always preserves the selected current component's trace journal;
+`--keeptrace` is accepted for consistency but is redundant for this command.
 """,
     "runfrom": """
 Runfrom is the fresh-run form for one Hoeflein component and its quotient-DAG
@@ -366,6 +374,8 @@ then schedules the selected branch in dependency order.
 For A -> B -> C:
   mwf runfrom A --plan
   mwf runfrom A --monitor
+  mwf runfrom A refuseafter B
+  mwf runfrom A refuseafter B --keeptrace
 
 The inline dashboard observes the complete descendant set and retains every
 timestamped snapshot in the terminal, which is useful for diagnosing readiness
@@ -374,7 +384,10 @@ one, and C might write the answer after a short ctx.sleep(1) delay. Runfrom
 rebuilds only work attributable to the selected producer components. A later
 runfrom from another incoming branch keeps this branch's completed descendant
 jobs. Use resumefrom when unsuccessful jobs should continue without fresh
-producer cleanup.
+producer cleanup. `refuseafter B` keeps the ordinary full descendant freshening,
+but stops admitting new Hoeflein components once B's component completes or
+fails; already-running parallel components are joined and later jobs remain
+queued. Trace journals clear by default and are retained with `--keeptrace`.
 """,
     "resumefrom": """
 Resumefrom mirrors runfrom's graph selection but uses resume semantics. It keeps
@@ -388,7 +401,9 @@ For A -> B -> C:
 
 If A is done, one B job failed, and C has not run yet, resumefrom preserves A,
 reruns the failed B job, and then allows C to continue when B completes. It does not perform producer-component cleanup and therefore preserves every
-existing successful descendant job.
+existing successful descendant job. The start Hoeflein component's trace is
+always preserved. Descendant trace journals are cleared before the resume unless
+`--keeptrace` is supplied.
 """,
     "top": """
 Top is an event-driven, htop-style diagnostic view for a running or completed

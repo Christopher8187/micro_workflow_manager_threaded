@@ -22,6 +22,7 @@ def active_workflow_run(
     start_node: str,
     nodes: list[str],
     selected_jobs: list[int] | None = None,
+    refuse_after_node: str | None = None,
     stats: bool = False,
     stats_interval: float = 5.0,
     monitor: bool = False,
@@ -39,6 +40,7 @@ def active_workflow_run(
             for node_name in nodes
         },
         "selected_jobs": list(selected_jobs or []),
+        "refuse_after_node": refuse_after_node,
         "started_at": now_iso(),
         "heartbeat_at": now_iso(),
         "pid": os.getpid(),

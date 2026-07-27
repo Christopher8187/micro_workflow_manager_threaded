@@ -157,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="One or more node names; each selects its entire Hoeflein component, or '*' for all nodes.",
     )
     clean_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
+    add_keeptrace_argument(clean_cmd)
 
     reset_cmd = commands.add_parser(
         "reset",
@@ -171,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Each DAG node selects itself; a Hoeflein member selects its whole component; use '*' for all nodes.",
     )
     reset_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
+    add_keeptrace_argument(reset_cmd)
 
     wipe_cmd = commands.add_parser(
         "wipe",
@@ -185,6 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="One or more node names; each selects its entire Hoeflein component, or '*' for all nodes.",
     )
     wipe_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
+    add_keeptrace_argument(wipe_cmd)
 
     run_cmd = commands.add_parser(
         "run",
@@ -210,6 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=RUNNER_CHOICES,
         help="Temporarily override the workflow runner for this run.",
     )
+    add_keeptrace_argument(run_cmd)
 
 
     resume_cmd = commands.add_parser(
@@ -219,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume_cmd.add_argument("node", help="Node name to resume.")
     resume_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
+    add_keeptrace_argument(resume_cmd)
     resume_cmd.add_argument("--plan", action="store_true", help="Show the resume selection without changing or running anything.")
     add_stats_arguments(resume_cmd)
 
@@ -305,10 +310,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     runfrom_cmd.add_argument("node", help="Start node for the partial workflow run.")
     runfrom_cmd.add_argument(
+        "refuse_mode",
+        nargs="?",
+        choices=("refuseafter",),
+        metavar="refuseafter",
+        help="Optional literal refuseafter followed by a stop-boundary node.",
+    )
+    runfrom_cmd.add_argument(
+        "refuse_node",
+        nargs="?",
+        metavar="node",
+        help="Stop admitting new Hoeflein components after this node's component terminates.",
+    )
+    runfrom_cmd.add_argument(
         "--runner",
         choices=RUNNER_CHOICES,
         help="Temporarily override the workflow runner for this runfrom.",
     )
+    add_keeptrace_argument(runfrom_cmd)
     resumefrom_cmd = commands.add_parser(
         "resumefrom",
         help="Continue a node and descendants without resetting done jobs.",
@@ -316,6 +335,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resumefrom_cmd.add_argument("node", help="Start node for the resumed partial workflow.")
     resumefrom_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
+    add_keeptrace_argument(resumefrom_cmd)
 
     run_cmd.add_argument("--plan", action="store_true", help="Show the run selection and reset effects without changing or running anything.")
     runfrom_cmd.add_argument("--plan", action="store_true", help="Show the descendant run selection without changing or running anything.")
@@ -411,4 +431,12 @@ def add_stats_arguments(command: argparse.ArgumentParser):
         type=positive_float,
         default=2.0,
         help="Seconds between inline --monitor snapshots. Default: 2.",
+    )
+
+
+def add_keeptrace_argument(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--keeptrace",
+        action="store_true",
+        help="Preserve existing job trace journals that this command would otherwise clear.",
     )

@@ -137,10 +137,12 @@ class JobBatchStorageMixin:
                 "VALUES(?, ?, ?, ?, ?, '{}')",
                 job_rows,
             )
-            connection.executemany(
-                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
-                "VALUES(?, ?, ?, ?, ?)",
-                event_rows,
+            self.insert_job_created_events(
+                connection,
+                [
+                    (node_name, job_id, event_time, data_json)
+                    for node_name, job_id, event_time, _event_name, data_json in event_rows
+                ],
             )
             if idempotency_rows:
                 connection.executemany(
@@ -269,10 +271,12 @@ class JobBatchStorageMixin:
                     "VALUES(?, ?, ?, ?, ?, '{}')",
                     job_rows,
                 )
-                connection.executemany(
-                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
-                    "VALUES(?, ?, ?, ?, ?)",
-                    event_rows,
+                self.insert_job_created_events(
+                    connection,
+                    [
+                        (node_name, job_id, event_time, data_json)
+                        for node_name, job_id, event_time, _event_name, data_json in event_rows
+                    ],
                 )
                 if idempotency_rows:
                     connection.executemany(

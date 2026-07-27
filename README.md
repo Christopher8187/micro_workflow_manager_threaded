@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.4.9
+# micro-workflow-manager 0.5.0
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,27 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.5.0
+
+- `mwf runfrom START refuseafter STOP` performs the same full freshening as an
+  ordinary `runfrom`, but stops admitting new Hoeflein components as soon as
+  STOP's component completes or fails. Components already running at that
+  instant are joined; downstream jobs remain queued for a later command.
+- Fresh and destructive commands now clear affected job trace journals by
+  default. Add `--keeptrace` to `run`, `runfrom`, selected-job runs, `reset`,
+  `clean`, or `wipe` to retain the prior transcript.
+- `resume` always preserves the selected current component's trace. Default
+  `resumefrom` preserves its start component and clears descendant traces;
+  `resumefrom --keeptrace` retains the entire selected descendant history.
+- Preserved event journals survive node copy/paste and can remain attached to a
+  temporarily deleted job identity. When a recreated job keeps its node/job ID
+  but receives a different parent, producer component, or job kind, MWF appends
+  and renders a separate `ORIGIN CHANGED` subsection before the new execution
+  history.
+- Repeated CLI/storage churn no longer risks a same-thread SQLite registry
+  deadlock when cyclic garbage collection invokes an old storage finalizer
+  during connection setup.
 
 ## What changed in 0.4.8
 
@@ -1168,6 +1189,7 @@ Execution commands provide `--plan` instead of pretending to run:
 ```bash
 mwf run A --plan
 mwf runfrom A --plan
+mwf runfrom A refuseafter C --plan
 mwf resume A --plan
 mwf resumefrom A --plan
 ```
@@ -1211,6 +1233,22 @@ mwf resumefrom A
 Both preserve `done` and `skipped` jobs and their outputs, leave queued jobs
 available, and requeue only failed, cancelled, or abandoned-running jobs. By
 contrast, `run` and `runfrom` retain their fresh-reset behavior.
+
+Trace retention is independent of output retention. Fresh/destructive commands
+clear the affected job transcript unless `--keeptrace` is supplied:
+
+```bash
+mwf run A --keeptrace
+mwf runfrom A refuseafter C --keeptrace
+mwf reset A --keeptrace
+mwf clean A --keeptrace
+mwf wipe A --keeptrace
+```
+
+`resume A` preserves the current Hoeflein component's trace without requiring
+the flag. Default `resumefrom A` also preserves that start component, but clears
+trace journals for selected descendants before continuing. Add `--keeptrace` to
+retain those descendant histories as well.
 
 ## Centralized checkpoint watchdog, progress, and total timeouts
 
@@ -1660,6 +1698,10 @@ Paste replaces `node/preprocess` and restores that node's jobs, statuses, events
 `.mwfignore` excludes `clipboard/`, `.mwf/`, `.venv/`, version-control metadata,
 editor metadata, caches, and build output.
 
+The SQLite snapshot includes the complete trace journal for every copied job.
+After `mwf paste preprocess`, `mwf trace preprocess job ID` therefore renders the
+same preserved transcript that existed when the copy was made.
+
 ## Inspect a node debug log
 
 ```bash
@@ -1712,3 +1754,9 @@ output writes, forwarded inputs, downstream job creation, and the terminal state
 MWF supplies the canonical event timestamp and execution provenance automatically;
 reserved keys supplied by user code, such as `time`, are retained under a
 `trace_` prefix instead of replacing framework metadata.
+
+When `--keeptrace` preserves a transcript across deletion and recreation of the
+same node/job ID, the new creation is compared with the most recent preserved
+origin. A different parent, producer component, or job kind adds an
+`ORIGIN CHANGED` block containing the previous and current provenance before the
+new task/fallback events.

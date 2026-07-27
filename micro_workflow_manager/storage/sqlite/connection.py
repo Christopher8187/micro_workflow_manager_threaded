@@ -27,7 +27,12 @@ class SQLiteConnectionMixin:
     _initialized_databases: set[tuple[Path, int]] = set()
     _connection_registry: dict[tuple[Path, int, int], sqlite3.Connection] = {}
     _connection_threads: dict[tuple[Path, int, int], threading.Thread] = {}
-    _connection_registry_guard = threading.Lock()
+    # SQLite connection setup can allocate and therefore trigger cyclic GC.
+    # A collected FileStorage finalizer may re-enter _release_storage_path on
+    # that same thread while db_connection is still registering a connection.
+    # The registry critical section is otherwise tiny, so a re-entrant lock is
+    # the correct guard and avoids a same-thread finalizer deadlock.
+    _connection_registry_guard = threading.RLock()
     _storage_path_refcounts: dict[tuple[Path, int], int] = {}
     _advisory_owner_registry: set[str] = set()
     _advisory_owner_registry_guard = threading.Lock()

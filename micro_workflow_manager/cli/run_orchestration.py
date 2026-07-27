@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from threading import Event
 from typing import Callable
 
-from micro_workflow_manager.models import DONE, FAILED, QUEUED, RUNNING, SKIPPED
+from micro_workflow_manager.models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED
 from micro_workflow_manager.system import MicroWorkflow
 
 from .graph_utils import ready_for_run_set
@@ -22,6 +23,7 @@ def run_nodes(
     monitor_interval: float = 2.0,
     prepare: Callable[[], None] | None = None,
     require_start_queued: bool = True,
+    refuse_after_node: str | None = None,
 ) -> int:
     run_set = set(nodes)
     previous_allowed_run_nodes = workflow.allowed_run_nodes
@@ -31,6 +33,21 @@ def run_nodes(
     workflow.allowed_run_nodes = run_set
     workflow.autostart_mode = "queue"
     workflow.active_job_restart_enabled = True
+    refusal_event = Event()
+    refuse_after_component = (
+        workflow.component_key(workflow.component_for(refuse_after_node))
+        if refuse_after_node is not None
+        else None
+    )
+
+    def refusal_target_terminal() -> bool:
+        if refuse_after_component is None:
+            return False
+        return all(
+            workflow.node_complete(item)
+            or workflow.storage.get_node_status(item) in {FAILED, CANCELLED}
+            for item in refuse_after_component
+        )
 
     try:
         with active_workflow_run(
@@ -38,6 +55,7 @@ def run_nodes(
             command=command,
             start_node=start_node,
             nodes=nodes,
+            refuse_after_node=refuse_after_node,
             stats=stats,
             stats_interval=stats_interval,
             monitor=monitor,
@@ -69,12 +87,18 @@ def run_nodes(
                         run_set,
                         ignore_external,
                     ),
+                    refuse_after_component=refuse_after_component,
+                    refusal_event=refusal_event,
                 )
             else:
                 ran = []
                 units = workflow.execution_components(nodes)
 
                 while True:
+                    workflow.finalize_ready_nodes()
+                    if refusal_target_terminal():
+                        refusal_event.set()
+                        break
                     ready_units = [
                         unit
                         for unit in units
@@ -90,6 +114,11 @@ def run_nodes(
 
                     for unit in ready_units:
                         ran.extend(workflow.run_component(set(unit), ignore_readiness=True))
+                        if refuse_after_component is not None and unit == refuse_after_component:
+                            refusal_event.set()
+                            break
+                    if refusal_event.is_set():
+                        break
 
             workflow.finalize_ready_nodes()
             if ignore_external:
@@ -107,6 +136,30 @@ def run_nodes(
                     if total > 0 and successful == total and not failed and not active:
                         for name in unit:
                             workflow.storage.set_node_status(name, "done")
+
+            if refusal_event.is_set():
+                failed_boundary = any(
+                    workflow.storage.get_node_status(item) in {FAILED, CANCELLED}
+                    for item in (refuse_after_component or ())
+                )
+                finish_run("failed" if failed_boundary else "done")
+                boundary = ", ".join(refuse_after_component or ())
+                print(
+                    "Refused further Hoeflein-component admission after "
+                    f"{{{boundary}}} terminated."
+                )
+                queued_after = [
+                    item for item in nodes if workflow.storage.has_queued_jobs(item)
+                ]
+                if queued_after:
+                    print("Left queued for a later run:")
+                    for item in queued_after:
+                        print(f"  {item}")
+                if ran:
+                    print("Ran:")
+                    for item in ran:
+                        print(f"  {item}")
+                return 1 if failed_boundary else 0
 
             blocked = [node for node in nodes if workflow.storage.has_queued_jobs(node)]
 

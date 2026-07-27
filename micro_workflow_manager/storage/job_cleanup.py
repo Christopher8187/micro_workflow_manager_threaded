@@ -16,7 +16,14 @@ from micro_workflow_manager.models import Job, QUEUED
 class JobCleanupStorageMixin:
     """Job deletion and fresh-run reset operations."""
 
-    def delete_job(self, node_name: str, job_id: int, *, remove_payload: bool = True) -> bool:
+    def delete_job(
+        self,
+        node_name: str,
+        job_id: int,
+        *,
+        remove_payload: bool = True,
+        preserve_events: bool = False,
+    ) -> bool:
         job_id = self.validate_job_id(job_id)
         with self.db_transaction() as connection:
             existed = connection.execute(
@@ -27,10 +34,11 @@ class JobCleanupStorageMixin:
                 "DELETE FROM idempotency WHERE node_name=? AND job_id=?",
                 (node_name, job_id),
             )
-            connection.execute(
-                "DELETE FROM job_events WHERE node_name=? AND job_id=?",
-                (node_name, job_id),
-            )
+            if not preserve_events:
+                connection.execute(
+                    "DELETE FROM job_events WHERE node_name=? AND job_id=?",
+                    (node_name, job_id),
+                )
             connection.execute(
                 "DELETE FROM jobs WHERE node_name=? AND job_id=?",
                 (node_name, job_id),
@@ -45,6 +53,7 @@ class JobCleanupStorageMixin:
         job_ids: list[int],
         *,
         remove_payload: bool = True,
+        preserve_events: bool = False,
     ) -> int:
         """Delete selected jobs with one transaction and bulk directory removal."""
         node_name = self.validate_node_name(node_name)
@@ -60,7 +69,8 @@ class JobCleanupStorageMixin:
         with self.db_transaction() as connection:
             if remove_whole_jobs_dir:
                 connection.execute("DELETE FROM idempotency WHERE node_name=?", (node_name,))
-                connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
+                if not preserve_events:
+                    connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
                 connection.execute("DELETE FROM jobs WHERE node_name=?", (node_name,))
             else:
                 for offset in range(0, len(targets), 500):
@@ -71,10 +81,11 @@ class JobCleanupStorageMixin:
                         f"DELETE FROM idempotency WHERE node_name=? AND job_id IN ({placeholders})",
                         args,
                     )
-                    connection.execute(
-                        f"DELETE FROM job_events WHERE node_name=? AND job_id IN ({placeholders})",
-                        args,
-                    )
+                    if not preserve_events:
+                        connection.execute(
+                            f"DELETE FROM job_events WHERE node_name=? AND job_id IN ({placeholders})",
+                            args,
+                        )
                     connection.execute(
                         f"DELETE FROM jobs WHERE node_name=? AND job_id IN ({placeholders})",
                         args,
@@ -113,6 +124,7 @@ class JobCleanupStorageMixin:
         node_names: Iterable[str],
         *,
         mark_nodes_queued: bool = True,
+        preserve_events: bool = True,
     ) -> int:
         """Requeue every retained job for several nodes in one transaction.
 
@@ -137,6 +149,11 @@ class JobCleanupStorageMixin:
                         chunk,
                     ).fetchone()[0]
                 )
+                if not preserve_events:
+                    connection.execute(
+                        f"DELETE FROM job_events WHERE node_name IN ({placeholders})",
+                        chunk,
+                    )
                 # Preserve one ordinary queued event per job, but create all of
                 # them inside SQLite rather than materializing thousands of
                 # Python dictionaries and issuing one mutation per job.
@@ -169,7 +186,13 @@ class JobCleanupStorageMixin:
             self.notify_queue_change()
         return reset_count
 
-    def reset_jobs_for_run_batch(self, node_name: str, job_ids: list[int]) -> int:
+    def reset_jobs_for_run_batch(
+        self,
+        node_name: str,
+        job_ids: list[int],
+        *,
+        preserve_events: bool = True,
+    ) -> int:
         """Requeue retained jobs with one state/event transaction."""
         node_name = self.validate_node_name(node_name)
         normalized = sorted({self.validate_job_id(job_id) for job_id in job_ids})
@@ -192,6 +215,15 @@ class JobCleanupStorageMixin:
             if not rows:
                 return 0
             existing = [int(row["job_id"]) for row in rows]
+            if not preserve_events:
+                for offset in range(0, len(existing), 500):
+                    chunk = existing[offset:offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    connection.execute(
+                        f"DELETE FROM job_events WHERE node_name=? "
+                        f"AND job_id IN ({placeholders})",
+                        [node_name, *chunk],
+                    )
             for offset in range(0, len(existing), 500):
                 chunk = existing[offset:offset + 500]
                 placeholders = ",".join("?" for _ in chunk)
@@ -227,11 +259,18 @@ class JobCleanupStorageMixin:
         self.notify_queue_change()
         return len(existing)
 
-    def delete_node_jobs(self, node_name: str, *, remove_payload: bool = True) -> int:
+    def delete_node_jobs(
+        self,
+        node_name: str,
+        *,
+        remove_payload: bool = True,
+        preserve_events: bool = False,
+    ) -> int:
         ids = self.list_job_ids(node_name)
         with self.db_transaction() as connection:
             connection.execute("DELETE FROM idempotency WHERE node_name=?", (node_name,))
-            connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
+            if not preserve_events:
+                connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
             connection.execute("DELETE FROM default_job_specs WHERE node_name=?", (node_name,))
             connection.execute("DELETE FROM jobs WHERE node_name=?", (node_name,))
             connection.execute(

@@ -36,7 +36,7 @@ def copy_node_to_clipboard(root: Path, node: str) -> int:
     temporary.replace(destination)
     print(f"Saved clipboard node: {destination}")
     print(f"  files copied: {file_count}")
-    print("  SQLite job state snapshot included")
+    print("  SQLite job state and trace journal snapshot included")
     ensure_vscode_settings(root)
     return 0
 
@@ -67,7 +67,7 @@ def paste_node_from_clipboard(root: Path, node: str) -> int:
         storage.set_node_status(node, QUEUED)
     print(f"Restored node from clipboard: {destination}")
     print(f"  files pasted: {file_count}")
-    print("  SQLite job state restored and synchronized immediately")
+    print("  SQLite job state and trace journals restored and synchronized immediately")
     print(
         f"  jobs available: {reconciled['jobs']} "
         f"(rebuilt: {reconciled['created']}, requeued: {reconciled['requeued']}, "

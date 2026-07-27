@@ -66,10 +66,9 @@ class JobCreationStorageMixin:
         except BaseException:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise
-        self.append_job_event(
+        self.append_job_created_event(
             job.node_name,
             job.job_id,
-            "created",
             status=QUEUED,
             parent=job.parent,
             producer_component=list(job.producer_component or ()),
@@ -145,10 +144,9 @@ class JobCreationStorageMixin:
                 "VALUES(?, ?, ?, ?, ?, '{}')",
                 (job.node_name, job_id, parent_json, job.created_at, QUEUED),
             )
-            connection.execute(
-                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
-                "VALUES(?, ?, ?, 'created', ?)",
-                (job.node_name, job_id, event_time, event_data),
+            self.insert_job_created_events(
+                connection,
+                [(job.node_name, job_id, event_time, event_data)],
             )
             if idempotency_key is not None:
                 connection.execute(
@@ -291,10 +289,9 @@ class JobCreationStorageMixin:
                     QUEUED,
                 ),
             )
-            connection.execute(
-                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
-                "VALUES(?, ?, ?, 'created', ?)",
-                (node_name, job_id, event_time, event_data),
+            self.insert_job_created_events(
+                connection,
+                [(node_name, job_id, event_time, event_data)],
             )
             if idempotency_key is not None:
                 connection.execute(

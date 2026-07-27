@@ -21,6 +21,7 @@ def run_selected_jobs(
     stats_interval: float = 5.0,
     monitor: bool = False,
     monitor_interval: float = 2.0,
+    keep_trace: bool = False,
 ) -> int:
     refuse_competing_run(workflow)
 
@@ -55,7 +56,14 @@ def run_selected_jobs(
             # reset, so a second run command cannot race with preparation.
             workflow.storage.set_node_status(node, RUNNING)
             for job_id in job_ids:
-                reset_job_for_run(root, workflow, node, job_id, mark_queued=False)
+                reset_job_for_run(
+                    root,
+                    workflow,
+                    node,
+                    job_id,
+                    mark_queued=False,
+                    keep_trace=keep_trace,
+                )
 
             jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
             workflow.run_node_jobs(node, jobs, ignore_readiness=True)

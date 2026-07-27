@@ -35,6 +35,8 @@ def print_run_plan(
     command: str,
     node: str,
     selected_jobs: list[int] | None = None,
+    keep_trace: bool = False,
+    refuse_after_node: str | None = None,
 ) -> int:
     if selected_jobs is not None:
         nodes = [node]
@@ -66,6 +68,27 @@ def print_run_plan(
         ) or "no jobs"
         print(f"    {item}: node_status={workflow.storage.get_node_status(item) or 'missing'}, {counts}")
     print("  same Hoeflein component: " + (", ".join(companions) if companions else "(none)"))
+    if refuse_after_node is not None:
+        if refuse_after_node not in nodes:
+            raise RuntimeError(
+                f"refuseafter node {refuse_after_node!r} is not in the runfrom "
+                f"selection starting at {node!r}"
+            )
+        boundary = workflow.component_key(workflow.component_for(refuse_after_node))
+        print(
+            "  refusal boundary: stop admitting new components after "
+            f"{{{', '.join(boundary)}}} terminates"
+        )
+        print("  reset scope: unchanged; every selected runfrom component is still freshened")
+    if command == "resume":
+        trace_mode = "preserve the current component trace journal"
+    elif command == "resumefrom" and not keep_trace:
+        trace_mode = "preserve the start component trace; clear descendant traces"
+    elif keep_trace:
+        trace_mode = "preserve all affected trace journals"
+    else:
+        trace_mode = "clear affected trace journals before reexecution"
+    print(f"  trace mode: {trace_mode}")
     print("  incomplete start-component inputs: " + (", ".join(sorted(blockers)) if blockers else "(none)"))
     if command in {"runfrom", "resumefrom"}:
         external = direct_incomplete_inputs(workflow, set(nodes)) - blockers

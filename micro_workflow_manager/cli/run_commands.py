@@ -34,7 +34,17 @@ def _refuse_start_component_inputs(workflow: MicroWorkflow, node: str, command: 
         print(f"  {previous}: {workflow.storage.get_node_status(previous) or 'missing'}")
     return True
 
-def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0, monitor: bool = False, monitor_interval: float = 2.0) -> int:
+def run_node(
+    root: Path,
+    workflow: MicroWorkflow,
+    node: str,
+    *,
+    stats: bool = False,
+    stats_interval: float = 5.0,
+    monitor: bool = False,
+    monitor_interval: float = 2.0,
+    keep_trace: bool = False,
+) -> int:
     refuse_competing_run(workflow)
     nodes = _component_notice(workflow, node)
     if _refuse_start_component_inputs(workflow, node, f"run {node}"):
@@ -44,7 +54,12 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
 
     def prepare():
         workflow.storage.set_node_status(node, RUNNING)
-        removed = prepare_fresh_components(root, workflow, [component])
+        removed = prepare_fresh_components(
+            root,
+            workflow,
+            [component],
+            keep_trace=keep_trace,
+        )
         if removed:
             summary = ", ".join(f"{name}={count}" for name, count in sorted(removed.items()))
             print(f"Removed jobs produced by Hoeflein component {{{', '.join(nodes)}}}: {summary}")
@@ -55,12 +70,32 @@ def run_node(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
         monitor_interval=monitor_interval, prepare=prepare,
     )
 
-def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = False, stats_interval: float = 5.0, monitor: bool = False, monitor_interval: float = 2.0) -> int:
+def run_from(
+    root: Path,
+    workflow: MicroWorkflow,
+    node: str,
+    *,
+    stats: bool = False,
+    stats_interval: float = 5.0,
+    monitor: bool = False,
+    monitor_interval: float = 2.0,
+    keep_trace: bool = False,
+    refuse_after_node: str | None = None,
+) -> int:
     refuse_competing_run(workflow)
     start_component = workflow.component_for(node)
     start_nodes = _component_notice(workflow, node)
     components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
     nodes = [name for component in components for name in workflow.component_key(component)]
+    if refuse_after_node is not None:
+        refuse_component = workflow.component_for(refuse_after_node)
+        if workflow.component_id(refuse_component) not in {
+            workflow.component_id(component) for component in components
+        }:
+            raise RuntimeError(
+                f"refuseafter node {refuse_after_node!r} is not in the runfrom "
+                f"selection starting at {node!r}"
+            )
     if _refuse_start_component_inputs(workflow, node, f"runfrom {node}"):
         return 1
     external_descendant_blockers = direct_incomplete_inputs(workflow, set(nodes))
@@ -72,7 +107,12 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
 
     def prepare():
         workflow.storage.set_node_status(node, RUNNING)
-        removed = prepare_fresh_components(root, workflow, components)
+        removed = prepare_fresh_components(
+            root,
+            workflow,
+            components,
+            keep_trace=keep_trace,
+        )
         if removed:
             summary = ", ".join(f"{name}={count}" for name, count in sorted(removed.items()))
             selected = "; ".join("{" + ", ".join(workflow.component_key(c)) + "}" for c in components)
@@ -82,6 +122,7 @@ def run_from(root: Path, workflow: MicroWorkflow, node: str, *, stats: bool = Fa
         workflow, nodes, node, ignore_external=True, command="runfrom",
         stats=stats, stats_interval=stats_interval, monitor=monitor,
         monitor_interval=monitor_interval, prepare=prepare,
+        refuse_after_node=refuse_after_node,
     )
 
 def _recover_finished_before_resume(
@@ -124,6 +165,7 @@ def resume_node(
     stats_interval: float = 5.0,
     monitor: bool = False,
     monitor_interval: float = 2.0,
+    keep_trace: bool = False,
 ) -> int:
     refuse_competing_run(workflow)
     nodes = list(workflow.component_key(workflow.component_for(node)))
@@ -161,12 +203,18 @@ def resume_from(
     stats_interval: float = 5.0,
     monitor: bool = False,
     monitor_interval: float = 2.0,
+    keep_trace: bool = False,
 ) -> int:
     refuse_competing_run(workflow)
     start_component = workflow.component_for(node)
     components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
     nodes = [name for component in components for name in workflow.component_key(component)]
     _recover_finished_before_resume(workflow, nodes)
+    if not keep_trace:
+        start_nodes = set(workflow.component_key(start_component))
+        workflow.storage.clear_job_events_for_nodes(
+            [name for name in nodes if name not in start_nodes]
+        )
 
     blockers = direct_incomplete_inputs(workflow, set(nodes))
     ignore_external = not not blockers

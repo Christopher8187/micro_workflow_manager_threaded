@@ -193,16 +193,31 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {label}: " + ", ".join(scopes))
                 for item in nodes:
                     print(f"  {item}: would {action}")
+                print(
+                    "  trace journals: "
+                    + ("would be preserved" if args.keeptrace else "would be cleared")
+                )
                 print("  no files or statuses were changed")
                 return 0
 
             if args.command == "reset":
-                reset_nodes_for_run(root, workflow, nodes)
+                reset_nodes_for_run(
+                    root,
+                    workflow,
+                    nodes,
+                    keep_trace=args.keeptrace,
+                )
                 verb = "Reset"
             else:
                 remove_input = args.command == "wipe"
                 for node in nodes:
-                    clean_node(root, workflow, node, remove_input=remove_input)
+                    clean_node(
+                        root,
+                        workflow,
+                        node,
+                        remove_input=remove_input,
+                        keep_trace=args.keeptrace,
+                    )
                 verb = "Wiped" if remove_input else "Cleaned"
 
             if is_all_nodes_request(args.nodes):
@@ -222,7 +237,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run":
             job_ids = selected_job_ids_from_args(args.job_mode, args.job_specs)
             if args.plan:
-                return print_run_plan(root, workflow, command="run", node=node, selected_jobs=job_ids)
+                return print_run_plan(
+                    root,
+                    workflow,
+                    command="run",
+                    node=node,
+                    selected_jobs=job_ids,
+                    keep_trace=args.keeptrace,
+                )
             if job_ids is not None:
                 return run_selected_jobs(
                     root,
@@ -233,23 +255,88 @@ def main(argv: list[str] | None = None) -> int:
                     stats_interval=args.stats_interval,
                     monitor=args.monitor,
                     monitor_interval=args.monitor_interval,
+                    keep_trace=args.keeptrace,
                 )
-            return run_node(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval, monitor=args.monitor, monitor_interval=args.monitor_interval)
+            return run_node(
+                root,
+                workflow,
+                node,
+                stats=args.stats,
+                stats_interval=args.stats_interval,
+                monitor=args.monitor,
+                monitor_interval=args.monitor_interval,
+                keep_trace=args.keeptrace,
+            )
 
         if args.command == "resume":
             if args.plan:
-                return print_run_plan(root, workflow, command="resume", node=node)
-            return resume_node(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval, monitor=args.monitor, monitor_interval=args.monitor_interval)
+                return print_run_plan(
+                    root,
+                    workflow,
+                    command="resume",
+                    node=node,
+                    keep_trace=args.keeptrace,
+                )
+            return resume_node(
+                root,
+                workflow,
+                node,
+                stats=args.stats,
+                stats_interval=args.stats_interval,
+                monitor=args.monitor,
+                monitor_interval=args.monitor_interval,
+                keep_trace=args.keeptrace,
+            )
 
         if args.command == "runfrom":
+            if (args.refuse_mode is None) != (args.refuse_node is None):
+                raise RuntimeError(
+                    "Use: mwf runfrom <node> [refuseafter <node>] [--keeptrace]"
+                )
+            refuse_after_node = None
+            if args.refuse_node is not None:
+                refuse_after_node = safe_node_name(args.refuse_node)
+                require_node(workflow, refuse_after_node)
             if args.plan:
-                return print_run_plan(root, workflow, command="runfrom", node=node)
-            return run_from(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval, monitor=args.monitor, monitor_interval=args.monitor_interval)
+                return print_run_plan(
+                    root,
+                    workflow,
+                    command="runfrom",
+                    node=node,
+                    keep_trace=args.keeptrace,
+                    refuse_after_node=refuse_after_node,
+                )
+            return run_from(
+                root,
+                workflow,
+                node,
+                stats=args.stats,
+                stats_interval=args.stats_interval,
+                monitor=args.monitor,
+                monitor_interval=args.monitor_interval,
+                keep_trace=args.keeptrace,
+                refuse_after_node=refuse_after_node,
+            )
 
         if args.command == "resumefrom":
             if args.plan:
-                return print_run_plan(root, workflow, command="resumefrom", node=node)
-            return resume_from(root, workflow, node, stats=args.stats, stats_interval=args.stats_interval, monitor=args.monitor, monitor_interval=args.monitor_interval)
+                return print_run_plan(
+                    root,
+                    workflow,
+                    command="resumefrom",
+                    node=node,
+                    keep_trace=args.keeptrace,
+                )
+            return resume_from(
+                root,
+                workflow,
+                node,
+                stats=args.stats,
+                stats_interval=args.stats_interval,
+                monitor=args.monitor,
+                monitor_interval=args.monitor_interval,
+                keep_trace=args.keeptrace,
+            )
 
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)

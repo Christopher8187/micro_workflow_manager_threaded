@@ -621,10 +621,21 @@ def test_reset_component_uses_one_scope_wide_batch(tmp_path, monkeypatch, capsys
     calls = []
     original = FileStorage.reset_nodes_for_run_batch
 
-    def record_batch(self, node_names, *, mark_nodes_queued=True):
+    def record_batch(
+        self,
+        node_names,
+        *,
+        mark_nodes_queued=True,
+        preserve_events=True,
+    ):
         names = tuple(node_names)
         calls.append(names)
-        return original(self, names, mark_nodes_queued=mark_nodes_queued)
+        return original(
+            self,
+            names,
+            mark_nodes_queued=mark_nodes_queued,
+            preserve_events=preserve_events,
+        )
 
     def reject_per_job_status(*args, **kwargs):
         raise AssertionError("mwf reset must not issue one status mutation per job")

@@ -5,7 +5,7 @@ from threading import Event
 from typing import Callable
 
 from ..errors import InvalidGraphError
-from ..models import FAILED, RUNNING, Job, now
+from ..models import CANCELLED, FAILED, RUNNING, Job, now
 from ..storage.job_sources import PrefetchingQueuedJobObjectSource
 
 
@@ -124,6 +124,9 @@ class DagSchedulerMixin:
         self,
         nodes: list[str] | None = None,
         ready_check: Callable[[str], bool] | None = None,
+        *,
+        refuse_after_component: tuple[str, ...] | None = None,
+        refusal_event: Event | None = None,
     ) -> list[str]:
         """Run ready execution units concurrently.
 
@@ -140,6 +143,20 @@ class DagSchedulerMixin:
             return self.node_ready(node_name)
 
         check = ready_check or default_ready_check
+        refuse_after = (
+            tuple(refuse_after_component)
+            if refuse_after_component is not None
+            else None
+        )
+
+        def refusal_target_terminal() -> bool:
+            if refuse_after is None:
+                return False
+            return all(
+                self.node_complete(node_name)
+                or self.storage.get_node_status(node_name) in {FAILED, CANCELLED}
+                for node_name in refuse_after
+            )
 
         def unit_ready(unit: tuple[str, ...]) -> bool:
             return any(self.storage.has_queued_jobs(node_name) for node_name in unit) and all(
@@ -150,6 +167,7 @@ class DagSchedulerMixin:
         ran: list[str] = []
         in_flight: set[tuple[str, ...]] = set()
         futures = {}
+        admission_stopped = False
 
         with ThreadPoolExecutor(
             max_workers=max_workers,
@@ -158,7 +176,12 @@ class DagSchedulerMixin:
             while True:
                 self.finalize_ready_nodes()
 
-                ready = [
+                if not admission_stopped and refusal_target_terminal():
+                    admission_stopped = True
+                    if refusal_event is not None:
+                        refusal_event.set()
+
+                ready = [] if admission_stopped else [
                     unit
                     for unit in units
                     if unit not in in_flight
@@ -182,6 +205,11 @@ class DagSchedulerMixin:
                 for future in done:
                     unit = futures.pop(future)
                     in_flight.remove(unit)
+
+                    if refuse_after is not None and unit == refuse_after:
+                        admission_stopped = True
+                        if refusal_event is not None:
+                            refusal_event.set()
 
                     try:
                         ran.extend(future.result())

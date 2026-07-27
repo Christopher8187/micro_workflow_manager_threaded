@@ -41,6 +41,37 @@ def _body_without(event: dict[str, Any], *keys: str) -> dict[str, Any]:
     return {key: value for key, value in event.items() if key not in excluded and value is not None}
 
 
+def _origin_label(parent: Any) -> str:
+    if isinstance(parent, dict):
+        from_node = parent.get("from_node")
+        from_job_id = parent.get("from_job_id")
+        if from_node is not None and from_job_id is not None:
+            return f"{from_node} job {from_job_id}"
+        return _json(parent)
+    return "script (root job defined by node behavior/router)"
+
+
+def _origin_change_body(event: dict[str, Any]) -> str:
+    previous = event.get("previous_origin")
+    current = event.get("current_origin")
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return (
+            "Previous: " + _origin_label(event.get("previous_parent"))
+            + "\nCurrent: " + _origin_label(event.get("current_parent"))
+        )
+
+    def describe(label: str, origin: dict[str, Any]) -> list[str]:
+        lines = [f"{label}: {_origin_label(origin.get('parent'))}"]
+        producer = origin.get("producer_component") or []
+        if producer:
+            lines.append(f"{label} producer component: {{{', '.join(map(str, producer))}}}")
+        if origin.get("job_kind") is not None:
+            lines.append(f"{label} job kind: {origin['job_kind']}")
+        return lines
+
+    return "\n".join(describe("Previous", previous) + describe("Current", current))
+
+
 def trace_command(workflow, node: str, job_id: int) -> int:
     storage = workflow.storage
     if not storage.job_exists(node, job_id):
@@ -50,10 +81,7 @@ def trace_command(workflow, node: str, job_id: int) -> int:
     status = storage.read_job_status_data(node, job_id) or {"status": "queued"}
     control = storage.read_job_control(node, job_id)
 
-    if job.parent:
-        origin = f"{job.parent.get('from_node')} job {job.parent.get('from_job_id')}"
-    else:
-        origin = "script (root job defined by node behavior/router)"
+    origin = _origin_label(job.parent)
     _block("ORIGIN", origin)
 
     current_task = "MAIN TASK"
@@ -74,6 +102,11 @@ def trace_command(workflow, node: str, job_id: int) -> int:
             label = _task_label(event, default=current_task)
             title = f"({stamp}) TRACE {event.get('name', 'trace')} FOR {label}"
             _block(title, _json(_body_without(event, "name")))
+        elif kind == "origin_changed":
+            _block(
+                f"({stamp}) ORIGIN CHANGED",
+                _origin_change_body(event),
+            )
         elif kind == "output_written":
             label = _task_label(event, default=current_task)
             _block(f"({stamp}) OUTPUT FOR {label}", _json(_body_without(event)))

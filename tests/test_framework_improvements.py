@@ -108,7 +108,11 @@ def test_events_and_inspect_show_job_history(tmp_path, monkeypatch, capsys):
 
     rows = FileStorage(tmp_path).read_job_events("A", 1)
     names = [row["event"] for row in rows]
-    assert "created" in names
+    # A fresh CLI run clears the pre-run journal by default. The new execution
+    # history starts with its reset/queued event rather than retaining the
+    # original job-creation record.
+    assert "created" not in names
+    assert "queued" in names
     assert "started" in names
     assert "done" in names
 
@@ -402,7 +406,7 @@ def test_active_run_state_contains_ownership_and_heartbeat(tmp_path, monkeypatch
     assert state["hostname"]
     assert state["pid"] > 0
     assert state["heartbeat_at"]
-    assert state["mwf_version"] == "0.4.9"
+    assert state["mwf_version"] == "0.5.0"
     assert state["status"] == "done"
 
 
