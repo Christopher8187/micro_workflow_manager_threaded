@@ -282,45 +282,22 @@ class SharedHTTPTransport:
         kwargs["timeout"] = timeout_obj
         future = _RUNTIME.submit(self._request(method, url, **kwargs))
         attempt = _CURRENT_NETWORK_ATTEMPT.get()
-        operation_name = wait_name or f"HTTP {method.upper()} {url}"
-        # httpx read timeouts are inactivity limits, not whole-request limits.
-        # A provider can therefore keep a response alive indefinitely by sending
-        # occasional bytes. MWF already treats the largest configured HTTP timeout
-        # as the request's transport lease, but historically only the supervisor
-        # enforced that lease. Its forced cancellation bypassed application-level
-        # retry/fallback code. Enforce the same lease here first, leaving the
-        # supervisor's cleanup grace available for cancellation and unwinding.
-        lease_seconds = timeout_budget_seconds(timeout_obj)
         if attempt is not None:
             workflow, _ctx, watch = attempt
             workflow.scheduler_supervisor.begin_external_wait(
                 watch,
-                name=operation_name,
-                timeout=lease_seconds,
+                name=wait_name or f"HTTP {method.upper()} {url}",
+                timeout=timeout_budget_seconds(timeout_obj),
             )
         started = time.monotonic()
-        deadline = started + lease_seconds
         interval = max(0.1, float(heartbeat_interval))
         try:
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    future.cancel()
-                    raise httpx.ReadTimeout(
-                        f"{operation_name} exceeded its {lease_seconds:g}s total transport lease"
-                    )
-                wait_for = min(interval, remaining) if heartbeat_callback else remaining
                 try:
-                    return future.result(timeout=wait_for)
+                    return future.result(timeout=interval if heartbeat_callback else None)
                 except FutureTimeoutError:
-                    elapsed = time.monotonic() - started
-                    if elapsed >= lease_seconds:
-                        future.cancel()
-                        raise httpx.ReadTimeout(
-                            f"{operation_name} exceeded its {lease_seconds:g}s total transport lease"
-                        )
                     if heartbeat_callback is not None:
-                        heartbeat_callback(elapsed)
+                        heartbeat_callback(time.monotonic() - started)
         except BaseException:
             future.cancel()
             raise

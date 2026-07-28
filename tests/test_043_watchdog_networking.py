@@ -138,26 +138,3 @@ def test_many_framework_network_waits_do_not_cascade_checkpoint_cancellations(tm
     counts = workflow.storage.node_job_summary("A")["counts"]
     assert counts.get("done") == 100
     assert counts.get("failed", 0) == 0
-
-
-def test_transport_lease_becomes_catchable_read_timeout_before_supervisor_cleanup():
-    """A never-ending/trickling provider must fail in transport code, not watchdog code."""
-    from micro_workflow_manager import networking
-
-    original_submit = networking._RUNTIME.submit
-    pending: Future[httpx.Response] = Future()
-    networking._RUNTIME.submit = lambda coroutine: (coroutine.close(), pending)[1]
-    started = time.monotonic()
-    try:
-        with pytest.raises(httpx.ReadTimeout, match="total transport lease"):
-            shared_http_transport.request(
-                "POST",
-                "https://example.test/never-finishes",
-                timeout=(0.01, 0.05),
-                json={},
-                wait_name="mock provider",
-            )
-    finally:
-        networking._RUNTIME.submit = original_submit
-    assert time.monotonic() - started < 0.3
-    assert pending.cancelled()
