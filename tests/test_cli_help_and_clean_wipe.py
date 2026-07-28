@@ -82,7 +82,7 @@ def test_clean_star_cleans_all_nodes_but_preserves_inputs(tmp_path, monkeypatch,
     seed_dirty_node(tmp_path, "beta")
     capsys.readouterr()
 
-    assert cli.main(["clean", "*"]) == 0
+    assert cli.main(["clean", "*", "--yes"]) == 0
     out = capsys.readouterr().out
 
     assert "Cleaned all nodes: alpha, beta, gamma" in out
@@ -101,7 +101,7 @@ def test_reset_star_preserves_job_definitions_and_requeues_jobs(tmp_path, monkey
     seed_dirty_node(tmp_path, "beta")
     capsys.readouterr()
 
-    assert cli.main(["reset", "*"]) == 0
+    assert cli.main(["reset", "*", "--yes"]) == 0
     out = capsys.readouterr().out
 
     assert "Reset all nodes: alpha, beta, gamma" in out
@@ -124,7 +124,7 @@ def test_wipe_star_wipes_all_nodes_and_removes_inputs(tmp_path, monkeypatch, cap
     seed_dirty_node(tmp_path, "gamma")
     capsys.readouterr()
 
-    assert cli.main(["wipe", "*"]) == 0
+    assert cli.main(["wipe", "*", "--yes"]) == 0
     out = capsys.readouterr().out
 
     assert "Wiped all nodes: alpha, beta, gamma" in out
@@ -144,7 +144,7 @@ def test_clean_star_also_works_when_shell_expands_star(tmp_path, monkeypatch, ca
     capsys.readouterr()
 
     expanded_star = sorted(path.name for path in tmp_path.iterdir() if not path.name.startswith("."))
-    assert cli.main(["clean", *expanded_star]) == 0
+    assert cli.main(["clean", *expanded_star, "--yes"]) == 0
     out = capsys.readouterr().out
 
     assert "Cleaned all nodes: alpha, beta, gamma" in out
@@ -222,7 +222,7 @@ def test_cleaning_a_removes_finished_status_and_blocks_b(tmp_path, monkeypatch, 
     assert cli.main(["run", "A", "--runner", "direct"]) == 0
     capsys.readouterr()
 
-    assert cli.main(["clean", "A"]) == 0
+    assert cli.main(["clean", "A", "--yes"]) == 0
     capsys.readouterr()
     assert FileStorage(tmp_path).get_node_status("A") == "queued"
     assert not (tmp_path / "node" / "A" / "jobs" / "1").exists()
@@ -552,7 +552,7 @@ def test_cleanup_commands_expand_one_node_to_whole_hoeflein_component(
         seed_dirty_node(tmp_path, node)
     capsys.readouterr()
 
-    assert cli.main([command, "B"]) == 0
+    assert cli.main([command, "B", "--yes"]) == 0
     out = capsys.readouterr().out
     assert "Hoeflein component(s) {B, C}" in out
 
@@ -596,7 +596,7 @@ def test_reset_dag_node_does_not_reset_other_quotient_nodes(tmp_path, monkeypatc
         seed_dirty_node(tmp_path, node)
     capsys.readouterr()
 
-    assert cli.main(["reset", "A"]) == 0
+    assert cli.main(["reset", "A", "--yes"]) == 0
     out = capsys.readouterr().out
     assert "Reset DAG node A: A" in out
 
@@ -612,37 +612,31 @@ def test_reset_dag_node_does_not_reset_other_quotient_nodes(tmp_path, monkeypatc
         assert (tmp_path / "node" / node / "output" / "remove.txt").exists()
 
 
-def test_reset_component_uses_one_scope_wide_batch(tmp_path, monkeypatch, capsys):
+def test_reset_component_uses_per_node_batch_preparation(tmp_path, monkeypatch, capsys):
     make_cleanup_component_project(tmp_path, monkeypatch)
     for node in ["B", "C"]:
         seed_dirty_node(tmp_path, node)
     capsys.readouterr()
 
     calls = []
-    original = FileStorage.reset_nodes_for_run_batch
+    original = FileStorage.reset_jobs_for_run_batch
 
-    def record_batch(
-        self,
-        node_names,
-        *,
-        mark_nodes_queued=True,
-        preserve_events=True,
-    ):
-        names = tuple(node_names)
-        calls.append(names)
+    def record_batch(self, node_name, job_ids, *, preserve_events=True):
+        ids = tuple(job_ids)
+        calls.append((node_name, ids))
         return original(
             self,
-            names,
-            mark_nodes_queued=mark_nodes_queued,
+            node_name,
+            ids,
             preserve_events=preserve_events,
         )
 
     def reject_per_job_status(*args, **kwargs):
         raise AssertionError("mwf reset must not issue one status mutation per job")
 
-    monkeypatch.setattr(FileStorage, "reset_nodes_for_run_batch", record_batch)
+    monkeypatch.setattr(FileStorage, "reset_jobs_for_run_batch", record_batch)
     monkeypatch.setattr(FileStorage, "set_job_status", reject_per_job_status)
 
-    assert cli.main(["reset", "B"]) == 0
+    assert cli.main(["reset", "B", "--yes"]) == 0
     capsys.readouterr()
-    assert calls == [("B", "C")]
+    assert sorted(calls) == [("B", (1,)), ("C", (1,))]

@@ -10,7 +10,7 @@ from typing import Any, Callable, TypeVar
 
 from .errors import JobRestartedError, JobTimeoutError
 from .models import Job
-
+from .paths import relative_posix
 
 def _event_value(value: Any, *, depth: int = 0) -> Any:
     """Convert trace/event payloads to durable JSON without surprising callers."""
@@ -290,7 +290,7 @@ class NodeHandle(_ExecutionChecks):
         )
         self._record_event(
             "input_forwarded", target_node=self.to_node,
-            path=f"{self.to_node}/input/{path.relative_to(self.system.storage.node_input_dir(self.to_node)).as_posix()}",
+            path=f"{self.to_node}/input/{relative_posix(path, self.system.storage.node_input_dir(self.to_node))}",
             **_content_preview(content),
         )
         return path
@@ -303,7 +303,7 @@ class NodeHandle(_ExecutionChecks):
         )
         self._record_event(
             "input_forwarded", target_node=self.to_node,
-            path=f"{self.to_node}/input/{path.relative_to(self.system.storage.node_input_dir(self.to_node)).as_posix()}",
+            path=f"{self.to_node}/input/{relative_posix(path, self.system.storage.node_input_dir(self.to_node))}",
             **_content_preview(content),
         )
         return path
@@ -325,7 +325,7 @@ class NodeHandle(_ExecutionChecks):
         for path, (_filename, content) in zip(paths, entries):
             self._record_event(
                 "input_forwarded", target_node=self.to_node,
-                path=f"{self.to_node}/input/{path.relative_to(root).as_posix()}",
+                path=f"{self.to_node}/input/{relative_posix(path, root)}",
                 **_content_preview(content),
             )
         return paths
@@ -345,7 +345,7 @@ class NodeHandle(_ExecutionChecks):
         root = self.system.storage.node_input_dir(self.to_node)
         self._record_event(
             "input_forwarded", target_node=self.to_node,
-            path=f"{self.to_node}/input/{path.relative_to(root).as_posix()}",
+            path=f"{self.to_node}/input/{relative_posix(path, root)}",
             source=str(source), content_type="file", size=path.stat().st_size if path.exists() else None,
         )
         return path
@@ -472,9 +472,9 @@ class JobContext(_ExecutionChecks):
 
     def _record_output(self, path: Path, content: Any, *, scope: str = "output") -> None:
         if scope == "job_files":
-            display_path = f"output/jobs/{self.job_id}/files/{path.relative_to(self.files_dir).as_posix()}"
+            display_path = f"output/jobs/{self.job_id}/files/{relative_posix(path, self.files_dir)}"
         else:
-            display_path = f"output/{path.relative_to(self.output_dir).as_posix()}"
+            display_path = f"output/{relative_posix(path, self.output_dir)}"
         self._record_event("output_written", path=display_path, **_content_preview(content))
 
     def checkpoint(

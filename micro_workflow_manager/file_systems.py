@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .file_entry import FileSystemEntry
+from .paths import relative_posix
 from .file_helpers import (
     _copy_file,
     _format_template,
@@ -219,9 +220,9 @@ class OutputFileSystem(FileSystem):
         ctx._record_event(
             "output_written",
             path=(
-                f"output/jobs/{ctx.job_id}/files/{path.relative_to(ctx.files_dir).as_posix()}"
+                f"output/jobs/{ctx.job_id}/files/{relative_posix(path, ctx.files_dir)}"
                 if self.scope == "job_files"
-                else f"output/{path.relative_to(ctx.output_dir).as_posix()}"
+                else f"output/{relative_posix(path, ctx.output_dir)}"
             ),
             content_type="file", source=str(source),
             size=path.stat().st_size if path.exists() else None,
@@ -312,9 +313,9 @@ class JobFileSystem(FileSystem):
         ctx._record_event(
             "output_written",
             path=(
-                f"output/jobs/{ctx.job_id}/files/{path.relative_to(ctx.files_dir).as_posix()}"
+                f"output/jobs/{ctx.job_id}/files/{relative_posix(path, ctx.files_dir)}"
                 if self.scope == "job_files"
-                else f"output/{path.relative_to(ctx.output_dir).as_posix()}"
+                else f"output/{relative_posix(path, ctx.output_dir)}"
             ),
             content_type="file", source=str(source),
             size=path.stat().st_size if path.exists() else None,

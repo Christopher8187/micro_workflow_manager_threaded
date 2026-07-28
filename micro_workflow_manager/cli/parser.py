@@ -6,6 +6,12 @@ import textwrap
 from .constants import RUNNER_CHOICES
 from .descriptions import COMMAND_HELP_DESCRIPTIONS, HELP_EPILOG
 
+def add_destructive_arguments(command) -> None:
+    command.add_argument("--dry-run", action="store_true", help="Describe the destructive operation without changing state.")
+    command.add_argument("--yes", action="store_true", help="Acknowledge the danger and skip the interactive typed confirmation.")
+    add_keeptrace_argument(command)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mwf",
@@ -146,48 +152,61 @@ def build_parser() -> argparse.ArgumentParser:
 
     clean_cmd = commands.add_parser(
         "clean",
-        help="Reset whole Hoeflein-component output/job artifacts while keeping input files. Use '*' for all nodes.",
+        help="Delete every job and output in one or more selected Hoeflein components.",
         description=COMMAND_HELP_DESCRIPTIONS["clean"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    clean_cmd.add_argument(
-        "nodes",
-        nargs="+",
-        metavar="node",
-        help="One or more node names; each selects its entire Hoeflein component, or '*' for all nodes.",
+    clean_cmd.add_argument("nodes", nargs="+", metavar="node", help="One or more component members, or '*' for all nodes.")
+    add_destructive_arguments(clean_cmd)
+
+    cleanfrom_cmd = commands.add_parser(
+        "cleanfrom",
+        help="Delete every job and output from one component through all descendants.",
+        description=COMMAND_HELP_DESCRIPTIONS["cleanfrom"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    clean_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
-    add_keeptrace_argument(clean_cmd)
+    cleanfrom_cmd.add_argument("node", help="Start node for descendant cleanup, or '*' for all nodes.")
+    add_destructive_arguments(cleanfrom_cmd)
 
     reset_cmd = commands.add_parser(
         "reset",
-        help="Reset one DAG node or the whole Hoeflein component containing the named node, while keeping inputs/jobs. Use '*' for all nodes.",
+        help="Perform run's fresh preparation without executing task code.",
         description=COMMAND_HELP_DESCRIPTIONS["reset"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    reset_cmd.add_argument(
-        "nodes",
-        nargs="+",
-        metavar="node",
-        help="Each DAG node selects itself; a Hoeflein member selects its whole component; use '*' for all nodes.",
+    reset_cmd.add_argument("node", help="Node/component to freshen, or '*' for all nodes.")
+    reset_cmd.add_argument("job_mode", nargs="?", metavar="job", help="Optional literal 'job' or 'jobs'.")
+    reset_cmd.add_argument("job_specs", nargs="*", metavar="id|start-end", help="Job IDs and ranges when job/jobs is used.")
+    add_destructive_arguments(reset_cmd)
+
+    resetfrom_cmd = commands.add_parser(
+        "resetfrom",
+        help="Perform runfrom's fresh descendant preparation without running.",
+        description=COMMAND_HELP_DESCRIPTIONS["resetfrom"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    reset_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
-    add_keeptrace_argument(reset_cmd)
+    resetfrom_cmd.add_argument("node", help="Start node for fresh descendant preparation, or '*' for all nodes.")
+    resetfrom_cmd.add_argument("refuse_mode", nargs="?", choices=("refuseafter",), metavar="refuseafter", help="Optional compatibility boundary; reset scope remains the full descendant set.")
+    resetfrom_cmd.add_argument("refuse_node", nargs="?", metavar="node", help="Boundary node to validate against the selection.")
+    add_destructive_arguments(resetfrom_cmd)
 
     wipe_cmd = commands.add_parser(
         "wipe",
-        help="Like component-level clean, but remove input files too. Use '*' for all nodes.",
+        help="Delete every job, output, and input in selected Hoeflein components.",
         description=COMMAND_HELP_DESCRIPTIONS["wipe"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    wipe_cmd.add_argument(
-        "nodes",
-        nargs="+",
-        metavar="node",
-        help="One or more node names; each selects its entire Hoeflein component, or '*' for all nodes.",
+    wipe_cmd.add_argument("nodes", nargs="+", metavar="node", help="One or more component members, or '*' for all nodes.")
+    add_destructive_arguments(wipe_cmd)
+
+    wipefrom_cmd = commands.add_parser(
+        "wipefrom",
+        help="Delete every job, output, and input from one component through descendants.",
+        description=COMMAND_HELP_DESCRIPTIONS["wipefrom"].strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    wipe_cmd.add_argument("--dry-run", action="store_true", help="Describe the cleanup without changing files or statuses.")
-    add_keeptrace_argument(wipe_cmd)
+    wipefrom_cmd.add_argument("node", help="Start node for descendant wipe, or '*' for all nodes.")
+    add_destructive_arguments(wipefrom_cmd)
 
     run_cmd = commands.add_parser(
         "run",

@@ -2,16 +2,8 @@ from __future__ import annotations
 
 import sys
 
-from .cleanup import (
-    clean_node,
-    is_all_nodes_request,
-    reset_nodes_for_run,
-    resolve_node_targets,
-    resolve_component_targets,
-    resolve_reset_targets,
-    selected_component_labels,
-    selected_reset_scope_labels,
-)
+from .cleanup import resolve_node_targets
+from .destructive import execute_destructive_command
 from .describe import describe_command
 from .files import find_root, safe_node_name
 from .doctor import doctor_command
@@ -169,67 +161,14 @@ def main(argv: list[str] | None = None) -> int:
                 recent_events=args.events,
             )
 
-        if args.command in {"clean", "reset", "wipe"}:
-            if args.command == "reset":
-                nodes = resolve_reset_targets(workflow, args.nodes)
-                scopes = selected_reset_scope_labels(workflow, nodes)
-            else:
-                nodes = resolve_component_targets(workflow, args.nodes)
-                scopes = selected_component_labels(workflow, nodes)
-
-            if args.dry_run:
-                action = {
-                    "clean": "delete jobs and output; preserve input",
-                    "reset": "preserve jobs/input; requeue all jobs and clear generated output",
-                    "wipe": "delete jobs, output, and input",
-                }[args.command]
-                print(f"Dry run for mwf {args.command}:")
-                if args.command == "reset" and all(scope.startswith("{") for scope in scopes):
-                    label = "selected Hoeflein components"
-                elif args.command == "reset":
-                    label = "selected reset scopes"
-                else:
-                    label = "selected Hoeflein components"
-                print(f"  {label}: " + ", ".join(scopes))
-                for item in nodes:
-                    print(f"  {item}: would {action}")
-                print(
-                    "  trace journals: "
-                    + ("would be preserved" if args.keeptrace else "would be cleared")
+        if args.command in {"clean", "cleanfrom", "reset", "resetfrom", "wipe", "wipefrom"}:
+            if args.command == "resetfrom" and (
+                (args.refuse_mode is None) != (args.refuse_node is None)
+            ):
+                raise RuntimeError(
+                    "Use: mwf resetfrom <node> [refuseafter <node>] [--yes]"
                 )
-                print("  no files or statuses were changed")
-                return 0
-
-            if args.command == "reset":
-                reset_nodes_for_run(
-                    root,
-                    workflow,
-                    nodes,
-                    keep_trace=args.keeptrace,
-                )
-                verb = "Reset"
-            else:
-                remove_input = args.command == "wipe"
-                for node in nodes:
-                    clean_node(
-                        root,
-                        workflow,
-                        node,
-                        remove_input=remove_input,
-                        keep_trace=args.keeptrace,
-                    )
-                verb = "Wiped" if remove_input else "Cleaned"
-
-            if is_all_nodes_request(args.nodes):
-                print(f"{verb} all nodes: {', '.join(nodes)}")
-            elif args.command == "reset":
-                if all(scope.startswith("{") for scope in scopes):
-                    print(f"Reset Hoeflein component(s) {', '.join(scopes)}: {', '.join(nodes)}")
-                else:
-                    print(f"Reset {', '.join(scopes)}: {', '.join(nodes)}")
-            else:
-                print(f"{verb} Hoeflein component(s) {', '.join(scopes)}: {', '.join(nodes)}")
-            return 0
+            return execute_destructive_command(root, workflow, args)
 
         node = safe_node_name(args.node)
         require_node(workflow, node)

@@ -26,10 +26,13 @@ Common flow:
   mwf resumefrom A
   mwf monitor
 
-Cleaning all nodes:
-  mwf clean *
-  mwf reset *
-  mwf wipe *
+Destructive preparation and cleanup:
+  mwf reset A --dry-run
+  mwf reset * --yes
+  mwf resetfrom A --dry-run
+  mwf clean * --yes
+  mwf wipe * --yes
+  mwf wipefrom A --yes
 
 Use 'mwf <command> --help' for syntax. Use 'mwf --describe <command>'
 for a longer essay explaining behavior, file effects, and abstract examples.
@@ -44,9 +47,12 @@ COMMAND_HELP_DESCRIPTIONS = {
     "trace": "Render one job's chronological origin, task/fallback starts, ctx.trace objects, outputs, forwarded inputs, downstream jobs, and terminal state.",
     "filter": "Show the retry/fallback funnel, or list jobs at one stage boundary.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
-    "clean": "Delete jobs and output for selected Hoeflein components while keeping node input files.",
-    "reset": "Requeue every existing job for one selected DAG node or the selected node's whole Hoeflein component, while keeping job definitions and inputs.",
-    "wipe": "Like component-level clean, but remove the selected components' input files as well.",
+    "clean": "Delete every job and generated output in selected Hoeflein components while preserving node inputs; confirmation is required unless --yes is used.",
+    "cleanfrom": "Delete every job and generated output from one Hoeflein component through all quotient-DAG descendants while preserving inputs.",
+    "reset": "Perform the same fresh preparation as mwf run, including selected-job mode, but do not execute task code.",
+    "resetfrom": "Perform the same producer-aware fresh descendant preparation as mwf runfrom, but do not execute task code.",
+    "wipe": "Delete every job, generated output, and input file in selected Hoeflein components.",
+    "wipefrom": "Delete every job, generated output, and input file from one component through all descendants.",
     "run": "Reset and run one ready node or selected jobs; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control that restarts running and failed/cancelled jobs in the selected active Hoeflein component; it never starts another scheduler.",
     "threads": "View or change run-scoped per-node max_threads overrides. API values are cooperative fiber counts with no aggregate framework cap; active nodes scale live.",
@@ -201,59 +207,84 @@ while the recorded owner is still live.
 """,
     "clean": """
 Code context:
-Clean loads the configured graph and routers only to validate node names; it does
-not execute a task function. Naming any node selects its entire Hoeflein component.
-Clean removes every selected component member's job folders and output while
-preserving their input folders.
+Clean is the non-executing destructive counterpart to run preparation and uses
+the same graph and Hoeflein-component selection rules.
 
 File-system context:
-The jobs and output directories are recreated empty, while input remains in place. It is the broad reset to use when existing job definitions are no
-longer useful and should be recreated from router.create_job(...) or by an
-upstream node on the next run.
+Clean selects the same Hoeflein component unit as `mwf run`, but it deletes every
+job and generated output in that selection instead of requeueing jobs. Input files
+remain. Multiple named components and `*` remain available for administrative
+cleanup. The command prints a danger summary and requires typing `clean`; scripts
+must pass `--yes` explicitly.
 
 Examples:
-  mwf clean make_number --dry-run
-  mwf clean make_number
-  mwf clean A B
-  mwf clean "*"
+  mwf clean transform --dry-run
+  mwf clean transform
+  mwf clean A B --yes
+  mwf clean "*" --yes
 
-If make_number previously created five random-number jobs, clean removes those
-five job records. It does not run the function and does not delete files you put
-in node/make_number/input/. Existing trace journals are cleared unless
-`--keeptrace` is supplied. Use reset when you want to keep the same jobs.
+Use reset when job identities and payloads should be preserved for a fresh rerun.
+Use cleanfrom when all quotient-DAG descendants must also lose their jobs.
+""",
+    "cleanfrom": """
+Cleanfrom selects the named node's complete Hoeflein component and every
+quotient-DAG descendant. It deletes all jobs and generated output in those nodes,
+including work produced by unselected incoming branches, while preserving input
+files. This is intentionally broader than resetfrom's producer-aware cleanup.
+
+Examples:
+  mwf cleanfrom classify --dry-run
+  mwf cleanfrom classify
+  mwf cleanfrom classify --keeptrace --yes
 """,
     "reset": """
-Reset preserves each SQLite job identity and `input.json`, but clears status/result
-state and job-local returned files so every existing job becomes queued again. A
-normal quotient-DAG node resets only itself. Naming a member of a nontrivial
-Hoeflein component resets every member because that component is one scheduling
-and lifecycle unit. The reset is batched across the selected scope.
+Reset is `mwf run` without execution. Whole-node mode performs the exact fresh-run
+preparation for the selected Hoeflein component: retained jobs are requeued,
+generated output is cleared, and jobs produced by that component are removed so
+they can be recreated deterministically later. Selected-job mode resets only the
+named jobs, matching `mwf run NODE job ...` preparation.
 
 Examples:
-  mwf reset double_number --dry-run
-  mwf reset double_number
-  mwf reset A B
+  mwf reset transform --dry-run
+  mwf reset transform
+  mwf reset transform job 2
+  mwf reset transform jobs 1 3-5 --yes
 
-If jobs 1 and 2 were done, both are requeued. If you only want to continue the
-failed job while preserving the done one, use mwf resume double_number instead.
-Reset clears the affected trace journals by default; add `--keeptrace` to retain
-the prior transcript while requeueing the jobs.
+A typed `reset` confirmation is required unless `--yes` is supplied. No task,
+fallback, HTTP request, or downstream scheduler is started.
+""",
+    "resetfrom": """
+Resetfrom is `mwf runfrom` without execution. It applies the same fresh,
+producer-aware preparation to the start Hoeflein component and all descendants:
+selected-producer jobs are removed, the start component is fully reset, and merge
+components preserve jobs originating from unselected branches.
+
+Examples:
+  mwf resetfrom ingest --dry-run
+  mwf resetfrom ingest
+  mwf resetfrom ingest refuseafter publish --yes
+
+`refuseafter` is accepted for command symmetry and validated against the selected
+branch, but no admission occurs, so it never shrinks the reset scope.
 """,
     "wipe": """
-Wipe performs the same component-level cleanup as clean and also recreates every
-selected component member's input folder empty. It is intended for a complete
-local restart of a Hoeflein component's stored material, not for ordinary failure
-recovery.
+Wipe selects one or more Hoeflein components and deletes every job, generated
+output, and input file in them. It requires typing `wipe` unless `--yes` is used.
+This is a destructive local rebuild operation, not ordinary failure recovery.
 
 Examples:
   mwf wipe temporary_result --dry-run
   mwf wipe temporary_result
-  mwf wipe "*"
+  mwf wipe "*" --yes
+""",
+    "wipefrom": """
+Wipefrom applies wipe to the named Hoeflein component and every quotient-DAG
+descendant. All selected jobs, generated output, and inputs are deleted. Use
+`--dry-run` first and `--yes` only in reviewed automation.
 
-A node function is not executed by wipe. Because input files are removed, use
-this command only when those files can be recreated or are no longer needed.
-`--keeptrace` preserves the SQLite trace journal even though the jobs and input
-payloads themselves are removed.
+Examples:
+  mwf wipefrom import_book --dry-run
+  mwf wipefrom import_book
 """,
     "run": """
 Run deliberately starts fresh work for one node. In normal node mode it resets

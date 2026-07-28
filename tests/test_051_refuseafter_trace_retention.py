@@ -325,7 +325,7 @@ def test_default_fresh_run_clears_orphan_trace_left_by_prior_keeptrace(
 
     assert cli.main(["runfrom", "A", "--keeptrace"]) == 0
     capsys.readouterr()
-    assert cli.main(["clean", "B", "--keeptrace"]) == 0
+    assert cli.main(["clean", "B", "--keeptrace", "--yes"]) == 0
     capsys.readouterr()
     storage = FileStorage(tmp_path)
     assert not storage.job_exists("B", 1)
@@ -422,7 +422,7 @@ def test_clean_keeptrace_and_copy_paste_preserve_trace_journals(
     assert cli.main(["copy", "A"]) == 0
     capsys.readouterr()
 
-    assert cli.main(["clean", "A", "--keeptrace"]) == 0
+    assert cli.main(["clean", "A", "--keeptrace", "--yes"]) == 0
     capsys.readouterr()
     storage = FileStorage(tmp_path)
     assert not storage.job_exists("A", 1)

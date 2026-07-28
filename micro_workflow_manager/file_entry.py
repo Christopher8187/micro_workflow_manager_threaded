@@ -14,6 +14,7 @@ from .file_helpers import (
     _write_bytes_file,
     _write_text_file,
 )
+from .paths import relative_path
 
 
 def _is_node_input_filesystem(filesystem: Any) -> bool:
@@ -233,7 +234,7 @@ class FileSystemEntry(os.PathLike[str]):
         for path in sorted(paths):
             resolved = path.resolve()
             try:
-                relative = resolved.relative_to(root_resolved)
+                relative = relative_path(resolved, root_resolved)
             except ValueError:
                 continue
             result.append(self.file(*relative.parts))

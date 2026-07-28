@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.5.0
+# micro-workflow-manager 0.5.1
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -16,8 +16,19 @@ command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
 
-## What changed in 0.5.0
+## What changed in 0.5.1
 
+- `mwf reset` and `mwf resetfrom` now perform the exact fresh preparation
+  used by `run` and `runfrom` without starting a scheduler or executing tasks.
+- `mwf cleanfrom` deletes all jobs and generated output in the selected Hoeflein
+  component and quotient-DAG descendants; `mwf wipefrom` additionally deletes
+  their inputs. `clean` and `wipe` apply the same semantics to the current
+  component. All six destructive preparation commands require a typed
+  confirmation unless `--yes` is supplied, and all support `--dry-run`.
+- `AGENT.md`, `examples/README.md`, and the new
+  `examples/agent_reference_architecture` provide a standard project layout and
+  a complete API/HTTP, fallback, transactional fan-out, durable fan-in, and
+  bounded Hoeflein-component reference design.
 - `mwf runfrom START refuseafter STOP` performs the same full freshening as an
   ordinary `runfrom`, but stops admitting new Hoeflein components as soon as
   STOP's component completes or fails. Components already running at that
