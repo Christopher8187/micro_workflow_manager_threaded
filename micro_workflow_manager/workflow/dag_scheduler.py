@@ -7,6 +7,7 @@ from typing import Callable
 from ..errors import InvalidGraphError
 from ..models import CANCELLED, FAILED, RUNNING, Job, now
 from ..storage.job_sources import PrefetchingQueuedJobObjectSource
+from .component_scheduler import WaitDeadlockResolver
 
 
 @dataclass(slots=True)
@@ -127,6 +128,7 @@ class DagSchedulerMixin:
         *,
         refuse_after_component: tuple[str, ...] | None = None,
         refusal_event: Event | None = None,
+        wait_deadlock_resolver: WaitDeadlockResolver | None = None,
     ) -> list[str]:
         """Run ready execution units concurrently.
 
@@ -166,6 +168,7 @@ class DagSchedulerMixin:
         max_workers = max(1, len(units))
         ran: list[str] = []
         in_flight: set[tuple[str, ...]] = set()
+        blocked_units: set[tuple[str, ...]] = set()
         futures = {}
         admission_stopped = False
 
@@ -185,6 +188,7 @@ class DagSchedulerMixin:
                     unit
                     for unit in units
                     if unit not in in_flight
+                    and unit not in blocked_units
                     and unit_ready(unit)
                 ]
 
@@ -193,6 +197,7 @@ class DagSchedulerMixin:
                         self.run_component,
                         set(unit),
                         True,
+                        wait_deadlock_resolver=wait_deadlock_resolver,
                     )
                     futures[future] = unit
                     in_flight.add(unit)
@@ -213,6 +218,13 @@ class DagSchedulerMixin:
 
                     try:
                         ran.extend(future.result())
+                        if self.component_wait_deadlocked(set(unit)):
+                            # The user declined the override (or no interactive
+                            # resolver was supplied). Do not resubmit the same
+                            # quiescent component in a tight waiting loop.
+                            blocked_units.add(unit)
+                        else:
+                            blocked_units.discard(unit)
                     except Exception:
                         for pending in futures:
                             pending.cancel()

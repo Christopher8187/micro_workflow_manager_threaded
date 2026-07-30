@@ -120,6 +120,12 @@ A downstream component does not start until external predecessor components are
 complete. Reason from component membership and producer component, not only raw
 edges.
 
+When every queued member of a Hoeflein component is blocked by `wait_for`,
+`mwf run` and `mwf runfrom` ask the operator which node should temporarily
+ignore waiting. That node drains once; then normal waiting is recalculated. Do
+not implement project-level bootstrap hacks for this case, and do not assume the
+override persists after the selected node pump exits.
+
 ### 6. Keep fallbacks source-aware and inspectable
 
 Use named `@router.fallback(...)` functions. Each fallback receives the prior

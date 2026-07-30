@@ -681,9 +681,14 @@ skipped, and cancelled rows do not block the gate.
 
 The gate is checked only before a pump starts. Once admitted, a pump continues
 to refill and drain its live source even if a waited-for peer later receives
-new work. Waiting declarations are strict: the scheduler does not bootstrap or
-bypass a mutually blocked cycle. A restart, resume, or producer action must
-clear the declared conditions before another pump is admitted.
+new work. Normal scheduling never silently bootstraps a mutually blocked cycle.
+For foreground `run`, `runfrom`, `resume`, and `resumefrom`, however, an
+all-waiting component invokes a serialized CLI resolver. One queued node may be admitted as a temporary override
+until its node pump drains. The scheduler then discards the override and
+recalculates the ordinary waiting graph. A remaining deadlock prompts again;
+a declined or unavailable prompt leaves the component blocked and suppresses
+same-run resubmission. Programmatic scheduling without a resolver remains
+noninteractive and returns the deadlocked component as quiescent.
 
 Node status `waiting` is lifecycle metadata. Individual job rows remain `queued`,
 so cleanup, resume, restart, and provenance semantics do not acquire a new job

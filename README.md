@@ -131,6 +131,10 @@ manager, and a Pygame state machine.
 - A waiting node now requires every selected peer to have zero queued, running,
   and failed jobs. The old queued-only cycle bootstrap has been removed, so the
   declared gate is never bypassed.
+- Foreground `run`, `runfrom`, `resume`, and `resumefrom` commands detect an
+  all-waiting Hoeflein deadlock and ask which queued node should temporarily
+  ignore waiting. The chosen node drains, the override is discarded, and the
+  normal waiting graph is recalculated; a remaining deadlock prompts again.
 
 ## What changed in 0.4.2
 
@@ -264,9 +268,13 @@ limit.
 - Waiting on a singleton DAG component is allowed but has no effect; CLI loading
   prints a reminder that ordinary DAG predecessor readiness is the available
   queue-independent mechanism.
-- Waiting declarations are strict. A mutually waiting set with blocked work on
-  every side remains waiting until a restart, resume, or producer action clears
-  the declared queued/running/failed conditions.
+- Waiting declarations remain strict during ordinary scheduling. When `mwf run`
+  or `mwf runfrom` finds a component where every queued node is waiting on a
+  peer, the CLI lists the blocked nodes and asks which one to run temporarily.
+  The selected node drains, then the scheduler restores normal waiting checks.
+  If the recalculated component is still deadlocked, the same choice is offered
+  again. Choosing `q`, submitting a blank answer, or running noninteractively
+  leaves the component blocked without a scheduler resubmission loop.
 
 ### Waiting-node example
 
@@ -288,6 +296,8 @@ router = NodeRouter(
 Waiting is a node-pump admission rule, not a job-status rewrite. Jobs stay
 `queued` in SQLite so reset/resume semantics remain unchanged; `mwf monitor`
 shows the node lifecycle state as `waiting` and includes `waiting_on` in JSON.
+The interactive override changes only one admission decision: it does not edit
+`wait_for`, job statuses, graph structure, or future scheduling policy.
 
 ## What changed in 0.3.15
 

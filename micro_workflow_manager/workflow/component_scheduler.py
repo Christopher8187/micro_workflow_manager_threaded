@@ -1,5 +1,6 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Event
+from typing import Callable
 
 import networkx as nx
 
@@ -8,6 +9,17 @@ from ..models import FAILED, QUEUED, RUNNING, WAITING
 
 
 WAIT_BLOCKING_JOB_STATUSES = {QUEUED, RUNNING, FAILED}
+
+WaitDeadlockResolver = Callable[
+    [
+        tuple[str, ...],
+        tuple[str, ...],
+        dict[str, tuple[str, ...]],
+    ],
+    str | None,
+]
+
+
 class ComponentSchedulerMixin:
     # Durable lifecycle commits wake the scheduler immediately. The timeout is
     # only a defensive cross-process fallback if an external writer cannot use
@@ -68,16 +80,76 @@ class ComponentSchedulerMixin:
         self.storage.set_node_statuses(waiting_statuses)
         return result
 
+    def waiting_deadlock_details(
+        self,
+        component: set[str] | tuple[str, ...] | list[str],
+    ) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]] | None:
+        """Describe an all-waiting queued component, or return ``None``.
+
+        A wait deadlock exists only when the component has queued work and every
+        queued node is blocked by at least one selected peer. Non-waiting queued
+        nodes are therefore always startable and cannot produce this result.
+        """
+        component_nodes = list(self.component_key(component))
+        queued = self.storage.queued_nodes(component_nodes)
+        if not queued:
+            return None
+        blocking = self._component_wait_blockers(component_nodes)
+        blockers: dict[str, tuple[str, ...]] = {}
+        for node_name in component_nodes:
+            if node_name not in queued:
+                continue
+            waiting_on = tuple(sorted(
+                self.waiting_dependencies(node_name).intersection(blocking)
+            ))
+            if not waiting_on:
+                return None
+            blockers[node_name] = waiting_on
+        queued_nodes = tuple(
+            node_name for node_name in component_nodes if node_name in queued
+        )
+        return queued_nodes, blockers
+
+    def component_wait_deadlocked(
+        self,
+        component: set[str] | tuple[str, ...] | list[str],
+    ) -> bool:
+        return self.waiting_deadlock_details(component) is not None
+
+    def _resolve_wait_deadlock(
+        self,
+        component_nodes: list[str],
+        resolver: WaitDeadlockResolver | None,
+    ) -> str | None:
+        details = self.waiting_deadlock_details(component_nodes)
+        if details is None or resolver is None:
+            return None
+        queued_nodes, blockers = details
+        selected = resolver(tuple(component_nodes), queued_nodes, blockers)
+        if selected is None:
+            return None
+        if selected not in queued_nodes:
+            raise ValueError(
+                f"Waiting-deadlock resolver selected {selected!r}; choose one of "
+                f"{', '.join(queued_nodes)}"
+            )
+        return selected
+
     def run_component(
         self,
         component: set[str] | tuple[str, ...] | list[str],
         ignore_readiness: bool = False,
+        *,
+        wait_deadlock_resolver: WaitDeadlockResolver | None = None,
     ) -> list[str]:
         """Pump one Hoeflein component until it is quiescent.
 
         A waiting node is admitted only after every selected peer has no queued,
         running, or failed jobs. A pump that has already started is allowed to
         finish its current jobs; waiting is checked again before later admission.
+        An optional foreground resolver may select one queued node during an
+        all-waiting deadlock. That override ends when the selected pump drains,
+        after which ordinary waiting is recalculated from durable state.
         """
         component_set = set(component)
         if not component_set:
@@ -102,8 +174,14 @@ class ComponentSchedulerMixin:
                     blocking_nodes=blocking_nodes,
                 )
                 if not startable:
-                    self.refresh_component_status(component_set)
-                    return ran
+                    override = self._resolve_wait_deadlock(
+                        component_nodes,
+                        wait_deadlock_resolver,
+                    )
+                    if override is None:
+                        self.refresh_component_status(component_set)
+                        return ran
+                    startable = [override]
                 try:
                     for node_name in startable:
                         self.storage.set_node_status(node_name, RUNNING)
@@ -185,8 +263,21 @@ class ComponentSchedulerMixin:
                                 allow_complete=True,
                             )
                             return ran
-                        self.refresh_component_status(component_set)
-                        return ran
+
+                        override = self._resolve_wait_deadlock(
+                            component_nodes,
+                            wait_deadlock_resolver,
+                        )
+                        if override is None:
+                            self.refresh_component_status(component_set)
+                            return ran
+
+                        self.storage.set_node_status(override, RUNNING)
+                        future = executor.submit(run_node_worker, override)
+                        futures[future] = override
+                        active_nodes.add(override)
+                        future.add_done_callback(lambda _future: wake_event.set())
+                        continue
 
                     # Once every component member already owns a live pump, no
                     # durable job transition can make another node startable. Do
