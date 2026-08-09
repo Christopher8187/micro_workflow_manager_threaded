@@ -72,11 +72,7 @@ creating a new client per job. Every request needs finite connect/read timeouts.
 Pass a meaningful `wait_name`; the scheduler can then distinguish external wait
 from a frozen handler.
 
-Keep transport failure separate from semantic failure. When a request must return
-to task-level retry/fallback code even if the framework transport lease itself
-expires, opt that request into `recoverable_lease=True`; leave the default fatal
-lease in place when an overlong external wait should abandon the whole task
-attempt.
+Keep transport failure separate from semantic failure:
 
 - task retries handle transient transport/provider errors;
 - local parsing and validation reject malformed responses;

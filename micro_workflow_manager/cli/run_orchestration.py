@@ -47,7 +47,7 @@ def _interactive_wait_deadlock_resolver(workflow: MicroWorkflow):
                     answer = input(
                         "Node to run [number/name, q to leave blocked]: "
                     ).strip()
-                except (EOFError, OSError):
+                except EOFError:
                     print(
                         "No interactive input available; leaving the component blocked."
                     )
