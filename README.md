@@ -235,6 +235,13 @@ manager, and a Pygame state machine.
   `http2=` and `streams_per_connection=`. These settings choose a client for
   each in-flight request; they never cap job admission. Per-node `max_threads`
   remains the concurrency control.
+- Requests that must return a transport-lease expiry to task-level retry or
+  fallback logic may opt into `recoverable_lease=True` on
+  `shared_http_transport.request/post_json`. Checkpoint expiry stays suspended
+  during the external wait, total task timeout/restart fencing remain active,
+  and exhaustion of the HTTP budget plus cleanup grace raises
+  `httpx.ReadTimeout` back into the handler. The default lease remains fatal to
+  the task attempt.
 
 ### HTTP/2 connection sharding
 

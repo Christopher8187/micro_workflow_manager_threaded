@@ -138,3 +138,50 @@ def test_many_framework_network_waits_do_not_cascade_checkpoint_cancellations(tm
     counts = workflow.storage.node_job_summary("A")["counts"]
     assert counts.get("done") == 100
     assert counts.get("failed", 0) == 0
+
+
+def test_recoverable_transport_lease_returns_to_handler_instead_of_timing_out_job(tmp_path):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.2)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    close_shared_http_transport()
+    configure_shared_http_transport(transport=httpx.MockTransport(handler))
+    workflow = MicroWorkflow(tmp_path, runner="api")
+    workflow.graph([("A", "B")])
+    observed = []
+
+    @workflow.task("A", runner="api", max_threads=1, timeout=1.0, checkpoint_timeout=0.01)
+    def a(ctx):
+        ctx.checkpoint("before recoverable network wait", timeout=0.01)
+        try:
+            shared_http_transport.post_json(
+                "https://example.test/stuck",
+                timeout=0.01,
+                cleanup_grace=0.02,
+                recoverable_lease=True,
+                json={},
+                wait_name="recoverable model request",
+            )
+        except httpx.ReadTimeout as exc:
+            observed.append(str(exc))
+            ctx.checkpoint("fallback continues", timeout=0.05)
+            return "fallback-success"
+        raise AssertionError("recoverable transport lease did not fire")
+
+    @workflow.task("B")
+    def b(ctx):
+        return None
+
+    workflow.start("A", job_id=1)
+    started = time.monotonic()
+    try:
+        assert workflow.run_node("A", ignore_readiness=True) == ["fallback-success"]
+    finally:
+        close_shared_http_transport()
+
+    assert time.monotonic() - started < 0.15
+    assert observed and "recoverable transport lease" in observed[0]
+    counts = workflow.storage.node_job_summary("A")["counts"]
+    assert counts.get("done") == 1
+    assert counts.get("failed", 0) == 0

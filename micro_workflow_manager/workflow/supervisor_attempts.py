@@ -163,6 +163,7 @@ class SupervisorAttemptMixin:
         name: str,
         timeout: float | int,
         cleanup_grace: float = 30.0,
+        fatal_timeout: bool = True,
     ) -> None:
         """Suspend checkpoint expiry while a framework-managed network call is live.
 
@@ -174,6 +175,8 @@ class SupervisorAttemptMixin:
         assert timeout_value is not None
         grace = _validate_timeout(cleanup_grace, name="external wait cleanup grace")
         assert grace is not None
+        if type(fatal_timeout) is not bool:
+            raise ValueError("fatal_timeout must be a bool")
         now_value = monotonic()
         with self._condition:
             if watch.state != "active":
@@ -184,8 +187,18 @@ class SupervisorAttemptMixin:
             watch.external_wait_depth += 1
             watch.external_wait_name = str(name)
             watch.external_wait_timeout = timeout_value + grace
-            deadline = now_value + timeout_value + grace
-            watch.external_wait_deadline = max(watch.external_wait_deadline or 0.0, deadline)
+            if fatal_timeout:
+                deadline = now_value + timeout_value + grace
+                watch.external_wait_deadline = max(
+                    watch.external_wait_deadline or 0.0,
+                    deadline,
+                )
+            elif watch.external_wait_depth == 1:
+                # The transport itself owns this deadline and will raise back
+                # into user code. Keeping the watch in external-wait mode still
+                # suspends checkpoint expiry while preserving the task's total
+                # timeout and restart fencing.
+                watch.external_wait_deadline = None
             watch.revision += 1
             self._schedule_watch_locked(watch)
             self._compact_deadlines_locked()

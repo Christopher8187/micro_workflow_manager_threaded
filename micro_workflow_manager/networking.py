@@ -276,10 +276,20 @@ class SharedHTTPTransport:
         heartbeat_callback: Callable[[float], None] | None = None,
         heartbeat_interval: float = 15.0,
         wait_name: str | None = None,
+        recoverable_lease: bool = False,
+        cleanup_grace: float = 30.0,
         **kwargs: Any,
     ) -> httpx.Response:
+        if type(recoverable_lease) is not bool:
+            raise ValueError("recoverable_lease must be a bool")
+        cleanup_grace = float(cleanup_grace)
+        if cleanup_grace <= 0:
+            raise ValueError("cleanup_grace must be positive")
+
         timeout_obj = normalize_httpx_timeout(timeout)
         kwargs["timeout"] = timeout_obj
+        transport_budget = timeout_budget_seconds(timeout_obj)
+        lease_seconds = transport_budget + cleanup_grace
         future = _RUNTIME.submit(self._request(method, url, **kwargs))
         attempt = _CURRENT_NETWORK_ATTEMPT.get()
         if attempt is not None:
@@ -287,15 +297,36 @@ class SharedHTTPTransport:
             workflow.scheduler_supervisor.begin_external_wait(
                 watch,
                 name=wait_name or f"HTTP {method.upper()} {url}",
-                timeout=timeout_budget_seconds(timeout_obj),
+                timeout=transport_budget,
+                cleanup_grace=cleanup_grace,
+                fatal_timeout=not recoverable_lease,
             )
         started = time.monotonic()
+        lease_deadline = started + lease_seconds if recoverable_lease else None
         interval = max(0.1, float(heartbeat_interval))
         try:
             while True:
+                wait_timeout = interval if heartbeat_callback is not None else None
+                if lease_deadline is not None:
+                    remaining = lease_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise httpx.ReadTimeout(
+                            f"{wait_name or f'HTTP {method.upper()} {url}'} exceeded "
+                            f"its {lease_seconds:g}s recoverable transport lease"
+                        )
+                    wait_timeout = (
+                        remaining
+                        if wait_timeout is None
+                        else min(wait_timeout, remaining)
+                    )
                 try:
-                    return future.result(timeout=interval if heartbeat_callback else None)
+                    return future.result(timeout=wait_timeout)
                 except FutureTimeoutError:
+                    if lease_deadline is not None and time.monotonic() >= lease_deadline:
+                        raise httpx.ReadTimeout(
+                            f"{wait_name or f'HTTP {method.upper()} {url}'} exceeded "
+                            f"its {lease_seconds:g}s recoverable transport lease"
+                        )
                     if heartbeat_callback is not None:
                         heartbeat_callback(time.monotonic() - started)
         except BaseException:

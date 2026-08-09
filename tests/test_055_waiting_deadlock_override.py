@@ -288,3 +288,22 @@ def test_resume_declining_deadlock_override_leaves_component_blocked_once(
     assert output.count("Waiting deadlock in Hoeflein component {A, B, C}") == 1
     assert "Leaving the Hoeflein component blocked." in output
     assert "Stopped before these queued nodes became ready:" in output
+
+def test_unavailable_stdin_leaves_waiting_deadlock_blocked_instead_of_crashing(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _make_cli_project(tmp_path, monkeypatch, runner="threaded")
+    capsys.readouterr()
+
+    def unavailable(_prompt):
+        raise OSError("pytest-style captured stdin is unavailable")
+
+    monkeypatch.setattr("builtins.input", unavailable)
+    assert cli.main(["run", "A"]) == 1
+    output = capsys.readouterr().out
+    assert output.count("Waiting deadlock in Hoeflein component {A, B, C}") == 1
+    assert "No interactive input available; leaving the component blocked." in output
+    assert "Stopped before these queued nodes became ready:" in output
+
