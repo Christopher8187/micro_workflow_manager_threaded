@@ -183,7 +183,7 @@ class JobCleanupStorageMixin:
                 )
 
         if reset_count:
-            self.notify_queue_change()
+            self.notify_queue_changes(normalized)
         return reset_count
 
     def reset_jobs_for_run_batch(
@@ -256,7 +256,7 @@ class JobCleanupStorageMixin:
                     for job_id in existing
                 ],
             )
-        self.notify_queue_change()
+        self.notify_queue_change(node_name)
         return len(existing)
 
     def delete_node_jobs(

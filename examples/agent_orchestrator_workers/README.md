@@ -13,7 +13,7 @@ mwf inspect assemble_report job 1
 
 ## Architecture conventions
 
-This example uses the standard 0.5.1 source layout: the graph is declarative,
+This example uses the standard 0.5.2 source layout: the graph is declarative,
 node modules are thin, reusable logic/provenance belongs in `src/utils`, and
 workflow-owned data is written through MWF filesystem objects. For a
 production-shaped HTTP/API, fallback, fan-out/fan-in, and Hoeflein-component

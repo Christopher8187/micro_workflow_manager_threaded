@@ -1,7 +1,12 @@
-# Agent guide for micro-workflow-manager 0.5.1
+# Agent guide for micro-workflow-manager 0.5.3
 
-This file is the first resource an AI coding agent should read after opening the
-archive. It serves two purposes:
+This file is the first architecture/contributor resource an AI coding agent should
+read after opening the archive. **Before running tests, read
+[HOW_TO_TEST.md](HOW_TO_TEST.md).** That file is the authoritative executable
+test protocol, including the mandatory rule that ordinary tests run in a batch
+while each autostart-cycle test runs in its own fresh Python process.
+
+This file serves two purposes:
 
 1. guide the construction of a new MWF project; and
 2. protect the framework's scheduling, filesystem, and durability invariants
@@ -120,12 +125,6 @@ A downstream component does not start until external predecessor components are
 complete. Reason from component membership and producer component, not only raw
 edges.
 
-When every queued member of a Hoeflein component is blocked by `wait_for`,
-`mwf run` and `mwf runfrom` ask the operator which node should temporarily
-ignore waiting. That node drains once; then normal waiting is recalculated. Do
-not implement project-level bootstrap hacks for this case, and do not assume the
-override persists after the selected node pump exits.
-
 ### 6. Keep fallbacks source-aware and inspectable
 
 Use named `@router.fallback(...)` functions. Each fallback receives the prior
@@ -136,7 +135,7 @@ bypass a safety contract.
 
 ### 7. Make fresh preparation and deletion unambiguous
 
-MWF 0.5.1 separates execution from preparation:
+MWF 0.5.3 separates execution from preparation:
 
 ```bash
 mwf reset NODE --dry-run       # run preparation, no execution
@@ -216,20 +215,11 @@ When editing MWF itself, preserve these invariants:
 7. Exercise the CLI more than once and in dry-run/confirmation modes.
 8. Update README, command help, examples, and this file when behavior changes.
 
-Ordinary suite:
-
-```bash
-python -m pytest -q --ignore=tests/test_autostart_cycles.py
-```
-
-Run cyclic/autostart tests in fresh processes:
-
-```bash
-python -m pytest -q tests/test_autostart_cycles.py::test_runfrom_supports_self_and_mutual_autostart_cycles_before_downstream
-python -m pytest -q tests/test_autostart_cycles.py::test_threaded_diamond_cycle_spawns_100_seed_jobs_without_deadlock
-python -m pytest -q tests/test_autostart_cycles.py::test_threaded_ring_cycle_spawns_100_seed_jobs_without_deadlock
-python -m pytest -q tests/test_autostart_cycles.py::test_threaded_stochastic_game_engine_spawn_cycle_finishes
-```
+Exact commands and ordering are maintained in [HOW_TO_TEST.md](HOW_TO_TEST.md).
+The non-negotiable execution rule is: run the ordinary suite as a batch with
+`tests/test_autostart_cycles.py` excluded, then run **each listed autostart-cycle
+test as a separate pytest command/fresh Python process**. Never combine those
+cycle cases into one pytest invocation.
 
 Scheduling, fresh-preparation, cleanup, or provenance changes must also run:
 

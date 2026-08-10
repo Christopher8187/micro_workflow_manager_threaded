@@ -75,7 +75,7 @@ class JobCreationStorageMixin:
             job_kind=job.job_kind,
         )
         self.advance_job_sequence(job.node_name, job.job_id + 1)
-        self.notify_queue_change()
+        self.notify_queue_change(job.node_name)
 
     def commit_prepared_job_resolving_idempotency(
         self,
@@ -170,7 +170,7 @@ class JobCreationStorageMixin:
 
         result = self.submit_db_mutation(publish, priority=0)
         if result[0]:
-            self.notify_queue_change()
+            self.notify_queue_change(job.node_name)
         return result
 
     def create_auto_id_job(
@@ -317,7 +317,7 @@ class JobCreationStorageMixin:
             shutil.rmtree(staging_dir, ignore_errors=True)
 
         if created:
-            self.notify_queue_change()
+            self.notify_queue_change(node_name)
             return Job(
                 job_id=job_id,
                 node_name=node_name,

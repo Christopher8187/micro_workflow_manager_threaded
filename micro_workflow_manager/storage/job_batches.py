@@ -158,7 +158,7 @@ class JobBatchStorageMixin:
                 "updated_at=CURRENT_TIMESTAMP",
                 (node_name, QUEUED),
             )
-        self.notify_queue_change()
+        self.notify_queue_change(node_name)
         return jobs
 
     def commit_prepared_jobs_batch_resolving_idempotency(
@@ -291,7 +291,7 @@ class JobBatchStorageMixin:
                     (node_name, QUEUED),
                 )
         if commit_jobs:
-            self.notify_queue_change()
+            self.notify_queue_change(node_name)
         return commit_jobs, existing_by_key
 
     def create_jobs_batch(

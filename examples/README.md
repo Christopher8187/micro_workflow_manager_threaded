@@ -1,7 +1,7 @@
 # MWF example index
 
 Start with `agent_reference_architecture/` when building a new project. It shows
-the recommended 0.5.1 layout and combines pooled HTTP/API processing, validated
+the recommended 0.5.2 layout and combines pooled HTTP/API processing, validated
 agent responses, retries and named fallbacks, transactional fan-out, durable
 fan-in, provenance, and a bounded review/revise Hoeflein component.
 

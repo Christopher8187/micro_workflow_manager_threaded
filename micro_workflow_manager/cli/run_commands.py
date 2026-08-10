@@ -204,11 +204,21 @@ def resume_from(
     monitor: bool = False,
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
+    refuse_after_node: str | None = None,
 ) -> int:
     refuse_competing_run(workflow)
     start_component = workflow.component_for(node)
     components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
     nodes = [name for component in components for name in workflow.component_key(component)]
+    if refuse_after_node is not None:
+        refuse_component = workflow.component_for(refuse_after_node)
+        if workflow.component_id(refuse_component) not in {
+            workflow.component_id(component) for component in components
+        }:
+            raise RuntimeError(
+                f"refuseafter node {refuse_after_node!r} is not in the resumefrom "
+                f"selection starting at {node!r}"
+            )
     _recover_finished_before_resume(workflow, nodes)
     if not keep_trace:
         start_nodes = set(workflow.component_key(start_component))
@@ -237,4 +247,5 @@ def resume_from(
         monitor_interval=monitor_interval,
         prepare=prepare,
         require_start_queued=False,
+        refuse_after_node=refuse_after_node,
     )

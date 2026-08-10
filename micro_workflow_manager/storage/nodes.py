@@ -347,7 +347,8 @@ class NodeFileStorageMixin:
     def set_node_status(self, node_name: str, status: str):
         status = self.validate_node_status(status)
         node_name = self.validate_node_name(node_name)
-        with self.db_transaction() as connection:
+
+        def update(connection):
             connection.execute(
                 "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
                 "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
@@ -355,21 +356,31 @@ class NodeFileStorageMixin:
                 (node_name, status),
             )
 
+        # All project-local SQLite writes share the same mutation lane. A direct
+        # worker-thread node-status transaction can otherwise hold the write
+        # lock while that worker waits for a queued job-status mutation, leaving
+        # the single mutation writer waiting for the same lock. Resident
+        # Hoeflein pumps make that inversion reproducible under heavy feedback.
+        self.submit_db_mutation(update, priority=5)
+
     def set_node_statuses(self, statuses: dict[str, str]) -> None:
-        """Persist a component status snapshot with one SQLite commit."""
+        """Persist a component status snapshot through the mutation writer."""
         if not statuses:
             return
         rows = [
             (self.validate_node_name(node_name), self.validate_node_status(status))
             for node_name, status in statuses.items()
         ]
-        with self.db_transaction() as connection:
+
+        def update(connection):
             connection.executemany(
                 "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
                 "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
                 "updated_at=CURRENT_TIMESTAMP WHERE nodes.status IS NOT excluded.status",
                 rows,
             )
+
+        self.submit_db_mutation(update, priority=5)
 
     def get_node_status(self, node_name: str) -> str | None:
         row = self.db_connection().execute(

@@ -227,7 +227,7 @@ class JobQueryStorageMixin:
 
         self.submit_db_mutation(update)
         if status == QUEUED:
-            self.notify_queue_change()
+            self.notify_queue_change(node_name)
 
     def get_job_status(self, node_name: str, job_id: int) -> str | None:
         row = self.db_connection().execute(

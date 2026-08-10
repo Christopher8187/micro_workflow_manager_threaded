@@ -353,6 +353,19 @@ def build_parser() -> argparse.ArgumentParser:
         description=COMMAND_HELP_DESCRIPTIONS["resumefrom"],
     )
     resumefrom_cmd.add_argument("node", help="Start node for the resumed partial workflow.")
+    resumefrom_cmd.add_argument(
+        "refuse_mode",
+        nargs="?",
+        choices=("refuseafter",),
+        metavar="refuseafter",
+        help="Optional literal refuseafter followed by a stop-boundary node.",
+    )
+    resumefrom_cmd.add_argument(
+        "refuse_node",
+        nargs="?",
+        metavar="node",
+        help="Stop admitting new Hoeflein components after this node's component terminates.",
+    )
     resumefrom_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
     add_keeptrace_argument(resumefrom_cmd)
 

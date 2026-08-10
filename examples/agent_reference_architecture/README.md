@@ -1,6 +1,6 @@
 # Reference agent architecture
 
-This is the first example to copy for a new MWF 0.5.1 project. It demonstrates:
+This is the first example to copy for a new MWF 0.5.2 project. It demonstrates:
 
 - `runner="api"` nodes using the framework-owned pooled HTTP transport;
 - finite connect/read timeouts and deterministic offline behavior;

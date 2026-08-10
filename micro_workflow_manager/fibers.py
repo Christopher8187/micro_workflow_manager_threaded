@@ -616,6 +616,9 @@ class FiberRuntime:
                     # source once more before declaring the pump quiescent.
                     refill = pull_items(min(limit, MIN_ADMISSION_BURST, self.max_admission_burst))
                     if not refill:
+                        waiter = getattr(items, "wait_for_change", None)
+                        if callable(waiter) and waiter(self._next_wait_timeout() or self.poll_interval):
+                            continue
                         break
                     admission_burst = min(MIN_ADMISSION_BURST, self.max_admission_burst)
                     for position, item in enumerate(refill):

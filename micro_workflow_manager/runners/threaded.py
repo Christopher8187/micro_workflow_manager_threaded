@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from threading import Condition, Lock, Thread
 from typing import Callable, Iterable
 
@@ -26,6 +27,45 @@ class ThreadedRunner(BaseRunner):
     """
 
     prefers_preloaded_jobs = True
+    supports_refreshable_job_source = True
+    refreshable_only_when_live = True
+    # The scheduler wraps queued job objects in a bounded background prefetch
+    # source. Payload I/O therefore happens outside the worker source lock.
+    prefetches_job_bursts = True
+
+    def job_prefetch_workers(self) -> int:
+        import os
+        configured = os.environ.get("MWF_THREADED_JOB_PREFETCH_WORKERS")
+        if configured is None:
+            return 2
+        try:
+            value = int(configured)
+        except ValueError as error:
+            raise ValueError(
+                "MWF_THREADED_JOB_PREFETCH_WORKERS must be an integer >= 1"
+            ) from error
+        if value < 1:
+            raise ValueError(
+                "MWF_THREADED_JOB_PREFETCH_WORKERS must be an integer >= 1"
+            )
+        return min(value, 32)
+
+    def job_prefetch_batches(self) -> int:
+        import os
+        configured = os.environ.get("MWF_THREADED_JOB_PREFETCH_BATCHES")
+        if configured is None:
+            return self.job_prefetch_workers()
+        try:
+            value = int(configured)
+        except ValueError as error:
+            raise ValueError(
+                "MWF_THREADED_JOB_PREFETCH_BATCHES must be an integer >= 1"
+            ) from error
+        if value < 1:
+            raise ValueError(
+                "MWF_THREADED_JOB_PREFETCH_BATCHES must be an integer >= 1"
+            )
+        return min(value, 32)
 
     def __init__(
         self,
@@ -67,11 +107,15 @@ class ThreadedRunner(BaseRunner):
         known_count: int | None = None,
     ):
         iterator = iter(items)
-        source_lock = Lock()
+        source_pull = getattr(items, "pull", None)
+        source_wait = getattr(items, "wait_for_change", None)
+        source_condition = Condition()
         condition = Condition()
 
         desired = self.effective_limit()
         source_exhausted = False
+        source_loading = False
+        source_buffer = deque()
         stop = False
         next_item_index = 0
         next_worker_id = 0
@@ -80,18 +124,66 @@ class ThreadedRunner(BaseRunner):
         first_error: BaseException | None = None
 
         def take_item():
-            nonlocal source_exhausted, next_item_index
-            with source_lock:
-                if source_exhausted:
-                    return None
+            nonlocal source_exhausted, source_loading, next_item_index
+            while True:
+                with source_condition:
+                    if stop:
+                        return None
+                    if source_buffer:
+                        item = source_buffer.popleft()
+                        pair = (next_item_index, item)
+                        next_item_index += 1
+                        return pair
+                    if source_exhausted:
+                        return None
+                    if source_loading:
+                        source_condition.wait(self.poll_interval)
+                        continue
+                    source_loading = True
+
                 try:
-                    item = next(iterator)
-                except StopIteration:
-                    source_exhausted = True
-                    return None
-                pair = (next_item_index, item)
-                next_item_index += 1
-                return pair
+                    if callable(source_pull):
+                        # Pull one admission-sized batch outside the shared source
+                        # condition, then hand those already-loaded objects to
+                        # workers from a deque. This pays synchronization once per
+                        # batch rather than once per ``next()`` while still never
+                        # holding peers behind slow payload/filesystem I/O.
+                        loaded_batch = list(source_pull(64))
+                        while not loaded_batch and callable(source_wait) and not stop:
+                            if not source_wait(self.poll_interval):
+                                break
+                            if stop:
+                                break
+                            loaded_batch = list(source_pull(64))
+                        exhausted = not loaded_batch
+                    else:
+                        try:
+                            loaded_batch = [next(iterator)]
+                            exhausted = False
+                        except StopIteration:
+                            loaded_batch = []
+                            exhausted = True
+                except BaseException:
+                    # Never turn a payload-loader failure (notably EMFILE) into
+                    # a phantom job. Release peers waiting on the source
+                    # condition, then propagate the original exception so the
+                    # component scheduler can stop admission and join siblings.
+                    with source_condition:
+                        source_loading = False
+                        source_condition.notify_all()
+                    raise
+
+                with source_condition:
+                    source_loading = False
+                    if loaded_batch:
+                        source_buffer.extend(loaded_batch)
+                    elif exhausted:
+                        source_exhausted = True
+                    source_condition.notify_all()
+                    if source_buffer:
+                        continue
+                    if source_exhausted:
+                        return None
 
         def worker_loop(worker_id: int) -> None:
             nonlocal stop, first_error
@@ -105,7 +197,17 @@ class ThreadedRunner(BaseRunner):
                         if len(workers) > desired:
                             return
 
-                    pair = take_item()
+                    try:
+                        pair = take_item()
+                    except BaseException as error:
+                        with condition:
+                            if first_error is None:
+                                first_error = error
+                            stop = True
+                            condition.notify_all()
+                        with source_condition:
+                            source_condition.notify_all()
+                        return
                     if pair is None:
                         with condition:
                             condition.notify_all()
@@ -120,6 +222,8 @@ class ThreadedRunner(BaseRunner):
                                 first_error = error
                             stop = True
                             condition.notify_all()
+                        with source_condition:
+                            source_condition.notify_all()
                         return
 
                     with condition:

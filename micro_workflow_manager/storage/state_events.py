@@ -22,6 +22,8 @@ class StateEventStorageMixin:
 
     _state_listeners: dict[Path, set[Callable[[], None]]] = {}
     _state_listeners_guard = threading.Lock()
+    _queue_listeners: dict[tuple[Path, str], set[Callable[[], None]]] = {}
+    _queue_listeners_guard = threading.Lock()
 
     def _init_state_event_broker(self) -> None:
         self._state_cross_callbacks: set[Callable[[], None]] = set()
@@ -133,13 +135,60 @@ class StateEventStorageMixin:
                 pass
         self._broadcast_state_change()
 
-    # Queue subscriptions are retained as compatibility aliases.  Queue state is
-    # now one view of the lifecycle event stream rather than a separate signal.
-    def subscribe_queue_changes(self, callback: Callable[[], None]) -> Callable[[], None]:
-        return self.subscribe_state_changes(callback, local=True)
+    def subscribe_queue_changes(
+        self,
+        callback: Callable[[], None],
+        *,
+        node_name: str | None = None,
+    ) -> Callable[[], None]:
+        """Subscribe to queue publication, optionally for one node only.
 
-    def notify_queue_change(self) -> None:
+        A live Hoeflein component can contain many resident node pumps. Waking
+        every pump for every lifecycle transition creates a thundering herd of
+        empty SQLite queue probes. Node-scoped subscriptions wake only the pump
+        that can consume a newly queued job; the ordinary state broker remains
+        the durable/cross-process fallback for supervisors and diagnostics.
+        """
+        if node_name is None:
+            return self.subscribe_state_changes(callback, local=True)
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        node_name = self.validate_node_name(node_name)
+        key = (self.state_database_path(), node_name)
+        with self._queue_listeners_guard:
+            self._queue_listeners.setdefault(key, set()).add(callback)
+
+        def unsubscribe() -> None:
+            with self._queue_listeners_guard:
+                listeners = self._queue_listeners.get(key)
+                if listeners is not None:
+                    listeners.discard(callback)
+                    if not listeners:
+                        self._queue_listeners.pop(key, None)
+
+        return unsubscribe
+
+    def notify_queue_changes(self, node_names) -> None:
+        normalized = tuple({self.validate_node_name(name) for name in node_names})
+        path = self.state_database_path()
+        callbacks: set[Callable[[], None]] = set()
+        with self._queue_listeners_guard:
+            for node_name in normalized:
+                callbacks.update(self._queue_listeners.get((path, node_name), ()))
+        for callback in tuple(callbacks):
+            try:
+                callback()
+            except Exception:
+                pass
+        # Keep the pre-0.5.3 global state signal for monitors, supervisors and
+        # cross-process writers, but live node pumps no longer subscribe to it.
         self.notify_state_change()
+
+    def notify_queue_change(self, node_name: str | None = None) -> None:
+        if node_name is None:
+            self.notify_state_change()
+            return
+        self.notify_queue_changes((node_name,))
 
     def _subscriber_dir(self) -> Path:
         path = self.project_dir / ".mwf" / "state_subscribers"

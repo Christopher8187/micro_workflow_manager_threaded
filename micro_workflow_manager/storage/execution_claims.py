@@ -421,4 +421,4 @@ class JobExecutionClaimStorageMixin:
 
         changed = self.submit_db_mutation(release, priority=0)
         if changed:
-            self.notify_queue_change()
+            self.notify_queue_change(node_name)

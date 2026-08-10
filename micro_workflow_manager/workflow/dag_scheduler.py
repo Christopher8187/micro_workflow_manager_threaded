@@ -6,8 +6,10 @@ from typing import Callable
 
 from ..errors import InvalidGraphError
 from ..models import CANCELLED, FAILED, RUNNING, Job, now
-from ..storage.job_sources import PrefetchingQueuedJobObjectSource
-from .component_scheduler import WaitDeadlockResolver
+from ..storage.job_sources import (
+    LiveRefreshableQueuedJobObjectSource,
+    PrefetchingQueuedJobObjectSource,
+)
 
 
 @dataclass(slots=True)
@@ -68,6 +70,10 @@ class _ClaimedQueuedJobSource:
         hint = getattr(self.source, "remaining_hint", None)
         return None if not callable(hint) else hint()
 
+    def wait_for_change(self, timeout: float = 5.0) -> bool:
+        waiter = getattr(self.source, "wait_for_change", None)
+        return False if not callable(waiter) else bool(waiter(timeout))
+
 
 class _StoppingJobSource:
     """Stop a node pump from admitting more jobs after a component failure."""
@@ -101,6 +107,12 @@ class _StoppingJobSource:
         hint = getattr(self.source, "remaining_hint", None)
         return None if not callable(hint) else hint()
 
+    def wait_for_change(self, timeout: float = 5.0) -> bool:
+        if self.stop_event.is_set():
+            return False
+        waiter = getattr(self.source, "wait_for_change", None)
+        return False if not callable(waiter) else bool(waiter(timeout))
+
 
 class DagSchedulerMixin:
     def run(self):
@@ -128,7 +140,8 @@ class DagSchedulerMixin:
         *,
         refuse_after_component: tuple[str, ...] | None = None,
         refusal_event: Event | None = None,
-        wait_deadlock_resolver: WaitDeadlockResolver | None = None,
+        wait_deadlock_resolver=None,
+        wait_deadlock_blocked_components: set[tuple[str, ...]] | None = None,
     ) -> list[str]:
         """Run ready execution units concurrently.
 
@@ -167,8 +180,8 @@ class DagSchedulerMixin:
 
         max_workers = max(1, len(units))
         ran: list[str] = []
+        blocked_components = wait_deadlock_blocked_components if wait_deadlock_blocked_components is not None else set()
         in_flight: set[tuple[str, ...]] = set()
-        blocked_units: set[tuple[str, ...]] = set()
         futures = {}
         admission_stopped = False
 
@@ -188,7 +201,7 @@ class DagSchedulerMixin:
                     unit
                     for unit in units
                     if unit not in in_flight
-                    and unit not in blocked_units
+                    and unit not in blocked_components
                     and unit_ready(unit)
                 ]
 
@@ -197,7 +210,7 @@ class DagSchedulerMixin:
                         self.run_component,
                         set(unit),
                         True,
-                        wait_deadlock_resolver=wait_deadlock_resolver,
+                        wait_deadlock_resolver,
                     )
                     futures[future] = unit
                     in_flight.add(unit)
@@ -218,13 +231,6 @@ class DagSchedulerMixin:
 
                     try:
                         ran.extend(future.result())
-                        if self.component_wait_deadlocked(set(unit)):
-                            # The user declined the override (or no interactive
-                            # resolver was supplied). Do not resubmit the same
-                            # quiescent component in a tight waiting loop.
-                            blocked_units.add(unit)
-                        else:
-                            blocked_units.discard(unit)
                     except Exception:
                         for pending in futures:
                             pending.cancel()
@@ -253,6 +259,7 @@ class DagSchedulerMixin:
         ignore_readiness: bool = False,
         *,
         _stop_event: Event | None = None,
+        _live_until_event: Event | None = None,
     ):
         """Run all currently queued jobs for one node using a lazy job source."""
         if not ignore_readiness and not self.node_ready(node_name):
@@ -260,7 +267,7 @@ class DagSchedulerMixin:
 
         node = self.nodes[node_name]
 
-        if not self.storage.has_queued_jobs(node_name):
+        if not self.storage.has_queued_jobs(node_name) and _live_until_event is None:
             self.refresh_node_status(node_name, allow_complete=True)
             return []
 
@@ -270,21 +277,48 @@ class DagSchedulerMixin:
         refreshable = bool(
             getattr(runner, "supports_refreshable_job_source", False)
         )
+        if (
+            refreshable
+            and getattr(runner, "refreshable_only_when_live", False)
+            and _live_until_event is None
+        ):
+            # Ordinary DAG threaded nodes keep the original finite snapshot
+            # source. Refreshability is needed only for resident Hoeflein pumps;
+            # enabling it globally adds rowid/live-source overhead to fast DAG
+            # fan-out such as idimage -> merge/organize/... .
+            refreshable = False
         preloaded = bool(getattr(runner, "prefers_preloaded_jobs", False))
         if preloaded:
             job_source = self.storage.queued_job_object_source(
                 node_name,
                 refreshable=refreshable,
             )
-            if (
-                refreshable
-                and getattr(runner, "prefetches_job_bursts", False)
-                and getattr(runner, "startup_lanes", lambda: 1)() == 1
-            ):
-                job_source = PrefetchingQueuedJobObjectSource(
-                    self.storage,
-                    job_source,
+            if _live_until_event is not None:
+                if not refreshable:
+                    raise RuntimeError(
+                        f"runner for live Hoeflein node {node_name} does not support a refreshable job source"
+                    )
+                job_source = LiveRefreshableQueuedJobObjectSource(
+                    self.storage, job_source, _live_until_event
                 )
+            if getattr(runner, "prefetches_job_bursts", False):
+                # API runners retain their one-lane prefetch behavior. Threaded
+                # runners use a bounded multi-batch background loader so a
+                # worker never holds its shared source lock while 64 payload
+                # files are read from disk.
+                if not refreshable or getattr(runner, "startup_lanes", lambda: 1)() == 1:
+                    prefetch_workers = getattr(
+                        runner, "job_prefetch_workers", lambda: 1
+                    )()
+                    prefetch_batches = getattr(
+                        runner, "job_prefetch_batches", lambda: 1
+                    )()
+                    job_source = PrefetchingQueuedJobObjectSource(
+                        self.storage,
+                        job_source,
+                        prefetch_workers=prefetch_workers,
+                        prefetch_batches=prefetch_batches,
+                    )
             if (
                 refreshable
                 and self.active_job_restart_enabled
@@ -366,7 +400,8 @@ class DagSchedulerMixin:
             if callable(close_source):
                 close_source()
 
-        self.refresh_node_status(node_name, allow_complete=True)
+        if _live_until_event is None:
+            self.refresh_node_status(node_name, allow_complete=True)
 
         return result
 

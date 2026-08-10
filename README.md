@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.5.1
+# micro-workflow-manager 0.5.3
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -15,6 +15,18 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.5.3
+
+- Hoeflein components now keep every ordinary threaded/API member attached to a live, event-driven queue pump for the lifetime of the component. Temporary empty queues no longer tear down a member and turn internal feedback into a mini-DAG queue; explicit `wait_for` nodes remain phase-gated.
+- Threaded source advancement no longer holds peer workers behind payload I/O, and payload-loader failures such as `EMFILE` propagate as their original exception instead of creating a phantom `None` job.
+- Component failure is published only after all already-started member runners join. Output-backed terminal states are reconciled first and any remaining abandoned `running` leases are marked failed, so a failed Hoeflein component cannot retain ghost running jobs.
+- Retains 0.5.2 `resumefrom ... refuseafter ...`, automatic FD-limit raising, and bounded threaded payload prefetch.
+
+## What changed in 0.5.2
+
+- `mwf resumefrom START refuseafter BOUNDARY` now has the same inclusive Hoeflein-component admission boundary as `runfrom ... refuseafter ...`: the named boundary component may finish or fail, no new later component is admitted afterward, already-running parallel components are joined, and queued later work is retained for a future resume.
+- Retains the 0.5.1 threaded payload-prefetch and automatic open-file-limit improvements.
 
 ## What changed in 0.5.1
 
@@ -131,10 +143,6 @@ manager, and a Pygame state machine.
 - A waiting node now requires every selected peer to have zero queued, running,
   and failed jobs. The old queued-only cycle bootstrap has been removed, so the
   declared gate is never bypassed.
-- Foreground `run`, `runfrom`, `resume`, and `resumefrom` commands detect an
-  all-waiting Hoeflein deadlock and ask which queued node should temporarily
-  ignore waiting. The chosen node drains, the override is discarded, and the
-  normal waiting graph is recalculated; a remaining deadlock prompts again.
 
 ## What changed in 0.4.2
 
@@ -268,13 +276,9 @@ limit.
 - Waiting on a singleton DAG component is allowed but has no effect; CLI loading
   prints a reminder that ordinary DAG predecessor readiness is the available
   queue-independent mechanism.
-- Waiting declarations remain strict during ordinary scheduling. When `mwf run`
-  or `mwf runfrom` finds a component where every queued node is waiting on a
-  peer, the CLI lists the blocked nodes and asks which one to run temporarily.
-  The selected node drains, then the scheduler restores normal waiting checks.
-  If the recalculated component is still deadlocked, the same choice is offered
-  again. Choosing `q`, submitting a blank answer, or running noninteractively
-  leaves the component blocked without a scheduler resubmission loop.
+- Waiting declarations are strict. A mutually waiting set with blocked work on
+  every side remains waiting until a restart, resume, or producer action clears
+  the declared queued/running/failed conditions.
 
 ### Waiting-node example
 
@@ -296,8 +300,6 @@ router = NodeRouter(
 Waiting is a node-pump admission rule, not a job-status rewrite. Jobs stay
 `queued` in SQLite so reset/resume semantics remain unchanged; `mwf monitor`
 shows the node lifecycle state as `waiting` and includes `waiting_on` in JSON.
-The interactive override changes only one admission decision: it does not edit
-`wait_for`, job statuses, graph structure, or future scheduling policy.
 
 ## What changed in 0.3.15
 
@@ -1638,28 +1640,18 @@ python -m pip uninstall micro-workflow-manager
 
 ## Run tests
 
-[AGENT.md](AGENT.md) is the authoritative testing and diagnosis protocol for automated contributors. It requires focused reproduction, repeat-use testing, concurrency and timeout experiments, and explicit freeze analysis before changing scheduler semantics.
+**Read [HOW_TO_TEST.md](HOW_TO_TEST.md) before running the suite.** It is the
+authoritative test execution order for this repository. In particular:
 
-Run the ordinary suite without combining the timing-sensitive cyclic tests:
+- ordinary tests are run together as a batch with
+  `tests/test_autostart_cycles.py` excluded;
+- every test in `tests/test_autostart_cycles.py` listed by the runbook is run in
+  its **own fresh pytest/Python process** and must not be combined; and
+- the marked long stress test is run explicitly.
 
-```bash
-python -m pytest -q --ignore=tests/test_autostart_cycles.py
-```
-
-Run every cyclic-autostart test in its own process with an extended outer timeout:
-
-```bash
-python -m pytest -q tests/test_autostart_cycles.py::test_runfrom_supports_self_and_mutual_autostart_cycles_before_downstream
-python -m pytest -q tests/test_autostart_cycles.py::test_threaded_diamond_cycle_spawns_100_seed_jobs_without_deadlock
-python -m pytest -q tests/test_autostart_cycles.py::test_threaded_ring_cycle_spawns_100_seed_jobs_without_deadlock
-python -m pytest -q tests/test_autostart_cycles.py::test_threaded_stochastic_game_engine_spawn_cycle_finishes
-```
-
-Run the marked long stress test explicitly:
-
-```bash
-python -m pytest -q -m stress tests/test_markov_chain_stress.py
-```
+[AGENT.md](AGENT.md) contains the broader contributor and diagnosis protocol,
+but agents must use `HOW_TO_TEST.md` for the exact release-verification
+commands and ordering.
 
 ## Checkpoint API
 

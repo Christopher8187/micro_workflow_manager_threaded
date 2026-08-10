@@ -26,6 +26,7 @@ from .deploy import deploy_command
 from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs
 from .validation import require_node
 from .node_clipboard import copy_node_to_clipboard, paste_node_from_clipboard
+from .resource_limits import raise_open_file_limit
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,6 +40,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command is None:
             parser.print_help()
             return 0
+
+        if args.command in {"run", "runfrom", "resume", "resumefrom"} and not getattr(args, "plan", False):
+            raise_open_file_limit()
 
         if args.command == "init":
             return init_project(args.archive)
@@ -258,6 +262,14 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.command == "resumefrom":
+            if (args.refuse_mode is None) != (args.refuse_node is None):
+                raise RuntimeError(
+                    "Use: mwf resumefrom <node> [refuseafter <node>] [--keeptrace]"
+                )
+            refuse_after_node = None
+            if args.refuse_node is not None:
+                refuse_after_node = safe_node_name(args.refuse_node)
+                require_node(workflow, refuse_after_node)
             if args.plan:
                 return print_run_plan(
                     root,
@@ -265,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
                     command="resumefrom",
                     node=node,
                     keep_trace=args.keeptrace,
+                    refuse_after_node=refuse_after_node,
                 )
             return resume_from(
                 root,
@@ -275,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
                 monitor=args.monitor,
                 monitor_interval=args.monitor_interval,
                 keep_trace=args.keeptrace,
+                refuse_after_node=refuse_after_node,
             )
 
     except Exception as error:

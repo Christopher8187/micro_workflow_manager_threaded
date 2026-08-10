@@ -59,7 +59,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Register output-backed finished jobs, then continue unsuccessful or queued work for one node without resetting done or skipped jobs.",
     "runfrom": "Reset and run one node and its descendants; optional refuseafter stops later component admission without shrinking the reset scope.",
-    "resumefrom": "Continue unsuccessful or queued work from one node through its descendants; the start trace is preserved and descendant traces clear unless --keeptrace is used.",
+    "resumefrom": "Continue unsuccessful or queued work from one node through its descendants; optional refuseafter stops later component admission without discarding queued work.",
     "monitor": "Show live or one-shot node/job statistics without running task code; completed sequences report active run: none.",
     "top": "Show event-driven htop-style scheduler, latency, process, database, and mutation-writer diagnostics.",
 }
@@ -305,10 +305,7 @@ snapshot is emitted after the run record becomes terminal, so it reports
 
 A basic task might choose a random integer, double it, or call ctx.sleep(1). Run
 uses the configured threaded, API, process, or direct runner and refuses to start if
-another CLI sequence already owns the project. If all queued members of the
-selected Hoeflein component are mutually waiting, the CLI asks which node should
-temporarily override waiting until its queue drains, then recalculates normally.
-To preserve completed work after
+another CLI sequence already owns the project. To preserve completed work after
 a failure, use resume rather than run. Fresh runs clear affected trace journals
 unless `--keeptrace` is supplied.
 """,
@@ -403,9 +400,7 @@ rerun. Resume always preserves the selected current component's trace journal;
 Runfrom is the fresh-run form for one Hoeflein component and its quotient-DAG
 descendants. Naming any member selects the whole component. It deletes only jobs
 produced by selected components, preserves jobs produced by other branches, and
-then schedules the selected branch in dependency order. If every queued node in
-a selected Hoeflein component is waiting on a peer, the CLI asks which node to
-run temporarily; after that node drains, ordinary waiting is recalculated.
+then schedules the selected branch in dependency order.
 
 For A -> B -> C:
   mwf runfrom A --plan
@@ -434,11 +429,17 @@ normal command after a partial runfrom failure.
 For A -> B -> C:
   mwf resumefrom A --plan
   mwf resumefrom A
+  mwf resumefrom A refuseafter B
+  mwf resumefrom A refuseafter B --keeptrace
 
 If A is done, one B job failed, and C has not run yet, resumefrom preserves A,
-reruns the failed B job, and then allows C to continue when B completes. It does not perform producer-component cleanup and therefore preserves every
-existing successful descendant job. The start Hoeflein component's trace is
-always preserved. Descendant trace journals are cleared before the resume unless
+reruns the failed B job, and then allows C to continue when B completes. With
+`refuseafter B`, B's whole Hoeflein component is still allowed to terminate, but
+no new later component is admitted afterward; already-running parallel
+components are joined and later work remains queued for a future resume. It does
+not perform producer-component cleanup and therefore preserves every existing
+successful descendant job. The start Hoeflein component's trace is always
+preserved. Descendant trace journals are cleared before the resume unless
 `--keeptrace` is supplied.
 """,
     "top": """

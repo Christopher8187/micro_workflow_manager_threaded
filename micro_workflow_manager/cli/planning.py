@@ -71,7 +71,7 @@ def print_run_plan(
     if refuse_after_node is not None:
         if refuse_after_node not in nodes:
             raise RuntimeError(
-                f"refuseafter node {refuse_after_node!r} is not in the runfrom "
+                f"refuseafter node {refuse_after_node!r} is not in the {command} "
                 f"selection starting at {node!r}"
             )
         boundary = workflow.component_key(workflow.component_for(refuse_after_node))
@@ -79,7 +79,10 @@ def print_run_plan(
             "  refusal boundary: stop admitting new components after "
             f"{{{', '.join(boundary)}}} terminates"
         )
-        print("  reset scope: unchanged; every selected runfrom component is still freshened")
+        if command == "runfrom":
+            print("  reset scope: unchanged; every selected runfrom component is still freshened")
+        else:
+            print("  resume scope: unchanged; later selected work remains queued for a future resume")
     if command == "resume":
         trace_mode = "preserve the current component trace journal"
     elif command == "resumefrom" and not keep_trace:
