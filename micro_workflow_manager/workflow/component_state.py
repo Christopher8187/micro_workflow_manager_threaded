@@ -293,7 +293,14 @@ class ComponentStateMixin:
             return
         self.storage.set_node_status(node_name, QUEUED)
 
-    def finalize_ready_nodes(self):
+    def finalize_ready_nodes(self, skip_components=None):
+        # This method runs after every completed concurrent DAG unit. The old
+        # implementation reread predecessor state and rewrote already-terminal
+        # siblings on every pass, turning a 20-way fan-out into O(width^2) node
+        # status traffic. One bulk snapshot preserves the same readiness rule
+        # while terminal components become true no-ops.
+        statuses = self.storage.get_node_statuses(self.graph_obj.nodes)
+        skipped = {tuple(key) for key in (skip_components or ())}
         seen: set[tuple[str, ...]] = set()
         for node_name in self.graph_obj.nodes:
             component = self.component_for(node_name)
@@ -301,8 +308,19 @@ class ComponentStateMixin:
             if key in seen:
                 continue
             seen.add(key)
-            if self.component_ready(component):
+            # An in-flight unit owns its own lifecycle publication. Refreshing
+            # it from the outer DAG loop only rewrites RUNNING while siblings
+            # finish, producing O(width^2) status traffic.
+            if key in skipped:
+                continue
+            if all(statuses.get(name) in NODE_COMPLETE_STATUSES for name in component):
+                continue
+            predecessors = self.component_predecessors(component)
+            if all(statuses.get(name) in NODE_COMPLETE_STATUSES for name in predecessors):
                 self.refresh_component_status(component, allow_complete=True)
+                # A refresh can make a later component ready during this same
+                # pass. Keep the snapshot coherent without rereading every node.
+                statuses.update(self.storage.get_node_statuses(component))
 
     def ready_nodes(self) -> list[str]:
         self.finalize_ready_nodes()

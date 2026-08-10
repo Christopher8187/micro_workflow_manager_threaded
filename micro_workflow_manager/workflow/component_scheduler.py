@@ -175,8 +175,11 @@ class ComponentSchedulerMixin:
                     startable = [override]
                 try:
                     for node_name in startable:
-                        self.storage.set_node_status(node_name, RUNNING)
-                        self.run_queued_node_jobs(node_name, ignore_readiness=True)
+                        self.run_queued_node_jobs(
+                            node_name,
+                            ignore_readiness=True,
+                            _defer_final_status_refresh=True,
+                        )
                         ran.append(node_name)
                 except Exception:
                     self.mark_component_failed(component_set)
@@ -223,6 +226,7 @@ class ComponentSchedulerMixin:
                         True,
                         _stop_event=stop_event,
                         _live_until_event=(stop_event if node_name in live_nodes else None),
+                        _defer_final_status_refresh=True,
                     )
                 finally:
                     self.storage.close_thread_connection()
@@ -235,7 +239,6 @@ class ComponentSchedulerMixin:
             def submit_node(node_name: str) -> None:
                 if node_name in active_nodes or stop_event.is_set():
                     return
-                self.storage.set_node_status(node_name, RUNNING)
                 future = executor.submit(run_node_worker, node_name)
                 futures[future] = node_name
                 active_nodes.add(node_name)

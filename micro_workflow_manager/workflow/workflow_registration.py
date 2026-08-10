@@ -33,13 +33,15 @@ class WorkflowRegistrationMixin:
         This is similar in spirit to FastAPI's app.include_router(...).
         """
         if isinstance(router, NodeRouter):
-            router_id = id(router)
-
-            if router_id in self._included_router_ids:
+            # Keep the router object itself alive and deduplicate by identity.
+            # Storing only ``id(router)`` allows CPython to recycle an id after
+            # a short-lived programmatic router is garbage-collected, which can
+            # silently skip a later distinct router in wide generated fan-outs.
+            if router in self._included_routers:
                 return router
 
             router.mount_to(self)
-            self._included_router_ids.add(router_id)
+            self._included_routers.add(router)
             return router
 
         found = routers_from_module(router)

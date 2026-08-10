@@ -33,6 +33,8 @@ class ExecutionClaimBatch:
     pid: int
     thread_id: int
     event_time: str
+    task_started_data: dict[str, Any] | None = None
+    task_started_mask: tuple[bool, ...] | None = None
 
     @property
     def mutation_weight(self) -> int:
@@ -68,11 +70,9 @@ class JobExecutionClaimStorageMixin:
     def _apply_runtime_updates(connection, updates: list[RuntimeUpdate]):
         if not updates:
             return []
-        node_name = updates[0].node_name
-        if any(update.node_name != node_name for update in updates):
-            raise RuntimeError("runtime mutation group contains multiple nodes")
-
-        # Runtime rows are observability metadata, not execution ownership. Fence
+        # Runtime rows are observability metadata, not execution ownership.
+        # Keep each node in its own mutation group. Cross-node runtime grouping
+        # was benchmarked for wide fan-out and did not improve throughput. Fence
         # every queued write to the generation and execution that produced it so
         # an asynchronous API checkpoint/completion can never overwrite a later
         # restart. One executemany also avoids a savepoint and transaction unit per
@@ -81,9 +81,12 @@ class JobExecutionClaimStorageMixin:
         # API call can enqueue both ``running`` and ``completed`` before the
         # writer reaches this priority class; persisting the intermediate value
         # adds work without improving inspection.
-        latest_by_attempt: dict[tuple[int, int, str | None], RuntimeUpdate] = {}
+        latest_by_attempt: dict[
+            tuple[str, int, int, str | None], RuntimeUpdate
+        ] = {}
         for update in updates:
             latest_by_attempt[(
+                update.node_name,
                 update.job_id,
                 update.generation,
                 update.execution_id,
@@ -242,7 +245,11 @@ class JobExecutionClaimStorageMixin:
                 continue
 
             results = []
-            for job_id, execution_id in zip(batch.job_ids, batch.execution_ids):
+            mask = batch.task_started_mask
+            if mask is not None and len(mask) != len(batch.job_ids):
+                outcomes.append((False, ValueError("task_started_mask length mismatch")))
+                continue
+            for index, (job_id, execution_id) in enumerate(zip(batch.job_ids, batch.execution_ids)):
                 row = node_rows[job_id]
                 generation = int(row["generation"])
                 previous_status = str(row["status"])
@@ -270,6 +277,7 @@ class JobExecutionClaimStorageMixin:
                         batch.node_name,
                         job_id,
                         batch.event_time,
+                        "started",
                         json.dumps(
                             {
                                 "previous_status": previous_status,
@@ -281,6 +289,24 @@ class JobExecutionClaimStorageMixin:
                         ),
                     )
                 )
+                record_task_started = (
+                    batch.task_started_data is not None
+                    and (mask is None or mask[index])
+                )
+                if record_task_started:
+                    events.append(
+                        (
+                            batch.node_name,
+                            job_id,
+                            batch.event_time,
+                            "task_started",
+                            json.dumps(
+                                batch.task_started_data,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    )
                 results.append((generation, execution_id))
             outcomes.append((True, results))
 
@@ -295,7 +321,7 @@ class JobExecutionClaimStorageMixin:
             )
             connection.executemany(
                 "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
-                "VALUES(?, ?, ?, 'started', ?)",
+                "VALUES(?, ?, ?, ?, ?)",
                 events,
             )
         return outcomes
@@ -352,6 +378,8 @@ class JobExecutionClaimStorageMixin:
         *,
         started_at: str,
         priority: int = 10,
+        task_started_data: dict[str, Any] | None = None,
+        task_started_mask: list[bool] | tuple[bool, ...] | None = None,
     ) -> list[tuple[int, str]]:
         """Claim one preloaded API admission burst in one state mutation."""
         node_name = self.validate_node_name(node_name)
@@ -368,6 +396,12 @@ class JobExecutionClaimStorageMixin:
             pid=os.getpid(),
             thread_id=get_ident(),
             event_time=datetime.now().isoformat(timespec="milliseconds"),
+            task_started_data=(dict(task_started_data) if task_started_data is not None else None),
+            task_started_mask=(
+                tuple(bool(value) for value in task_started_mask)
+                if task_started_mask is not None
+                else None
+            ),
         )
         return self.submit_grouped_db_mutation(
             ("execution-claims", priority),

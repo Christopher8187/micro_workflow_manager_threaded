@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.5.3
+# micro-workflow-manager 0.5.4
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -11,10 +11,21 @@ user-owned provenance that makes the result easier to debug and improve. Useful
 provenance includes the relevant inputs, algorithm/model/tool choice, attempt or
 fallback, validation evidence, and important parameters. Framework diagnostics in `.mwf/state.sqlite3` explain scheduler behavior and are shown by `mwf inspect`; they do not replace domain provenance written by the project.
 
+See [HOW_TO_TEST.md](HOW_TO_TEST.md) for the authoritative release-test order, including separate autostart-cycle processes and the localhost HTTP performance matrix.
+
 See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.5.4
+
+- High-concurrency API admission records the first valid main-task `task_started` event in the existing grouped execution-claim transaction instead of submitting one extra synchronous SQLite mutation per job. Malformed jobs with missing required parameters retain the old trace semantics and are not falsely marked task-started.
+- Wide DAG finalization now bulk-reads node status, skips already-terminal and in-flight sibling components, and gives component execution one owner for `RUNNING`/`DONE` publication. This removes repeated sibling status rewrites as fan-out width grows into tens of nodes.
+- HTTP/1.1 shared transport now uses elastic 16-connection client shards by default; HTTP/2 keeps its stream-per-connection behavior unchanged. The localhost benchmark measured about 3.55x higher H1 runner throughput at 512 concurrent requests versus the previous 100-connection shards.
+- `include_router()` retains router objects instead of remembering only `id(router)`, preventing CPython object-id reuse from silently skipping short-lived programmatically generated routers in wide fan-outs.
+- Adds a real localhost HTTP delay/throttle service and a three-axis fan-out benchmark over concurrency, per-response transfer rate, and fan-out node count. See `HOW_TO_TEST.md` and `HTTP_FANOUT_BENCHMARKS_054.md`.
+- Retains all 0.5.3 Hoeflein live-pump, clean failure/join, EMFILE, threaded prefetch, FD-limit and `resumefrom ... refuseafter ...` behavior.
 
 ## What changed in 0.5.3
 

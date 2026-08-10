@@ -406,7 +406,7 @@ def test_active_run_state_contains_ownership_and_heartbeat(tmp_path, monkeypatch
     assert state["hostname"]
     assert state["pid"] > 0
     assert state["heartbeat_at"]
-    assert state["mwf_version"] == "0.5.3"
+    assert state["mwf_version"] == "0.5.4"
     assert state["status"] == "done"
 
 

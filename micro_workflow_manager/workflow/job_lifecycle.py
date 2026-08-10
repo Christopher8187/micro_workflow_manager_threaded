@@ -68,6 +68,7 @@ class JobLifecycleMixin:
         job_id: int,
         *,
         preloaded_job: Job | None = None,
+        defer_node_status_refresh: bool = False,
     ):
         """Run a job through the original low-overhead execution path.
 
@@ -121,7 +122,10 @@ class JobLifecycleMixin:
                 duration_seconds=round(perf_counter() - started_perf, 6),
             )
 
-            if self.storage.get_node_status(node_name) != RUNNING:
+            if (
+                not defer_node_status_refresh
+                and self.storage.get_node_status(node_name) != RUNNING
+            ):
                 self.refresh_node_status(node_name, allow_complete=False)
             return result
 
@@ -141,7 +145,10 @@ class JobLifecycleMixin:
                 duration_seconds=round(perf_counter() - started_perf, 6),
             )
 
-            if self.storage.get_node_status(node_name) != RUNNING:
+            if (
+                not defer_node_status_refresh
+                and self.storage.get_node_status(node_name) != RUNNING
+            ):
                 self.refresh_node_status(node_name, allow_complete=False)
             raise JobFailedError(f"Job {node_name}/{job_id} failed") from error
 
@@ -153,6 +160,8 @@ class JobLifecycleMixin:
         *,
         _preloaded_job: Job | None = None,
         _preclaimed_execution: tuple[int, str, str, float] | None = None,
+        _task_started_pre_recorded: bool = False,
+        _defer_node_status_refresh: bool = False,
     ):
         if not ignore_readiness and not self.node_ready(node_name):
             raise InvalidGraphError(f"Node {node_name} is not ready yet")
@@ -166,6 +175,7 @@ class JobLifecycleMixin:
                 node_name,
                 job_id,
                 preloaded_job=_preloaded_job,
+                defer_node_status_refresh=_defer_node_status_refresh,
             )
 
         # The runner worker is now the attempt controller. It invokes the
@@ -175,6 +185,7 @@ class JobLifecycleMixin:
         # generation while the stale handler remains fenced.
         preloaded_job = _preloaded_job
         preclaimed_execution = _preclaimed_execution
+        task_started_pre_recorded = bool(_task_started_pre_recorded)
         claim_priority = (
             5 if (node.runner_override or self.runner) == "threaded" else 10
         )
@@ -206,9 +217,11 @@ class JobLifecycleMixin:
                     job,
                     execution_generation=generation,
                     execution_id=execution_id,
+                    first_task_started_pre_recorded=task_started_pre_recorded,
                 )
                 outcome_kind, payload = "result", result
             except JobRestartedError as error:
+                task_started_pre_recorded = False
                 self.scheduler_supervisor.cancel_execution(
                     node_name,
                     job_id,
@@ -224,6 +237,10 @@ class JobLifecycleMixin:
                 continue
             except BaseException as error:
                 outcome_kind, payload = "error", error
+            finally:
+                # The pre-recorded event belongs only to the initial preclaimed
+                # main-task attempt. Any replacement generation records its own.
+                task_started_pre_recorded = False
 
             try:
                 if outcome_kind == "result":
@@ -292,7 +309,10 @@ class JobLifecycleMixin:
                 )
                 continue
 
-            if self.storage.get_node_status(node_name) != RUNNING:
+            if (
+                not _defer_node_status_refresh
+                and self.storage.get_node_status(node_name) != RUNNING
+            ):
                 self.refresh_node_status(node_name, allow_complete=False)
 
             if outcome_kind == "result":

@@ -1,6 +1,6 @@
 # How to test micro-workflow-manager
 
-This is the **authoritative execution order for testing MWF 0.5.3**.
+This is the **authoritative execution order for testing MWF 0.5.4**.
 
 AI coding agents and human contributors should follow this file before declaring a
 framework change verified. The important distinction is:
@@ -78,10 +78,45 @@ Some agent/container harnesses terminate one command before the full ordinary
 suite can finish. In that case, do **not** fall back to one test file at a time.
 Run these multi-file batches, each in one pytest process:
 
+The numbered suite is intentionally split into **two multi-file batches** in
+short-horizon agent harnesses. Do not replace these with one-file-at-a-time runs.
+
 ```bash
 python -m pytest -q \
   examples/agent_reference_architecture/tests/test_smoke.py \
-  tests/test_0*.py
+  tests/test_030_runtime_updates.py \
+  tests/test_031_inspect_failed_and_examples.py \
+  tests/test_033_filter_icons_design.py \
+  tests/test_034_sqlite_api_runner.py \
+  tests/test_036_hoeflein_scheduling.py \
+  tests/test_037_advisory_lock_recovery.py \
+  tests/test_038_fresh_resume_restart_semantics.py \
+  tests/test_039_sqlite_contention_recovery.py \
+  tests/test_040_high_fanout_batching.py \
+  tests/test_041_live_component_pumping.py \
+  tests/test_042_cooperative_api_scaling.py \
+  tests/test_043_waiting_nodes.py \
+  tests/test_043_watchdog_networking.py \
+  tests/test_044_queue_transport_scaling.py \
+  tests/test_045_terminal_recovery.py \
+  tests/test_046_module_boundaries.py \
+  tests/test_046_resume_restart_wait.py \
+  tests/test_047_event_state_top.py \
+  tests/test_048_ghost_free_admission.py \
+  tests/test_049_job_trace.py \
+  tests/test_050_windows_process_signal_safety.py \
+  tests/test_051_refuseafter_trace_retention.py \
+  tests/test_052_sqlite_finalizer_reentrancy.py \
+  tests/test_053_windows_extended_paths.py
+```
+
+```bash
+python -m pytest -q \
+  tests/test_054_destructive_preparation_commands.py \
+  tests/test_055_threaded_prefetch_and_nofile.py \
+  tests/test_056_resumefrom_refuseafter_052.py \
+  tests/test_057_hoeflein_live_sync_053.py \
+  tests/test_058_http_fanout_scaling_054.py
 ```
 
 ```bash
@@ -169,11 +204,122 @@ run these focused files together as a batch (they may already have run in step
 python -m pytest -q \
   tests/test_036_hoeflein_scheduling.py \
   tests/test_038_fresh_resume_restart_semantics.py \
-  tests/test_cli_help_and_clean_wipe.py
+  tests/test_cli_help_and_clean_wipe.py \
+  tests/test_055_threaded_prefetch_and_nofile.py \
+  tests/test_056_resumefrom_refuseafter_052.py \
+  tests/test_057_hoeflein_live_sync_053.py \
+  tests/test_058_http_fanout_scaling_054.py
 ```
 
 If the change has its own new regression file, run that focused file first,
 then still complete steps 1-4.
+
+
+## Local HTTP delay/throttle benchmark (required for networking or high-concurrency scheduler changes)
+
+MWF ships a local service so performance work never depends on a paid provider or
+a public test endpoint. Run it in a **separate terminal/process** from the
+benchmark. The service uses real TCP sockets; HTTP/2 mode generates a temporary
+one-day localhost certificate with `openssl`.
+
+HTTP/2 (closest to Kaicenat/OpenRouter):
+
+```bash
+python benchmarks/local_http_delay_server.py --port 8766 --http2
+```
+
+HTTP/1.1 control:
+
+```bash
+python benchmarks/local_http_delay_server.py --port 8765
+```
+
+The endpoint is `/transfer?bytes=65536&bps=262144&delay_ms=5&chunk=4096`.
+`bps=0` means unlimited. Throttling is per response/HTTP2 stream.
+
+Run the benchmark from the repository root with the repository on `PYTHONPATH`:
+
+```bash
+PYTHONPATH="$PWD" python benchmarks/benchmark_http_fanout_matrix.py \
+  --endpoint https://127.0.0.1:8766 --http2 \
+  --mode workflow --concurrency 32 --fanout-nodes 4 --jobs 64 \
+  --response-bytes 65536 --bytes-per-second 262144 --delay-ms 5 --repeats 3
+```
+
+`--repeats 3` prints each sample and a median summary. Use medians for comparisons.
+The three modes must be understood before diagnosing a bottleneck:
+
+- `transport`: direct httpx, no MWF runner/storage;
+- `runner`: MWF ApiRunner + shared transport, no SQLite/filesystem workflow;
+- `workflow`: full durable MWF DAG/lifecycle/restart path.
+
+### Benchmark exploration order
+
+**Start low first** to verify the harness and locate the transfer-bound edge:
+
+```bash
+for mode in transport runner workflow; do
+  for rate in 0 262144 65536; do
+    PYTHONPATH="$PWD" python benchmarks/benchmark_http_fanout_matrix.py \
+      --endpoint https://127.0.0.1:8766 --http2 --mode "$mode" \
+      --concurrency 32 --fanout-nodes 4 --jobs 64 --response-bytes 65536 \
+      --bytes-per-second "$rate" --delay-ms 5 --repeats 3
+  done
+done
+```
+
+Then hold transfer fast and sweep **fan-out width**:
+
+```bash
+PYTHONPATH="$PWD" python benchmarks/benchmark_http_fanout_matrix.py \
+  --endpoint https://127.0.0.1:8766 --http2 --mode workflow --matrix \
+  --concurrencies 512 --fanout-node-counts 1,4,10,20 \
+  --transfer-rates 0 --jobs 1024 --response-bytes 1024 --delay-ms 5 --repeats 3
+```
+
+Then hold width at 20 and push **aggregate concurrency** into the thousands:
+
+```bash
+PYTHONPATH="$PWD" python benchmarks/benchmark_http_fanout_matrix.py \
+  --endpoint https://127.0.0.1:8766 --http2 --mode workflow --matrix \
+  --concurrencies 128,512,1024,2048 --fanout-node-counts 20 \
+  --transfer-rates 0 --response-bytes 1024 --delay-ms 5 --repeats 3
+```
+
+For the three-dimensional transfer/width/concurrency map, use staged grids rather
+than one enormous command so a harness outer timeout does not destroy every
+sample. A representative grid is:
+
+```bash
+PYTHONPATH="$PWD" python benchmarks/benchmark_http_fanout_matrix.py \
+  --endpoint https://127.0.0.1:8766 --http2 --mode workflow --matrix \
+  --concurrencies 128,512 --fanout-node-counts 1,10,20 \
+  --transfer-rates 0,262144,65536 --response-bytes 65536 --delay-ms 5 \
+  --jsonl benchmark-results.jsonl
+```
+
+Run the 2048-concurrency cells separately with an extended outer timeout and a
+fresh local service. If the **transport/runner controls also collapse**, the
+local HTTP stack/service/data movement is part of the limit; do not label that
+as framework overhead. If runner remains fast while workflow collapses, inspect
+SQLite mutation backlog, job lifecycle events, node-status writes and FDs.
+
+A deliberate near-edge cell used for 0.5.4 is 2048 concurrency, 20 nodes and
+4096 small jobs (about 205 jobs/node). Do not start there. Dial upward only after
+32/128/512 cells are healthy.
+
+HTTP/1.1 shard control:
+
+```bash
+PYTHONPATH="$PWD" python benchmarks/benchmark_http_fanout_matrix.py \
+  --endpoint http://127.0.0.1:8765 --mode runner --concurrency 512 \
+  --fanout-nodes 1 --jobs 1024 --response-bytes 1024 --delay-ms 5 \
+  --streams-per-connection 100 --http1-connections-per-shard 16 --repeats 3
+```
+
+See `HTTP_FANOUT_BENCHMARKS_054.md` for the measured 0.5.3/0.5.4 region map and
+why the final fixes were selected. Benchmark passes **do not replace** the
+correctness/release tests below.
 
 ## 6. Release/archive verification
 

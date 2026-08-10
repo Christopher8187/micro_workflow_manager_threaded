@@ -53,7 +53,7 @@ class MicroWorkflow(
         self.autostart_edges: set[tuple[str, str]] = set()
         self.nodes: dict[str, JobNode] = {}
         self.lock = RLock()
-        self._included_router_ids: set[int] = set()
+        self._included_routers: set[object] = set()
         self.scheduler_supervisor = SchedulerSupervisor(self)
 
         # Runtime max_threads overrides are local testing controls stored in

@@ -1,4 +1,4 @@
-# Agent guide for micro-workflow-manager 0.5.3
+# Agent guide for micro-workflow-manager 0.5.4
 
 This file is the first architecture/contributor resource an AI coding agent should
 read after opening the archive. **Before running tests, read
@@ -135,7 +135,7 @@ bypass a safety contract.
 
 ### 7. Make fresh preparation and deletion unambiguous
 
-MWF 0.5.3 separates execution from preparation:
+MWF 0.5.4 separates execution from preparation:
 
 ```bash
 mwf reset NODE --dry-run       # run preparation, no execution

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -78,24 +79,49 @@ class _AsyncHTTPRuntime:
         self._client_kwargs: dict[str, Any] = {}
         self._http2 = False
         self._streams_per_connection = 100
+        self._http1_connections_per_shard = 16
 
     def configure(
         self,
         *,
         http2: bool = False,
         streams_per_connection: int = 100,
+        http1_connections_per_shard: int | None = None,
         **client_kwargs: Any,
     ) -> None:
         if type(http2) is not bool:
             raise ValueError("http2 must be a bool")
         if type(streams_per_connection) is not int or streams_per_connection < 1:
             raise ValueError("streams_per_connection must be an integer >= 1")
+        if http1_connections_per_shard is None:
+            raw_http1_shard = os.getenv("MWF_HTTP1_CONNECTIONS_PER_SHARD", "16")
+            try:
+                http1_connections_per_shard = int(raw_http1_shard)
+            except ValueError as error:
+                raise ValueError(
+                    "MWF_HTTP1_CONNECTIONS_PER_SHARD must be an integer >= 1"
+                ) from error
+        if (
+            type(http1_connections_per_shard) is not int
+            or http1_connections_per_shard < 1
+        ):
+            raise ValueError("http1_connections_per_shard must be an integer >= 1")
         with self._lock:
             if self._clients:
                 raise RuntimeError("shared HTTP client is already active")
             self._client_kwargs = dict(client_kwargs)
             self._http2 = http2
             self._streams_per_connection = streams_per_connection
+            self._http1_connections_per_shard = http1_connections_per_shard
+
+    def _shard_capacity(self) -> int:
+        if self._http2:
+            return self._streams_per_connection
+        # Large HTTP/1.1 pools become connection-management bottlenecks long
+        # before the cooperative fiber runtime is saturated. Keep each pool
+        # small and open additional client shards elastically instead of
+        # forcing hundreds of sockets through one httpx connection pool.
+        return min(self._streams_per_connection, self._http1_connections_per_shard)
 
     def _thread_main(self) -> None:
         loop = asyncio.new_event_loop()
@@ -144,9 +170,10 @@ class _AsyncHTTPRuntime:
                     keepalive_expiry=60.0,
                 )
             else:
+                shard_capacity = self._shard_capacity()
                 kwargs["limits"] = httpx.Limits(
-                    max_connections=self._streams_per_connection,
-                    max_keepalive_connections=self._streams_per_connection,
+                    max_connections=shard_capacity,
+                    max_keepalive_connections=shard_capacity,
                     keepalive_expiry=60.0,
                 )
         shard = _ClientShard(httpx.AsyncClient(**kwargs))
@@ -156,11 +183,12 @@ class _AsyncHTTPRuntime:
     async def acquire_client(self) -> _ClientShard:
         # All calls run on the one transport event loop, so allocation and
         # counters do not need a cross-thread lock.
+        shard_capacity = self._shard_capacity()
         shard = next(
             (
                 candidate
                 for candidate in self._clients
-                if candidate.in_flight < self._streams_per_connection
+                if candidate.in_flight < shard_capacity
             ),
             None,
         )
@@ -193,6 +221,8 @@ class _AsyncHTTPRuntime:
         return {
             "http2": self._http2,
             "streams_per_connection": self._streams_per_connection,
+            "shard_capacity": self._shard_capacity(),
+            "http1_connections_per_shard": self._http1_connections_per_shard,
             "client_count": len(self._clients),
             "in_flight": sum(shard.in_flight for shard in self._clients),
             "peak_in_flight_per_client": [
@@ -208,6 +238,8 @@ class _AsyncHTTPRuntime:
                 return {
                     "http2": self._http2,
                     "streams_per_connection": self._streams_per_connection,
+                    "shard_capacity": self._shard_capacity(),
+                    "http1_connections_per_shard": self._http1_connections_per_shard,
                     "client_count": 0,
                     "in_flight": 0,
                     "peak_in_flight_per_client": [],
@@ -242,17 +274,22 @@ def configure_shared_http_transport(
     *,
     http2: bool = False,
     streams_per_connection: int = 100,
+    http1_connections_per_shard: int | None = None,
     **client_kwargs: Any,
 ) -> None:
     """Configure connection sharding without imposing workflow concurrency.
 
     ``max_threads`` on each API node remains the only job admission limit. This
     setting merely starts another HTTP client/connection whenever all existing
-    clients already carry ``streams_per_connection`` in-flight requests.
+    shards are full. HTTP/2 uses ``streams_per_connection`` directly. HTTP/1.1
+    deliberately keeps each httpx pool smaller (16 connections by default) and
+    adds shards elastically; override with ``http1_connections_per_shard`` or
+    ``MWF_HTTP1_CONNECTIONS_PER_SHARD``.
     """
     _RUNTIME.configure(
         http2=http2,
         streams_per_connection=streams_per_connection,
+        http1_connections_per_shard=http1_connections_per_shard,
         **client_kwargs,
     )
 

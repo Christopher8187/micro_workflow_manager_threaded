@@ -389,6 +389,23 @@ class NodeFileStorageMixin:
         ).fetchone()
         return None if row is None else row["status"]
 
+    def get_node_statuses(self, node_names) -> dict[str, str]:
+        """Read many node lifecycle states with one bounded SQLite query set."""
+        normalized = sorted({self.validate_node_name(name) for name in node_names})
+        if not normalized:
+            return {}
+        result: dict[str, str] = {}
+        connection = self.db_connection()
+        for offset in range(0, len(normalized), 500):
+            chunk = normalized[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = connection.execute(
+                f"SELECT node_name, status FROM nodes WHERE node_name IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            result.update({str(row["node_name"]): str(row["status"]) for row in rows})
+        return result
+
     def write_debug(self, node_name: str, message: str):
         from datetime import datetime
 

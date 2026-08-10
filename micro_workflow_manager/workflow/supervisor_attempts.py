@@ -48,47 +48,74 @@ class SupervisorAttemptMixin:
             default_checkpoint_timeout=checkpoint_timeout,
             force_abandonable=bool(force_abandonable),
         )
-        if total_timeout is not None:
-            watch.total_deadline = watch.started_monotonic + total_timeout
         if checkpoint_timeout is not None:
             watch.checkpoint_timeout = checkpoint_timeout
-            watch.checkpoint_at = watch.started_at
             watch.checkpoint_name = "task start"
-            watch.checkpoint_deadline = watch.started_monotonic + checkpoint_timeout
 
         with self._condition:
             self._watches[watch.key] = watch
             if watch.execution_id is not None:
                 self._restartable_keys.add(watch.key)
                 self._ensure_restart_event_subscription_locked()
+        # Do not arm timeout/checkpoint deadlines until the user handler is
+        # actually about to execute. Dense admission can spend measurable time
+        # in framework-owned trace/runtime bookkeeping; charging that time to a
+        # short user checkpoint budget creates false timeouts before line 1.
+        with self._condition:
+            if watch.supervised or watch.force_abandonable:
+                self._ensure_thread_locked()
+                self._condition.notify_all()
+        return watch
+
+    def begin_handler_execution(self, watch: AttemptWatch) -> None:
+        """Arm attempt deadlines immediately before invoking user code."""
+        if watch.state != "active":
+            error = self.timeout_error(watch) or self.execution_cancel_error(watch)
+            if error is not None:
+                raise error
+            return
+
+        # Prepare/persist the initial runtime row before the deadline is exposed
+        # to the supervisor. The grouped API write is asynchronous in a fiber;
+        # direct/thread/process callers retain synchronous inspect visibility.
         if watch.supervised:
-            # API controllers share one cooperative pump. Waiting synchronously
-            # for one runtime-row write per job serializes admission and lets
-            # already-completed provider responses become invisible "ghosts"
-            # until an entire legacy dense admission wave has started. Runtime metadata is
-            # generation-fenced in storage, so API writes can be grouped and
-            # asynchronous while direct/thread/process inspection stays durable.
+            provisional = monotonic()
+            watch.started_monotonic = provisional
+            if watch.total_timeout is not None:
+                watch.total_deadline = provisional + watch.total_timeout
+            if watch.checkpoint_timeout is not None:
+                watch.checkpoint_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                watch.checkpoint_name = "task start"
+                watch.checkpoint_deadline = provisional + watch.checkpoint_timeout
             self._persist_runtime(
                 watch,
                 state="running",
                 wait=not in_fiber_runtime(),
                 priority=20 if in_fiber_runtime() else 10,
             )
-            watch.started_monotonic = monotonic()
-            if watch.total_timeout is not None:
-                watch.total_deadline = watch.started_monotonic + watch.total_timeout
-            if watch.checkpoint_timeout is not None:
-                watch.checkpoint_deadline = (
-                    watch.started_monotonic + watch.checkpoint_timeout
-                )
+
+        now_value = monotonic()
+        now_text = datetime.now().astimezone().isoformat(timespec="milliseconds")
         with self._condition:
+            if watch.state != "active":
+                error = self.timeout_error(watch) or self.execution_cancel_error(watch)
+                if error is not None:
+                    raise error
+                return
+            watch.started_monotonic = now_value
+            watch.started_at = now_text
+            if watch.total_timeout is not None:
+                watch.total_deadline = now_value + watch.total_timeout
+            if watch.checkpoint_timeout is not None:
+                watch.checkpoint_at = now_text
+                watch.checkpoint_name = "task start"
+                watch.checkpoint_deadline = now_value + watch.checkpoint_timeout
+            watch.revision += 1
             if watch.supervised:
                 self._schedule_watch_locked(watch)
                 self._compact_deadlines_locked()
-            if watch.supervised or watch.force_abandonable:
                 self._ensure_thread_locked()
                 self._condition.notify_all()
-        return watch
 
     def report_checkpoint(
         self,

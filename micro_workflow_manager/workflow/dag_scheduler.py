@@ -1,117 +1,14 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
-from time import perf_counter
 from threading import Event
 from typing import Callable
 
 from ..errors import InvalidGraphError
-from ..models import CANCELLED, FAILED, RUNNING, Job, now
+from ..models import CANCELLED, FAILED, RUNNING, Job
+from .admission_sources import ClaimedJob, ClaimedQueuedJobSource, StoppingJobSource
 from ..storage.job_sources import (
     LiveRefreshableQueuedJobObjectSource,
     PrefetchingQueuedJobObjectSource,
 )
-
-
-@dataclass(slots=True)
-class _ClaimedJob:
-    storage: object
-    job: Job
-    generation: int
-    execution_id: str
-    started_at: str
-    started_perf: float
-
-    def abandon_unstarted(self) -> None:
-        self.storage.release_unstarted_job_execution(
-            self.job.node_name,
-            self.job.job_id,
-            self.generation,
-            self.execution_id,
-        )
-
-
-class _ClaimedQueuedJobSource:
-    """Preload and claim each refreshable API admission burst atomically."""
-
-    def __init__(self, storage, node_name: str, source):
-        self.storage = storage
-        self.node_name = node_name
-        self.source = source
-
-    def pull(self, max_items: int) -> list[_ClaimedJob]:
-        jobs = self.source.pull(max_items)
-        if not jobs:
-            return []
-        started_at = now()
-        started_perf = perf_counter()
-        leases = self.storage.claim_job_executions_batch(
-            self.node_name,
-            [job.job_id for job in jobs],
-            started_at=started_at,
-        )
-        return [
-            _ClaimedJob(
-                storage=self.storage,
-                job=job,
-                generation=generation,
-                execution_id=execution_id,
-                started_at=started_at,
-                started_perf=started_perf,
-            )
-            for job, (generation, execution_id) in zip(jobs, leases)
-        ]
-
-    def close(self):
-        close = getattr(self.source, "close", None)
-        if callable(close):
-            close()
-
-    def remaining_hint(self):
-        hint = getattr(self.source, "remaining_hint", None)
-        return None if not callable(hint) else hint()
-
-    def wait_for_change(self, timeout: float = 5.0) -> bool:
-        waiter = getattr(self.source, "wait_for_change", None)
-        return False if not callable(waiter) else bool(waiter(timeout))
-
-
-class _StoppingJobSource:
-    """Stop a node pump from admitting more jobs after a component failure."""
-
-    def __init__(self, source, stop_event: Event):
-        self.source = source
-        self.stop_event = stop_event
-
-    def pull(self, max_items: int):
-        if self.stop_event.is_set():
-            return []
-        pull = getattr(self.source, "pull", None)
-        if not callable(pull):
-            raise TypeError("wrapped source does not support pull")
-        return pull(max_items)
-
-    def __iter__(self):
-        for item in self.source:
-            if self.stop_event.is_set():
-                return
-            yield item
-
-    def close(self):
-        close = getattr(self.source, "close", None)
-        if callable(close):
-            close()
-
-    def remaining_hint(self):
-        if self.stop_event.is_set():
-            return 0
-        hint = getattr(self.source, "remaining_hint", None)
-        return None if not callable(hint) else hint()
-
-    def wait_for_change(self, timeout: float = 5.0) -> bool:
-        if self.stop_event.is_set():
-            return False
-        waiter = getattr(self.source, "wait_for_change", None)
-        return False if not callable(waiter) else bool(waiter(timeout))
 
 
 class DagSchedulerMixin:
@@ -190,7 +87,7 @@ class DagSchedulerMixin:
             thread_name_prefix="mwf-unit",
         ) as executor:
             while True:
-                self.finalize_ready_nodes()
+                self.finalize_ready_nodes(skip_components=in_flight)
 
                 if not admission_stopped and refusal_target_terminal():
                     admission_stopped = True
@@ -260,6 +157,7 @@ class DagSchedulerMixin:
         *,
         _stop_event: Event | None = None,
         _live_until_event: Event | None = None,
+        _defer_final_status_refresh: bool = False,
     ):
         """Run all currently queued jobs for one node using a lazy job source."""
         if not ignore_readiness and not self.node_ready(node_name):
@@ -324,10 +222,23 @@ class DagSchedulerMixin:
                 and self.active_job_restart_enabled
                 and getattr(runner, "preclaims_job_bursts", False)
             ):
-                job_source = _ClaimedQueuedJobSource(
+                main_task = self.nodes[node_name].main_task
+                task_started_data = None
+                if main_task is not None:
+                    task_started_data = {
+                        "task": main_task.name,
+                        "task_role": "main",
+                        "attempt": 1,
+                        "repeat_index": 1,
+                        "previous_error": None,
+                    }
+                job_source = ClaimedQueuedJobSource(
                     self.storage,
                     node_name,
                     job_source,
+                    task_started_data=task_started_data,
+                    required_params=(main_task.required_params if main_task is not None else None),
+                    allowed_params=(main_task.allowed_params if main_task is not None else None),
                 )
         elif refreshable:
             job_source = self.storage.queued_job_source(node_name)
@@ -335,7 +246,7 @@ class DagSchedulerMixin:
             job_source = self.storage.iter_queued_job_ids(node_name)
 
         if _stop_event is not None:
-            job_source = _StoppingJobSource(job_source, _stop_event)
+            job_source = StoppingJobSource(job_source, _stop_event)
 
         def run_source_item(item):
             # A sibling node may fail after this item was pulled but before its
@@ -348,7 +259,7 @@ class DagSchedulerMixin:
                 return None
 
             try:
-                if isinstance(item, _ClaimedJob):
+                if isinstance(item, ClaimedJob):
                     return self.run_job(
                         node_name=item.job.node_name,
                         job_id=item.job.job_id,
@@ -360,6 +271,8 @@ class DagSchedulerMixin:
                             item.started_at,
                             item.started_perf,
                         ),
+                        _task_started_pre_recorded=item.task_started_recorded,
+                        _defer_node_status_refresh=True,
                     )
                 if isinstance(item, Job):
                     return self.run_job(
@@ -367,11 +280,13 @@ class DagSchedulerMixin:
                         job_id=item.job_id,
                         ignore_readiness=True,
                         _preloaded_job=item,
+                        _defer_node_status_refresh=True,
                     )
                 return self.run_job(
                     node_name=node_name,
                     job_id=item,
                     ignore_readiness=True,
+                    _defer_node_status_refresh=True,
                 )
             except BaseException:
                 # The failed job has already published its terminal state.
@@ -400,7 +315,7 @@ class DagSchedulerMixin:
             if callable(close_source):
                 close_source()
 
-        if _live_until_event is None:
+        if _live_until_event is None and not _defer_final_status_refresh:
             self.refresh_node_status(node_name, allow_complete=True)
 
         return result
@@ -439,6 +354,7 @@ class DagSchedulerMixin:
                     job_id=job.job_id,
                     ignore_readiness=True,
                     _preloaded_job=job,
+                    _defer_node_status_refresh=True,
                 ),
             )
 

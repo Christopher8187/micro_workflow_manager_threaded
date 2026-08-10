@@ -61,6 +61,7 @@ class MountedTaskExecutionMixin:
                 ctx.raise_if_cancelled()
             try:
                 with cancellation_scope(check_cancelled), network_attempt_context(self, ctx, watch):
+                    supervisor.begin_handler_execution(watch)
                     result = self._call_mounted_handler(mounted, ctx, params)
                 check_cancelled()
             except BaseException as error:
@@ -81,6 +82,7 @@ class MountedTaskExecutionMixin:
 
         if not watch.abandonable:
             try:
+                supervisor.begin_handler_execution(watch)
                 result = self._call_mounted_handler(mounted, ctx, params)
             except BaseException as error:
                 supervisor.finish_attempt(watch, state="failed", error=error)
@@ -93,6 +95,7 @@ class MountedTaskExecutionMixin:
 
         def target():
             try:
+                supervisor.begin_handler_execution(watch)
                 outcomes.put(("result", self._call_mounted_handler(mounted, ctx, params)))
             except BaseException as error:
                 outcomes.put(("error", error))
@@ -135,6 +138,7 @@ class MountedTaskExecutionMixin:
         *,
         execution_generation: int,
         execution_id: str | None,
+        first_task_started_pre_recorded: bool = False,
     ):
         node = self.nodes[job.node_name]
         assert node.main_task is not None
@@ -146,6 +150,7 @@ class MountedTaskExecutionMixin:
                 execution_generation=execution_generation,
                 execution_id=execution_id,
                 task_role="main",
+                first_task_started_pre_recorded=first_task_started_pre_recorded,
             )
 
         except JobRestartedError:
@@ -216,6 +221,7 @@ class MountedTaskExecutionMixin:
         execution_generation: int,
         execution_id: str | None,
         task_role: str = "main",
+        first_task_started_pre_recorded: bool = False,
     ):
         attempts = mounted.retries + 1
         all_results = []
@@ -242,6 +248,31 @@ class MountedTaskExecutionMixin:
                     if missing:
                         raise InvalidJobError(
                             f"Missing params for {job.node_name}.{mounted.name}: {missing}"
+                        )
+
+                    # Publish framework trace bookkeeping before starting the
+                    # checkpoint watch. A strict checkpoint timeout must measure
+                    # user-handler progress, not time spent waiting for MWF's own
+                    # SQLite task_started event under a large admission wave.
+                    if not (
+                        first_task_started_pre_recorded
+                        and task_role == "main"
+                        and attempt == 1
+                        and repeat_index == 1
+                    ):
+                        self.storage.append_job_event(
+                            job.node_name,
+                            job.job_id,
+                            "task_started",
+                            task=mounted.name,
+                            task_role=task_role,
+                            attempt=attempt,
+                            repeat_index=repeat_index,
+                            previous_error=(
+                                repr(previous_error)
+                                if previous_error is not None
+                                else None
+                            ),
                         )
 
                     cancellation_event = Event()
@@ -273,16 +304,6 @@ class MountedTaskExecutionMixin:
                         cancellation_event=cancellation_event,
                         attempt_watch=watch,
                         task_role=task_role,
-                    )
-                    self.storage.append_job_event(
-                        job.node_name,
-                        job.job_id,
-                        "task_started",
-                        task=mounted.name,
-                        task_role=task_role,
-                        attempt=attempt,
-                        repeat_index=repeat_index,
-                        previous_error=repr(previous_error) if previous_error is not None else None,
                     )
 
                     result = self._invoke_handler_with_timeout(
