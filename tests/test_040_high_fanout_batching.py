@@ -169,7 +169,7 @@ def test_schema_v1_upgrade_preserves_jobs_and_initializes_sequences(tmp_path):
     try:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone()[0] == "3"
+        ).fetchone()[0] == "4"
     finally:
         connection.close()
 

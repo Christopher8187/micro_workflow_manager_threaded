@@ -1,0 +1,9 @@
+{
+  "environment_note": "Observed during the 2026-08-11 local HTTP/2 prototype pass; 22 nodes, 6000 jobs, 512 proportional slots, 4 KiB responses, unlimited bandwidth, 5 ms server delay.",
+  "cells": [
+    {"architecture":"direct","mode":"runner","elapsed_seconds":9.544,"jobs_per_second_total":628.7,"throughput_ratio_big_to_small":19.743,"network_send_delay_p99_seconds":0.60899,"network_receive_delay_p99_seconds":0.00289,"ingress_wakeups_per_request":1.0},
+    {"architecture":"manager","mode":"runner","elapsed_seconds":8.963,"jobs_per_second_total":669.4,"throughput_ratio_big_to_small":19.882,"network_send_delay_p99_seconds":0.15243,"network_receive_delay_p99_seconds":0.00242,"ingress_wakeups_per_request":0.349},
+    {"architecture":"direct","mode":"workflow","elapsed_seconds":18.869,"jobs_per_second_total":318.0,"throughput_ratio_big_to_small":11.685,"network_send_delay_p99_seconds":0.2092,"network_receive_delay_p99_seconds":1.17521,"persisted_network_nodes":22,"ingress_wakeups_per_request":1.0},
+    {"architecture":"manager","mode":"workflow","elapsed_seconds":17.724866098,"jobs_per_second_total":338.5074938,"throughput_ratio_big_to_small":13.15846445,"network_send_delay_p99_seconds":0.233595744,"network_send_delay_max_seconds":0.246604285,"network_receive_delay_p99_seconds":0.960058009,"network_receive_delay_max_seconds":1.07394657,"persisted_network_nodes":22,"ingress_wakeups_per_request":0.0496666667}
+  ]
+}

@@ -89,13 +89,14 @@ async def h1_transfer(writer, total_bytes, bps, delay_ms, chunk_size):
     started = asyncio.get_running_loop().time()
     while sent < total_bytes:
         amount = min(len(chunk), total_bytes - sent)
+        if bps:
+            release_at = started + (sent + amount) / bps
+            remaining = release_at - asyncio.get_running_loop().time()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
         writer.write(chunk[:amount])
         sent += amount
         await writer.drain()
-        if bps and sent < total_bytes:
-            remaining = started + sent / bps - asyncio.get_running_loop().time()
-            if remaining > 0:
-                await asyncio.sleep(remaining)
 
 
 async def handle_h1(reader, writer):
@@ -142,14 +143,17 @@ class H2Session:
 
     async def flush_locked(self):
         data = self.conn.data_to_send()
-        if data:
-            self.writer.write(data)
-            await self.writer.drain()
+        if not data:
+            return False
+        self.writer.write(data)
+        return True
 
     async def headers(self, stream_id, headers, end_stream=False):
         async with self.lock:
             self.conn.send_headers(stream_id, headers, end_stream=end_stream)
-            await self.flush_locked()
+            queued = await self.flush_locked()
+        if queued:
+            await self.writer.drain()
 
     async def data(self, stream_id, payload, end_stream=False):
         offset = 0
@@ -164,14 +168,24 @@ class H2Session:
                     final = end_stream and offset + amount == len(payload)
                     self.conn.send_data(stream_id, payload[offset:offset + amount], end_stream=final)
                     offset += amount
-                    await self.flush_locked()
-                    continue
-                self.flow_event.clear()
-            await self.flow_event.wait()
+                    queued = await self.flush_locked()
+                else:
+                    queued = False
+                    self.flow_event.clear()
+            if amount:
+                if queued:
+                    await self.writer.drain()
+                continue
+            try:
+                await asyncio.wait_for(self.flow_event.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
         if not payload and end_stream:
             async with self.lock:
                 self.conn.end_stream(stream_id)
-                await self.flush_locked()
+                queued = await self.flush_locked()
+            if queued:
+                await self.writer.drain()
 
     async def serve_stream(self, stream_id, target):
         kind, values = parse_target(target)
@@ -202,18 +216,21 @@ class H2Session:
         started = asyncio.get_running_loop().time()
         while sent < total:
             amount = min(len(chunk), total - sent)
-            await self.data(stream_id, chunk[:amount], end_stream=(sent + amount == total))
-            sent += amount
-            if bps and sent < total:
-                remaining = started + sent / bps - asyncio.get_running_loop().time()
+            if bps:
+                release_at = started + (sent + amount) / bps
+                remaining = release_at - asyncio.get_running_loop().time()
                 if remaining > 0:
                     await asyncio.sleep(remaining)
+            await self.data(stream_id, chunk[:amount], end_stream=(sent + amount == total))
+            sent += amount
 
     async def run(self):
         from h2.events import DataReceived, RequestReceived, StreamEnded, WindowUpdated
         self.conn.initiate_connection()
         async with self.lock:
-            await self.flush_locked()
+            queued = await self.flush_locked()
+        if queued:
+            await self.writer.drain()
         targets = {}
         try:
             while True:
@@ -229,7 +246,9 @@ class H2Session:
                             targets[event.stream_id] = dict(event.headers).get(":path", "/")
                         elif isinstance(event, WindowUpdated):
                             self.flow_event.set()
-                    await self.flush_locked()
+                    queued = await self.flush_locked()
+                if queued:
+                    await self.writer.drain()
                 for event in events:
                     if isinstance(event, StreamEnded):
                         task = asyncio.create_task(self.serve_stream(event.stream_id, targets.pop(event.stream_id, "/")))

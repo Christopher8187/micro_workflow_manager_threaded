@@ -1,4 +1,4 @@
-# Agent guide for micro-workflow-manager 0.5.4
+# Agent guide for micro-workflow-manager 0.5.6
 
 This file is the first architecture/contributor resource an AI coding agent should
 read after opening the archive. **Before running tests, read

@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 
-DATABASE_SCHEMA_VERSION = 3
+DATABASE_SCHEMA_VERSION = 4
 
 
 class SQLiteSchemaMixin:
@@ -21,6 +21,7 @@ class SQLiteSchemaMixin:
             "default_job_specs",
             "advisory_locks",
             "job_sequences",
+            "network_state",
         }
         try:
             # WAL keeps monitor/inspect readers from blocking the scheduler's
@@ -137,6 +138,22 @@ class SQLiteSchemaMixin:
                     CREATE TABLE IF NOT EXISTS job_sequences (
                         node_name TEXT PRIMARY KEY,
                         next_job_id INTEGER NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS network_state (
+                        node_name TEXT PRIMARY KEY,
+                        submitted INTEGER NOT NULL DEFAULT 0,
+                        dispatched INTEGER NOT NULL DEFAULT 0,
+                        completed INTEGER NOT NULL DEFAULT 0,
+                        failed INTEGER NOT NULL DEFAULT 0,
+                        bytes_received INTEGER NOT NULL DEFAULT 0,
+                        in_flight INTEGER NOT NULL DEFAULT 0,
+                        peak_in_flight INTEGER NOT NULL DEFAULT 0,
+                        max_ingress_delay_seconds REAL NOT NULL DEFAULT 0,
+                        max_request_seconds REAL NOT NULL DEFAULT 0,
+                        average_request_seconds REAL NOT NULL DEFAULT 0,
+                        last_error TEXT,
+                        updated_at REAL NOT NULL DEFAULT 0
                     );
                     """
                 )

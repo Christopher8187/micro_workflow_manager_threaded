@@ -548,7 +548,16 @@ class FiberRuntime:
                 if type(limit) is not int or limit < 0:
                     raise ValueError("runtime API lane concurrency must be an integer >= 0")
                 capacity = max(0, limit - active)
-                requested = min(capacity, admission_burst)
+                refill_floor = (
+                    min(32, max(1, limit // 8))
+                    if refreshable and limit >= 64
+                    else 1
+                )
+                requested = (
+                    0
+                    if active > 0 and 0 < capacity < refill_floor
+                    else min(capacity, admission_burst)
+                )
                 pulled = pull_items(requested)
                 added = len(pulled)
                 if requested > 0 and added == requested and active + added < limit:

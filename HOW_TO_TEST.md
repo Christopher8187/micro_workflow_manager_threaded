@@ -1,6 +1,6 @@
 # How to test micro-workflow-manager
 
-This is the **authoritative execution order for testing MWF 0.5.4**.
+This is the **authoritative execution order for testing MWF 0.5.6**.
 
 AI coding agents and human contributors should follow this file before declaring a
 framework change verified. The important distinction is:
@@ -116,7 +116,8 @@ python -m pytest -q \
   tests/test_055_threaded_prefetch_and_nofile.py \
   tests/test_056_resumefrom_refuseafter_052.py \
   tests/test_057_hoeflein_live_sync_053.py \
-  tests/test_058_http_fanout_scaling_054.py
+  tests/test_058_http_fanout_scaling_054.py \
+  tests/test_060_network_manager_056.py
 ```
 
 ```bash
@@ -356,3 +357,18 @@ at least:
 For a stubborn issue, reproduce it at low and high concurrency and preserve a
 focused regression test. Do not weaken scheduler semantics merely to make a
 timing test pass.
+
+
+## 0.5.6 central NetworkManager regression
+
+Run the focused networking/storage/pacing coverage:
+
+```bash
+python -m pytest -q tests/test_060_network_manager_056.py \
+  tests/test_043_watchdog_networking.py \
+  tests/test_044_queue_transport_scaling.py \
+  tests/test_048_ghost_free_admission.py \
+  tests/test_058_http_fanout_scaling_054.py
+```
+
+For the 22-node A/B, start `benchmarks/local_http_delay_server.py --http2` and run `benchmarks/benchmark_network_manager_skew.py` once with `--architecture direct` and once with `--architecture manager`, for both `runner` and `workflow` modes. See `NETWORK_MANAGER_ARCHITECTURE_056.md`.

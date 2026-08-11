@@ -16,14 +16,15 @@ from micro_workflow_manager.models import Job, QUEUED
 
 
 class RefreshableQueuedJobSource:
-    """Incrementally expose queued jobs that appear while a node pump is active.
+    """Incrementally expose queued jobs in durable commit order.
 
-    The cursor follows SQLite insertion order rather than ``job_id`` order. Batch
-    producers reserve IDs before writing payloads and may commit those batches out
-    of ID order; ``rowid`` still advances in commit order, so no late lower-ID batch
-    is skipped. Existing jobs are included on the first pull, and newly inserted
-    queued jobs become visible to later pulls.
+    Job IDs may be reserved before payload work and committed out of ID order,
+    so the cursor follows SQLite insertion order rather than ``job_id``.
+    ``NOT INDEXED`` forces a direct rowid range scan; otherwise SQLite may use
+    the status index and build a temporary ORDER BY tree on every pull.
     """
+
+    REMAINING_HINT_CAP = 2048
 
     def __init__(self, storage, node_name: str):
         self.storage = storage
@@ -38,10 +39,10 @@ class RefreshableQueuedJobSource:
             return []
         with self.lock:
             rows = self.storage.db_connection().execute(
-                "SELECT rowid AS source_rowid, job_id FROM jobs "
-                "WHERE node_name=? AND status=? AND rowid>? "
+                "SELECT rowid AS source_rowid, job_id FROM jobs NOT INDEXED "
+                "WHERE rowid>? AND node_name=? AND status=? "
                 "ORDER BY rowid LIMIT ?",
-                (self.node_name, QUEUED, self.last_rowid, max_items),
+                (self.last_rowid, self.node_name, QUEUED, max_items),
             ).fetchall()
             if not rows:
                 return []
@@ -49,12 +50,14 @@ class RefreshableQueuedJobSource:
         return [int(row["job_id"]) for row in rows]
 
     def remaining_hint(self) -> int:
-        """Return a cheap startup-window hint for the current queue suffix."""
+        """Return a bounded startup/live-queue hint after the rowid cursor."""
         with self.lock:
             row = self.storage.db_connection().execute(
-                "SELECT COUNT(*) AS count FROM jobs "
-                "WHERE node_name=? AND status=? AND rowid>?",
-                (self.node_name, QUEUED, self.last_rowid),
+                "SELECT COUNT(*) AS count FROM ("
+                "SELECT 1 FROM jobs NOT INDEXED "
+                "WHERE rowid>? AND node_name=? AND status=? LIMIT ?"
+                ")",
+                (self.last_rowid, self.node_name, QUEUED, self.REMAINING_HINT_CAP),
             ).fetchone()
         return 0 if row is None else int(row["count"])
 

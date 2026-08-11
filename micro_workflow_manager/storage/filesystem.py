@@ -6,12 +6,14 @@ from .events import JobEventStorageMixin
 from .job_index import JobIndexStorageMixin
 from .jobs import JobFileStorageMixin
 from .nodes import NodeFileStorageMixin
+from .network_state import NetworkStateStorageMixin
 from .runtime_config import RuntimeConfigStorageMixin
 from .sqlite_state import SQLiteStateMixin
 from .state_events import StateEventStorageMixin
 
 
 class FileStorage(
+    NetworkStateStorageMixin,
     StateEventStorageMixin,
     RuntimeConfigStorageMixin,
     JobEventStorageMixin,
