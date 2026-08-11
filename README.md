@@ -73,10 +73,11 @@ manager, and a Pygame state machine.
 
 ## What changed in 0.4.8
 
-- Dense API nodes use a source-aware **balanced dual-window** loader. Queues
-  below 128 jobs use one pump; larger queues use two coordinated pumps. Each
-  pump sizes its first window from the actual remaining jobs and a four-turn
-  target, capped at 512, instead of climbing through fixed 64/128/256 plateaus.
+- API nodes use a **single cooperative admission pump** by default. One pump
+  multiplexes thousands of fibers without duplicate dense-source claim/controller
+  contention, while still sizing its first admission window from the remaining
+  queue and a four-turn target capped at 512. Explicit `balanced`, `elastic`,
+  `adaptive`, and `lanes:N` strategies remain available for experiments.
 - Simultaneous Hoeflein claim bursts are combined into one grouped SQLite
   operation. The mutation writer also caps ordinary claim transactions at 192
   job rows, so a multi-thousand-job admission wave cannot trap urgent terminal
@@ -104,9 +105,10 @@ manager, and a Pygame state machine.
   counts, effective limits, starts/finishes per second, queue and terminal p95
   latency, recent lifecycle events, process RSS/thread data, SQLite/WAL size,
   and the active process's mutation-writer backlog and batch diagnostics.
-- The production API startup strategy was changed to `balanced`, with bounded
-  completion/admission turns and terminal-pressure priority. Version 0.4.8
-  replaces its fixed 64/96 admission ladder with source-aware dual windows.
+- The production API startup strategy is `single`; explicit multi-lane strategies
+  remain available for workloads that benefit from them. Dense HTTP fan-out testing
+  at 512–4096 fibers showed that duplicate startup pumps add more durable-claim and
+  controller contention than useful admission parallelism on the default path.
 - Retry/fallback inspection moved from `mwf inspect NODE filter` to
   `mwf filter NODE`; `mwf filter NODE stage X` shows terminal failures at the
   final stage or failures at X that succeeded at X+1.

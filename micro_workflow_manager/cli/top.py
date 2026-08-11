@@ -306,8 +306,8 @@ def render_top(snapshot: dict[str, Any]) -> str:
             f"run={run.get('status', 'none')} command={run.get('command', '-')} "
             f"pid={process.get('pid') or '-'} alive={process.get('alive', False)} "
             f"rss={_bytes((process.get('rss_kib') or 0) * 1024)} "
-            f"threads={process.get('threads', '-')} strategy={run.get('api_startup_strategy', 'balanced')} "
-            f"windows={run.get('api_startup_windows', 'auto:1-2')} burst={run.get('api_max_admission_burst', '512')} "
+            f"threads={process.get('threads', '-')} strategy={run.get('api_startup_strategy', 'single')} "
+            f"windows={run.get('api_startup_windows', '1')} burst={run.get('api_max_admission_burst', '512')} "
             f"rounds={run.get('api_admission_target_rounds', '4')} claim-tx={run.get('api_claim_transaction_rows', '192')}"
         ),
         (

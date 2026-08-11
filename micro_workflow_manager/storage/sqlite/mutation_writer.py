@@ -447,6 +447,19 @@ class SQLiteMutationWriter:
                     self._refresh_urgent_signal()
 
                 self._publish_diagnostics()
+                # If this batch drained the queue, retire the daemon immediately
+                # instead of keeping it alive for another 250 ms queue timeout.
+                # The guarded recheck is race-safe with _enqueue(): either a
+                # request is already visible and this thread continues, or we
+                # publish _thread=None before a later enqueue, which then starts
+                # a fresh writer. Besides removing an idle thread/connection
+                # tail from short workflows, this prevents late diagnostic
+                # writes from recreating files while a finished temporary
+                # project is being deleted.
+                with self._guard:
+                    if self._queue.empty():
+                        self._thread = None
+                        return
         finally:
             self.storage.close_thread_connection()
             with self._progress:

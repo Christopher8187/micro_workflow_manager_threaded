@@ -13,6 +13,9 @@ from uuid import uuid4
 from micro_workflow_manager.models import QUEUED, RUNNING
 
 
+from .priorities import ADMISSION_PRIORITY
+
+
 @dataclass(slots=True, frozen=True)
 class RuntimeUpdate:
     node_name: str
@@ -332,7 +335,7 @@ class JobExecutionClaimStorageMixin:
         job_id: int,
         *,
         started_at: str,
-        priority: int = 10,
+        priority: int = ADMISSION_PRIORITY,
     ) -> tuple[int, str]:
         node_name = self.validate_node_name(node_name)
         job_id = self.validate_job_id(job_id)
@@ -377,7 +380,7 @@ class JobExecutionClaimStorageMixin:
         job_ids: list[int],
         *,
         started_at: str,
-        priority: int = 10,
+        priority: int = ADMISSION_PRIORITY,
         task_started_data: dict[str, Any] | None = None,
         task_started_mask: list[bool] | tuple[bool, ...] | None = None,
     ) -> list[tuple[int, str]]:

@@ -265,7 +265,7 @@ def test_supervised_completion_wave_releases_file_fence_before_group_commit(
     assert peak_fences < 10
 
 
-def test_api_terminal_commits_outrank_admission_and_reach_monitor(tmp_path, monkeypatch):
+def test_api_admission_and_terminal_commits_share_highest_runtime_priority(tmp_path, monkeypatch):
     count = 200
     workflow = MicroWorkflow(tmp_path, runner="api")
     workflow.graph([("A", "sink")])
@@ -318,7 +318,7 @@ def test_api_terminal_commits_outrank_admission_and_reach_monitor(tmp_path, monk
     row = next(
         row for row in workflow_snapshot(workflow)["nodes"] if row["node"] == "A"
     )
-    assert priorities["claim"] == {10}
+    assert priorities["claim"] == {5}
     assert priorities["finalize"] == {5}
     assert row["done"] == count
     assert row["running"] == 0

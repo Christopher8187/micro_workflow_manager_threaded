@@ -63,10 +63,11 @@ class _LaneCoordinator:
 class ApiRunner(BaseRunner):
     """Cooperative API runner with event-prioritized terminal publication.
 
-    The default strategy uses one pump for small queues and two coordinated
-    pumps for dense queues. Admission windows are sized from the remaining
-    queue and terminal-state pressure preempts ordinary claim work. Experimental
-    strategies remain available for benchmarking, but are not production defaults.
+    The production default uses one cooperative pump per node. A single pump
+    already multiplexes thousands of fibers; adding startup lanes to a dense
+    durable source multiplies claim/controller contention and was substantially
+    slower in 512-4096 fiber fan-out benchmarks. Multi-lane strategies remain
+    available explicitly for source-bound experiments.
     """
 
     supports_refreshable_job_source = True
@@ -100,7 +101,7 @@ class ApiRunner(BaseRunner):
         self.startup_strategy = (
             startup_strategy
             or os.environ.get("MWF_API_STARTUP_STRATEGY")
-            or "balanced"
+            or "single"
         ).strip().lower()
 
     def effective_limit(self) -> int:

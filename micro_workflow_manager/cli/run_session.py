@@ -29,6 +29,24 @@ def active_workflow_run(
     monitor_interval: float = 2.0,
 ):
     run_id = f"{int(time.time())}-{os.getpid()}-{uuid4().hex[:8]}"
+    api_startup_strategy = os.environ.get("MWF_API_STARTUP_STRATEGY", "single").strip().lower()
+    if api_startup_strategy in {"single", "event", "latency", "serial", "legacy"}:
+        api_startup_windows = "1"
+    elif api_startup_strategy == "balanced":
+        api_startup_windows = "auto:1-2"
+    elif api_startup_strategy == "elastic":
+        api_startup_windows = "auto:1-4"
+    elif api_startup_strategy == "adaptive":
+        api_startup_windows = "auto:1-8"
+    elif api_startup_strategy.startswith("lanes:"):
+        api_startup_windows = api_startup_strategy.split(":", 1)[1]
+    else:
+        api_startup_windows = "auto"
+    api_completion_service_batch = (
+        "8" if api_startup_strategy == "latency"
+        else "12" if api_startup_strategy in {"event", "balanced"}
+        else "16"
+    )
     data = {
         "run_id": run_id,
         "status": "running",
@@ -46,13 +64,13 @@ def active_workflow_run(
         "pid": os.getpid(),
         "hostname": socket.gethostname(),
         "mwf_version": __version__,
-        "api_startup_strategy": os.environ.get("MWF_API_STARTUP_STRATEGY", "balanced"),
+        "api_startup_strategy": api_startup_strategy,
         "api_event_drain_seconds": os.environ.get("MWF_API_EVENT_DRAIN_SECONDS", "0.010"),
         "api_terminal_microbatch": os.environ.get("MWF_API_TERMINAL_MICROBATCH", "1"),
         "api_max_admission_burst": os.environ.get("MWF_API_MAX_ADMISSION_BURST", "512"),
-        "api_completion_service_batch": "12",
+        "api_completion_service_batch": api_completion_service_batch,
         "api_admission_target_rounds": os.environ.get("MWF_API_ADMISSION_TARGET_ROUNDS", "4"),
-        "api_startup_windows": "auto:1-2",
+        "api_startup_windows": api_startup_windows,
         "api_claim_transaction_rows": os.environ.get(
             "MWF_SQLITE_CLAIM_TRANSACTION_ROWS", "192"
         ),

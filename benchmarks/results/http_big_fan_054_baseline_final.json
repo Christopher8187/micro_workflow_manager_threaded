@@ -1,0 +1,19 @@
+{
+  "benchmark": "full durable workflow HTTP/2 big-fan matrix",
+  "mwf_version": "0.5.4",
+  "response_bytes": 1024,
+  "delay_ms": 5,
+  "jobs_rule": "2 * aggregate concurrency",
+  "baseline_default_strategy": "balanced",
+  "final_default_strategy": "single",
+  "cells": [
+    {"concurrency": 2048, "fanout_nodes": 1, "baseline_jobs_per_second": 246.4419, "final_jobs_per_second": 434.8429099158216, "final_failed": 0},
+    {"concurrency": 2048, "fanout_nodes": 2, "baseline_jobs_per_second": 296.62935, "final_jobs_per_second": 421.35030621463574, "final_failed": 0},
+    {"concurrency": 2048, "fanout_nodes": 4, "baseline_jobs_per_second": 319.87486, "final_jobs_per_second": 373.18749661604556, "final_failed": 0},
+    {"concurrency": 2048, "fanout_nodes": 8, "baseline_jobs_per_second": 291.54301, "final_jobs_per_second": 361.21490796738505, "final_failed": 0},
+    {"concurrency": 4096, "fanout_nodes": 1, "baseline_jobs_per_second": 282.32772, "final_jobs_per_second": 419.2844317857498, "final_failed": 0},
+    {"concurrency": 4096, "fanout_nodes": 2, "baseline_jobs_per_second": 284.94088, "final_jobs_per_second": 380.2530798361517, "final_failed": 0},
+    {"concurrency": 4096, "fanout_nodes": 4, "baseline_jobs_per_second": 292.82620, "final_jobs_per_second": 356.7760006212523, "final_failed": 0},
+    {"concurrency": 4096, "fanout_nodes": 8, "baseline_jobs_per_second": 274.43352, "final_jobs_per_second": 322.76679010927876, "final_failed": 0}
+  ]
+}

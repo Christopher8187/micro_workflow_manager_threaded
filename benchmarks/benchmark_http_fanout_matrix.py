@@ -287,6 +287,12 @@ def run_workflow(args, jobs):
         finally:
             elapsed = time.perf_counter() - started
             stop.set(); sampler.join(timeout=1)
+        # ``run()`` intentionally returns after terminal job publication; low-priority
+        # advisory runtime metadata may still be draining. Fence benchmark teardown
+        # so temporary-project cleanup never races a late diagnostic/runtime write.
+        # The durability tail is outside ``elapsed`` and therefore does not change
+        # the production-shaped run-time metric being compared across versions.
+        workflow.storage.flush_db_mutations()
         failed = sum(workflow.storage.job_status_counts(f"H{i:03d}").get("failed", 0) for i in range(args.fanout_nodes))
         snap = shared_http_transport.snapshot()
         final_diag = workflow.storage.mutation_writer_diagnostics()

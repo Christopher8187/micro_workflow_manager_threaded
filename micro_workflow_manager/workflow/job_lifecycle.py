@@ -15,6 +15,7 @@ from ..errors import (
 from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
 from ..fibers import cancellation_scope, in_fiber_runtime
 from ..networking import network_attempt_context
+from ..storage.priorities import ADMISSION_PRIORITY
 
 
 T = TypeVar("T")
@@ -186,9 +187,7 @@ class JobLifecycleMixin:
         preloaded_job = _preloaded_job
         preclaimed_execution = _preclaimed_execution
         task_started_pre_recorded = bool(_task_started_pre_recorded)
-        claim_priority = (
-            5 if (node.runner_override or self.runner) == "threaded" else 10
-        )
+        claim_priority = ADMISSION_PRIORITY
         while True:
             job = preloaded_job or self.storage.load_job(node_name, job_id)
             # A restarted generation must reread the durable payload. The

@@ -241,3 +241,31 @@ def test_programmatic_wide_fanout_retains_ephemeral_router_identity(tmp_path):
 
     assert all(workflow.nodes[name].main_task is not None for name in names)
     assert len(workflow._included_routers) == 101
+
+
+def test_api_runner_defaults_to_single_startup_lane_for_dense_refreshable_sources(monkeypatch):
+    class DenseSource:
+        def remaining_hint(self):
+            return 10000
+
+    monkeypatch.delenv("MWF_API_STARTUP_STRATEGY", raising=False)
+    runner = ApiRunner(max_threads=4096)
+    assert runner.startup_strategy == "single"
+    assert runner.startup_lanes(DenseSource()) == 1
+
+
+def test_execution_claim_defaults_match_terminal_priority():
+    import inspect
+
+    from micro_workflow_manager.storage.execution_claims import JobExecutionClaimStorageMixin
+    from micro_workflow_manager.storage.priorities import (
+        ADMISSION_PRIORITY,
+        RUNTIME_CRITICAL_PRIORITY,
+        TERMINAL_PRIORITY,
+    )
+
+    single = inspect.signature(JobExecutionClaimStorageMixin.claim_job_execution)
+    batch = inspect.signature(JobExecutionClaimStorageMixin.claim_job_executions_batch)
+    assert ADMISSION_PRIORITY == RUNTIME_CRITICAL_PRIORITY == TERMINAL_PRIORITY == 5
+    assert single.parameters["priority"].default == ADMISSION_PRIORITY
+    assert batch.parameters["priority"].default == ADMISSION_PRIORITY

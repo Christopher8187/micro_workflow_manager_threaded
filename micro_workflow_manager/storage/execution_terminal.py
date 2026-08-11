@@ -9,8 +9,10 @@ from micro_workflow_manager.errors import JobRestartedError
 from micro_workflow_manager.models import CANCELLED, DONE, FAILED, RUNNING, SKIPPED
 
 
+from .priorities import TERMINAL_PRIORITY
+
+
 TERMINAL_REFRESH_SECONDS = 0.001
-TERMINAL_PRIORITY = 5
 
 
 @dataclass(slots=True, frozen=True)

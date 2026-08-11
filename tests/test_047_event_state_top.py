@@ -152,3 +152,14 @@ def test_top_help_and_text_surface_htop_style_fields(capsys, tmp_path, monkeypat
     assert "writer source=" in output
     assert "START/s" in output
     assert "TERM95" in output
+
+
+def test_mutation_writer_retires_immediately_after_draining_queue(tmp_path):
+    storage = FileStorage(tmp_path)
+    storage.submit_db_mutation(lambda connection: connection.execute("SELECT 1").fetchone(), wait=True)
+
+    deadline = time.monotonic() + 0.15
+    while storage.mutation_writer_diagnostics()["writer_alive"] and time.monotonic() < deadline:
+        time.sleep(0.002)
+
+    assert storage.mutation_writer_diagnostics()["writer_alive"] is False
