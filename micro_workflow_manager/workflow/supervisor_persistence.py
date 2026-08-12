@@ -21,6 +21,7 @@ class SupervisorPersistenceMixin:
         *,
         state: str,
         error: str | None = None,
+        checkpoint_remaining_override: float | None = None,
     ) -> dict[str, Any]:
         now_value = monotonic()
         total_remaining = (
@@ -28,11 +29,13 @@ class SupervisorPersistenceMixin:
             if watch.total_deadline is not None and state == "running"
             else None
         )
-        checkpoint_remaining = (
-            max(0.0, watch.checkpoint_deadline - now_value)
-            if watch.checkpoint_deadline is not None and state == "running"
-            else None
-        )
+        checkpoint_remaining = checkpoint_remaining_override
+        if checkpoint_remaining is None:
+            checkpoint_remaining = (
+                max(0.0, watch.checkpoint_deadline - now_value)
+                if watch.checkpoint_deadline is not None and state == "running"
+                else None
+            )
         payload = {
             "state": state,
             "watch_id": watch.watch_id,
@@ -71,8 +74,14 @@ class SupervisorPersistenceMixin:
         error: str | None = None,
         wait: bool = True,
         priority: int = 10,
+        checkpoint_remaining_override: float | None = None,
     ):
-        payload = self._runtime_payload(watch, state=state, error=error)
+        payload = self._runtime_payload(
+            watch,
+            state=state,
+            error=error,
+            checkpoint_remaining_override=checkpoint_remaining_override,
+        )
         self.storage.write_job_runtime(
             watch.node_name,
             watch.job_id,

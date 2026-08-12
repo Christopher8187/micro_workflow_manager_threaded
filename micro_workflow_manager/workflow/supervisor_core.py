@@ -260,12 +260,29 @@ class SchedulerSupervisor(
                         )
 
                     if deadline is None:
-                        # No active deadline and no run heartbeat. End the idle
-                        # daemon so many short-lived programmatic workflows do
-                        # not accumulate sleeping threads.
+                        if self._watches:
+                            # A direct/thread/process checkpoint briefly disarms
+                            # its deadline while the synchronous framework write
+                            # is in progress. All active watches can therefore
+                            # have no heap deadline for a small window. Keep the
+                            # one central watchdog alive until those writes rearm
+                            # the watches instead of mistaking that window for an
+                            # idle supervisor and exiting.
+                            self._condition.wait()
+                            continue
+                        # No active watch, deadline, or run heartbeat. End the
+                        # idle daemon so many short-lived programmatic workflows
+                        # do not accumulate sleeping threads.
                         self._thread = None
                         return
 
+                    # The cross-process restart listener deliberately remains
+                    # warm for a short idle grace so dense API waves do not
+                    # create one listener per job. That grace must not retain a
+                    # SQLite connection after the final watch has gone away.
+                    # A later wake reopens a connection lazily if it needs one.
+                    if not self._watches and self._run_heartbeat is None:
+                        self.storage.close_thread_connection()
                     self._condition.wait(max(0.0, deadline - monotonic()))
                     continue
 

@@ -135,6 +135,7 @@ class JobCreationMixin:
         job_id: int | None = None,
         autostart: bool = False,
         _parent_job_id: int | None = None,
+        _parent_event_data: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         **params,
     ):
@@ -143,6 +144,29 @@ class JobCreationMixin:
 
         if _parent_job_id is not None:
             self.storage.validate_job_id(_parent_job_id)
+        if _parent_event_data is not None and not isinstance(_parent_event_data, dict):
+            raise TypeError("_parent_event_data must be a dict or None")
+
+        def record_parent_event(created_job: Job) -> None:
+            if (
+                _parent_event_data is None
+                or from_node is None
+                or _parent_job_id is None
+            ):
+                return
+            self.storage.append_job_event(
+                from_node,
+                _parent_job_id,
+                "jobs_created",
+                **_parent_event_data,
+                jobs=[
+                    {
+                        "node": to_node,
+                        "job_id": created_job.job_id,
+                        "params": params,
+                    }
+                ],
+            )
 
         if from_node is not None:
             self.validate_edge(from_node, to_node)
@@ -170,6 +194,7 @@ class JobCreationMixin:
         if idempotency_key is not None:
             existing = self.storage.lookup_idempotent_job(to_node, idempotency_key)
             if existing is not None:
+                record_parent_event(existing)
                 return existing
 
         parent = None
@@ -198,6 +223,7 @@ class JobCreationMixin:
                     if idempotency_key is not None:
                         self.storage.record_idempotent_job(to_node, idempotency_key, job_id)
                     self.storage.set_node_status(to_node, QUEUED)
+                    record_parent_event(job)
         else:
             # Stage the unpublished input first, then allocate its ID and
             # publish the payload/row/event in one priority queue mutation.
@@ -208,6 +234,15 @@ class JobCreationMixin:
                 producer_component=source_component,
                 job_kind="component" if same_component else ("dag" if from_node is not None else None),
                 idempotency_key=idempotency_key,
+                parent_event=(
+                    (from_node, _parent_job_id, _parent_event_data)
+                    if (
+                        from_node is not None
+                        and _parent_job_id is not None
+                        and _parent_event_data is not None
+                    )
+                    else None
+                ),
             )
             job_id = job.job_id
 

@@ -9,6 +9,7 @@ from time import monotonic
 from typing import Any, Callable, TypeVar
 
 from .errors import JobRestartedError, JobTimeoutError
+from .fibers import in_fiber_runtime
 from .models import Job
 from .paths import relative_posix
 
@@ -152,6 +153,7 @@ class NodeHandle(_ExecutionChecks):
         task_role: str = "main",
         attempt: int | None = None,
         repeat_index: int | None = None,
+        pending_event_recorder: Callable[[Any], None] | None = None,
     ):
         super().__init__(cancellation_event=cancellation_event)
         self.system = system
@@ -165,6 +167,7 @@ class NodeHandle(_ExecutionChecks):
         self.task_role = task_role
         self.attempt = attempt
         self.repeat_index = repeat_index
+        self._pending_event_recorder = pending_event_recorder
 
     def _guarded(self, action: Callable[[], T]) -> T:
         self.checkpoint()
@@ -187,15 +190,20 @@ class NodeHandle(_ExecutionChecks):
         }
 
     def _record_event(self, event: str, **data: Any) -> None:
-        self._guarded(
-            lambda: self.system.storage.append_job_event(
-                self.from_node,
-                self.from_job_id,
-                event,
-                **self._event_fields(),
-                **{key: _event_value(value) for key, value in data.items()},
-            )
+        self._check_local_execution()
+        asynchronous = in_fiber_runtime() and self._pending_event_recorder is not None
+        future = self.system.storage.append_job_event(
+            self.from_node,
+            self.from_job_id,
+            event,
+            _wait=not asynchronous,
+            _execution_generation=self.execution_generation,
+            _execution_id=self.execution_id,
+            **self._event_fields(),
+            **{key: _event_value(value) for key, value in data.items()},
         )
+        if asynchronous:
+            self._pending_event_recorder(future)
 
     def checkpoint(self):
         """Raise if the parent job was restarted or this task timed out."""
@@ -225,14 +233,10 @@ class NodeHandle(_ExecutionChecks):
                     job_id=job_id,
                     autostart=autostart,
                     _parent_job_id=self.from_job_id,
+                    _parent_event_data=self._event_fields(),
                     idempotency_key=key,
                     **params,
                 )
-            )
-            created_job_id = getattr(result, "job_id", job_id)
-            self._record_event(
-                "jobs_created",
-                jobs=[{"node": self.to_node, "job_id": created_job_id, "params": params}],
             )
             return result
 
@@ -387,6 +391,7 @@ class JobContext(_ExecutionChecks):
         self._attempt_watch = attempt_watch
         self._transaction: JobTransaction | None = None
         self.task_role = task_role
+        self._pending_event_futures: list[Any] = []
 
     def _check_execution(self):
         """Validate cancellation/restart without reporting progress."""
@@ -430,15 +435,32 @@ class JobContext(_ExecutionChecks):
         }
 
     def _record_event(self, event: str, **data: Any) -> None:
-        self._guarded(
-            lambda: self.system.storage.append_job_event(
-                self.current_node,
-                self.job_id,
-                event,
-                **self._event_fields(),
-                **{key: _event_value(value) for key, value in data.items()},
-            )
+        self._check_execution()
+        asynchronous = in_fiber_runtime()
+        future = self.system.storage.append_job_event(
+            self.current_node,
+            self.job_id,
+            event,
+            _wait=not asynchronous,
+            _execution_generation=self.execution_generation,
+            _execution_id=self.execution_id,
+            **self._event_fields(),
+            **{key: _event_value(value) for key, value in data.items()},
         )
+        if asynchronous:
+            self._pending_event_futures.append(future)
+
+    def flush_pending_events(self) -> None:
+        """Make every event from this attempt durable in submission order.
+
+        API handlers enqueue observability rows without blocking their pump on
+        every SQLite commit. The attempt flushes this short list before it can
+        publish success or enter fallback handling, preserving the existing
+        durable-before-terminal contract and chronological event order.
+        """
+        pending, self._pending_event_futures = self._pending_event_futures, []
+        for future in pending:
+            future.result()
 
     def trace(self, name: str | dict[str, Any] | None = None, content: Any = None, **details: Any) -> None:
         """Append one user-defined trace object to this job's ordered event journal.
@@ -667,4 +689,5 @@ class JobContext(_ExecutionChecks):
             task_role=self.task_role,
             attempt=self.attempt,
             repeat_index=self.repeat_index,
+            pending_event_recorder=self._pending_event_futures.append,
         )

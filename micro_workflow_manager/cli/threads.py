@@ -19,6 +19,43 @@ from .project import load_workflow
 RESET_WORDS = {"reset", "default", "clear"}
 
 
+def _proportional_api_limits(requested: dict[str, int], total: int) -> dict[str, int]:
+    if not requested or total >= sum(requested.values()):
+        return requested
+    if total < len(requested):
+        return {name: 1 for name in requested}
+    requested_total = sum(requested.values())
+    shares = {
+        name: max(1, (total * value) // requested_total)
+        for name, value in requested.items()
+    }
+    used = sum(shares.values())
+    order = sorted(
+        requested,
+        key=lambda name: (-((total * requested[name]) % requested_total), name),
+    )
+    while used < total:
+        changed = False
+        for name in order:
+            if shares[name] >= requested[name]:
+                continue
+            shares[name] += 1
+            used += 1
+            changed = True
+            if used == total:
+                break
+        if not changed:
+            break
+    while used > total:
+        for name in reversed(order):
+            if shares[name] > 1:
+                shares[name] -= 1
+                used -= 1
+                if used == total:
+                    break
+    return shares
+
+
 def _node_schema(storage: FileStorage, node: str) -> dict:
     # Do not call node_schema_file() here: storage path helpers intentionally
     # materialize directories for normal workflow writes. A read-only control
@@ -126,18 +163,66 @@ def list_thread_statuses(root: Path, storage: FileStorage) -> int:
         print("No mounted nodes found. Run 'mwf graph --update' first.")
         return 0
 
+    statuses = [thread_status(root, storage, node) for node in nodes]
+    api_total = storage.read_api_total_limit()
+    if api_total is not None:
+        requested = {
+            status["node"]: status["effective"]
+            for status in statuses
+            if status["runner"] == "api"
+        }
+        allocated = _proportional_api_limits(requested, api_total)
+        for status in statuses:
+            if status["node"] in allocated:
+                status["effective"] = allocated[status["node"]]
+
     print("Runtime max_threads")
-    print("API node limits are cooperative fiber counts; there is no aggregate API cap.")
+    if api_total is None:
+        print("API aggregate admission budget: (none)")
+    else:
+        print(f"API aggregate admission budget: {api_total} (proportional by node request)")
     print("node                     runner    declared  override  effective")
     print("-----------------------  --------  --------  --------  ---------")
-    for node in nodes:
-        status = thread_status(root, storage, node)
+    for status in statuses:
+        node = status["node"]
         override = status["override"] if status["override"] is not None else "-"
         print(
             f"{node[:23]:23}  {status['runner'][:8]:8}  "
             f"{status['declared']:8}  {str(override):8}  {status['effective']:9}"
         )
     return 0
+
+
+def api_total_command(root: Path, value: str) -> int:
+    storage = FileStorage(root)
+    try:
+        with storage.interprocess_lock("active-run-state"):
+            active = live_active_run(storage)
+            run_id = (active or {}).get("run_id")
+            if value.lower() in RESET_WORDS:
+                existed = storage.clear_api_total_limit(run_id=run_id)
+                print(
+                    "Cleared aggregate API admission budget."
+                    if existed
+                    else "Aggregate API admission budget was already unset."
+                )
+                return 0
+
+            current = storage.read_api_total_limit() or 1
+            requested = _parse_new_limit(value, current, maximum=None)
+            storage.set_api_total_limit(requested, run_id=run_id)
+        print(f"Updated aggregate API admission budget: {requested}")
+        print(
+            "MWF allocates the budget proportionally across API nodes in the active run; "
+            "per-node max_threads values remain the weights and upper bounds."
+        )
+        if active is not None:
+            print("Active API runners will apply the new budget within about 0.2 seconds.")
+        else:
+            print("The budget is pending for the next run only and clears when that run finishes.")
+        return 0
+    finally:
+        storage.close_database_connections()
 
 
 def update_declared_threads(root: Path) -> int:
@@ -244,8 +329,8 @@ def threads_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="mwf threads",
         description=(
-            "View or change a node's local runtime max_threads override. API values "
-            "are cooperative fiber counts and have no workflow-wide aggregate cap."
+            "View or change run-scoped concurrency controls. Per-node API values are "
+            "cooperative fiber counts; --api-total adds a proportional workflow budget."
         ),
     )
     parser.add_argument(
@@ -259,6 +344,11 @@ def threads_cli(argv: list[str]) -> int:
         help="Absolute integer, +N, -N, or reset/default/clear.",
     )
     parser.add_argument(
+        "--api-total",
+        metavar="VALUE",
+        help="Set the aggregate API admission budget, or use reset/default/clear.",
+    )
+    parser.add_argument(
         "--update",
         action="store_true",
         help="Reload node behavior files and refresh declared max_threads/runner values.",
@@ -269,9 +359,13 @@ def threads_cli(argv: list[str]) -> int:
         root = find_root()
         ensure_runtime_layout(root)
         if args.update:
-            if args.node is not None or args.value is not None:
+            if args.node is not None or args.value is not None or args.api_total is not None:
                 raise RuntimeError("mwf threads --update does not accept a node or runtime value")
             return update_declared_threads(root)
+        if args.api_total is not None:
+            if args.node is not None or args.value is not None:
+                raise RuntimeError("mwf threads --api-total does not accept a node or node value")
+            return api_total_command(root, args.api_total)
         return threads_command(root, args.node, args.value)
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)

@@ -63,11 +63,11 @@ class _LaneCoordinator:
 class ApiRunner(BaseRunner):
     """Cooperative API runner with event-prioritized terminal publication.
 
-    The production default uses one cooperative pump per node. A single pump
-    already multiplexes thousands of fibers; adding startup lanes to a dense
-    durable source multiplies claim/controller contention and was substantially
-    slower in 512-4096 fiber fan-out benchmarks. Multi-lane strategies remain
-    available explicitly for source-bound experiments.
+    The production default scales the number of cooperative pumps with a dense
+    node's declared concurrency. Each pump owns a disjoint share of the same
+    total limit, so sharding raises controller/callback throughput without
+    changing job concurrency. Small nodes retain one pump; large nodes stop at
+    a measured twelve-pump safety cap.
     """
 
     supports_refreshable_job_source = True
@@ -83,6 +83,7 @@ class ApiRunner(BaseRunner):
         worker_cleanup: Callable[[], None] | None = None,
         poll_interval: float = 0.05,
         startup_strategy: str | None = None,
+        startup_lanes_provider: Callable[[object], int] | None = None,
         admission_pressure_provider: Callable[[], bool] | None = None,
         **_ignored,
     ):
@@ -94,6 +95,7 @@ class ApiRunner(BaseRunner):
         self.limit_provider = limit_provider
         self.worker_cleanup = worker_cleanup
         self.poll_interval = float(poll_interval)
+        self.startup_lanes_provider = startup_lanes_provider
         self.admission_pressure_provider = admission_pressure_provider
         self.prefetches_job_bursts = os.environ.get(
             "MWF_API_PREFETCH", "0"
@@ -101,7 +103,7 @@ class ApiRunner(BaseRunner):
         self.startup_strategy = (
             startup_strategy
             or os.environ.get("MWF_API_STARTUP_STRATEGY")
-            or "single"
+            or "adaptive"
         ).strip().lower()
 
     def effective_limit(self) -> int:
@@ -136,10 +138,15 @@ class ApiRunner(BaseRunner):
             # node while allowing 3k-10k queues to use three or four loaders.
             return min(4, limit, 1 + ceil(remaining / jobs_per_lane))
         if strategy == "adaptive":
-            # One lane per 128 desired in-flight jobs gives 256/512/1024 jobs
-            # two/four/eight startup controllers without creating a thread per
-            # job or allowing an unbounded admission wave.
-            return min(8, max(1, (limit + 127) // 128))
+            if self.startup_lanes_provider is not None:
+                lanes = self.startup_lanes_provider(items)
+                if type(lanes) is not int or lanes < 1:
+                    raise ValueError("API startup lane provider must return an integer >= 1")
+                return min(lanes, limit)
+            # Standalone ApiRunner use has no simultaneous-node vector. Use the
+            # independently measured curve; workflow/component runners inject
+            # the shared-budget vector allocation instead.
+            return min(12, max(1, (limit + 63) // 64))
         if strategy.startswith("lanes:"):
             try:
                 requested = int(strategy.split(":", 1)[1])

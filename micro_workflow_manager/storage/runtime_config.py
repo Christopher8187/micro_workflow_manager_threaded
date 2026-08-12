@@ -12,11 +12,11 @@ from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 class RuntimeConfigStorageMixin:
     """Small mutable project settings used by second-terminal controls.
 
-    Per-node concurrency overrides are deliberately run-scoped. The legacy
-    api_total_limit field is accepted only for state-schema compatibility and is
-    ignored by MWF 0.3.15. A command issued outside a run creates a pending
-    setting for the next run only. When a run claims the project, pending
-    settings are bound to that run ID; when the run finishes they are removed.
+    Per-node concurrency overrides and the optional aggregate API admission
+    budget are deliberately run-scoped. A command issued outside a run creates
+    a pending setting for the next run only. When a run claims the project,
+    pending settings are bound to that run ID; when the run finishes they are
+    removed.
     """
 
     def thread_overrides_file(self) -> Path:

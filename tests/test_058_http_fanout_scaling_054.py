@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from types import SimpleNamespace
 
 import httpx
 
@@ -10,7 +11,9 @@ from micro_workflow_manager.networking import (
     configure_shared_http_transport,
     shared_http_transport,
 )
-from micro_workflow_manager.runners.api import ApiRunner
+from micro_workflow_manager.runners.api import ApiRunner, _LaneCoordinator
+from micro_workflow_manager.workflow.component_scheduler import allocate_api_pumps
+from micro_workflow_manager.workflow.dag_scheduler import DagSchedulerMixin
 
 
 def test_preclaimed_api_burst_records_first_task_started_in_claim_batch(tmp_path):
@@ -243,15 +246,136 @@ def test_programmatic_wide_fanout_retains_ephemeral_router_identity(tmp_path):
     assert len(workflow._included_routers) == 101
 
 
-def test_api_runner_defaults_to_single_startup_lane_for_dense_refreshable_sources(monkeypatch):
+def test_api_runner_defaults_to_fixed_limit_adaptive_sharding(monkeypatch):
     class DenseSource:
         def remaining_hint(self):
             return 10000
 
     monkeypatch.delenv("MWF_API_STARTUP_STRATEGY", raising=False)
     runner = ApiRunner(max_threads=4096)
-    assert runner.startup_strategy == "single"
-    assert runner.startup_lanes(DenseSource()) == 1
+    assert runner.startup_strategy == "adaptive"
+    assert runner.startup_lanes(DenseSource()) == 12
+    assert ApiRunner(max_threads=63).startup_lanes(DenseSource()) == 1
+    assert ApiRunner(max_threads=200).startup_lanes(DenseSource()) == 4
+    assert ApiRunner(max_threads=400).startup_lanes(DenseSource()) == 7
+    assert ApiRunner(max_threads=800).startup_lanes(DenseSource()) == 12
+    assert ApiRunner(max_threads=1400).startup_lanes(DenseSource()) == 12
+    assert ApiRunner(max_threads=10000).startup_lanes(DenseSource()) == 12
+
+
+def test_simultaneous_api_pump_vector_guarantees_one_and_uses_shared_budget():
+    limits = {
+        "explodeclaim": 200,
+        "explodecontext": 400,
+        "explodedefinition": 800,
+        "explodeexample": 500,
+        "explodeexercise": 1400,
+        "explodeexplanation": 400,
+        "explodejas": 400,
+        "explodenotation": 200,
+        "exploderemark": 400,
+        "explodetheorem": 600,
+    }
+
+    allocations = allocate_api_pumps(limits, logical_processors=16)
+
+    assert allocations == {
+        "explodeclaim": 1,
+        "explodecontext": 2,
+        "explodedefinition": 3,
+        "explodeexample": 2,
+        "explodeexercise": 4,
+        "explodeexplanation": 2,
+        "explodejas": 2,
+        "explodenotation": 1,
+        "exploderemark": 2,
+        "explodetheorem": 2,
+    }
+    assert sum(allocations.values()) == 21
+    assert all(allocations[name] >= 1 for name in limits)
+
+
+def test_api_pump_vector_never_starves_a_node_when_nodes_exceed_cpu_budget():
+    limits = {f"H{index:02d}": 400 for index in range(30)}
+    allocations = allocate_api_pumps(limits, logical_processors=16)
+
+    assert allocations == {name: 1 for name in limits}
+    assert sum(allocations.values()) == len(limits)
+
+
+def test_later_dag_wave_remains_inside_running_nodes_global_pump_budget(monkeypatch):
+    from micro_workflow_manager.workflow import component_scheduler
+
+    monkeypatch.setattr(component_scheduler.os, "cpu_count", lambda: 16)
+    queued = {"A": True, "B": True, "C": False}
+    allocations: dict[str, int] = {}
+    c_started = threading.Event()
+
+    class Storage:
+        @staticmethod
+        def has_queued_jobs(node_name):
+            return queued[node_name]
+
+    class Scheduler(DagSchedulerMixin):
+        runner = "api"
+        storage = Storage()
+        nodes = {
+            name: SimpleNamespace(runner_override=None, waiting=False)
+            for name in queued
+        }
+
+        @staticmethod
+        def execution_components(_nodes=None):
+            return [("A",), ("B",), ("C",)]
+
+        @staticmethod
+        def node_ready(_node_name):
+            return True
+
+        @staticmethod
+        def effective_max_threads(_node_name):
+            return 1400
+
+        @staticmethod
+        def finalize_ready_nodes(skip_components=None):
+            return None
+
+        @staticmethod
+        def run_component(component, _ignore, _resolver, api_pump_allocations):
+            node_name = next(iter(component))
+            allocations[node_name] = api_pump_allocations[node_name]
+            queued[node_name] = False
+            if node_name == "A":
+                queued["C"] = True
+            elif node_name == "B":
+                assert c_started.wait(5)
+            elif node_name == "C":
+                c_started.set()
+            return [node_name]
+
+    assert set(Scheduler().run_concurrently()) == {"A", "B", "C"}
+    assert allocations["A"] + allocations["B"] == 21
+    # A has finished when C becomes ready, but B's ten pumps still count. C
+    # receives the remaining eleven rather than a fresh isolated twelve.
+    assert allocations["B"] + allocations["C"] == 21
+    assert allocations["C"] >= 1
+
+
+def test_adaptive_lane_shards_conserve_the_declared_concurrency_exactly():
+    configured_limit = 1400
+    coordinator = _LaneCoordinator(4, lambda: configured_limit)
+
+    allocations = [coordinator.limit_for(lane) for lane in range(4)]
+    assert sum(allocations) == configured_limit
+    assert max(allocations) - min(allocations) <= 1
+
+    # When a pump drains first, its share is redistributed instead of lost or
+    # added. The live node limit therefore remains exactly the user's 1400.
+    coordinator.unregister(3)
+    remaining = [lane for lane in range(4) if lane != 3]
+    allocations = [coordinator.limit_for(lane) for lane in remaining]
+    assert sum(allocations) == configured_limit
+    assert max(allocations) - min(allocations) <= 1
 
 
 def test_execution_claim_defaults_match_terminal_priority():

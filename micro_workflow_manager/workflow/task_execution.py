@@ -33,7 +33,18 @@ class MountedTaskExecutionMixin:
         self._job_context.generation = ctx.execution_generation
         self._job_context.execution_id = ctx.execution_id
         try:
-            return mounted.handler(ctx, **params)
+            try:
+                result = mounted.handler(ctx, **params)
+            except BaseException:
+                # Preserve the handler's original failure. Its already-queued
+                # observability rows are still drained before fallback logic.
+                try:
+                    ctx.flush_pending_events()
+                except BaseException:
+                    pass
+                raise
+            ctx.flush_pending_events()
+            return result
         finally:
             self._job_context.node_name = previous_node_name
             self._job_context.job_id = previous_job_id

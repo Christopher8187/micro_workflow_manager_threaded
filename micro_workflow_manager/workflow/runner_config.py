@@ -23,7 +23,7 @@ def normalize_workflow_runner(runner: str) -> str:
 
 
 class RunnerFactoryMixin:
-    def make_runner(self, node: JobNode):
+    def make_runner(self, node: JobNode, *, api_startup_lanes: int | None = None):
         effective_runner = node.runner_override or self.runner
 
         if effective_runner == "direct":
@@ -41,6 +41,11 @@ class RunnerFactoryMixin:
                 max_threads=node.max_threads,
                 limit_provider=lambda: self.effective_max_threads(node.name),
                 worker_cleanup=self.storage.close_thread_connection,
+                startup_lanes_provider=(
+                    (lambda _items: api_startup_lanes)
+                    if api_startup_lanes is not None
+                    else None
+                ),
                 admission_pressure_provider=self.storage.urgent_state_mutation_pending,
             )
 

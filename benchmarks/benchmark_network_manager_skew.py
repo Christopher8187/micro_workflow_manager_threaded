@@ -68,7 +68,7 @@ def run_runner(args,limits,rec):
 
 def run_workflow(args,limits,rec):
     configure(args); target=url(args)
-    with tempfile.TemporaryDirectory(prefix="mwf-network-manager-skew-") as d:
+    with tempfile.TemporaryDirectory(prefix="mwf-network-manager-skew-", ignore_cleanup_errors=True) as d:
         wf=MicroWorkflow(Path(d),runner="api"); wf.active_job_restart_enabled=True; wf.graph([("fanout",n) for n in NAMES])
         source=NodeRouter("fanout",runner="threaded",max_threads=1); source.create_job(params={"seed":True})
         @source.task
@@ -81,6 +81,8 @@ def run_workflow(args,limits,rec):
         started=time.perf_counter(); wf.run(); elapsed=time.perf_counter()-started; snap=shared_http_transport.snapshot(); close_shared_http_transport()
         wf.storage.flush_db_mutations(); persisted=wf.storage.network_manager_state()
         failed=sum(wf.storage.job_status_counts(n).get("failed",0) for n in NAMES)
+        time.sleep(0.6)
+        wf.storage.close_database_connections()
         if failed: raise RuntimeError(f"{failed} failed jobs")
         return elapsed,snap,persisted
 

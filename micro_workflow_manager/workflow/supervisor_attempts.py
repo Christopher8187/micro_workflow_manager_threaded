@@ -140,6 +140,10 @@ class SupervisorAttemptMixin:
                 "run the handler under the centralized scheduler watchdog."
             )
 
+        effective = timeout_value
+        if effective is None:
+            effective = watch.default_checkpoint_timeout
+        fiber_runtime = in_fiber_runtime()
         now_text = datetime.now().astimezone().isoformat(timespec="milliseconds")
         now_value = monotonic()
         with self._condition:
@@ -159,14 +163,18 @@ class SupervisorAttemptMixin:
             if detail is not None:
                 watch.progress_detail = detail
 
-            effective = timeout_value
-            if effective is None:
-                effective = watch.default_checkpoint_timeout
             if effective is not None:
                 if not watch.supervised:
                     raise RuntimeError("Checkpoint timeout supervision is not enabled")
                 watch.checkpoint_timeout = effective
-                watch.checkpoint_deadline = now_value + effective
+                # A direct/thread/process checkpoint persists synchronously for
+                # immediate inspect/recovery visibility. Temporarily disarm its
+                # checkpoint deadline so framework-owned SQLite time is not
+                # charged to the user's interval. API fibers persist without
+                # waiting and retain the ordinary deadline path.
+                watch.checkpoint_deadline = (
+                    now_value + effective if fiber_runtime else None
+                )
                 watch.revision += 1
                 self._schedule_watch_locked(watch)
                 self._compact_deadlines_locked()
@@ -176,12 +184,26 @@ class SupervisorAttemptMixin:
         # A cooperative API fiber must not charge group-commit latency against
         # a very short checkpoint deadline. Direct/thread/process callers keep
         # synchronous checkpoint visibility for inspect and recovery.
-        self._persist_runtime(
-            watch,
-            state="running",
-            wait=not in_fiber_runtime(),
-            priority=20 if in_fiber_runtime() else 10,
-        )
+        try:
+            self._persist_runtime(
+                watch,
+                state="running",
+                wait=not fiber_runtime,
+                priority=20 if fiber_runtime else 10,
+                checkpoint_remaining_override=(
+                    effective if not fiber_runtime else None
+                ),
+            )
+        finally:
+            if effective is not None and not fiber_runtime:
+                with self._condition:
+                    if watch.state == "active":
+                        watch.checkpoint_deadline = monotonic() + effective
+                        watch.revision += 1
+                        self._schedule_watch_locked(watch)
+                        self._compact_deadlines_locked()
+                        self._ensure_thread_locked()
+                        self._condition.notify_all()
 
     def begin_external_wait(
         self,

@@ -124,10 +124,15 @@ A node behavior file should read in this order:
   worker growth is useful.
 - Use `api` for blocking model providers, HTTP SDKs, remote databases, and other
   high-latency calls. Its `max_threads` value intentionally means the node's
-  maximum in-flight calls. All API nodes additionally share a default
-  workflow-wide budget of 256, preventing their independent limits from
-  oversubscribing one provider/account. Active nodes receive proportional fair
-  shares and may borrow unused sibling capacity.
+  maximum in-flight calls. Simultaneously runnable API nodes share a bounded
+  controller-pump vector. One pump is guaranteed per node; the remaining pool is
+  allocated from the full concurrency vector by marginal benefit. Pump limits
+  are exact partitions of each node's `max_threads`: internal sharding improves
+  admission and callback throughput but never changes configured concurrency.
+  Independent node limits add together by default.
+  When several nodes share one provider/account, `mwf threads --api-total N`
+  adds a run-scoped aggregate admission budget and divides it proportionally by
+  their requested limits before jobs are claimed.
 - Use `process` for CPU-heavy, pickleable tasks that benefit from process
   isolation.
 
@@ -156,8 +161,9 @@ start, quiesce, and fail together. Every original edge between members is
 implicitly component-autostart, so do not rely on a non-autostart internal edge
 to create a later DAG barrier. Put a real barrier between separate components.
 
-The component scheduler keeps at most one node pump active per member and polls
-idle member queues while other pumps are still running. This matters for router
+The component scheduler keeps one resident node runner active per member; an API
+runner may own several cooperative controller pumps within its exact node limit.
+It polls idle member queues while other runners are still active. This matters for router
 patterns: a long-running router can continue creating handler jobs while those
 handlers drain concurrently, and a handler whose current queue snapshot empties
 is restarted when more work arrives. Queued work alone does not make a component
@@ -655,8 +661,10 @@ ordering.
 
 ## Cooperative API networking and watchdog leases (0.3.15)
 
-API nodes are limited only by each node's effective `max_threads`, interpreted
-as a fiber count. The framework does not apply an aggregate admission ceiling.
+API nodes use each node's effective `max_threads` as a fiber request. Without an
+aggregate runtime setting, those requests remain independent. With
+`mwf threads --api-total N`, the workflow computes deterministic proportional
+per-node shares whose sum is `N` and applies them at the execution-claim layer.
 Each node pump hosts greenlet job controllers and one scheduler loop, while one
 process-wide asyncio thread owns the framework HTTP client shards.
 
@@ -858,16 +866,39 @@ state because the cursor, not the datagram, defines progress. Component scheduli
 active restart detection, and `mwf top` therefore react to commits immediately,
 with a slow timeout retained only for defensive recovery.
 
-API startup must remain bounded and terminal-aware. The default `balanced` strategy
-uses one cooperative pump per node, begins with a 64-job probe, grows only to a
-96-job dense claim slice, and alternates at most 12 ready completions with the next
-admission turn. It pauses only while the SQLite writer's urgent terminal signal is
-set. Do not replace this with more
-startup lanes solely to reduce claim time: the explode benchmark showed that
-lanes can admit more provider work while increasing output-to-terminal visibility
-lag. Evaluate alternatives with `benchmarks/compare_startup_strategies.py` and
-require zero missing monitor rows, zero queued/running residue, and bounded exact
-terminal publication p95 before considering throughput.
+API startup must remain bounded and terminal-aware. The default `adaptive`
+strategy computes one vector for API nodes becoming runnable in the same wave,
+whether they share a Hoeflein component or are sibling DAG components. Each node
+gets one pump. The shared ceiling is
+`min(sum(isolated_ceiling_i), max(k, max(12, logical_processors + 5)))`, where
+`isolated_ceiling_i = min(12, ceil(n_i / 64))`. Extra pumps greedily maximize
+`n_i / (p_i * (p_i + 1))`, the marginal reduction of evenly divided controller
+load. Separate DAG waves retain already-running pumps in the same global
+accounting; a newly ready component waits if there is not yet one pump for each
+of its API members. Within a node, lane concurrency shares (not pump counts)
+sum exactly to `n_i`. This is controller parallelism, not an aggregate
+concurrency override.
+
+Evaluate alternate budgets with `benchmarks/benchmark_explode_pump_function.py`.
+The supplied ten-node shape measured 14/18/20/21/24 pump totals and peaked at 21
+on a 16-logical-processor host. Require zero missing monitor rows, zero
+queued/running residue, and bounded exact terminal publication before accepting
+throughput gains.
+
+API-fiber observability must not serialize the controller after a provider
+response. Trace, output, and input-forwarding journal rows are appended through
+the ordinary ordered group commit without waiting at each call. Their append is
+generation/execution fenced, and the attempt waits for all its event futures
+before it can enter fallback or publish terminal state. This preserves both
+restart correctness and durable-before-terminal trace order while allowing a
+pump to interleave post-response work from many jobs.
+
+Checkpoint runtime JSON is advisory state, not execution ownership. Multiple
+not-yet-executing asynchronous `running` snapshots for the same job attempt and
+priority therefore share one replaceable slot; the SQLite writer freezes the
+newest value only when its transaction starts. Timeout persistence remains
+synchronous, and the terminal job row/event remains authoritative. Admission,
+successful completion, and failed completion retain equal priority 5.
 
 `mwf top` is the generic diagnostic surface for that evaluation. In addition to
 job counts and rates, it reads a throttled heartbeat from the active process's

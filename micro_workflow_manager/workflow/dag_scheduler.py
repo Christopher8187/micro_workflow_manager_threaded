@@ -5,6 +5,7 @@ from typing import Callable
 from ..errors import InvalidGraphError
 from ..models import CANCELLED, FAILED, RUNNING, Job
 from .admission_sources import ClaimedJob, ClaimedQueuedJobSource, StoppingJobSource
+from .component_scheduler import allocate_api_pumps
 from ..storage.job_sources import (
     LiveRefreshableQueuedJobObjectSource,
     PrefetchingQueuedJobObjectSource,
@@ -80,6 +81,7 @@ class DagSchedulerMixin:
         blocked_components = wait_deadlock_blocked_components if wait_deadlock_blocked_components is not None else set()
         in_flight: set[tuple[str, ...]] = set()
         futures = {}
+        future_api_pumps: dict[object, dict[str, int]] = {}
         admission_stopped = False
 
         with ThreadPoolExecutor(
@@ -102,14 +104,78 @@ class DagSchedulerMixin:
                     and unit_ready(unit)
                 ]
 
+                # A later DAG branch may become ready while an independent
+                # component from an earlier wave is still running. Retain those
+                # pumps in the global accounting; otherwise every wave could
+                # independently consume the whole host budget. Existing pumps
+                # are non-preemptive, so newly ready components receive the
+                # remaining budget. A component starts only when every one of
+                # its API members can receive the guaranteed first pump.
+                active_api_pumps = {
+                    node_name: pumps
+                    for allocation in future_api_pumps.values()
+                    for node_name, pumps in allocation.items()
+                }
+                active_api_nodes = {
+                    node_name: self.effective_max_threads(node_name)
+                    for node_name in active_api_pumps
+                }
+                ready_api_by_unit = {
+                    unit: {
+                        node_name: self.effective_max_threads(node_name)
+                        for node_name in unit
+                        if (self.nodes[node_name].runner_override or self.runner) == "api"
+                    }
+                    for unit in ready
+                }
+                possible_api_nodes = dict(active_api_nodes)
+                for limits in ready_api_by_unit.values():
+                    possible_api_nodes.update(limits)
+                target_pump_total = sum(allocate_api_pumps(possible_api_nodes).values())
+                available_pumps = max(0, target_pump_total - sum(active_api_pumps.values()))
+
+                launch: list[tuple[str, ...]] = []
+                launch_api_nodes: dict[str, int] = {}
+                skipped_api_unit = False
                 for unit in ready:
+                    unit_api_nodes = ready_api_by_unit[unit]
+                    if len(unit_api_nodes) > available_pumps:
+                        skipped_api_unit = True
+                        continue
+                    launch.append(unit)
+                    launch_api_nodes.update(unit_api_nodes)
+                    available_pumps -= len(unit_api_nodes)
+
+                if launch_api_nodes:
+                    # If every ready API component fits, use all remaining host
+                    # capacity. If one must wait, keep unused pumps available
+                    # rather than converting them into non-preemptive extras.
+                    launch_budget = (
+                        len(launch_api_nodes)
+                        if skipped_api_unit
+                        else target_pump_total - sum(active_api_pumps.values())
+                    )
+                    wave_api_pumps = allocate_api_pumps(
+                        launch_api_nodes,
+                        pump_budget=launch_budget,
+                    )
+                else:
+                    wave_api_pumps = {}
+
+                for unit in launch:
+                    unit_api_pumps = {
+                        node_name: wave_api_pumps[node_name]
+                        for node_name in ready_api_by_unit[unit]
+                    }
                     future = executor.submit(
                         self.run_component,
                         set(unit),
                         True,
                         wait_deadlock_resolver,
+                        unit_api_pumps,
                     )
                     futures[future] = unit
+                    future_api_pumps[future] = unit_api_pumps
                     in_flight.add(unit)
 
                 if not futures:
@@ -119,6 +185,7 @@ class DagSchedulerMixin:
 
                 for future in done:
                     unit = futures.pop(future)
+                    future_api_pumps.pop(future, None)
                     in_flight.remove(unit)
 
                     if refuse_after is not None and unit == refuse_after:
@@ -158,6 +225,7 @@ class DagSchedulerMixin:
         _stop_event: Event | None = None,
         _live_until_event: Event | None = None,
         _defer_final_status_refresh: bool = False,
+        _api_startup_lanes: int | None = None,
     ):
         """Run all currently queued jobs for one node using a lazy job source."""
         if not ignore_readiness and not self.node_ready(node_name):
@@ -170,7 +238,7 @@ class DagSchedulerMixin:
             return []
 
         self.storage.set_node_status(node_name, RUNNING)
-        runner = self.make_runner(node)
+        runner = self.make_runner(node, api_startup_lanes=_api_startup_lanes)
 
         refreshable = bool(
             getattr(runner, "supports_refreshable_job_source", False)
