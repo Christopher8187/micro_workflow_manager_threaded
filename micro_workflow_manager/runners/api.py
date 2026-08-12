@@ -34,6 +34,22 @@ class _SharedRefreshableSource:
         hint = getattr(self.source, "remaining_hint", None)
         return None if not callable(hint) else hint()
 
+    def wait_for_change(self, timeout: float = 5.0) -> bool:
+        """Keep every allocated lane resident across a temporarily empty queue.
+
+        Hoeflein handler pumps commonly start when the first fan-out job lands.
+        The other lanes therefore see an empty live queue during their first
+        probe.  Dropping the wrapped source's event wait made those lanes exit
+        permanently, leaving a large node such as ``explodeexercise`` with one
+        of its four allocated pumps for the remainder of the run.
+        """
+        if self.stopped.is_set():
+            return False
+        waiter = getattr(self.source, "wait_for_change", None)
+        if not callable(waiter):
+            return False
+        return bool(waiter(timeout)) and not self.stopped.is_set()
+
 
 class _LaneCoordinator:
     """Split a live node limit exactly across the fiber pumps still running."""

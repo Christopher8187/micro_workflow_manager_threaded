@@ -263,6 +263,48 @@ def test_api_runner_defaults_to_fixed_limit_adaptive_sharding(monkeypatch):
     assert ApiRunner(max_threads=10000).startup_lanes(DenseSource()) == 12
 
 
+def test_sharded_live_api_pumps_survive_a_sparse_start_and_admit_later_work():
+    class InitiallyEmptyPerLaneSource:
+        def __init__(self):
+            self.items = list(range(8))
+            self.pulls_by_thread = {}
+            self.lock = threading.Lock()
+            self.wait_count = 0
+
+        def pull(self, max_items):
+            thread_id = threading.get_ident()
+            with self.lock:
+                pulls = self.pulls_by_thread.get(thread_id, 0) + 1
+                self.pulls_by_thread[thread_id] = pulls
+                # FiberRuntime probes twice before consulting wait_for_change.
+                # Model the real Hoeflein startup where a lane begins before
+                # the fan-out has published work for it.
+                if pulls <= 2:
+                    return []
+                result = self.items[:max_items]
+                del self.items[:max_items]
+                return result
+
+        def remaining_hint(self):
+            with self.lock:
+                return len(self.items)
+
+        def wait_for_change(self, _timeout):
+            with self.lock:
+                self.wait_count += 1
+                return bool(self.items)
+
+    source = InitiallyEmptyPerLaneSource()
+    results = ApiRunner(
+        max_threads=8,
+        poll_interval=0.001,
+        startup_strategy="lanes:2",
+    ).run_job_source("A", source, lambda value: value)
+
+    assert sorted(results) == list(range(8))
+    assert source.wait_count >= 1
+
+
 def test_simultaneous_api_pump_vector_guarantees_one_and_uses_shared_budget():
     limits = {
         "explodeclaim": 200,

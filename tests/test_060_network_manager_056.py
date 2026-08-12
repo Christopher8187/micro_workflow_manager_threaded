@@ -1,4 +1,5 @@
 import asyncio
+import ssl
 import threading
 import time
 
@@ -13,6 +14,28 @@ from micro_workflow_manager.networking import (
     shared_http_transport,
 )
 from micro_workflow_manager.runners.api import ApiRunner
+from micro_workflow_manager.network.manager import NetworkManager
+
+
+def test_network_manager_reuses_one_default_ssl_context_for_every_client_shard(monkeypatch):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    calls = []
+
+    def build_context(*, verify, cert, trust_env):
+        calls.append((verify, cert, trust_env))
+        return context
+
+    monkeypatch.setattr(httpx, "create_ssl_context", build_context)
+    manager = NetworkManager()
+    manager.configure(http2=True, streams_per_connection=32)
+    first = manager._new_client_shard()
+    second = manager._new_client_shard()
+    try:
+        assert manager._client_kwargs["verify"] is context
+        assert calls == [(True, None, True)]
+    finally:
+        asyncio.run(first.client.aclose())
+        asyncio.run(second.client.aclose())
 
 
 def test_http2_stream_width_is_safely_capped_and_observable(monkeypatch):
@@ -28,7 +51,7 @@ def test_http2_stream_width_is_safely_capped_and_observable(monkeypatch):
     assert snapshot["streams_per_connection"] == 32
     assert snapshot["shard_capacity"] == 32
     assert snapshot["http2_stream_safety_cap"] == 32
-    assert snapshot["active_request_limit"] == 1024
+    assert "active_request_limit" not in snapshot
 
 
 def test_http2_stream_safety_cap_is_explicitly_overridable(monkeypatch):
@@ -45,18 +68,22 @@ def test_http2_stream_safety_cap_is_explicitly_overridable(monkeypatch):
     assert snapshot["http2_stream_safety_cap"] == 80
 
 
-def test_network_manager_bounds_active_requests_without_reducing_job_concurrency():
+def test_network_manager_dispatches_all_admitted_requests_without_a_global_gate():
     lock = threading.Lock()
     active = 0
     peak = 0
+    request_count = 24
+    all_dispatched = asyncio.Event()
 
     async def handler(request):
         nonlocal active, peak
         with lock:
             active += 1
             peak = max(peak, active)
+            if active == request_count:
+                all_dispatched.set()
         try:
-            await asyncio.sleep(0.02)
+            await asyncio.wait_for(all_dispatched.wait(), timeout=2)
             return httpx.Response(200, content=b"ok", request=request)
         finally:
             with lock:
@@ -66,13 +93,12 @@ def test_network_manager_bounds_active_requests_without_reducing_job_concurrency
     configure_shared_http_transport(
         transport=httpx.MockTransport(handler),
         streams_per_connection=3,
-        active_request_limit=6,
         architecture="manager",
     )
     try:
-        results = ApiRunner(max_threads=32, poll_interval=0.001).run_jobs(
+        results = ApiRunner(max_threads=request_count, poll_interval=0.001).run_jobs(
             "A",
-            list(range(48)),
+            list(range(request_count)),
             lambda _index: shared_http_transport.request(
                 "GET", "https://example.test/", timeout=2
             ).status_code,
@@ -81,10 +107,10 @@ def test_network_manager_bounds_active_requests_without_reducing_job_concurrency
     finally:
         close_shared_http_transport()
 
-    assert results == [200] * 48
-    assert peak == 6
-    assert snapshot["active_request_limit"] == 6
-    assert snapshot["client_count"] == 2
+    assert results == [200] * request_count
+    assert peak == request_count
+    assert "active_request_limit" not in snapshot
+    assert snapshot["client_count"] == 8
 
 
 def test_network_manager_is_default_and_coalesces_ingress_wakeups():
