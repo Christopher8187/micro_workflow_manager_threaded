@@ -9,6 +9,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from micro_workflow_manager import cli
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
@@ -188,3 +190,59 @@ def test_job_event_append_uses_one_groupable_journal_mutation(tmp_path, monkeypa
     assert captured["rows"][0][0:2] == ("node", 7)
     assert captured["rows"][0][3] == "trace"
     assert json.loads(captured["rows"][0][4]) == {"name": "batched"}
+
+
+def test_api_job_event_append_can_return_a_future_and_flush_in_order(tmp_path):
+    storage = FileStorage(tmp_path)
+    storage.create_job(Job(node_name="A", job_id=1, params={}))
+    generation, execution_id = storage.claim_job_execution(
+        "A", 1, started_at="2026-01-01T00:00:00"
+    )
+
+    first = storage.append_job_event(
+        "A", 1, "trace",
+        _wait=False,
+        _execution_generation=generation,
+        _execution_id=execution_id,
+        sequence=1,
+    )
+    second = storage.append_job_event(
+        "A", 1, "trace",
+        _wait=False,
+        _execution_generation=generation,
+        _execution_id=execution_id,
+        sequence=2,
+    )
+
+    first.result()
+    second.result()
+    events = [
+        event for event in storage.read_job_events("A", 1)
+        if event["event"] == "trace"
+    ]
+    assert [event["sequence"] for event in events] == [1, 2]
+
+
+def test_api_job_event_append_rejects_superseded_execution(tmp_path):
+    from micro_workflow_manager.errors import JobRestartedError
+
+    storage = FileStorage(tmp_path)
+    storage.create_job(Job(node_name="A", job_id=1, params={}))
+    generation, execution_id = storage.claim_job_execution(
+        "A", 1, started_at="2026-01-01T00:00:00"
+    )
+    storage.request_job_restart("A", 1, reason="test")
+
+    future = storage.append_job_event(
+        "A", 1, "trace",
+        _wait=False,
+        _execution_generation=generation,
+        _execution_id=execution_id,
+        stale=True,
+    )
+
+    with pytest.raises(JobRestartedError):
+        future.result()
+    assert not any(
+        event.get("stale") for event in storage.read_job_events("A", 1)
+    )

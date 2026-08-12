@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from micro_workflow_manager.errors import JobRestartedError
+
 
 @dataclass(slots=True, frozen=True)
 class JobEventAppend:
@@ -13,6 +15,8 @@ class JobEventAppend:
     event_time: str
     event: str
     data_json: str
+    generation: int | None = None
+    execution_id: str | None = None
 
 
 class JobEventStorageMixin:
@@ -220,6 +224,42 @@ class JobEventStorageMixin:
         """
         if not appends:
             return []
+        fenced = [append for append in appends if append.execution_id is not None]
+        current: dict[tuple[str, int], tuple[int, str | None]] = {}
+        by_node: dict[str, list[int]] = {}
+        for append in fenced:
+            by_node.setdefault(append.node_name, []).append(append.job_id)
+        for node_name, job_ids in by_node.items():
+            unique_ids = sorted(set(job_ids))
+            for offset in range(0, len(unique_ids), 500):
+                chunk = unique_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    "SELECT job_id, generation, active_execution_id FROM jobs "
+                    f"WHERE node_name=? AND job_id IN ({placeholders})",
+                    [node_name, *chunk],
+                ).fetchall()
+                current.update({
+                    (node_name, int(row["job_id"])): (
+                        int(row["generation"]), row["active_execution_id"]
+                    )
+                    for row in rows
+                })
+
+        valid: list[JobEventAppend] = []
+        errors: list[BaseException | None] = []
+        for append in appends:
+            expected = (append.generation, append.execution_id)
+            observed = current.get((append.node_name, append.job_id))
+            if append.execution_id is not None and observed != expected:
+                errors.append(JobRestartedError(
+                    f"Job {append.node_name}/{append.job_id} generation "
+                    f"{append.generation} was restarted"
+                ))
+            else:
+                valid.append(append)
+                errors.append(None)
+
         connection.executemany(
             "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
             "VALUES(?, ?, ?, ?, ?)",
@@ -231,25 +271,48 @@ class JobEventStorageMixin:
                     append.event,
                     append.data_json,
                 )
-                for append in appends
+                for append in valid
             ],
         )
-        return [(True, None) for _append in appends]
+        # If any event from one job attempt became stale, report that fence
+        # failure only after every valid peer append in this transaction was
+        # persisted. Outcomes remain in request order.
+        return [
+            (False, error) if error is not None else (True, None)
+            for error in errors
+        ]
 
-    def append_job_event(self, node_name: str, job_id: int, event: str, **data: Any):
+    def append_job_event(
+        self,
+        node_name: str,
+        job_id: int,
+        event: str,
+        *,
+        _wait: bool = True,
+        _execution_generation: int | None = None,
+        _execution_id: str | None = None,
+        **data: Any,
+    ):
         append = JobEventAppend(
             node_name=node_name,
             job_id=self.validate_job_id(job_id),
             event_time=datetime.now().isoformat(timespec="milliseconds"),
             event=str(event),
             data_json=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            generation=(
+                int(_execution_generation)
+                if _execution_generation is not None else None
+            ),
+            execution_id=(str(_execution_id) if _execution_id is not None else None),
         )
-        self.submit_grouped_db_mutation(
+        options = {} if _wait else {"wait": False}
+        return self.submit_grouped_db_mutation(
             ("job-event-appends",),
             append,
             self._apply_job_event_appends,
             priority=10,
             collect_seconds=0.001,
+            **options,
         )
 
     def read_job_events(self, node_name: str, job_id: int) -> list[dict[str, Any]]:

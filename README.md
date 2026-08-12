@@ -20,6 +20,20 @@ manager, and a Pygame state machine.
 
 ## What changed in 0.5.6
 
+- Simultaneously runnable API nodes now receive a shared controller-pump vector.
+  Every node is guaranteed one pump; the host-bounded remainder is allocated by
+  marginal controller-load reduction. On the 16-logical-processor explode
+  shape, 21 pumps are allocated as `1,2,3,2,4,2,2,1,2,2` while every node's
+  configured concurrency remains exact and unchanged.
+- API-fiber trace, output, and input-forwarding events are generation-fenced and
+  enqueued asynchronously into the existing ordered SQLite group commit. Each
+  attempt flushes its event futures before fallback or terminal publication, so
+  provenance remains durable-before-terminal without one SQLite round trip per
+  observability record.
+- Not-yet-executing priority-20 checkpoint snapshots coalesce per job attempt.
+  The latest checkpoint stays inspectable, timeouts remain durable, and
+  admission, successful terminal publication, and failed terminal publication
+  all remain in the same priority-5 runtime-critical class.
 - API networking now has an explicit backend `NetworkManager`: one process-wide event loop owns persistent HTTPX client shards and all socket I/O. Node fibers enqueue lightweight requests; dense cross-thread submissions are coalesced before asyncio task creation instead of calling `run_coroutine_threadsafe` once per request. Existing `shared_http_transport` application code remains unchanged.
 - Network-manager state is aggregated in memory and bulk-upserted into the new SQLite `network_state` table at most every two seconds. This observability path is low-priority and non-fatal. SQLite schema version is 4.
 - Adds the requested 22-node skew A/B benchmark: two 2,000-job nodes plus twenty 100-job nodes with 512 proportionally allocated API slots. In the observed unlimited-bandwidth H2 sample, the manager improved runner throughput ~6.5%, durable workflow throughput ~6.4%, and the durable big:small ratio from 11.69:1 to 13.16:1. See `NETWORK_MANAGER_ARCHITECTURE_056.md`.
@@ -81,13 +95,19 @@ manager, and a Pygame state machine.
 
 ## What changed in 0.4.8
 
-- API nodes use an **event-prioritized single cooperative admission pump** by
-  default. One pump multiplexes thousands of fibers without duplicate
-  dense-source claim/controller contention, services provider completions
-  between bounded admission slices, and yields when urgent terminal publication
-  is pending. It still sizes its first admission window from the remaining queue
-  and a four-turn target capped at 512. Explicit `balanced`, `elastic`,
-  `adaptive`, and `lanes:N` strategies remain available for experiments.
+- API nodes use **fixed-limit adaptive admission sharding** by default. Dense
+  nodes that become runnable together receive one shared pump vector. Every API
+  node is guaranteed one pump. The total is bounded by the smaller of the nodes'
+  isolated benefit ceilings and `max(12, logical_processors + 5)`; remaining
+  pumps are assigned by marginal benefit `n / (p * (p + 1))`, where `n` is the
+  declared concurrency and `p` is the node's current pump count. On the supplied
+  16-logical-processor explode workload this gives 21 pumps across ten handlers.
+  `_LaneCoordinator` keeps each node's lane-concurrency sum exactly equal to its
+  declared limit, so controller sharding never reduces or increases job
+  concurrency. Already-running pumps remain charged when later DAG branches
+  become ready, preventing successive waves from each consuming a fresh host
+  budget. Explicit `event`, `balanced`, `elastic`, and `lanes:N` strategies
+  remain available for controlled comparisons.
 - Simultaneous Hoeflein claim bursts are combined into one grouped SQLite
   operation. The mutation writer also caps ordinary claim transactions at 192
   job rows, so a multi-thousand-job admission wave cannot trap urgent terminal
@@ -115,10 +135,10 @@ manager, and a Pygame state machine.
   counts, effective limits, starts/finishes per second, queue and terminal p95
   latency, recent lifecycle events, process RSS/thread data, SQLite/WAL size,
   and the active process's mutation-writer backlog and batch diagnostics.
-- The production API startup strategy is `single`; explicit multi-lane strategies
-  remain available for workloads that benefit from them. Dense HTTP fan-out testing
-  at 512–4096 fibers showed that duplicate startup pumps add more durable-claim and
-  controller contention than useful admission parallelism on the default path.
+- The former production API startup strategy was `single`. It remains available
+  as `event` for controlled comparisons, but shared-budget adaptive sharding is
+  the default after single-controller scaling tests exposed a large throughput
+  penalty at high declared concurrency.
 - Retry/fallback inspection moved from `mwf inspect NODE filter` to
   `mwf filter NODE`; `mwf filter NODE stage X` shows terminal failures at the
   final stage or failures at X that succeeded at X+1.
@@ -199,18 +219,13 @@ manager, and a Pygame state machine.
 
 ## What changed in 0.4.0
 
-- Terminal job status and event commits now use the writer's local-execution
-  priority. They continue to remain below durable queue publication, but run
-  ahead of API admission and checkpoint churn. A large API node can therefore
-  keep starting jobs without hiding already-published completions from
-  `mwf monitor`.
-- Claim priority and terminal priority are now independent. API claims remain
-  deliberately lower priority so live Hoeflein producers keep their commit
-  capacity; finished output still becomes monitor-visible promptly instead of
-  waiting behind the rest of a high-fanout start wave.
+- Terminal job status/event commits and execution claims now share runtime-
+  critical priority 5. Success, failure, and admission therefore enter one FIFO
+  class; bounded claim batches and cooperative callback servicing supply the
+  fairness without making one outcome type outrank another.
 - A monitor-shaped regression verifies that a large supervised API node reports
   every completion from SQLite and leaves no queued/running residue while its
-  claims use the lower-priority admission lane.
+  claims and terminal outcomes use that same priority.
 
 ## What changed in 0.3.18
 

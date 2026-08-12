@@ -406,7 +406,14 @@ def test_dense_api_source_uses_bounded_admission_slices_and_sparse_source_resets
             return result
 
     dense = DenseSource(2000)
-    results = ApiRunner(max_threads=2000, poll_interval=0.001).run_job_source(
+    # This regression isolates the geometric pull behavior of one controller
+    # pump. Adaptive production runners may partition the same 2000 limit over
+    # several pumps, so select the single-pump strategy explicitly here.
+    results = ApiRunner(
+        max_threads=2000,
+        poll_interval=0.001,
+        startup_strategy="event",
+    ).run_job_source(
         "A",
         dense,
         lambda value: value,

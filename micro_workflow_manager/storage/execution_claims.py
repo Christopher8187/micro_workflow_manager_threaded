@@ -6,7 +6,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime
-from threading import get_ident
+from threading import Lock, get_ident
 from typing import Any
 from uuid import uuid4
 
@@ -14,17 +14,6 @@ from micro_workflow_manager.models import QUEUED, RUNNING
 
 
 from .priorities import ADMISSION_PRIORITY
-
-
-@dataclass(slots=True, frozen=True)
-class RuntimeUpdate:
-    node_name: str
-    job_id: int
-    generation: int
-    execution_id: str | None
-    state: str
-    watch_id: str | None
-    serialized: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -47,131 +36,12 @@ class ExecutionClaimBatch:
 class JobExecutionClaimStorageMixin:
     """Runtime state plus execution-lease claiming and release."""
 
-    def _init_job_execution_state(self) -> None:
-        from threading import Lock
-
+    def _init_job_execution_claim_state(self) -> None:
         self._claim_batch_lock = Lock()
         self._claim_batches: dict[
             tuple[str, int],
             list[tuple[int, str, Future[tuple[int, str]]]],
         ] = {}
-
-    def read_job_runtime(self, node_name: str, job_id: int) -> dict[str, Any]:
-        row = self.db_connection().execute(
-            "SELECT runtime_json FROM jobs WHERE node_name=? AND job_id=?",
-            (node_name, self.validate_job_id(job_id)),
-        ).fetchone()
-        if row is None or not row["runtime_json"]:
-            return {}
-        try:
-            data = json.loads(row["runtime_json"])
-        except json.JSONDecodeError:
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    @staticmethod
-    def _apply_runtime_updates(connection, updates: list[RuntimeUpdate]):
-        if not updates:
-            return []
-        # Runtime rows are observability metadata, not execution ownership.
-        # Keep each node in its own mutation group. Cross-node runtime grouping
-        # was benchmarked for wide fan-out and did not improve throughput. Fence
-        # every queued write to the generation and execution that produced it so
-        # an asynchronous API checkpoint/completion can never overwrite a later
-        # restart. One executemany also avoids a savepoint and transaction unit per
-        # job during 1k-10k API admission waves.
-        # Keep only the latest queued observation for the same attempt. A fast
-        # API call can enqueue both ``running`` and ``completed`` before the
-        # writer reaches this priority class; persisting the intermediate value
-        # adds work without improving inspection.
-        latest_by_attempt: dict[
-            tuple[str, int, int, str | None], RuntimeUpdate
-        ] = {}
-        for update in updates:
-            latest_by_attempt[(
-                update.node_name,
-                update.job_id,
-                update.generation,
-                update.execution_id,
-            )] = update
-
-        connection.executemany(
-            "UPDATE jobs SET runtime_json=? WHERE node_name=? AND job_id=? "
-            "AND generation=? "
-            "AND ("
-            "(? IS NULL AND active_execution_id IS NULL) "
-            "OR active_execution_id=? "
-            "OR ("
-            "? IN ('timed_out','completed','failed','recovered') "
-            "AND status IN ('done','failed','skipped','cancelled') "
-            "AND json_valid(status_json)=1 "
-            "AND json_extract(status_json, '$.execution_id')=?"
-            ")"
-            ") "
-            "AND NOT ("
-            "?='running' AND runtime_json IS NOT NULL "
-            "AND json_valid(runtime_json)=1 "
-            "AND json_extract(runtime_json, '$.watch_id')=? "
-            "AND json_extract(runtime_json, '$.state') IN "
-            "('timed_out','completed','failed','restarted','recovered')"
-            ")",
-            [
-                (
-                    update.serialized,
-                    update.node_name,
-                    update.job_id,
-                    update.generation,
-                    update.execution_id,
-                    update.execution_id,
-                    update.state,
-                    update.execution_id,
-                    update.state,
-                    update.watch_id,
-                )
-                for update in latest_by_attempt.values()
-            ],
-        )
-        return [(True, None) for _update in updates]
-
-    def write_job_runtime(
-        self,
-        node_name: str,
-        job_id: int,
-        data: dict[str, Any],
-        *,
-        wait: bool = True,
-        priority: int = 10,
-    ):
-        node_name = self.validate_node_name(node_name)
-        job_id = self.validate_job_id(job_id)
-        state = str(data.get("state") or "")
-        try:
-            generation = int(data.get("generation", 0) or 0)
-        except (TypeError, ValueError):
-            generation = 0
-        execution_id = data.get("execution_id")
-        if execution_id is not None:
-            execution_id = str(execution_id)
-        watch_id = data.get("watch_id")
-        if watch_id is not None:
-            watch_id = str(watch_id)
-        update = RuntimeUpdate(
-            node_name=node_name,
-            job_id=job_id,
-            generation=generation,
-            execution_id=execution_id,
-            state=state,
-            watch_id=watch_id,
-            serialized=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-        )
-        return self.submit_grouped_db_mutation(
-            ("runtime", node_name),
-            update,
-            self._apply_runtime_updates,
-            wait=wait,
-            priority=priority,
-            collect_seconds=0.001,
-        )
 
     def job_execution_lock_name(self, node_name: str, job_id: int) -> str:
         self.validate_node_name(node_name)

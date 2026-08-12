@@ -1,51 +1,173 @@
 # Explode performance improvements
 
-## Result
+## Outcome
 
-The best bounded live run completed 704 explode-handler jobs with no failures in
-89.167 seconds. The original valid baseline completed 705 in 171.578 seconds.
-That is 1.92x handler throughput and a 48.0% reduction in time to the workflow's
-handler-only stop boundary.
+The retained MWF design makes large-concurrency nodes useful without changing
+their configured concurrency. Simultaneously running API nodes receive one
+globally allocated controller-pump vector. Every node gets a pump; large nodes
+receive more pumps only while there is measured marginal benefit; each node's
+lane concurrency shares always sum to its exact declared `max_threads`.
 
-The live result does not reach 5x end to end. Controlled local measurements show
-that MWF's router publication path is no longer the limiting layer: the same
-3,732-job, 10-target router benchmark improved from 211.01 jobs/s at commit
-`7a82e62` to 375.11 jobs/s on this branch (1.78x). It is also 6.37x the original
-live fan-out rate. In the complete workflow, OpenRouter response time and output
-size dominate after local mutation pressure is removed.
+In the final fixed-declared-concurrency five-minute live comparison, the ten
+explode handlers completed 1,609 jobs versus 1,367 at baseline, with no terminal
+handler failures in either run. Handler throughput rose from 4.5422/s to
+5.3393/s: **1.175x, or +17.5%**. Time to 701 handler completions fell from
+214.025 s to 156.558 s: **1.367x faster, or -26.8%**.
 
-All live runs followed `explode_testing_workflow.md`. The stop count is the
-combined terminal count for the ten explode handler nodes only; central
-`explode` and `redistribute` jobs are excluded. Each run was killed at the first
-of more than 700 handler jobs or five minutes, with `mwf monitor` and `mwf top`
-captured separately.
+The original 5x goal was reached for the isolated large-node MWF controller
+bottleneck, not for the provider-bound live workflow. A local real-socket H2
+benchmark of one node at declared concurrency 1,400 improved from 40.53 jobs/s
+with one pump to 268.81 jobs/s at the measured pump plateau: **6.63x**. With all
+ten explode-shaped nodes running simultaneously, the shared 21-pump allocator
+measured 241.43 jobs/s versus 126.6 jobs/s for the single-pump control:
+**1.91x**. Live OpenRouter throughput and heterogeneous response work then
+limit the end-to-end gain.
 
-## Stage comparison
+All final live measurements obeyed `explode_testing_workflow.md`: no aggregate
+API budget, no per-node override, every effective limit equal to its declaration
+(including `explodeexercise=1400`), separate `mwf monitor` and `mwf top`, and a
+hard stop at the first of more than 2,400 combined handler completions or five
+minutes. Both compared runs reached the five-minute boundary. Central `explode`
+and `redistribute` jobs are excluded from every handler count below.
 
-| Metric | Baseline | Best run | Change |
+## Live stage measurements
+
+| Fixed-concurrency metric | Baseline | Retained design | Change |
 |---|---:|---:|---:|
-| Time to bounded stop | 171.578 s | 89.167 s | 1.92x faster; -48.0% |
-| Handler completions/s | 4.109 | 7.895 | 1.92x; +92.2% |
-| Fan-out: `explode` to handlers | 58.890 jobs/s | 124.138 jobs/s | 2.11x; +110.8% |
-| Mixed: `explode` to handlers | 10.574 jobs/s | 34.666 jobs/s | 3.28x; +227.9% |
-| Mixed: handlers back to `explode` | 3.614 jobs/s | 4.590 jobs/s | 1.27x; +27.0% |
-| Mixed: both directions combined | 14.188 jobs/s | 39.255 jobs/s | 2.77x; +176.7% |
-| Peak queued SQLite requests | 4,990 | 228 | -95.4% |
-| Worst sampled terminal-lag p95 | 0.246 s | 0.143 s | -41.9% |
-| Handler failures | 0 | 0 | unchanged |
+| Handler completions in five minutes | 1,367 | 1,609 | +17.7% |
+| Handler completions/s | 4.5422 | 5.3393 | 1.175x; +17.5% |
+| Time to first handler completion | 19.721 s | 13.410 s | 1.471x; -32.0% |
+| Time to 100 completions | 77.729 s | 53.322 s | 1.458x; -31.4% |
+| Time to 250 completions | 106.479 s | 87.238 s | 1.221x; -18.1% |
+| Time to 500 completions | 163.120 s | 130.586 s | 1.249x; -19.9% |
+| Time to 701 completions | 214.025 s | 156.558 s | 1.367x; -26.8% |
+| Fan-out-only, `explode` to handlers | 89.8686 jobs/s | 76.4077 jobs/s | 0.850x; -15.0% |
+| Mixed, `explode` to handlers | 7.4522 jobs/s | 10.6713 jobs/s | 1.432x; +43.2% |
+| Mixed, handlers back to `explode` | 1.6404 jobs/s | 2.0121 jobs/s | 1.227x; +22.7% |
+| Mixed, both directions | 9.0927 jobs/s | 12.6834 jobs/s | 1.395x; +39.5% |
+| Peak mutation durability backlog | 8,147 | 5,915 | -27.4% |
+| Mutation backlog p95 | 2,007 | 1,027 | -48.8% |
+| Peak queued SQLite requests | 378 | 221 | -41.5% |
+| Queued SQLite requests p95 | 112 | 78 | -30.4% |
+| Terminal handler failures | 0 | 0 | unchanged |
 
-The best run used a run-scoped aggregate API budget of 128 for initial fan-out,
-then changed it to 512 after the first handler completion. The switch occurred
-at 9.656 seconds. This is intentionally admission control, not a late network
-semaphore: work above the budget remains `queued` and is not falsely reported as
-`running`.
+The pure initial fan-out phase did **not** improve in the live A/B; it regressed
+15.0%. This phase is short and its boundary moved from the first feedback at
+23.590 s to 16.569 s, so its rate is particularly sensitive to which provider
+responses arrive first. The controlled local router benchmark separately
+improved the 3,732-job, ten-target publication path from 211.01 to 375.11
+jobs/s (**1.78x**). The live result therefore does not justify claiming a
+provider-facing fan-out speedup. The repeatable live breakthrough is the mixed
+phase, where feedback, new fan-out, API completion, journaling, and terminal
+publication contend at the same time.
 
-## Root causes
+The disparity that motivated this work is substantially reduced. At baseline,
+`explodeexercise` (declared 1,400) did not show its first completion until
+226.944 s, while `explodejas` completed at 20.075 s. With pump allocation,
+exercise's first completion arrived at 22.464 s (**10.10x sooner**) and JAS's at
+13.239 s (**1.52x sooner**). Exercise completed 506 jobs in the window versus
+459 at baseline, while JAS completed 68 versus 61. The large node no longer
+waits behind one overloaded controller pump.
 
-### Same-priority FIFO admission waves
+## Global pump function
 
-Execution admission, successful terminal publication, and failed terminal
-publication already share the exact runtime-critical priority:
+For the set of actually simultaneous API nodes, let declared node concurrency
+be `(n_1, ..., n_k)` and allocated pump count be `(p_1, ..., p_k)`. MWF computes:
+
+```text
+isolated_ceiling_i = min(12, ceil(n_i / 64))
+B = max(k, min(sum(isolated_ceiling_i), max(12, logical_processors + 5)))
+p_i = 1 for every i
+while sum(p_i) < B:
+    choose eligible i maximizing n_i / (p_i * (p_i + 1))
+    p_i += 1
+```
+
+`n_i / (p_i(p_i+1))` is the marginal reduction in controller load under an
+even `n_i/p_i` partition. It is a separable diminishing-return objective, so
+greedily taking the largest remaining marginal benefit gives the optimal
+integer allocation for this model. Ties are deterministic by node name.
+
+On this 16-logical-processor host and the ten explode handlers, `B=21` and the
+allocation is:
+
+| Node | Declared concurrency | Pumps |
+|---|---:|---:|
+| `explodeclaim` | 200 | 1 |
+| `explodecontext` | 400 | 2 |
+| `explodedefinition` | 800 | 3 |
+| `explodeexample` | 500 | 2 |
+| `explodeexercise` | 1,400 | 4 |
+| `explodeexplanation` | 400 | 2 |
+| `explodejas` | 400 | 2 |
+| `explodenotation` | 200 | 1 |
+| `exploderemark` | 400 | 2 |
+| `explodetheorem` | 600 | 2 |
+| **Total** | **5,300** | **21** |
+
+The 14–21 range is a host/workload operating region, not a rule that can
+override the no-starvation constraint. If more than 21 API nodes run at once,
+the mathematical requirements conflict; MWF correctly makes `B >= k`, so the
+one-pump-per-node guarantee wins. A 30-node regression verifies that all 30 get
+one pump.
+
+The budget is global across overlapping DAG waves, not merely global within one
+scheduler iteration. Pumps owned by an earlier still-running component remain
+charged when a later branch becomes ready. A newly ready component waits if the
+remaining capacity cannot give each of its API members one pump. Pumps are
+non-preemptive within a running component, avoiding controller teardown while
+jobs are live.
+
+Pump count is not request concurrency. `_LaneCoordinator` partitions each
+node's current effective concurrency exactly across its pumps. For exercise,
+four live lane limits sum to exactly 1,400; if one pump exits, the remaining
+shares are recomputed and still sum to exactly 1,400. The allocator never
+changes a declared/effective concurrency value.
+
+## Pump plateau
+
+The simultaneous ten-node real-socket H2 benchmark held all declared limits and
+job populations fixed and changed only the shared pump budget:
+
+| Total pumps | Median jobs/s | Relative to 21 |
+|---:|---:|---:|
+| 14 | 177.90 | 0.737x |
+| 18 | 189.43 | 0.785x |
+| 20 | 216.43 | 0.896x |
+| **21** | **241.43** | **1.000x** |
+| 24 | 211.02 | 0.874x |
+
+Twenty-one is 35.7% faster than fourteen and 14.4% faster than twenty-four.
+The regression at 24 is why the default uses a bounded global host budget
+instead of blindly increasing pumps with concurrency. `min(12, ceil(n/64))`
+also caps the isolated curve after the 1,400-node benchmark plateaued.
+
+## Other retained bottleneck fixes
+
+### Non-blocking, lease-fenced event journals
+
+An API handler formerly blocked its pump on individual SQLite commits for
+`trace`, `output_written`, and `input_forwarded`. In live exercise traces these
+ordinary post-provider events could be separated by 12–95 seconds under writer
+pressure. API fibers now enqueue those rows into the ordered grouped mutation
+writer and continue cooperatively. Each append carries the execution generation
+and ID; stale attempts are rejected in the transaction. The handler flushes its
+pending event futures in submission order before fallback or terminal
+publication, preserving durable-before-terminal provenance.
+
+### Coalesced checkpoint observations
+
+Priority-20 runtime JSON is advisory observability, not execution ownership.
+Not-yet-executing asynchronous snapshots for the same node/job/generation/
+execution/priority now share one replaceable slot. The writer freezes the newest
+snapshot only when its transaction begins. Synchronous timeout records retain
+their barrier and the terminal job row remains authoritative. This reduced the
+live priority-20 request peak from 370 to 195 and prevented observability work
+from overwhelming the pump gain.
+
+### Equal critical priority
+
+The required invariant is explicit and regression-tested:
 
 ```text
 RUNTIME_CRITICAL_PRIORITY = 5
@@ -53,95 +175,43 @@ ADMISSION_PRIORITY = 5
 TERMINAL_PRIORITY = 5
 ```
 
-Both success and failure use the terminal path. This invariant is preserved and
-covered by regression tests.
+Successful and failed completion use the same lease-fenced terminal path.
+Admission, success, and failure therefore have equal priority. FIFO order within
+that class, bounded claim transaction weight, cooperative callback servicing,
+and asynchronous lower-priority observations prevent an impossible completion
+backlog without letting one kind of terminal outcome jump another.
 
-Equal priority is necessary but not sufficient. The SQLite mutation queue is
-FIFO within a priority. The old default API startup strategy could enqueue a
-large wave of same-priority execution claims before servicing provider-complete
-fibers. Later terminal updates then sat behind claims that had already entered
-the FIFO. This produced the apparently impossible state where provider output
-existed but thousands of jobs still appeared `running`.
+## Provider control and rejected experiments
 
-The default is now the event-prioritized single-lane strategy. It services
-provider callbacks between bounded admission slices and yields on the mutation
-writer's urgent event. Claims retain priority 5, terminal success retains
-priority 5, and terminal failure retains priority 5; scheduling now gives all
-three a chance to enter the shared FIFO in time order.
+The direct minimal OpenRouter probe succeeded at every tested level, but scaled
+sublinearly: 5.00 requests/s at concurrency 32, 7.60 at 128, 25.28 at 512, and
+32.36 at 1,024. Median latency rose from 3.79 s to 18.43 s. More admitted work
+therefore still raises throughput, but nowhere near proportionally; that is an
+external limit on a 5x live result.
 
-### Excess provider concurrency
+Rejected or non-default experiments:
 
-The ten handlers request 5,300 API fibers in total. Cooperative fibers avoid OS
-thread explosion, but 5,300 simultaneous long OpenRouter requests still overload
-the provider, sockets, and response-processing path. A standalone small-output
-probe found a throughput knee around 256 concurrent requests and no benefit at
-1,024. The real, heterogeneous explode workload performed best around 512 after
-the initial fan-out phase.
+- 24 global pumps: 211.02 jobs/s, slower than 21 pumps' 241.43 jobs/s.
+- Asynchronous events without checkpoint coalescing: only 1,478 live handler
+  completions and a 18,808 durability-backlog peak.
+- Manual SQLite `VACUUM`: shrank a 1.024 GB database with about 75% free pages
+  to 97 MB, but the compacted live sample fell to 1,242 handler completions. It
+  is not an automatic framework action.
+- An HTTP/2 client-shard width of 32 improved a small direct OpenRouter probe,
+  but did not improve the heterogeneous live workflow. The transport change was
+  removed.
+- Earlier aggregate-concurrency experiments predate the fixed-concurrency rule
+  and are intentionally excluded from the final A/B. The retained allocator
+  changes controller pumps only; final live runs used no `--api-total` setting
+  and no per-node override.
 
-MWF now exposes a run-scoped aggregate budget:
+## Added diagnostics and benchmark commands
 
-```powershell
-mwf threads --api-total 128
-# after the first explode-handler completion:
-mwf threads --api-total 512
-```
-
-The budget is divided deterministically in proportion to the active API nodes'
-effective `max_threads` requests. Per-node requests remain weights and upper
-bounds. It can be changed live and clears with the run, like existing thread
-overrides.
-
-### Redundant durable and filesystem work
-
-The mixed path generated thousands of synchronous trace/event inserts and paid
-two durable barriers for a common single-child route: child publication followed
-by the parent's `jobs_created` event. It also created and removed a temporary
-directory for every routed child before creating the final job directory.
-
-The retained implementation:
-
-- groups concurrent event appends into one SQLite `executemany` transaction
-  while each caller still waits for its own durable result;
-- groups auto-ID child publication across all target nodes, not just one target;
-- allocates per-node IDs, moves payloads, inserts child rows and creation events,
-  advances sequences, and marks nodes queued in one mutation;
-- writes the parent's `jobs_created` journal row in that same child-publication
-  transaction;
-- stages each payload as one flat temporary file, eliminating one temporary
-  directory create/remove cycle per routed child;
-- keeps idempotency resolution and cleanup correct under concurrent same-key
-  publishers.
-
-At 1,000 local routes, a 1 ms group window produced 397.15 jobs/s, versus
-240.20 jobs/s with grouping disabled. Longer 3 ms and 10 ms windows were slower,
-so 1 ms is the measured plateau rather than an arbitrary batch delay.
-
-## Experiments retained and rejected
-
-| Experiment | Outcome |
-|---|---|
-| Default single admission plus grouped events | 177.953 s; rejected |
-| Event-prioritized admission | 159.269 s; retained as default |
-| Static aggregate budget near 512 | 93.497 s best static sample |
-| Static aggregate budget 256 | 106.548 s; fan-out improved, mixed phase slower |
-| Static aggregate budget 128 | 181.884 s; too little provider parallelism |
-| 128 to 768 phase switch | 95.514 s; 768 overloaded mixed central routing |
-| 128 to 512 phase switch | 89.167 s; best coherent live run |
-| Late network cap of 256 | 229.928 s; rejected and removed |
-
-The late network cap was structurally wrong for explode: thousands of jobs had
-already been claimed and marked `running` before waiting for network capacity.
-Its code was removed. The retained aggregate control acts at admission, so
-monitor state remains truthful and the impossible backlog does not return.
-
-## Additional diagnostics and commands
-
-The following commands were added or used beyond the original workflow:
+In addition to the required preparation/run commands, these read-only MWF
+commands were used. They never delayed either hard stop:
 
 ```powershell
-mwf threads --api-total 128
-mwf threads --api-total 512
-mwf threads --api-total reset
+mwf threads
 mwf monitor --interval 0.5 --json --no-clear
 mwf top --interval 0.5 --json --no-clear
 mwf doctor
@@ -152,63 +222,37 @@ mwf inspect <node> job <job-id>
 mwf trace <node> job <job-id>
 ```
 
-`mwf monitor` supplied the handler-only stop count. `mwf top` exposed terminal
-lag, event rate, and mutation-writer queue pressure. The inspect/filter/trace
-commands are read-only drill-down tools and did not replace or delay either hard
-stop condition.
+Framework-local and provider controls used these additional commands/scripts:
 
-The separate OpenRouter concurrency probe requested by the testing instructions
-is at `C:\Users\Chris\Videos\openrouter_concurrency_probe.py`. Its result files
-are `openrouter_concurrency_results.json` and
-`openrouter_concurrency_results_high.json` in the same folder. The probe imports
-the already configured key without printing or copying it and uses minimal
-four-token responses.
+```powershell
+python benchmarks/local_http_delay_server.py --port 8766 --http2
+python benchmarks/benchmark_explode_pump_function.py --endpoint https://127.0.0.1:8766 --global-budget 21 --repeats 2
+python C:\Users\Chris\Videos\openrouter_concurrency_probe.py
+python C:\Users\Chris\Videos\openrouter_mwf_shard_probe.py
+```
 
-## Correctness and design notes
+The provider probes and JSON results are in `C:\Users\Chris\Videos` and use the
+existing configured key without printing or copying it. The reusable pump
+benchmark is committed under `benchmarks/benchmark_explode_pump_function.py`.
 
-- No bounded explode run reported a handler failure.
-- The new aggregate budget affects only API admission; direct, threaded, and
-  process runner semantics are unchanged.
-- A direct/thread/process checkpoint now excludes synchronous framework
-  persistence time from the user's next checkpoint interval.
-- The supervisor releases its thread-local SQLite connection while waiting only
-  for restart-listener idle grace, preventing a completed workflow from keeping
-  an otherwise idle handle open.
-- A killed run still requires the exact reset/paste preparation sequence before
-  another test.
+## Verification
 
-## Final validation
+The final branch passed the authoritative `HOW_TO_TEST.md` process:
 
-The retained branch passed the repository's complete Windows test gate:
+- compiled all 264 Python files in the final tree (the first full-suite compile
+  contained 263; the cohesive runtime-observation module was then extracted);
+- `291 passed, 1 deselected` in one complete ordinary batch (the deselection is
+  the explicitly separate stress test);
+- all four autostart/cycle cases passed in four fresh Python processes;
+- the explicit marked Markov-chain stress case passed;
+- `59 passed` in the mandatory scheduler/lifecycle/fan-out focused batch;
+- `38 passed` in the focused networking/storage/pacing batch; and
+- focused pump/event/checkpoint tests passed, including exact 1,400 lane-share
+  conservation, the ten-node vector, 30-node no-starvation, stale-event fencing,
+  runtime coalescing, and the cross-DAG-wave global-budget invariant.
 
-- `284 passed, 1 deselected` in the ordinary suite (the deselection is the
-  intentionally separate marked stress case);
-- all four autostart-cycle cases passed in four fresh Python processes;
-- the explicit Markov-chain stress case passed;
-- `92 passed` in the mandatory scheduler/lifecycle/fan-out focused batch; and
-- `34 passed` in the network-manager/watchdog/transport focused batch.
-
-The required real-socket localhost HTTP/2 controls also completed with zero
-failed jobs. At concurrency 32, median rates were 460.55 jobs/s for direct
-transport, 438.31 jobs/s for the bare API runner, and 48.95 jobs/s for the full
-durable workflow. With 1,024 small jobs and 512 aggregate concurrency, the
-fan-out-width medians were 39.55, 139.32, 205.23, and 170.76 jobs/s for 1, 4,
-10, and 20 handler nodes respectively. At 20 nodes the aggregate-concurrency
-sweep plateaued at 166.23, 172.60, 176.79, and 181.29 jobs/s for limits 128,
-512, 1,024, and 2,048, confirming that simply admitting more work yields little
-after the durable lifecycle path saturates.
-
-In the documented 22-node skew A/B, the central NetworkManager improved the
-bare-runner rate from 742.27 to 779.58 jobs/s and the full-workflow rate from
-116.88 to 121.10 jobs/s. Its full-workflow ingress wakeups fell from 1.0 to
-0.094 per request while preserving the configured 20:1 concurrency weighting.
-The benchmark harness now explicitly closes Windows SQLite handles, waits
-through the intentional restart-listener grace, and treats residual temporary
-cleanup as best effort; none of that teardown time is included in the measured
-run duration.
-
-The remaining variance is external: repeated runs with the same code and budget
-show materially different OpenRouter request durations. Further live tuning at
-this point changes sample noise more than framework behavior. The admission
-curve has been bracketed on both sides, the rejected late-cap design is removed,
-and the local routing path has reached its measured 1 ms group-commit plateau.
+The performance plateau is now bracketed on both sides, the 5x-plus isolated
+large-node controller result is reproduced with real sockets, the final live
+comparison keeps all user concurrency settings fixed, and further MWF pump
+growth demonstrably regresses. Remaining live scaling is primarily provider and
+application-response work rather than an unallocated large-node controller.

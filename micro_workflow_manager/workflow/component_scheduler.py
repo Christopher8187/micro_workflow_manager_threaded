@@ -1,3 +1,4 @@
+import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Event
 
@@ -8,6 +9,65 @@ from ..models import FAILED, QUEUED, RUNNING, WAITING
 
 
 WAIT_BLOCKING_JOB_STATUSES = {QUEUED, RUNNING, FAILED}
+
+
+def allocate_api_pumps(
+    limits: dict[str, int],
+    *,
+    logical_processors: int | None = None,
+    pump_budget: int | None = None,
+) -> dict[str, int]:
+    """Allocate one shared controller-pump pool across active API nodes.
+
+    Every node receives one pump. The shared budget is the smaller of (a) what
+    every node would choose alone and (b) logical processors plus five, but is
+    never smaller than the node count. On the 16-logical-CPU explode host this
+    is 21 pumps, the measured simultaneous-node plateau.
+
+    Remaining pumps are assigned by the marginal reduction in equally split
+    controller load. For node concurrency ``n`` and current pump count ``p``,
+    that benefit is ``n / (p * (p + 1))``. Greedy allocation is optimal for
+    this separable diminishing-return objective. Each node is capped at its
+    independently measured ``min(12, ceil(n/64))`` plateau.
+    """
+    names = sorted(limits)
+    if not names:
+        return {}
+    if any(type(limits[name]) is not int or limits[name] < 1 for name in names):
+        raise ValueError("API pump allocation limits must be integers >= 1")
+    independent = {
+        name: min(12, max(1, (limits[name] + 63) // 64))
+        for name in names
+    }
+    independent_total = sum(independent.values())
+    if pump_budget is None:
+        processors = os.cpu_count() if logical_processors is None else logical_processors
+        processors = 1 if processors is None else processors
+        if type(processors) is not int or processors < 1:
+            raise ValueError("logical processor count must be an integer >= 1")
+        pump_budget = max(12, processors + 5)
+    if type(pump_budget) is not int or pump_budget < 1:
+        raise ValueError("API pump budget must be an integer >= 1")
+    budget = max(len(names), min(independent_total, pump_budget))
+    allocations = {name: 1 for name in names}
+    while sum(allocations.values()) < budget:
+        candidates = [name for name in names if allocations[name] < independent[name]]
+        if not candidates:
+            break
+        # If work is evenly partitioned, controller load is w/p. The marginal
+        # benefit of the next pump is w/(p*(p+1)); greedily selecting the largest
+        # value solves the separable diminishing-return allocation.
+        chosen = max(
+            candidates,
+            key=lambda name: (
+                limits[name]
+                / (allocations[name] * (allocations[name] + 1)),
+            ),
+        )
+        allocations[chosen] += 1
+    return allocations
+
+
 class ComponentSchedulerMixin:
     # Durable lifecycle commits wake the scheduler immediately. The timeout is
     # only a defensive cross-process fallback if an external writer cannot use
@@ -127,6 +187,7 @@ class ComponentSchedulerMixin:
         component: set[str] | tuple[str, ...] | list[str],
         ignore_readiness: bool = False,
         wait_deadlock_resolver=None,
+        api_pump_allocations: dict[str, int] | None = None,
     ) -> list[str]:
         """Pump one Hoeflein component until it is quiescent.
 
@@ -142,6 +203,14 @@ class ComponentSchedulerMixin:
 
         ran: list[str] = []
         component_nodes = list(self.component_key(component_set))
+
+        api_nodes = {
+            node_name: self.effective_max_threads(node_name)
+            for node_name in component_nodes
+            if (self.nodes[node_name].runner_override or self.runner) == "api"
+        }
+        if api_pump_allocations is None:
+            api_pump_allocations = allocate_api_pumps(api_nodes)
 
         def resolve_wait_deadlock(queued_nodes, blocking_nodes):
             if wait_deadlock_resolver is None:
@@ -227,6 +296,7 @@ class ComponentSchedulerMixin:
                         _stop_event=stop_event,
                         _live_until_event=(stop_event if node_name in live_nodes else None),
                         _defer_final_status_refresh=True,
+                        _api_startup_lanes=api_pump_allocations.get(node_name),
                     )
                 finally:
                     self.storage.close_thread_connection()

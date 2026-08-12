@@ -118,6 +118,47 @@ def test_async_runtime_completion_can_follow_terminal_publication(tmp_path):
     assert storage.read_job_runtime("merge", 1)["state"] == "completed"
 
 
+def test_pending_async_checkpoints_coalesce_to_latest_observation(tmp_path, monkeypatch):
+    storage = FileStorage(tmp_path)
+    storage.create_job(Job(job_id=1, node_name="merge", params={}))
+    generation, execution_id = storage.claim_job_execution(
+        "merge", 1, started_at="2026-07-21T12:00:00"
+    )
+    queued = []
+    original = storage.submit_grouped_db_mutation
+
+    def capture(group_key, item, operation, **options):
+        if group_key == ("runtime", "merge") and options.get("wait") is False:
+            from concurrent.futures import Future
+            future = Future()
+            queued.append((item, operation, future))
+            return future
+        return original(group_key, item, operation, **options)
+
+    monkeypatch.setattr(storage, "submit_grouped_db_mutation", capture)
+    common = {
+        "watch_id": "watch-1",
+        "state": "running",
+        "generation": generation,
+        "execution_id": execution_id,
+    }
+    first = storage.write_job_runtime(
+        "merge", 1, {**common, "checkpoint_name": "load"},
+        wait=False, priority=20,
+    )
+    second = storage.write_job_runtime(
+        "merge", 1, {**common, "checkpoint_name": "write"},
+        wait=False, priority=20,
+    )
+
+    assert first is second
+    assert len(queued) == 1
+    slot, operation, future = queued[0]
+    with storage.db_transaction() as connection:
+        outcomes = operation(connection, [slot])
+    future.set_result(outcomes[0][1])
+    assert storage.read_job_runtime("merge", 1)["checkpoint_name"] == "write"
+
 def test_execution_fence_uses_filesystem_lock_not_sqlite_advisory_rows(tmp_path, monkeypatch):
     storage = FileStorage(tmp_path)
     storage.create_job(Job(job_id=1, node_name="merge", params={}))
