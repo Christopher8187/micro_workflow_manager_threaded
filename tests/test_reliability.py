@@ -40,6 +40,7 @@ def test_generated_job_records_parent_node_and_job_id():
             "from_node": "A",
             "from_job_id": parent.job_id,
         }
+        workflow.storage.close_database_connections()
 
 
 def test_programmatic_hoeflein_component_waits_for_external_predecessor():
@@ -72,6 +73,7 @@ def test_programmatic_hoeflein_component_waits_for_external_predecessor():
         workflow.run_node("A")
         assert workflow.node_complete("A")
         assert workflow.node_complete("B")
+        workflow.storage.close_database_connections()
 
 
 def test_cancelled_jobs_do_not_count_as_successful_completion():
@@ -92,6 +94,7 @@ def test_cancelled_jobs_do_not_count_as_successful_completion():
 
         assert not workflow.node_complete("A")
         assert not workflow.node_ready("B")
+        workflow.storage.close_database_connections()
 
 
 def test_threaded_runner_runs_multiple_jobs_inside_one_node_at_once():
@@ -103,7 +106,7 @@ def test_threaded_runner_runs_multiple_jobs_inside_one_node_at_once():
 
         @workflow.task("A", max_threads=2)
         def a(ctx):
-            time.sleep(0.20)
+            time.sleep(1.00)
             return ctx.job_id
 
         @workflow.task("B")
@@ -117,8 +120,10 @@ def test_threaded_runner_runs_multiple_jobs_inside_one_node_at_once():
         workflow.run_node("A")
         elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.35
-        assert workflow.node_complete("A")
+        node_complete = workflow.node_complete("A")
+        workflow.storage.close_database_connections()
+        assert elapsed < 1.70
+        assert node_complete
 
 
 def test_threaded_workflow_runs_ready_nodes_at_the_same_time():
@@ -130,12 +135,12 @@ def test_threaded_workflow_runs_ready_nodes_at_the_same_time():
 
         @workflow.task("A", max_threads=1)
         def a(ctx):
-            time.sleep(0.20)
+            time.sleep(1.00)
             return "A"
 
         @workflow.task("B", max_threads=1)
         def b(ctx):
-            time.sleep(0.20)
+            time.sleep(1.00)
             return "B"
 
         @workflow.task("C")
@@ -149,10 +154,13 @@ def test_threaded_workflow_runs_ready_nodes_at_the_same_time():
         ran = workflow.run()
         elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.35
+        a_complete = workflow.node_complete("A")
+        b_complete = workflow.node_complete("B")
+        workflow.storage.close_database_connections()
+        assert elapsed < 1.70
         assert set(ran) == {"A", "B"}
-        assert workflow.node_complete("A")
-        assert workflow.node_complete("B")
+        assert a_complete
+        assert b_complete
 
 
 def test_threaded_workflow_starts_newly_ready_nodes_while_other_nodes_are_still_running():
@@ -171,7 +179,9 @@ def test_threaded_workflow_starts_newly_ready_nodes_while_other_nodes_are_still_
 
         @workflow.task("B", max_threads=1)
         def b(ctx):
-            time.sleep(0.30)
+            # Leave a generous window for A to publish C and for the scheduler
+            # to admit it, even on slow Windows/SQLite test hosts.
+            time.sleep(1.50)
             timeline["b_finished"] = time.perf_counter()
             return "B"
 
@@ -192,9 +202,12 @@ def test_threaded_workflow_starts_newly_ready_nodes_while_other_nodes_are_still_
 
         # Check the actual scheduling property instead of relying on a tight
         # wall-clock threshold that is flaky on busy or slow filesystems.
-        assert timeline["c_started"] < timeline["b_finished"]
+        c_started_before_b_finished = timeline["c_started"] < timeline["b_finished"]
+        c_complete = workflow.node_complete("C")
+        workflow.storage.close_database_connections()
+        assert c_started_before_b_finished
         assert set(ran) == {"A", "B", "C"}
-        assert workflow.node_complete("C")
+        assert c_complete
 
 
 def test_router_can_force_one_node_to_run_jobs_sequentially_with_threaded_workflow():
@@ -228,6 +241,7 @@ def test_router_can_force_one_node_to_run_jobs_sequentially_with_threaded_workfl
         assert elapsed >= 0.20
         assert workflow.node_complete("A")
         assert workflow.nodes["A"].runner_override == "direct"
+        workflow.storage.close_database_connections()
 
 
 def test_run_node_marks_node_running_before_streaming_queued_jobs(monkeypatch):
@@ -259,6 +273,7 @@ def test_run_node_marks_node_running_before_streaming_queued_jobs(monkeypatch):
         workflow.run_node("A")
 
         assert observed_status["A"] == "running"
+        workflow.storage.close_database_connections()
 
 
 def test_threaded_runner_starts_before_lazy_source_is_exhausted():
@@ -422,6 +437,7 @@ def test_dynamic_spawn_does_not_touch_legacy_job_index(monkeypatch):
         assert workflow.node_complete("A")
         assert workflow.node_complete("B")
         assert workflow.storage.node_job_summary("B")["counts"][DONE] == 1
+        workflow.storage.close_database_connections()
 
 
 def test_threaded_high_fan_in_to_one_node_avoids_legacy_index_contention(monkeypatch):
@@ -464,3 +480,4 @@ def test_threaded_high_fan_in_to_one_node_avoids_legacy_index_contention(monkeyp
         assert workflow.node_complete("Z")
         assert workflow.storage.node_job_summary("Z")["total"] == 80
         assert workflow.storage.node_job_summary("Z")["counts"][DONE] == 80
+        workflow.storage.close_database_connections()

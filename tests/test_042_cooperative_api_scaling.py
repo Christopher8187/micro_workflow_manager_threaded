@@ -93,12 +93,10 @@ def test_api_runtime_override_can_exceed_os_thread_ceiling(tmp_path, monkeypatch
     assert "cannot exceed" in capsys.readouterr().err
 
 
-def test_removed_api_total_option_is_rejected(tmp_path, monkeypatch):
+def test_api_total_option_creates_pending_run_scoped_budget(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert cli.main(["init"]) == 0
-    try:
-        cli.main(["threads", "--api-total", "7"])
-    except SystemExit as error:
-        assert error.code == 2
-    else:
-        raise AssertionError("removed --api-total option was unexpectedly accepted")
+    assert cli.main(["threads", "--api-total", "7"]) == 0
+    state = json.loads((tmp_path / ".mwf" / "threads.json").read_text(encoding="utf-8"))
+    assert state["run_id"] is None
+    assert state["api_total_limit"] == 7

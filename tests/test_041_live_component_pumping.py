@@ -245,7 +245,9 @@ def test_api_handler_refills_from_jobs_added_after_its_pump_started(tmp_path):
                     max_active_before_routing_done,
                     active_handlers,
                 )
-        time.sleep(0.45)
+        # Keep handlers alive long enough to distinguish live-source refills
+        # from one initial snapshot even on slower Windows filesystems.
+        time.sleep(1.5)
         with lock:
             active_handlers -= 1
         return source
@@ -325,7 +327,7 @@ def test_cli_monitor_shows_api_handler_scaling_during_live_routing(
 
             @router.task
             def run(ctx, source):
-                ctx.sleep(0.45)
+                ctx.sleep(1.5)
                 return source
             """
         ).strip(),

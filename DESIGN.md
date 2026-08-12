@@ -124,10 +124,10 @@ A node behavior file should read in this order:
   worker growth is useful.
 - Use `api` for blocking model providers, HTTP SDKs, remote databases, and other
   high-latency calls. Its `max_threads` value intentionally means the node's
-  maximum in-flight calls. All API nodes additionally share a default
-  workflow-wide budget of 256, preventing their independent limits from
-  oversubscribing one provider/account. Active nodes receive proportional fair
-  shares and may borrow unused sibling capacity.
+  maximum in-flight calls. Independent node limits add together by default.
+  When several nodes share one provider/account, `mwf threads --api-total N`
+  adds a run-scoped aggregate admission budget and divides it proportionally by
+  their requested limits before jobs are claimed.
 - Use `process` for CPU-heavy, pickleable tasks that benefit from process
   isolation.
 
@@ -655,8 +655,10 @@ ordering.
 
 ## Cooperative API networking and watchdog leases (0.3.15)
 
-API nodes are limited only by each node's effective `max_threads`, interpreted
-as a fiber count. The framework does not apply an aggregate admission ceiling.
+API nodes use each node's effective `max_threads` as a fiber request. Without an
+aggregate runtime setting, those requests remain independent. With
+`mwf threads --api-total N`, the workflow computes deterministic proportional
+per-node shares whose sum is `N` and applies them at the execution-claim layer.
 Each node pump hosts greenlet job controllers and one scheduler loop, while one
 process-wide asyncio thread owns the framework HTTP client shards.
 

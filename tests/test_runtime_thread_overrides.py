@@ -182,6 +182,55 @@ def test_workflow_refreshes_override_from_atomic_runtime_file(tmp_path):
     assert workflow.effective_max_threads("A") == 2
 
 
+def test_api_total_budget_is_proportional_refreshable_and_run_scoped(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="api")
+    workflow.graph([("A", "B"), ("B", "C")])
+
+    @workflow.task("A", max_threads=200)
+    def a(ctx):
+        return None
+
+    @workflow.task("B", max_threads=400)
+    def b(ctx):
+        return None
+
+    @workflow.task("C", max_threads=1400)
+    def c(ctx):
+        return None
+
+    workflow.allowed_run_nodes = {"A", "B", "C"}
+    workflow.storage.set_api_total_limit(100)
+    assert [workflow.effective_max_threads(name) for name in ("A", "B", "C")] == [10, 20, 70]
+    assert workflow.effective_api_total_limit() == 100
+
+    workflow.storage.set_thread_override("B", 200)
+    limits = [workflow.effective_max_threads(name) for name in ("A", "B", "C")]
+    assert limits == [11, 11, 78]
+    assert sum(limits) == 100
+
+    workflow.storage.clear_api_total_limit()
+    assert workflow.api_total_limit_override() is None
+    assert workflow.effective_max_threads("A") == 200
+
+
+def test_threads_cli_sets_and_clears_pending_api_total_budget(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _make_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["threads", "--api-total", "64"]) == 0
+    assert "aggregate API admission budget: 64" in capsys.readouterr().out
+    data = json.loads((tmp_path / ".mwf" / "threads.json").read_text(encoding="utf-8"))
+    assert data["api_total_limit"] == 64
+
+    assert cli.main(["threads", "--api-total", "reset"]) == 0
+    assert "Cleared aggregate API admission budget" in capsys.readouterr().out
+    assert not (tmp_path / ".mwf" / "threads.json").exists()
+
+
 def test_threads_unknown_node_does_not_recreate_folder(tmp_path, monkeypatch, capsys):
     _make_project(tmp_path, monkeypatch)
     capsys.readouterr()

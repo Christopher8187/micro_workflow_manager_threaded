@@ -243,14 +243,14 @@ def test_programmatic_wide_fanout_retains_ephemeral_router_identity(tmp_path):
     assert len(workflow._included_routers) == 101
 
 
-def test_api_runner_defaults_to_single_startup_lane_for_dense_refreshable_sources(monkeypatch):
+def test_api_runner_defaults_to_event_prioritized_single_lane(monkeypatch):
     class DenseSource:
         def remaining_hint(self):
             return 10000
 
     monkeypatch.delenv("MWF_API_STARTUP_STRATEGY", raising=False)
     runner = ApiRunner(max_threads=4096)
-    assert runner.startup_strategy == "single"
+    assert runner.startup_strategy == "event"
     assert runner.startup_lanes(DenseSource()) == 1
 
 

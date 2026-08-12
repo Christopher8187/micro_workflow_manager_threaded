@@ -62,6 +62,7 @@ class MicroWorkflow(
         self._thread_override_lock = RLock()
         self._thread_override_signature: tuple[int, int, int, int] | None | object = object()
         self._thread_overrides: dict[str, int] = {}
+        self._api_total_limit: int | None = None
 
         # CLI safety controls. Normal library use keeps immediate autostarts.
         self.allowed_run_nodes: set[str] | None = None
@@ -99,29 +100,90 @@ class MicroWorkflow(
                 return self._thread_overrides
             state = self.storage.read_runtime_limit_state()
             self._thread_overrides = dict(state["overrides"])
+            self._api_total_limit = state.get("api_total_limit")
             self._thread_override_signature = signature
             return self._thread_overrides
 
     def thread_override(self, node_name: str) -> int | None:
         return self._refresh_runtime_limits().get(node_name)
 
-    def api_total_limit_override(self) -> None:
-        """Compatibility shim: aggregate API admission was removed in 0.3.15."""
-        return None
+    def api_total_limit_override(self) -> int | None:
+        """Return the run-scoped aggregate API admission budget, if configured."""
+        self._refresh_runtime_limits()
+        return self._api_total_limit
 
     def effective_api_total_limit(self) -> int:
-        """Descriptive aggregate API capacity; never an admission ceiling."""
-        total = 0
-        for name, node in self.nodes.items():
-            if (node.runner_override or self.runner) == "api":
-                total += self.effective_max_threads(name)
-        return max(1, total)
+        """Aggregate requested capacity after an optional proportional budget."""
+        limits = self._effective_api_node_limits()
+        return max(1, sum(limits.values()))
+
+    def _effective_api_node_limits(self) -> dict[str, int]:
+        overrides = self._refresh_runtime_limits()
+        allowed = self.allowed_run_nodes
+        requested = {
+            name: overrides.get(name, node.max_threads)
+            for name, node in self.nodes.items()
+            if (node.runner_override or self.runner) == "api"
+            and (allowed is None or name in allowed)
+        }
+        if not requested:
+            return {}
+
+        configured = self._api_total_limit
+        requested_total = sum(requested.values())
+        if configured is None or configured >= requested_total:
+            return requested
+        if configured < len(requested):
+            raise ValueError(
+                "aggregate API limit must be at least the number of active API nodes "
+                f"({len(requested)})"
+            )
+
+        shares = {
+            name: max(1, (configured * value) // requested_total)
+            for name, value in requested.items()
+        }
+        used = sum(shares.values())
+        remainders = sorted(
+            requested,
+            key=lambda name: (
+                -((configured * requested[name]) % requested_total),
+                name,
+            ),
+        )
+        while used < configured:
+            changed = False
+            for name in remainders:
+                if shares[name] >= requested[name]:
+                    continue
+                shares[name] += 1
+                used += 1
+                changed = True
+                if used == configured:
+                    break
+            if not changed:
+                break
+        while used > configured:
+            changed = False
+            for name in reversed(remainders):
+                if shares[name] <= 1:
+                    continue
+                shares[name] -= 1
+                used -= 1
+                changed = True
+                if used == configured:
+                    break
+            if not changed:
+                break
+        return shares
 
     def effective_max_threads(self, node_name: str) -> int:
         node = self.nodes[node_name]
         effective_runner = node.runner_override or self.runner
         if effective_runner == "direct":
             return 1
+        if effective_runner == "api" and self.api_total_limit_override() is not None:
+            return self._effective_api_node_limits().get(node_name, node.max_threads)
         override = self.thread_override(node_name)
         return override if override is not None else node.max_threads
 

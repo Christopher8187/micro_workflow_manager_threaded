@@ -184,7 +184,9 @@ def run_workflow(args, jobs):
     url = transfer_url(args)
     peak = [fd_count()]
     stop = threading.Event()
-    with tempfile.TemporaryDirectory(prefix="mwf-http-fanout-") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="mwf-http-fanout-", ignore_cleanup_errors=True
+    ) as directory:
         workflow = MicroWorkflow(Path(directory), runner="api")
         # CLI run/runfrom enables this. The benchmark deliberately uses the
         # production lease/fence/lifecycle path rather than the cheaper
@@ -207,10 +209,25 @@ def run_workflow(args, jobs):
             workflow.storage.guard_job_execution = _no_fence
         if args.diagnostic_no_runtime_start:
             _persist = workflow.scheduler_supervisor._persist_runtime
-            def _filtered_runtime(watch, *, state, error=None, wait=True, priority=10):
+            def _filtered_runtime(
+                watch,
+                *,
+                state,
+                error=None,
+                wait=True,
+                priority=10,
+                **kwargs,
+            ):
                 if state == "running":
                     return None
-                return _persist(watch, state=state, error=error, wait=wait, priority=priority)
+                return _persist(
+                    watch,
+                    state=state,
+                    error=error,
+                    wait=wait,
+                    priority=priority,
+                    **kwargs,
+                )
             workflow.scheduler_supervisor._persist_runtime = _filtered_runtime
         mutation_counts = {}
         node_status_writes = {}
@@ -301,6 +318,11 @@ def run_workflow(args, jobs):
             int(final_diag.get("submitted_serial", 0)),
             mutation_counts, node_status_writes,
         )
+        # Restart-event listeners intentionally remain warm for 0.5 seconds
+        # between dense execution waves. Let that bounded grace expire before a
+        # Windows TemporaryDirectory tries to remove the subscriber record.
+        time.sleep(0.6)
+        workflow.storage.close_database_connections()
     close_shared_http_transport()
     return elapsed, peak[0], int(snap.get("client_count", 0)), failed
 

@@ -29,7 +29,7 @@ def active_workflow_run(
     monitor_interval: float = 2.0,
 ):
     run_id = f"{int(time.time())}-{os.getpid()}-{uuid4().hex[:8]}"
-    api_startup_strategy = os.environ.get("MWF_API_STARTUP_STRATEGY", "single").strip().lower()
+    api_startup_strategy = os.environ.get("MWF_API_STARTUP_STRATEGY", "event").strip().lower()
     if api_startup_strategy in {"single", "event", "latency", "serial", "legacy"}:
         api_startup_windows = "1"
     elif api_startup_strategy == "balanced":

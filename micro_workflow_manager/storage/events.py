@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+
+@dataclass(slots=True, frozen=True)
+class JobEventAppend:
+    node_name: str
+    job_id: int
+    event_time: str
+    event: str
+    data_json: str
 
 
 class JobEventStorageMixin:
@@ -198,25 +208,49 @@ class JobEventStorageMixin:
             for node_name, job_ids in targets.items()
         )
 
-    def append_job_event(self, node_name: str, job_id: int, event: str, **data: Any):
-        self.validate_job_id(job_id)
-        event_time = datetime.now().isoformat(timespec="milliseconds")
-        data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    @staticmethod
+    def _apply_job_event_appends(connection, appends: list[JobEventAppend]):
+        """Persist concurrent journal appends with one SQLite statement.
 
-        def append(connection):
-            connection.execute(
-                "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
-                "VALUES(?, ?, ?, ?, ?)",
+        API component pumps and threaded routers can generate dozens of trace
+        records at the same instant. They are individually durable and each
+        caller still waits for its own commit, but making every record a
+        separate savepoint/INSERT was avoidable writer work on the mixed
+        fan-out/completion path.
+        """
+        if not appends:
+            return []
+        connection.executemany(
+            "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
+            "VALUES(?, ?, ?, ?, ?)",
+            [
                 (
-                    node_name,
-                    job_id,
-                    event_time,
-                    str(event),
-                    data_json,
-                ),
-            )
+                    append.node_name,
+                    append.job_id,
+                    append.event_time,
+                    append.event,
+                    append.data_json,
+                )
+                for append in appends
+            ],
+        )
+        return [(True, None) for _append in appends]
 
-        self.submit_db_mutation(append)
+    def append_job_event(self, node_name: str, job_id: int, event: str, **data: Any):
+        append = JobEventAppend(
+            node_name=node_name,
+            job_id=self.validate_job_id(job_id),
+            event_time=datetime.now().isoformat(timespec="milliseconds"),
+            event=str(event),
+            data_json=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        )
+        self.submit_grouped_db_mutation(
+            ("job-event-appends",),
+            append,
+            self._apply_job_event_appends,
+            priority=10,
+            collect_seconds=0.001,
+        )
 
     def read_job_events(self, node_name: str, job_id: int) -> list[dict[str, Any]]:
         rows = self.db_connection().execute(

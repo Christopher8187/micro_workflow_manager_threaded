@@ -101,7 +101,7 @@ class ApiRunner(BaseRunner):
         self.startup_strategy = (
             startup_strategy
             or os.environ.get("MWF_API_STARTUP_STRATEGY")
-            or "single"
+            or "event"
         ).strip().lower()
 
     def effective_limit(self) -> int:

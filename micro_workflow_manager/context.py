@@ -225,14 +225,10 @@ class NodeHandle(_ExecutionChecks):
                     job_id=job_id,
                     autostart=autostart,
                     _parent_job_id=self.from_job_id,
+                    _parent_event_data=self._event_fields(),
                     idempotency_key=key,
                     **params,
                 )
-            )
-            created_job_id = getattr(result, "job_id", job_id)
-            self._record_event(
-                "jobs_created",
-                jobs=[{"node": self.to_node, "job_id": created_job_id, "params": params}],
             )
             return result
 

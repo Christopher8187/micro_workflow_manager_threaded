@@ -1,12 +1,115 @@
 from __future__ import annotations
 
 import json
+import threading
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from micro_workflow_manager import NodeInputFileSystem, cli
 from micro_workflow_manager.cli.cleanup import prepare_fresh_components
 from micro_workflow_manager.system import MicroWorkflow
+
+
+def test_concurrent_single_job_routes_share_publish_group_and_keep_idempotency(tmp_path, monkeypatch):
+    workflow = MicroWorkflow(project_dir=tmp_path)
+    workflow.graph([])
+
+    @workflow.task("sink")
+    def sink(ctx, value=None):
+        return value
+
+    @workflow.task("sink2")
+    def sink2(ctx, value=None):
+        return value
+
+    applied_group_sizes = []
+    applied_group_nodes = []
+    original_apply = workflow.storage._apply_auto_job_publishes
+    original_submit = workflow.storage.submit_grouped_db_mutation
+
+    def apply(connection, publishes):
+        applied_group_sizes.append(len(publishes))
+        applied_group_nodes.append(
+            {publish.provisional.node_name for publish in publishes}
+        )
+        return original_apply(connection, publishes)
+
+    def submit(group_key, item, operation, **options):
+        if group_key[:1] == ("auto-job-publish",):
+            operation = apply
+            options["collect_seconds"] = 0.020
+        return original_submit(group_key, item, operation, **options)
+
+    monkeypatch.setattr(workflow.storage, "submit_grouped_db_mutation", submit)
+    gate = threading.Barrier(32)
+
+    def add_distinct(index):
+        gate.wait()
+        return workflow.add_job(
+            None,
+            "sink" if index % 2 == 0 else "sink2",
+            value=index,
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        jobs = list(executor.map(add_distinct, range(32)))
+
+    assert sorted(job.job_id for job in jobs if job.node_name == "sink") == list(range(1, 17))
+    assert sorted(job.job_id for job in jobs if job.node_name == "sink2") == list(range(1, 17))
+    assert max(applied_group_sizes) > 1
+    assert any(len(nodes) > 1 for nodes in applied_group_nodes)
+
+    duplicate_gate = threading.Barrier(32)
+
+    def add_duplicate(index):
+        duplicate_gate.wait()
+        return workflow.add_job(
+            None,
+            "sink",
+            value=index,
+            idempotency_key="shared-route",
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        duplicates = list(executor.map(add_duplicate, range(32)))
+
+    assert {job.job_id for job in duplicates} == {17}
+    assert workflow.storage.job_status_counts("sink")["queued"] == 17
+    staged = tmp_path / ".mwf" / "staged-jobs"
+    assert not staged.exists() or not any(staged.iterdir())
+
+
+def test_single_route_records_parent_jobs_created_in_publish_transaction(tmp_path, monkeypatch):
+    workflow = MicroWorkflow(project_dir=tmp_path)
+    workflow.graph([("parent", "sink")])
+
+    @workflow.task("parent")
+    def parent(ctx):
+        return ctx.node("sink").add(value=7).job_id
+
+    @workflow.task("sink")
+    def sink(ctx, value):
+        return value
+
+    direct_jobs_created_appends = 0
+    original_append = workflow.storage.append_job_event
+
+    def append(node_name, job_id, event, **data):
+        nonlocal direct_jobs_created_appends
+        if event == "jobs_created":
+            direct_jobs_created_appends += 1
+        return original_append(node_name, job_id, event, **data)
+
+    monkeypatch.setattr(workflow.storage, "append_job_event", append)
+    workflow.start("parent", job_id=1)
+    workflow.run_node("parent", ignore_readiness=True)
+
+    events = workflow.storage.read_job_events("parent", 1)
+    created = [event for event in events if event["event"] == "jobs_created"]
+    assert direct_jobs_created_appends == 0
+    assert len(created) == 1
+    assert created[0]["jobs"] == [{"node": "sink", "job_id": 1, "params": {"value": 7}}]
 
 
 def test_high_fanout_batch_creates_one_job_per_object_without_autostart(tmp_path):

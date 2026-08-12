@@ -163,3 +163,28 @@ def test_mutation_writer_retires_immediately_after_draining_queue(tmp_path):
         time.sleep(0.002)
 
     assert storage.mutation_writer_diagnostics()["writer_alive"] is False
+
+
+def test_job_event_append_uses_one_groupable_journal_mutation(tmp_path, monkeypatch):
+    storage = FileStorage(tmp_path)
+    captured = {}
+
+    class RecordingConnection:
+        def executemany(self, sql, rows):
+            captured["sql"] = sql
+            captured["rows"] = list(rows)
+
+    def submit(group_key, item, operation, **options):
+        captured["group_key"] = group_key
+        captured["options"] = options
+        captured["outcomes"] = operation(RecordingConnection(), [item])
+
+    monkeypatch.setattr(storage, "submit_grouped_db_mutation", submit)
+    storage.append_job_event("node", 7, "trace", name="batched")
+
+    assert captured["group_key"] == ("job-event-appends",)
+    assert captured["options"] == {"priority": 10, "collect_seconds": 0.001}
+    assert captured["outcomes"] == [(True, None)]
+    assert captured["rows"][0][0:2] == ("node", 7)
+    assert captured["rows"][0][3] == "trace"
+    assert json.loads(captured["rows"][0][4]) == {"name": "batched"}

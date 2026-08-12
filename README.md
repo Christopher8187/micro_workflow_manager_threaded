@@ -81,10 +81,12 @@ manager, and a Pygame state machine.
 
 ## What changed in 0.4.8
 
-- API nodes use a **single cooperative admission pump** by default. One pump
-  multiplexes thousands of fibers without duplicate dense-source claim/controller
-  contention, while still sizing its first admission window from the remaining
-  queue and a four-turn target capped at 512. Explicit `balanced`, `elastic`,
+- API nodes use an **event-prioritized single cooperative admission pump** by
+  default. One pump multiplexes thousands of fibers without duplicate
+  dense-source claim/controller contention, services provider completions
+  between bounded admission slices, and yields when urgent terminal publication
+  is pending. It still sizes its first admission window from the remaining queue
+  and a four-turn target capped at 512. Explicit `balanced`, `elastic`,
   `adaptive`, and `lanes:N` strategies remain available for experiments.
 - Simultaneous Hoeflein claim bursts are combined into one grouped SQLite
   operation. The mutation writer also caps ordinary claim transactions at 192
@@ -1058,14 +1060,15 @@ router = NodeRouter("fetch_requests", runner="api", max_threads=64)
 ```
 
 For this runner, `max_threads=64` intentionally means at most 64 in-flight API
-jobs **for that node**. API nodes also share a workflow-wide admission budget,
-which defaults to 256. Therefore ten nodes declared at 100 do not create 1,000
-simultaneous provider calls: they receive fair shares of the 256 slots and can
-borrow capacity when sibling queues are light. The familiar `max_threads` name
-is retained so router code, `mwf threads`, `monitor`, and `inspect` use one
-concurrency vocabulary. Unlike the adaptive `threaded` runner, `api` fills its
-available per-node and shared slots immediately. Executor threads are still
-created lazily, and `io` and `network` are aliases.
+jobs **for that node**. By default, independent API node limits add together.
+For a shared provider or account, set a run-scoped aggregate admission budget
+with `mwf threads --api-total N`. MWF divides that budget proportionally by the
+active API nodes' effective `max_threads` requests, while retaining each request
+as an upper bound. The familiar `max_threads` name is retained so router code,
+`mwf threads`, `monitor`, and `inspect` use one concurrency vocabulary. Unlike
+the adaptive `threaded` runner, `api` fills its available per-node slots
+immediately. Executor threads are still created lazily, and `io` and `network`
+are aliases.
 
 ### Synchronous controller and abandonable handler
 
@@ -1096,6 +1099,8 @@ mwf threads explode 24         # set an absolute runtime limit
 mwf threads explode +8         # add eight slots
 mwf threads explode -4         # remove four slots
 mwf threads explode reset      # return to the router declaration
+mwf threads --api-total 512     # cap aggregate API admission proportionally
+mwf threads --api-total reset   # remove the aggregate API budget
 ```
 
 The override is stored in `.mwf/threads.json`, which is ignored by the generated
@@ -1110,22 +1115,24 @@ roughly 0.2 seconds. A decrease never cancels jobs already running; the runner
 stops launching replacements until active concurrency falls to the new limit.
 
 API values are cooperative fiber counts. They may be set into the thousands
-without one controller or supervisor OS thread per request, and values from
-multiple API nodes add together without an aggregate framework cap. Provider,
-socket, memory, and rate limits still apply. Threaded and process runners retain
-their OS-worker safety ceiling and warnings.
+without one controller or supervisor OS thread per request. Values from multiple
+API nodes add together unless the optional aggregate budget is set. The budget
+is applied before execution claims, so excess jobs remain truthfully queued
+instead of becoming `running` while waiting behind a late network semaphore.
+Provider, socket, memory, and rate limits still apply. Threaded and process
+runners retain their OS-worker safety ceiling and warnings.
 
 If a process is killed while changing the override, the next command detects
 that the advisory-lock owner is no longer alive and immediately reclaims the
 lock. It does not wait for the old five-minute lease to expire.
 
 `mwf inspect NODE` shows the declared, overridden, and effective values.
-`mwf monitor` shows the effective per-node value in its `threads` column, marks
-runtime overrides with `*`, and prints cooperative API fiber totals with
-`aggregate_limit=none`. Each API runner grows toward its own node limit; the
-adaptive threaded runner grows toward its OS-worker limit. A process runner reads the override when its process pool is
-created; an already-created process pool is not resized live. The direct runner
-always remains at one job.
+`mwf monitor` shows the effective per-node value in its `threads` column and
+marks runtime overrides with `*`. Each API runner grows toward its proportional
+share when an aggregate budget is active, or toward its own node limit when it
+is not. The adaptive threaded runner grows toward its OS-worker limit. A process
+runner reads the override when its process pool is created; an already-created
+process pool is not resized live. The direct runner always remains at one job.
 
 For CPU-heavy work, use the process-pool runner:
 
