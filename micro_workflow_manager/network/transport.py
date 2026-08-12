@@ -35,12 +35,16 @@ def timeout_budget_seconds(timeout: TimeoutValue) -> float:
 def close_shared_http_transport(): network_manager.close()
 
 def configure_shared_http_transport(*, http2=False, streams_per_connection=100,
+                                    http2_stream_safety_cap=None,
                                     http1_connections_per_shard=None,
+                                    active_request_limit=None,
                                     architecture=None, state_flush_interval=2.0,
                                     **client_kwargs):
     """Configure the backend manager; ordinary MWF applications need no manager wiring."""
     network_manager.configure(http2=http2, streams_per_connection=streams_per_connection,
+        http2_stream_safety_cap=http2_stream_safety_cap,
         http1_connections_per_shard=http1_connections_per_shard,
+        active_request_limit=active_request_limit,
         architecture=architecture, state_flush_interval=state_flush_interval, **client_kwargs)
 
 class SharedHTTPTransport:

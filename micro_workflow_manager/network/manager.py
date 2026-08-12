@@ -93,8 +93,12 @@ class NetworkManager:
         self._clients: list[_ClientShard] = []
         self._client_kwargs: dict[str, Any] = {}
         self._http2 = False
+        self._requested_streams_per_connection = 100
         self._streams_per_connection = 100
+        self._http2_stream_safety_cap = 32
         self._http1_connections_per_shard = 16
+        self._active_request_limit = 1024
+        self._active_request_semaphore: asyncio.Semaphore | None = None
         self._architecture = "manager"
         self._state_flush_interval = 2.0
         self._ingress: queue.SimpleQueue[NetworkRequest] = queue.SimpleQueue()
@@ -105,12 +109,25 @@ class NetworkManager:
         self._sinks: dict[str, weakref.ReferenceType] = {}
 
     def configure(self, *, http2=False, streams_per_connection=100,
-                  http1_connections_per_shard=None, architecture=None,
+                  http2_stream_safety_cap=None,
+                  http1_connections_per_shard=None, active_request_limit=None,
+                  architecture=None,
                   state_flush_interval=2.0, **client_kwargs: Any) -> None:
         if type(http2) is not bool:
             raise ValueError("http2 must be a bool")
         if type(streams_per_connection) is not int or streams_per_connection < 1:
             raise ValueError("streams_per_connection must be an integer >= 1")
+        if http2_stream_safety_cap is None:
+            try:
+                http2_stream_safety_cap = int(
+                    os.getenv("MWF_HTTP2_STREAM_SAFETY_CAP", "32")
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "MWF_HTTP2_STREAM_SAFETY_CAP must be an integer >= 1"
+                ) from error
+        if type(http2_stream_safety_cap) is not int or http2_stream_safety_cap < 1:
+            raise ValueError("http2_stream_safety_cap must be an integer >= 1")
         if http1_connections_per_shard is None:
             try:
                 http1_connections_per_shard = int(os.getenv("MWF_HTTP1_CONNECTIONS_PER_SHARD", "16"))
@@ -118,6 +135,17 @@ class NetworkManager:
                 raise ValueError("MWF_HTTP1_CONNECTIONS_PER_SHARD must be an integer >= 1") from error
         if type(http1_connections_per_shard) is not int or http1_connections_per_shard < 1:
             raise ValueError("http1_connections_per_shard must be an integer >= 1")
+        if active_request_limit is None:
+            try:
+                active_request_limit = int(
+                    os.getenv("MWF_NETWORK_ACTIVE_REQUEST_LIMIT", "1024")
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "MWF_NETWORK_ACTIVE_REQUEST_LIMIT must be an integer >= 1"
+                ) from error
+        if type(active_request_limit) is not int or active_request_limit < 1:
+            raise ValueError("active_request_limit must be an integer >= 1")
         architecture = str(architecture or os.getenv("MWF_NETWORK_ARCHITECTURE", "manager")).strip().lower()
         architecture = {"legacy": "direct", "central": "manager"}.get(architecture, architecture)
         if architecture not in {"manager", "direct"}:
@@ -130,8 +158,15 @@ class NetworkManager:
                 raise RuntimeError("shared network manager is already active")
             self._client_kwargs = dict(client_kwargs)
             self._http2 = http2
-            self._streams_per_connection = streams_per_connection
+            self._requested_streams_per_connection = streams_per_connection
+            self._http2_stream_safety_cap = http2_stream_safety_cap
+            self._streams_per_connection = (
+                min(streams_per_connection, http2_stream_safety_cap)
+                if http2
+                else streams_per_connection
+            )
             self._http1_connections_per_shard = http1_connections_per_shard
+            self._active_request_limit = active_request_limit
             self._architecture = architecture
             self._state_flush_interval = state_flush_interval
 
@@ -144,6 +179,7 @@ class NetworkManager:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
+        self._active_request_semaphore = asyncio.Semaphore(self._active_request_limit)
         loop.create_task(self._state_flush_loop())
         self._ready.set()
         try:
@@ -157,6 +193,7 @@ class NetworkManager:
             loop.close()
             self._loop = None
             self._clients = []
+            self._active_request_semaphore = None
 
     def ensure_started(self) -> asyncio.AbstractEventLoop:
         with self._lock:
@@ -216,21 +253,28 @@ class NetworkManager:
 
     async def _execute(self, request: NetworkRequest) -> None:
         future = request.future
-        if not future.set_running_or_notify_cancel():
-            return
-        future.dispatched_at = time.monotonic()
-        counter = self._counter(request)
-        if counter is not None:
-            counter.dispatched += 1
-            counter.in_flight += 1
-            counter.peak_in_flight = max(counter.peak_in_flight, counter.in_flight)
-            counter.max_ingress_delay_seconds = max(
-                counter.max_ingress_delay_seconds, future.dispatched_at - future.submitted_at
-            )
+        semaphore = self._active_request_semaphore
+        if semaphore is None:
+            raise RuntimeError("network manager active-request limiter is unavailable")
+        acquired = False
         shard = None
-        started = time.monotonic()
+        counter = None
         try:
+            await semaphore.acquire()
+            acquired = True
+            if not future.set_running_or_notify_cancel():
+                return
+            future.dispatched_at = time.monotonic()
+            counter = self._counter(request)
+            if counter is not None:
+                counter.dispatched += 1
+                counter.in_flight += 1
+                counter.peak_in_flight = max(counter.peak_in_flight, counter.in_flight)
+                counter.max_ingress_delay_seconds = max(
+                    counter.max_ingress_delay_seconds, future.dispatched_at - future.submitted_at
+                )
             shard = await self._acquire_client()
+            started = time.monotonic()
             response = await shard.client.request(request.method, request.url, **request.kwargs)
         except BaseException as error:
             future.completed_at = time.monotonic()
@@ -261,6 +305,8 @@ class NetworkManager:
         finally:
             if shard is not None:
                 shard.in_flight = max(0, shard.in_flight - 1)
+            if acquired:
+                semaphore.release()
 
     def _drain_ingress(self) -> None:
         for _ in range(4096):
@@ -340,9 +386,12 @@ class NetworkManager:
         return {
             "architecture": self._architecture,
             "http2": self._http2,
+            "requested_streams_per_connection": self._requested_streams_per_connection,
             "streams_per_connection": self._streams_per_connection,
+            "http2_stream_safety_cap": self._http2_stream_safety_cap,
             "shard_capacity": self._shard_capacity(),
             "http1_connections_per_shard": self._http1_connections_per_shard,
+            "active_request_limit": self._active_request_limit,
             "client_count": len(self._clients),
             "in_flight": sum(x.in_flight for x in self._clients),
             "peak_in_flight_per_client": [x.peak_in_flight for x in self._clients],
@@ -356,7 +405,15 @@ class NetworkManager:
         with self._lock:
             loop, thread = self._loop, self._thread
         if loop is None or thread is None or not thread.is_alive():
-            return {"architecture": self._architecture, "client_count": 0,
+            return {"architecture": self._architecture,
+                    "http2": self._http2,
+                    "requested_streams_per_connection": self._requested_streams_per_connection,
+                    "streams_per_connection": self._streams_per_connection,
+                    "http2_stream_safety_cap": self._http2_stream_safety_cap,
+                    "shard_capacity": self._shard_capacity(),
+                    "http1_connections_per_shard": self._http1_connections_per_shard,
+                    "active_request_limit": self._active_request_limit,
+                    "client_count": 0,
                     "requests_enqueued": self._requests_enqueued,
                     "ingress_wakeups": self._ingress_wakeups,
                     "wakeups_per_request": 0.0,

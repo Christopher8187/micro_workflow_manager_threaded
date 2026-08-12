@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import httpx
@@ -12,6 +13,78 @@ from micro_workflow_manager.networking import (
     shared_http_transport,
 )
 from micro_workflow_manager.runners.api import ApiRunner
+
+
+def test_http2_stream_width_is_safely_capped_and_observable(monkeypatch):
+    monkeypatch.delenv("MWF_HTTP2_STREAM_SAFETY_CAP", raising=False)
+    close_shared_http_transport()
+    configure_shared_http_transport(http2=True, streams_per_connection=80)
+    try:
+        snapshot = shared_http_transport.snapshot()
+    finally:
+        close_shared_http_transport()
+
+    assert snapshot["requested_streams_per_connection"] == 80
+    assert snapshot["streams_per_connection"] == 32
+    assert snapshot["shard_capacity"] == 32
+    assert snapshot["http2_stream_safety_cap"] == 32
+    assert snapshot["active_request_limit"] == 1024
+
+
+def test_http2_stream_safety_cap_is_explicitly_overridable(monkeypatch):
+    monkeypatch.setenv("MWF_HTTP2_STREAM_SAFETY_CAP", "80")
+    close_shared_http_transport()
+    configure_shared_http_transport(http2=True, streams_per_connection=80)
+    try:
+        snapshot = shared_http_transport.snapshot()
+    finally:
+        close_shared_http_transport()
+
+    assert snapshot["requested_streams_per_connection"] == 80
+    assert snapshot["streams_per_connection"] == 80
+    assert snapshot["http2_stream_safety_cap"] == 80
+
+
+def test_network_manager_bounds_active_requests_without_reducing_job_concurrency():
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    async def handler(request):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.02)
+            return httpx.Response(200, content=b"ok", request=request)
+        finally:
+            with lock:
+                active -= 1
+
+    close_shared_http_transport()
+    configure_shared_http_transport(
+        transport=httpx.MockTransport(handler),
+        streams_per_connection=3,
+        active_request_limit=6,
+        architecture="manager",
+    )
+    try:
+        results = ApiRunner(max_threads=32, poll_interval=0.001).run_jobs(
+            "A",
+            list(range(48)),
+            lambda _index: shared_http_transport.request(
+                "GET", "https://example.test/", timeout=2
+            ).status_code,
+        )
+        snapshot = shared_http_transport.snapshot()
+    finally:
+        close_shared_http_transport()
+
+    assert results == [200] * 48
+    assert peak == 6
+    assert snapshot["active_request_limit"] == 6
+    assert snapshot["client_count"] == 2
 
 
 def test_network_manager_is_default_and_coalesces_ingress_wakeups():
@@ -76,6 +149,32 @@ def test_network_manager_snapshot_is_batched_into_sqlite(tmp_path):
     assert row["completed"] == 9
     assert row["failed"] == 1
     assert row["updated_at"] == 123.0
+
+    # A fresh process/run starts manager counters from zero. Persist that fresh
+    # high-water state instead of leaking the previous run's peaks into monitor.
+    workflow.storage.publish_network_manager_snapshot(
+        [{
+            "node_name": "A",
+            "submitted": 1,
+            "dispatched": 1,
+            "completed": 1,
+            "failed": 0,
+            "bytes_received": 2,
+            "in_flight": 0,
+            "peak_in_flight": 1,
+            "max_ingress_delay_seconds": 0.01,
+            "max_request_seconds": 0.02,
+            "average_request_seconds": 0.02,
+            "last_error": None,
+        }],
+        456.0,
+    )
+    workflow.storage.flush_db_mutations()
+    fresh = workflow.storage.network_manager_state()["A"]
+    assert fresh["peak_in_flight"] == 1
+    assert fresh["max_ingress_delay_seconds"] == 0.01
+    assert fresh["max_request_seconds"] == 0.02
+    assert fresh["updated_at"] == 456.0
 
 
 def test_network_state_schema_migrates_to_v4(tmp_path):

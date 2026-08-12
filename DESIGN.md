@@ -722,12 +722,21 @@ its exact generation and execution ID while holding the per-job filesystem lock.
 This preserves second-terminal restart semantics without an O(active jobs)
 database-query loop.
 
-The network runtime is elastic, not an admission controller. With HTTP/2 enabled,
-one client owns one connection and accepts at most `streams_per_connection`
-in-flight assignments before another client is created. HTTP/1.1 uses the same
-assignment threshold with a connection pool per client. The scheduler neither
-counts nor limits transport shards: node `max_threads` continues to define how
-many jobs may be in flight.
+The network runtime has distinct job-admission and transport-pressure planes.
+Node `max_threads` continues to define exactly how many jobs may be running.
+Those jobs submit into the process-wide manager, which dispatches at most
+`active_request_limit` requests to sockets and lets excess work wait without
+creating more provider-side queue pressure. With HTTP/2 enabled, one client owns
+one connection and accepts at most the smaller of `streams_per_connection` and
+`http2_stream_safety_cap` assignments before another client is created.
+HTTP/1.1 uses its configured connection-pool capacity per client.
+
+The defaults (32 HTTP/2 streams per connection, 1,024 active requests) are
+measured safety boundaries rather than node concurrency overrides. They can be
+changed per provider through configuration or environment, and every requested,
+effective, and active value is reported by the manager snapshot. Network-state
+high-water fields are overwritten when a new manager run starts so monitor does
+not confuse a previous run's peaks with current activity.
 
 
 ## High-fanout component admission and completion (0.3.18)

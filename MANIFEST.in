@@ -1,0 +1,9 @@
+include AGENT.md
+include DESIGN.md
+include HOW_TO_TEST.md
+include NETWORK_MANAGER_ARCHITECTURE_056.md
+include HTTP_FANOUT_BENCHMARKS_054.md
+include explode_improvements.md
+recursive-include benchmarks *.py
+recursive-include examples *.py *.md
+recursive-include tests *.py

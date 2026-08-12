@@ -19,8 +19,8 @@ class NetworkStateStorageMixin:
                 "INSERT INTO network_state(node_name,submitted,dispatched,completed,failed,bytes_received,in_flight,peak_in_flight,max_ingress_delay_seconds,max_request_seconds,average_request_seconds,last_error,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_name) DO UPDATE SET "
                 "submitted=excluded.submitted,dispatched=excluded.dispatched,completed=excluded.completed,failed=excluded.failed,bytes_received=excluded.bytes_received,in_flight=excluded.in_flight,"
-                "peak_in_flight=MAX(network_state.peak_in_flight,excluded.peak_in_flight),max_ingress_delay_seconds=MAX(network_state.max_ingress_delay_seconds,excluded.max_ingress_delay_seconds),"
-                "max_request_seconds=MAX(network_state.max_request_seconds,excluded.max_request_seconds),average_request_seconds=excluded.average_request_seconds,last_error=excluded.last_error,updated_at=excluded.updated_at",
+                "peak_in_flight=excluded.peak_in_flight,max_ingress_delay_seconds=excluded.max_ingress_delay_seconds,"
+                "max_request_seconds=excluded.max_request_seconds,average_request_seconds=excluded.average_request_seconds,last_error=excluded.last_error,updated_at=excluded.updated_at",
                 normalized)
         self.submit_db_mutation(operation, wait=False, priority=30)
 
