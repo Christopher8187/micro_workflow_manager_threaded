@@ -1,6 +1,6 @@
 # How to test micro-workflow-manager
 
-This is the **authoritative execution order for testing MWF 0.5.8**.
+This is the **authoritative execution order for testing MWF 0.5.9**.
 
 AI coding agents and human contributors should follow this file before declaring a
 framework change verified. The important distinction is:

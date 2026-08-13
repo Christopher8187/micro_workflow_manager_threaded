@@ -60,9 +60,13 @@ class NetworkManager(
         self._cohort_stall_seconds = 300.0
         self._cohort_terminal_evidence = 16
         self._cohort_retry_limit = 2
+        self._transport_error_retry_limit = 2
         self._retired_shards = 0
         self._json_stream_recoveries = 0
         self._cohort_stream_retries = 0
+        self._transport_error_retries = 0
+        self._recovery_shard_reuses = 0
+        self._recovery_shards_created = 0
         self._next_client_index = 0
         self._architecture = "manager"
         self._state_flush_interval = 2.0
@@ -162,10 +166,8 @@ class NetworkManager(
         shard.requests_started += 1
         return shard
 
-    async def _acquire_client(self, *, fresh: bool = False) -> ClientShard:
+    async def _acquire_client(self) -> ClientShard:
         capacity = self._shard_capacity()
-        if fresh:
-            return self._claim_shard(self._new_client_shard())
         shard = None
         count = len(self._clients)
         for offset in range(count):
@@ -233,10 +235,12 @@ class NetworkManager(
                 "started_at": started,
                 "phase": "client_acquired",
                 "phase_at": time.monotonic(),
-                "transport_retries": 0,
+                "cohort_retries": 0,
+                "transport_error_retries": 0,
         }
         self._active_requests[active_key] = active
-        transport_retries = 0
+        cohort_retries = 0
+        transport_error_retries = 0
         try:
             kwargs = dict(request.kwargs)
             extensions = dict(kwargs.get("extensions") or {})
@@ -256,7 +260,20 @@ class NetworkManager(
             extensions["trace"] = trace
             kwargs["extensions"] = extensions
             while True:
-                shard = await self._acquire_client(fresh=transport_retries > 0)
+                # A recovery request needs a different connection, not a
+                # dedicated client.  Its poisoned source shard is retiring and
+                # therefore excluded by _acquire_client; normal capacity-aware
+                # selection packs concurrent replays into shared replacement
+                # shards.  This preserves request concurrency while preventing
+                # one AsyncClient/TLS pool per stalled stream.
+                recovering = bool(cohort_retries or transport_error_retries)
+                next_shard_id = self._next_shard_id
+                shard = await self._acquire_client()
+                if recovering:
+                    if self._next_shard_id == next_shard_id:
+                        self._recovery_shard_reuses += 1
+                    else:
+                        self._recovery_shards_created += 1
                 active.update(
                     shard_id=shard.shard_id,
                     attempt_started_at=time.monotonic(),
@@ -267,6 +284,8 @@ class NetworkManager(
                     phase_at=time.monotonic(),
                     response_bytes=0,
                     last_response_progress_at=None,
+                    cohort_retries=cohort_retries,
+                    transport_error_retries=transport_error_retries,
                 )
                 try:
                     response = await self._request_with_progress(
@@ -282,10 +301,27 @@ class NetworkManager(
                     active["last_cohort_stall"] = str(error)
                     await self._release_client(shard)
                     shard = None
-                    if transport_retries >= self._cohort_retry_limit:
+                    if cohort_retries >= self._cohort_retry_limit:
                         raise
-                    transport_retries += 1
-                    active["transport_retries"] = transport_retries
+                    cohort_retries += 1
+                    active["cohort_retries"] = cohort_retries
+                except (httpx.NetworkError, httpx.ProtocolError) as error:
+                    # A connection-level read/write/protocol failure poisons
+                    # the shard for future work.  Replay on the shared healthy
+                    # pool; do not turn every failed stream into its own client.
+                    shard.retiring = True
+                    shard.retired_reason = f"{type(error).__name__}: {error}"
+                    shard.retired_at = time.monotonic()
+                    shard.requests_failed += 1
+                    shard.last_terminal_at = shard.retired_at
+                    shard.last_error = shard.retired_reason
+                    await self._release_client(shard)
+                    shard = None
+                    if transport_error_retries >= self._transport_error_retry_limit:
+                        raise
+                    transport_error_retries += 1
+                    self._transport_error_retries += 1
+                    active["transport_error_retries"] = transport_error_retries
         except BaseException as error:
             future.completed_at = time.monotonic()
             if shard is not None:
@@ -404,6 +440,9 @@ class NetworkManager(
         self._retired_shards = 0
         self._json_stream_recoveries = 0
         self._cohort_stream_retries = 0
+        self._transport_error_retries = 0
+        self._recovery_shard_reuses = 0
+        self._recovery_shards_created = 0
 
 
 network_manager = NetworkManager()

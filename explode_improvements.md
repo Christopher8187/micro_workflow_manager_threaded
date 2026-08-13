@@ -1,4 +1,4 @@
-# Explode improvements in MWF 0.5.8
+# Explode improvements in MWF 0.5.9
 
 ## Outcome
 
@@ -16,9 +16,19 @@ MWF 0.5.8 now detects and recovers both observed forms of this defect:
 2. a nonterminal stream for which enough newer same-shard streams have already
    terminated to prove that the shard is making progress around it.
 
-Recovery retires the affected shard and replays the request on a fresh shard.
+Recovery retires the affected shard and replays the request on a healthy
+previous shard with capacity, or on a capacity-required shared replacement.
 It does not change the caller's 930-second transport lease, lower any declared
 node concurrency, add an aggregate provider-request gate, or disable Astrill.
+
+The clean 0.5.8 acceptance run exposed an additional framework defect in that
+recovery path. At 1,069 seconds it had completed 9,033 router jobs and 7,911
+handler jobs with no job failure or qualifying debug error, but 728 cohort
+replays had created shard IDs through 824. Only 78 shards had retired; 746
+clients were still live, including 269 idle clients, while the controller had
+grown to about 3.5 GiB and was still increasing roughly 4 MiB/s. The run was
+stopped to prevent paging. MWF 0.5.9 fixes this client multiplication and is the
+release described below.
 
 The saved Explode state reached normal completion with no failed jobs and exact
 router/handler parity:
@@ -100,16 +110,27 @@ framework poison.
   valid complete JSON entity have arrived, a missing stream terminal is given a
   five-second grace period, then the response is returned and the shard drains.
 - A stream nonterminal for 300 seconds after at least 16 newer same-shard
-  terminals is replayed on a fresh shard. The evidence is monotonic: it remains
-  valid during the quiet tail when no new sibling has completed recently.
+  terminals is replayed away from its retiring source shard. Healthy previous
+  shards are reused first; simultaneous replays share replacement shards up to
+  the normal 32-stream connection width. The evidence is monotonic through a
+  quiet tail.
 - A request can receive at most two cohort replays, all within the original
   caller lease. The 930-second transport lease itself is untouched.
+- Connection-level read/write/protocol failures retire the affected shard and
+  receive the same capacity-aware shared-pool treatment rather than leaving a
+  known-bad client eligible for new jobs.
 - Cancelling an MWF network future now cancels its live asyncio/socket task.
 - A shared SSL context and TCP keepalive defaults (30-second idle, 10-second
   interval, three probes) cover connection-wide half-open VPN/TUN failures.
 - `.mwf/network_manager.json` reports active request phase, shard, stream, node,
   job ID, byte progress, newer sibling terminal evidence, shard retirement,
-  complete-JSON recovery, and cohort replay counters.
+  complete-JSON recovery, cohort replay counters, healthy-shard reuse, and new
+  recovery-shard creation.
+
+A deterministic 64-request mass-stall regression proves that all 64 replays can
+be active simultaneously while occupying 8 shared eight-stream shards. The old
+0.5.8 recovery would have created 64 clients. A separate regression proves that
+a healthy previous shard is reused without creating any new client.
 
 In the real recovery run, four requests crossed the 300-second cohort boundary
 and were transparently replayed with zero job failures. Examples had 261, 221,
@@ -130,6 +151,13 @@ the Explode feedback backlog impossible to drain.
 bounded reverse journal walk (`NOT INDEXED`) and honors its redraw interval
 during dense terminal waves. These changes remove observer load from the same
 CPU and SQLite budget used by the workflow.
+
+The 0.5.9 diagnostic path also groups active requests by shard once, changing a
+snapshot from `O(clients * requests)` to `O(clients + requests)`. SQLite writer
+bookkeeping retains only genuinely pending serials. In the stopped acceptance
+run, the displayed durability gap was 41,404 even though only 531 mutation
+objects were queued; completed serial IDs can no longer accumulate behind one
+older low-priority observation.
 
 ## Fan-out improvement
 
@@ -237,13 +265,7 @@ The release source passed:
 
 The network manager was split into focused configuration, diagnostics, recovery,
 and type modules so every architecture-guarded module remains below 500 lines.
-The built wheel is `micro_workflow_manager-0.5.8-py3-none-any.whl`; Kaicenat is
-pinned to that exact wheel and both runtime and installed distribution metadata
-report 0.5.8.
-
-A completely fresh paid Explode rerun using the newly versioned wheel was not
-started because the execution safeguard requires explicit approval to transmit
-repository-derived Explode prompts to OpenRouter. The saved fixture is prepared
-and idle for that acceptance run. This limitation does not affect the completed
-candidate-code run or the local/replay test results above, but it is stated here
-so the version history is exact.
+The 0.5.8 wheel passed the original clean packaging checks. MWF 0.5.9 adds the
+bounded recovery/client and mutation-watermark corrections found by that paid
+acceptance run. Kaicenat is pinned to the 0.5.9 wheel; the final verification
+and resumed full-component outcome are recorded below after acceptance.

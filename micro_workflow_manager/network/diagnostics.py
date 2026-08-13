@@ -70,6 +70,10 @@ class NetworkDiagnosticsMixin:
             "cohort_terminal_evidence": self._cohort_terminal_evidence,
             "cohort_retry_limit": self._cohort_retry_limit,
             "cohort_stream_retries": self._cohort_stream_retries,
+            "transport_error_retry_limit": self._transport_error_retry_limit,
+            "transport_error_retries": self._transport_error_retries,
+            "recovery_shard_reuses": self._recovery_shard_reuses,
+            "recovery_shards_created": self._recovery_shards_created,
         }
 
     def _manager_diagnostics(self, project_key: str | None = None) -> dict[str, Any]:
@@ -78,9 +82,17 @@ class NetworkDiagnosticsMixin:
             item for item in self._active_requests.values()
             if project_key is None or item.get("project_key") == project_key
         ]
+        active_by_shard: dict[int, list[dict[str, Any]]] = {}
+        for item in active:
+            shard_id = item.get("shard_id")
+            if isinstance(shard_id, int):
+                active_by_shard.setdefault(shard_id, []).append(item)
         shards = []
         for shard in self._clients:
-            shard_active = [item for item in active if item["shard_id"] == shard.shard_id]
+            # Group once above.  The previous nested scan was O(clients ×
+            # requests), which magnified the CPU cost precisely when a recovery
+            # defect had allowed the client population to grow.
+            shard_active = active_by_shard.get(shard.shard_id, [])
             oldest = min(shard_active, key=lambda item: item["started_at"], default=None)
             shards.append({
                 "shard_id": shard.shard_id,
@@ -136,6 +148,10 @@ class NetworkDiagnosticsMixin:
             })
         return {
             **self._configuration_snapshot(),
+            "client_count": len(self._clients),
+            "retiring_client_count": sum(shard.retiring for shard in self._clients),
+            "idle_client_count": sum(shard.in_flight == 0 for shard in self._clients),
+            "in_flight": len(active),
             "active_phase_counts": dict(Counter(str(item["phase"]) for item in active)),
             "oldest_active_seconds": max(
                 (now_value - item["started_at"] for item in active), default=0.0

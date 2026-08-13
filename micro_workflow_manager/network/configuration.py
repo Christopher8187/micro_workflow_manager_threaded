@@ -83,6 +83,9 @@ class NetworkConfigurationMixin:
         if cohort_terminal_evidence < 1:
             raise ValueError("MWF_HTTP2_COHORT_TERMINALS must be an integer >= 1")
         cohort_retry_limit = _nonnegative_integer("MWF_HTTP2_COHORT_RETRIES", 2)
+        transport_error_retry_limit = _nonnegative_integer(
+            "MWF_HTTP_TRANSPORT_RETRIES", 2
+        )
         architecture = str(
             architecture or os.getenv("MWF_NETWORK_ARCHITECTURE", "manager")
         ).strip().lower()
@@ -128,5 +131,6 @@ class NetworkConfigurationMixin:
             self._cohort_stall_seconds = cohort_stall_seconds
             self._cohort_terminal_evidence = cohort_terminal_evidence
             self._cohort_retry_limit = cohort_retry_limit
+            self._transport_error_retry_limit = transport_error_retry_limit
             self._architecture = architecture
             self._state_flush_interval = state_flush_interval

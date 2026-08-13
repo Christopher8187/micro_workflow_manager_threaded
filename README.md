@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.5.8
+# micro-workflow-manager 0.5.9
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -18,6 +18,19 @@ command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
 
+## What changed in 0.5.9
+
+- Cohort and connection-error replays reuse healthy existing HTTP/2 shards and
+  share capacity-required replacement shards. A recovery wave no longer opens
+  one `AsyncClient`, TLS pool, and socket pool per recovered stream. Provider
+  request concurrency and the caller's transport lease are unchanged.
+- Read, write, and protocol failures retire the exact affected shard before a
+  bounded transparent replay. Diagnostics distinguish healthy-shard reuse from
+  newly created recovery shards and report live, retiring, and idle clients.
+- Network diagnostics group active requests by shard in linear time. SQLite's
+  durability watermark now stores only genuinely pending serials, rather than
+  retaining every completed serial behind an older low-priority mutation.
+
 ## What changed in 0.5.8
 
 - HTTP/2 shards are selected round-robin and opened elastically after the
@@ -28,7 +41,7 @@ manager, and a Pygame state machine.
   replacing the caller's timeout. A complete checksum-valid JSON entity that
   lacks `END_STREAM` is returned after a five-second terminal grace period. A
   stream that remains nonterminal for five minutes while at least 16 newer
-  same-shard requests terminate is replayed on a fresh shard; this cohort proof
+  same-shard requests terminate is replayed on another shard; this cohort proof
   remains valid through the quiet tail of a run.
 - Live network futures cancel their underlying socket coroutines. TCP keepalive
   detects connection-wide half-open VPN/TUN paths, while
@@ -332,9 +345,13 @@ The environment equivalent is `MWF_HTTP2_STREAM_SAFETY_CAP` (default `32`).
 `MWF_HTTP2_COHORT_STALL_SECONDS` (default `300`),
 `MWF_HTTP2_COHORT_TERMINALS` (default `16`), and
 `MWF_HTTP2_COHORT_RETRIES` (default `2`) control terminal recovery without
-replacing the caller's request timeout. The manager snapshot reports
+replacing the caller's request timeout. `MWF_HTTP_TRANSPORT_RETRIES` (default
+`2`) bounds transparent read/write/protocol recovery. Replays use available
+capacity on previous healthy shards before opening another shared shard; the
+poisoned source shard is excluded and drained. The manager snapshot reports
 requested/effective stream width, the cap, client count, current in-flight
-requests, active stream phases, and recovery/retirement evidence. HTTP/1.1 keeps
+requests, active stream phases, healthy-shard reuse, new recovery shards, and
+recovery/retirement evidence. HTTP/1.1 keeps
 its independent `MWF_HTTP1_CONNECTIONS_PER_SHARD` setting.
 
 ## What changed in 0.3.16

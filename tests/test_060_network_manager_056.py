@@ -19,6 +19,7 @@ from micro_workflow_manager.networking import (
 )
 from micro_workflow_manager.runners.api import ApiRunner
 from micro_workflow_manager.network.manager import NetworkManager
+from micro_workflow_manager.network.types import CohortStreamStall
 
 
 def test_network_manager_reuses_one_default_ssl_context_for_every_client_shard(monkeypatch):
@@ -241,6 +242,188 @@ def test_cohort_stalled_stream_retries_on_fresh_shard_without_failing_job(monkey
         assert snapshot["retired_shards"] == 1
         assert snapshot["client_count"] == 1
         assert snapshot["shards"][0]["requests_failed"] == 0
+    finally:
+        manager.close()
+
+
+def test_mass_cohort_recovery_shares_replacement_shards_without_limiting_requests(
+    monkeypatch,
+):
+    """A recovery wave must not allocate one TLS client per stalled stream."""
+    monkeypatch.setenv("MWF_HTTP2_COHORT_RETRIES", "1")
+    request_count = 64
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=8,
+        http2_stream_safety_cap=8,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"ok", request=request)
+        ),
+    )
+    first_attempt_count = 0
+    all_first_attempts_acquired = asyncio.Event()
+    retry_active = 0
+    retry_peak = 0
+    all_retries_active = asyncio.Event()
+
+    async def synthetic_request(request, shard, kwargs, active):
+        nonlocal first_attempt_count, retry_active, retry_peak
+        if active["cohort_retries"] == 0:
+            first_attempt_count += 1
+            if first_attempt_count == request_count:
+                all_first_attempts_acquired.set()
+            await all_first_attempts_acquired.wait()
+            raise CohortStreamStall("synthetic poisoned cohort")
+
+        retry_active += 1
+        retry_peak = max(retry_peak, retry_active)
+        if retry_active == request_count:
+            all_retries_active.set()
+        try:
+            await asyncio.wait_for(all_retries_active.wait(), timeout=2)
+            return httpx.Response(
+                200,
+                content=b"ok",
+                request=httpx.Request(request.method, request.url),
+            )
+        finally:
+            retry_active -= 1
+
+    monkeypatch.setattr(manager, "_request_with_progress", synthetic_request)
+    futures = [
+        manager.submit_request("GET", f"https://example.test/{index}")
+        for index in range(request_count)
+    ]
+    try:
+        assert [future.result(timeout=5).status_code for future in futures] == [
+            200
+        ] * request_count
+        snapshot = manager.snapshot()
+        assert retry_peak == request_count
+        assert snapshot["cohort_stream_retries"] == request_count
+        assert snapshot["retired_shards"] == request_count // 8
+        assert snapshot["client_count"] == request_count // 8
+        assert max(snapshot["peak_in_flight_per_client"]) == 8
+        assert manager._next_shard_id == 2 * (request_count // 8) + 1
+        assert snapshot["recovery_shards_created"] == request_count // 8
+        assert snapshot["recovery_shard_reuses"] == (
+            request_count - request_count // 8
+        )
+        assert "active_request_limit" not in snapshot
+    finally:
+        manager.close()
+
+
+def test_cohort_recovery_reuses_an_existing_healthy_shard(monkeypatch):
+    monkeypatch.setenv("MWF_HTTP2_COHORT_RETRIES", "1")
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=4,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"ok", request=request)
+        ),
+    )
+    healthy = manager._new_client_shard()
+    poisoned = manager._new_client_shard()
+    manager._next_client_index = 1
+    selected_shards = []
+
+    async def fail_poisoned_once(request, shard, kwargs, active):
+        selected_shards.append(shard.shard_id)
+        if active["cohort_retries"] == 0:
+            raise CohortStreamStall("synthetic poisoned cohort")
+        return httpx.Response(
+            200,
+            content=b"ok",
+            request=httpx.Request(request.method, request.url),
+        )
+
+    monkeypatch.setattr(manager, "_request_with_progress", fail_poisoned_once)
+    future = manager.submit_request("GET", "https://example.test/")
+    try:
+        assert future.result(timeout=2).status_code == 200
+        snapshot = manager.snapshot()
+        assert selected_shards == [poisoned.shard_id, healthy.shard_id]
+        assert manager._next_shard_id == 3
+        assert snapshot["retired_shards"] == 1
+        assert snapshot["client_count"] == 1
+        assert snapshot["recovery_shard_reuses"] == 1
+        assert snapshot["recovery_shards_created"] == 0
+    finally:
+        manager.close()
+
+
+def test_connection_protocol_error_retires_and_retries_on_shared_pool(monkeypatch):
+    monkeypatch.setenv("MWF_HTTP_TRANSPORT_RETRIES", "1")
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=8,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"ok", request=request)
+        ),
+    )
+    attempts = 0
+
+    async def fail_once(request, shard, kwargs, active):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.RemoteProtocolError("poisoned connection")
+        return httpx.Response(
+            200,
+            content=b"ok",
+            request=httpx.Request(request.method, request.url),
+        )
+
+    monkeypatch.setattr(manager, "_request_with_progress", fail_once)
+    future = manager.submit_request("GET", "https://example.test/")
+    try:
+        assert future.result(timeout=2).status_code == 200
+        snapshot = manager.snapshot()
+        assert attempts == 2
+        assert snapshot["transport_error_retries"] == 1
+        assert snapshot["retired_shards"] == 1
+        assert snapshot["client_count"] == 1
+        assert snapshot["shards"][0]["requests_failed"] == 0
+    finally:
+        manager.close()
+
+
+def test_connection_error_retires_and_retries_on_shared_pool(monkeypatch):
+    monkeypatch.setenv("MWF_HTTP_TRANSPORT_RETRIES", "1")
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=8,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"ok", request=request)
+        ),
+    )
+    attempts = 0
+
+    async def fail_once(request, shard, kwargs, active):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("route unavailable")
+        return httpx.Response(
+            200,
+            content=b"ok",
+            request=httpx.Request(request.method, request.url),
+        )
+
+    monkeypatch.setattr(manager, "_request_with_progress", fail_once)
+    future = manager.submit_request("GET", "https://example.test/")
+    try:
+        assert future.result(timeout=2).status_code == 200
+        snapshot = manager.snapshot()
+        assert attempts == 2
+        assert snapshot["transport_error_retries"] == 1
+        assert snapshot["retired_shards"] == 1
+        assert snapshot["client_count"] == 1
     finally:
         manager.close()
 

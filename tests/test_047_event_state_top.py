@@ -191,6 +191,64 @@ def test_mutation_writer_retires_immediately_after_draining_queue(tmp_path):
     assert storage.mutation_writer_diagnostics()["writer_alive"] is False
 
 
+def test_mutation_writer_bounds_out_of_order_completion_bookkeeping(tmp_path):
+    storage = FileStorage(tmp_path)
+    writer = storage._mutation_writer
+    requests = [
+        writer._new_request(
+            priority=30,
+            collect_seconds=0,
+            weight=1,
+            operation=lambda connection: None,
+        )
+        for _ in range(5000)
+    ]
+
+    writer._record_completed(requests[1:])
+    diagnostics = writer.diagnostics()
+    assert diagnostics["completed_through"] == 0
+    assert diagnostics["durability_backlog"] == 5000
+    assert diagnostics["pending_mutations"] == 1
+    assert diagnostics["completion_heap_entries"] == 1
+
+    writer._record_completed(requests[:1])
+    diagnostics = writer.diagnostics()
+    assert diagnostics["completed_through"] == 5000
+    assert diagnostics["durability_backlog"] == 0
+    assert diagnostics["pending_mutations"] == 0
+    assert diagnostics["completion_heap_entries"] == 0
+
+
+def test_network_state_coalesces_unsaved_observations(tmp_path, monkeypatch):
+    storage = FileStorage(tmp_path)
+    operations = []
+
+    def defer(operation, **options):
+        operations.append((operation, options))
+
+    monkeypatch.setattr(storage, "submit_db_mutation", defer)
+    first = [{"node_name": "A", "submitted": 1}]
+    latest = [{"node_name": "A", "submitted": 99}]
+    storage.publish_network_manager_snapshot(first, 1.0)
+    storage.publish_network_manager_snapshot(latest, 2.0)
+
+    assert len(operations) == 1
+    assert operations[0][1] == {"wait": False, "priority": 30}
+
+    class RecordingConnection:
+        def executemany(self, sql, rows):
+            self.sql = sql
+            self.rows = list(rows)
+
+    connection = RecordingConnection()
+    operations[0][0](connection)
+    assert connection.rows[0][1] == 99
+    assert connection.rows[0][-1] == 2.0
+
+    storage.publish_network_manager_snapshot(first, 3.0)
+    assert len(operations) == 2
+
+
 def test_job_event_append_uses_one_groupable_journal_mutation(tmp_path, monkeypatch):
     storage = FileStorage(tmp_path)
     captured = {}

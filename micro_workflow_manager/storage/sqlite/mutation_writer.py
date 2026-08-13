@@ -5,6 +5,7 @@ import os
 import queue
 import sqlite3
 import time
+import heapq
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass
 from threading import Condition, Event, Lock, Thread, current_thread
@@ -74,7 +75,8 @@ class SQLiteMutationWriter:
         self._guard = Lock()
         self._progress = Condition(self._guard)
         self._completed_through = 0
-        self._completed_out_of_order: set[int] = set()
+        self._pending_serials: set[int] = set()
+        self._pending_serial_heap: list[int] = []
         self._urgent_pending = Event()
         self._diagnostic_path = self.storage.project_dir / ".mwf" / "mutation_writer.json"
         self._diagnostic_last_write = 0.0
@@ -146,6 +148,8 @@ class SQLiteMutationWriter:
         with self._guard:
             self._serial += 1
             serial = self._serial
+            self._pending_serials.add(serial)
+            heapq.heappush(self._pending_serial_heap, serial)
         return _MutationRequest(
             serial=serial,
             priority=priority,
@@ -191,6 +195,8 @@ class SQLiteMutationWriter:
                 queued = list(self._queue.queue)
             submitted = self._serial
             completed = self._completed_through
+            pending_mutations = len(self._pending_serials)
+            completion_heap_entries = len(self._pending_serial_heap)
             writer_alive = bool(self._thread is not None and self._thread.is_alive())
             active_priority = self._active_priority
             active_batch_size = self._active_batch_size
@@ -208,6 +214,8 @@ class SQLiteMutationWriter:
             "submitted_serial": submitted,
             "completed_through": completed,
             "durability_backlog": max(0, submitted - completed),
+            "pending_mutations": pending_mutations,
+            "completion_heap_entries": completion_heap_entries,
             "writer_alive": writer_alive,
             "active_priority": active_priority,
             "active_batch_size": active_batch_size,
@@ -311,10 +319,26 @@ class SQLiteMutationWriter:
 
     def _record_completed(self, requests: list[_MutationRequest]) -> None:
         with self._progress:
-            self._completed_out_of_order.update(request.serial for request in requests)
-            while self._completed_through + 1 in self._completed_out_of_order:
-                self._completed_through += 1
-                self._completed_out_of_order.remove(self._completed_through)
+            self._pending_serials.difference_update(
+                request.serial for request in requests
+            )
+            while (
+                self._pending_serial_heap
+                and self._pending_serial_heap[0] not in self._pending_serials
+            ):
+                heapq.heappop(self._pending_serial_heap)
+            # A long-lived low-priority mutation used to retain one Python int
+            # for every later high-priority completion.  Rebuild the lazy heap
+            # when stale entries exceed a bounded margin; memory now follows
+            # genuinely pending work rather than the serial-watermark gap.
+            if len(self._pending_serial_heap) > 2 * len(self._pending_serials) + 1024:
+                self._pending_serial_heap = list(self._pending_serials)
+                heapq.heapify(self._pending_serial_heap)
+            self._completed_through = (
+                self._pending_serial_heap[0] - 1
+                if self._pending_serial_heap
+                else self._serial
+            )
             self._progress.notify_all()
 
     @staticmethod
