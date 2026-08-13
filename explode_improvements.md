@@ -30,31 +30,38 @@ grown to about 3.5 GiB and was still increasing roughly 4 MiB/s. The run was
 stopped to prevent paging. MWF 0.5.9 fixes this client multiplication and is the
 release described below.
 
-The saved Explode state reached normal completion with no failed jobs and exact
-router/handler parity:
+The final acceptance state reached normal completion under MWF 0.5.9 with no
+failed jobs and exact router/handler parity:
 
 | Node | Done |
 |---|---:|
-| `explode` | 12,808 |
-| `explodeclaim` | 1,951 |
-| `explodecontext` | 1,173 |
-| `explodedefinition` | 1,252 |
-| `explodeexample` | 836 |
-| `explodeexercise` | 3,113 |
-| `explodeexplanation` | 915 |
-| `explodejas` | 1,365 |
-| `explodenotation` | 261 |
-| `exploderemark` | 646 |
-| `explodetheorem` | 1,296 |
-| **All handlers** | **12,808** |
+| `explode` | 13,522 |
+| `explodeclaim` | 2,192 |
+| `explodecontext` | 1,012 |
+| `explodedefinition` | 1,346 |
+| `explodeexample` | 913 |
+| `explodeexercise` | 3,228 |
+| `explodeexplanation` | 975 |
+| `explodejas` | 1,612 |
+| `explodenotation` | 343 |
+| `exploderemark` | 607 |
+| `explodetheorem` | 1,294 |
+| **All handlers** | **13,522** |
 
-The run was deliberately stopped and resumed when a qualifying network error
-or a newly discovered recovery edge case appeared. The last resume ended at
-20:37:29 on 2026-08-12 with every component job done, no queued/running/failed
-jobs, and no qualifying network error. The behavioral code used for the final
-resume is the code released as 0.5.8. The run metadata still said 0.5.7 because
-the user requested the version bump after the live investigation; the 0.5.8
-wheel and metadata were built and verified afterward.
+The persisted run record says `status: done`, `mwf_version: 0.5.9`, and records
+normal completion at 07:27:21 on 2026-08-13. A one-shot final monitor found no
+queued, running, or failed jobs. The clean fixture was originally started with
+0.5.8. That run exposed the client-retention defect and was stopped before the
+machine paged; the exact durable state was then resumed, without reset or
+paste, by 0.5.9. This is therefore a clean-fixture full-component acceptance
+completed by 0.5.9, not a claim that every request began in a from-zero 0.5.9
+controller.
+
+One semantic terminal failure occurred in the first 0.5.9 resume:
+`explodedefinition` job 361 exhausted its configured source-repair fallbacks.
+It was restarted exactly as the testing workflow requires, requeued at
+generation 2, and completed on the next sole-controller resume. Its final
+validation passed. This was not a network failure.
 
 ## Proof of the poisoned-stream root cause
 
@@ -177,12 +184,20 @@ the fixture was restored to a short 3,732-event journal, the same comparison was
 11.89 ms versus 3.44 ms, still **3.46x** faster.
 
 In the live full run, initial handler admission no longer remained hundreds of
-jobs behind indefinitely. By about 4.5 minutes all initial handler work was
-admitted; `explodeexercise` alone had 1,078 running and none queued. More than
-2,400 handler jobs completed at about 8 minutes 37 seconds. That did not meet
-the old six-minute performance wish, so this report does not claim a fivefold
-end-to-end speedup. It does show that local durable fan-out is no longer the
-limiting stage.
+jobs behind indefinitely. The clean 0.5.8 controller reached 2,407 handler
+completions at 452.887 seconds (7 minutes 32.887 seconds). At that checkpoint it
+had completed 4,811 router jobs, with 61 handler jobs queued and 2,343 running.
+`explodeexercise`'s initial queue peaked at 996 jobs at 102.478 seconds and
+returned to zero at 241.386 seconds; at that point 126 exercises were done and
+1,102 were running. Relative to the previously measured 8 minutes 37 seconds,
+the 2,400-handler time improved by 64.113 seconds, **12.40%**, or **1.14x**.
+
+That does not meet the requested six-minute or fivefold end-to-end target, so
+this report does not claim that it does. The evidence instead separates the
+stages: local publication of the original 2,400 durable jobs improved 76.14x,
+while end-to-end handler completion remains dominated by provider generation,
+semantic validation/fallbacks, and the workload's continuing feedback. Local
+fan-out is no longer the primary bottleneck.
 
 ## Mixed-stage improvement
 
@@ -191,17 +206,25 @@ feedback, rather than a throttled short-run headline:
 
 | Checkpoint | Router done | Handler done | Failed jobs | Qualifying network errors |
 |---|---:|---:|---:|---:|
-| First full-run stop | 8,606 | 6,791 | 0 | 1 poisoned stream at 930 s |
-| First resume | 11,489 | 11,009 | 0 | 0 |
-| Cohort-recovery resume | 12,773 | 12,767 | 0 | 0 |
-| Final resume | 12,808 | 12,808 | 0 | 0 |
+| 0.5.8 stopped for memory safety, 1,068.379 s | 9,033 | 7,911 | 0 | 0 job errors; framework memory defect |
+| 0.5.9 first resume, 600.388 s | 12,617 | 12,458 | 0 | 0 |
+| 0.5.9 first resume exit, 1,493.100 s | 12,777 | 12,776 | 0 active; job 361 requeued | 0 |
+| 0.5.9 final resume exit, 1,818.197 s | 13,522 | 13,522 | 0 | 0 |
 
-The cohort-recovery resume is the important stress point: four streams that
-would otherwise have joined the long tail were replayed at roughly 300 seconds,
-with no terminal job failure and a final mutation-writer backlog of 1. This
-prevents the healthy jobs from draining away around a set of 930-second zombies
-and removes the framework-caused freeze/lease-failure cycle from the mixed
-stage.
+The first 0.5.9 resume completed 4,807 additional handler jobs from its first
+sample to exit. It transparently handled 392 transport-error retries and 57
+cohort-stall retries. Those recovery allocations reused healthy capacity 440
+times and created only seven new shared shards. The run ended with one idle
+client, no in-flight request, and writer durability/pending/heap counts all
+zero. The one semantic failure was requeued before exit as described above.
+
+The final resume completed the feedback tail. It exercised another five cohort
+retries: four reused the existing healthy pool and all simultaneous remaining
+retries shared one replacement shard. It had no transport error, no qualifying
+debug error, and no failed job. At normal exit it had one idle client, no
+in-flight requests, no queued writer mutation, and a final observation/write
+watermark difference of one. Thus a real poisoned-shard tail was recovered
+without either a 930-second job error or per-replay client multiplication.
 
 The earlier 0.5.7 report's 2.79x mixed-stage rate came from a design that capped
 active provider requests at 1,024. That gate has been removed at the user's
@@ -250,9 +273,10 @@ bytes, age, newer sibling terminal count, and shard retirement reason. A live
 TCP socket or recent sibling activity is not proof that the individual stream
 is healthy.
 
-## Verification
+## Pre-0.5.9 verification history
 
-The release source passed:
+Before the memory acceptance exposed the per-replay client defect, the 0.5.8
+release source passed:
 
 - 309 ordinary tests in one batch, with only the explicitly marked stress test
   deselected;
@@ -267,5 +291,74 @@ The network manager was split into focused configuration, diagnostics, recovery,
 and type modules so every architecture-guarded module remains below 500 lines.
 The 0.5.8 wheel passed the original clean packaging checks. MWF 0.5.9 adds the
 bounded recovery/client and mutation-watermark corrections found by that paid
-acceptance run. Kaicenat is pinned to the 0.5.9 wheel; the final verification
-and resumed full-component outcome are recorded below after acceptance.
+acceptance run. Kaicenat is pinned to the 0.5.9 wheel.
+
+### MWF 0.5.9 memory acceptance
+
+The user's observed approximately 4 MiB/s memory growth was real and came from
+the framework's recovery architecture. MWF 0.5.8 requested a `fresh` client for
+each stalled replay. Because those one-request clients were still eligible to
+remain live after their request, cumulative recovery count—not current demand—
+drove client count and memory. Its active-diagnostic snapshot also scanned all
+requests separately for every client, amplifying CPU cost as both collections
+grew. Finally, writer serial IDs that completed out of order could remain
+retained behind one older mutation even though their mutation objects had
+already been released.
+
+MWF 0.5.9 fixes all three mechanisms:
+
+- recovery excludes only the poisoned source shard, then uses the same
+  capacity-aware shared pool as ordinary requests;
+- diagnostics group requests by shard in one pass, `O(clients + requests)`;
+- the writer keeps a bounded pending-serial set/heap rather than a historical
+  completed-serial set; and
+- replaceable low-priority network snapshots coalesce before persistence.
+
+The live comparison was decisive:
+
+| Measurement | Defective 0.5.8 controller | 0.5.9 acceptance |
+|---|---:|---:|
+| Peak live clients | 779 | 21 |
+| Late idle clients | 269 | at most 1 |
+| Recovery at representative exit | 728 cohort retries | 57 cohort + 392 transport retries |
+| Recovery allocation behavior | effectively one fresh client per cohort replay | 440 healthy/shared reuses, 7 new shared shards |
+| Peak measured working set | about 3.5 GiB before safety stop | 1,102.07 MiB |
+| 600–1,100 s working-set slope | still rising rapidly in the observed failure | 0.0126 MiB/s |
+| Writer at representative exit | 531 objects queued; misleading serial gap 41,404 | queued 0; pending 0; heap 0; durability gap 0 |
+
+The 0.5.9 working set rose while hundreds of responses and validation objects
+were concurrently live, then plateaued: 1,089.54 MiB at 600.388 seconds,
+1,097.25 MiB at 900.315 seconds, 1,098.32 MiB at 1,050.366 seconds, and
+1,100.98 MiB at 1,200.280 seconds. It peaked at 1,102.07 MiB, roughly **69.2%
+below** the 3.5 GiB safety-stop level, despite processing 449 recovery events.
+The final resume, which began with only the feedback tail, peaked at 284.68 MiB
+working set and 287.62 MiB private memory. It ended with a 44 MiB sampled
+working set immediately before process exit.
+
+These measurements also separate network conditions from framework behavior.
+The first 0.5.9 resume's independent watcher recorded a brief machine-wide
+reachability disturbance: 9 of 775 two-second internet TCP probes and 8 of 775
+OpenRouter probes failed, each timing out at about two seconds. MWF recovered
+the resulting transport attempts without a terminal job network error or
+client explosion. The final resume recorded 909/909 successful internet probes
+and 909/909 successful OpenRouter probes. In both cases, the framework's client
+count followed current in-flight demand back down instead of cumulative errors.
+
+### Final release verification
+
+The exact 0.5.9 repository source passed after the live acceptance:
+
+- 315 ordinary tests in one batch, with only the marked stress case deselected;
+- all four autostart-cycle tests, each in its own fresh Python process; and
+- the explicit marked filesystem stress test.
+
+The built `micro_workflow_manager-0.5.9.tar.gz` was extracted to a clean
+directory and independently passed the same 315 ordinary tests, four isolated
+cycle tests, and marked stress test. The installed Kaicenat environment reports
+MWF 0.5.9, and the MWF distribution wheel and Kaicenat vendored wheel have the
+same SHA-256:
+`13960dc8376e3d9dc66216265b3d8ccdf4654e19574f52fc034bae83539be91c`.
+
+Kaicenat's completed Explode SQLite state and generated outputs were deliberately
+left untouched after verification. No reset or paste was performed, so the
+finished state remains available for the user's subsequent `redistribute` run.
