@@ -61,6 +61,7 @@ def run_nodes(
     prepare: Callable[[], None] | None = None,
     require_start_queued: bool = True,
     refuse_after_node: str | None = None,
+    refuse_before_node: str | None = None,
 ) -> int:
     run_set = set(nodes)
     previous_allowed_run_nodes = workflow.allowed_run_nodes
@@ -76,6 +77,13 @@ def run_nodes(
         if refuse_after_node is not None
         else None
     )
+    refuse_before_component = (
+        workflow.component_key(workflow.component_for(refuse_before_node))
+        if refuse_before_node is not None
+        else None
+    )
+    if refuse_after_component is not None and refuse_before_component is not None:
+        raise ValueError("refuse and refuseafter are mutually exclusive")
     wait_deadlock_resolver = (
         _WaitDeadlockResolver()
         if command in {"run", "runfrom", "resume", "resumefrom"}
@@ -91,6 +99,15 @@ def run_nodes(
             for item in refuse_after_component
         )
 
+    def refusal_before_already_reached() -> bool:
+        if refuse_before_component is None:
+            return False
+        return all(
+            workflow.node_complete(item)
+            or workflow.storage.get_node_status(item) in {FAILED, CANCELLED}
+            for item in refuse_before_component
+        )
+
     try:
         with active_workflow_run(
             workflow,
@@ -98,6 +115,7 @@ def run_nodes(
             start_node=start_node,
             nodes=nodes,
             refuse_after_node=refuse_after_node,
+            refuse_before_node=refuse_before_node,
             stats=stats,
             stats_interval=stats_interval,
             monitor=monitor,
@@ -130,6 +148,7 @@ def run_nodes(
                         ignore_external,
                     ),
                     refuse_after_component=refuse_after_component,
+                    refuse_before_component=refuse_before_component,
                     refusal_event=refusal_event,
                     wait_deadlock_resolver=wait_deadlock_resolver,
                     wait_deadlock_blocked_components=(
@@ -144,6 +163,9 @@ def run_nodes(
                 while True:
                     workflow.finalize_ready_nodes()
                     if refusal_target_terminal():
+                        refusal_event.set()
+                        break
+                    if refusal_before_already_reached():
                         refusal_event.set()
                         break
                     ready_units = [
@@ -161,6 +183,13 @@ def run_nodes(
                     ]
 
                     if not ready_units:
+                        break
+
+                    if (
+                        refuse_before_component is not None
+                        and refuse_before_component in ready_units
+                    ):
+                        refusal_event.set()
                         break
 
                     for unit in ready_units:
@@ -192,6 +221,26 @@ def run_nodes(
                             workflow.storage.set_node_status(name, "done")
 
             if refusal_event.is_set():
+                if refuse_before_component is not None:
+                    finish_run("done")
+                    boundary = ", ".join(refuse_before_component)
+                    print(
+                        "Refused Hoeflein-component admission before "
+                        f"{{{boundary}}} started."
+                    )
+                    queued_after = [
+                        item for item in nodes if workflow.storage.has_queued_jobs(item)
+                    ]
+                    if queued_after:
+                        print("Left queued for a later run:")
+                        for item in queued_after:
+                            print(f"  {item}")
+                    if ran:
+                        print("Ran:")
+                        for item in ran:
+                            print(f"  {item}")
+                    return 0
+
                 failed_boundary = any(
                     workflow.storage.get_node_status(item) in {FAILED, CANCELLED}
                     for item in (refuse_after_component or ())

@@ -37,6 +37,7 @@ def print_run_plan(
     selected_jobs: list[int] | None = None,
     keep_trace: bool = False,
     refuse_after_node: str | None = None,
+    refuse_before_node: str | None = None,
 ) -> int:
     if selected_jobs is not None:
         nodes = [node]
@@ -68,17 +69,25 @@ def print_run_plan(
         ) or "no jobs"
         print(f"    {item}: node_status={workflow.storage.get_node_status(item) or 'missing'}, {counts}")
     print("  same Hoeflein component: " + (", ".join(companions) if companions else "(none)"))
-    if refuse_after_node is not None:
-        if refuse_after_node not in nodes:
+    refusal_node = refuse_before_node or refuse_after_node
+    if refusal_node is not None:
+        refusal_mode = "refuse" if refuse_before_node is not None else "refuseafter"
+        if refusal_node not in nodes:
             raise RuntimeError(
-                f"refuseafter node {refuse_after_node!r} is not in the {command} "
+                f"{refusal_mode} node {refusal_node!r} is not in the {command} "
                 f"selection starting at {node!r}"
             )
-        boundary = workflow.component_key(workflow.component_for(refuse_after_node))
-        print(
-            "  refusal boundary: stop admitting new components after "
-            f"{{{', '.join(boundary)}}} terminates"
-        )
+        boundary = workflow.component_key(workflow.component_for(refusal_node))
+        if refuse_before_node is not None:
+            print(
+                "  refusal boundary: stop before admitting "
+                f"{{{', '.join(boundary)}}}; the boundary component does not run"
+            )
+        else:
+            print(
+                "  refusal boundary: stop admitting new components after "
+                f"{{{', '.join(boundary)}}} terminates"
+            )
         if command == "runfrom":
             print("  reset scope: unchanged; every selected runfrom component is still freshened")
         else:

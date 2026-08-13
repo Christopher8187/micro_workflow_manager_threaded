@@ -58,8 +58,8 @@ COMMAND_HELP_DESCRIPTIONS = {
     "threads": "View or change run-scoped per-node max_threads overrides. API values are cooperative fiber counts with no aggregate framework cap; active nodes scale live.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Register output-backed finished jobs, then continue unsuccessful or queued work for one node without resetting done or skipped jobs.",
-    "runfrom": "Reset and run one node and its descendants; optional refuseafter stops later component admission without shrinking the reset scope.",
-    "resumefrom": "Continue unsuccessful or queued work from one node through its descendants; optional refuseafter stops later component admission without discarding queued work.",
+    "runfrom": "Reset and run one node and its descendants; optional refuse stops before a boundary and refuseafter stops after it, without shrinking reset scope.",
+    "resumefrom": "Continue work through descendants; optional refuse stops before a boundary and refuseafter stops after it, retaining queued work.",
     "monitor": "Show live or one-shot node/job statistics without running task code; completed sequences report active run: none.",
     "top": "Show event-driven htop-style scheduler, latency, process, database, and mutation-writer diagnostics.",
 }
@@ -405,6 +405,7 @@ then schedules the selected branch in dependency order.
 For A -> B -> C:
   mwf runfrom A --plan
   mwf runfrom A --monitor
+  mwf runfrom A refuse B
   mwf runfrom A refuseafter B
   mwf runfrom A refuseafter B --keeptrace
 
@@ -415,10 +416,12 @@ one, and C might write the answer after a short ctx.sleep(1) delay. Runfrom
 rebuilds only work attributable to the selected producer components. A later
 runfrom from another incoming branch keeps this branch's completed descendant
 jobs. Use resumefrom when unsuccessful jobs should continue without fresh
-producer cleanup. `refuseafter B` keeps the ordinary full descendant freshening,
-but stops admitting new Hoeflein components once B's component completes or
-fails; already-running parallel components are joined and later jobs remain
-queued. Trace journals clear by default and are retained with `--keeptrace`.
+producer cleanup. Both refusal modes keep the ordinary full descendant
+freshening. `refuse B` stops globally as soon as B's component is ready, before
+B or any other newly ready component starts. `refuseafter B` instead lets B's
+component complete or fail and then stops later admission. Already-running
+parallel components are joined and refused jobs remain queued. Trace journals
+clear by default and are retained with `--keeptrace`.
 """,
     "resumefrom": """
 Resumefrom mirrors runfrom's graph selection but uses resume semantics. It keeps
@@ -429,18 +432,20 @@ normal command after a partial runfrom failure.
 For A -> B -> C:
   mwf resumefrom A --plan
   mwf resumefrom A
+  mwf resumefrom A refuse B
   mwf resumefrom A refuseafter B
   mwf resumefrom A refuseafter B --keeptrace
 
 If A is done, one B job failed, and C has not run yet, resumefrom preserves A,
 reruns the failed B job, and then allows C to continue when B completes. With
-`refuseafter B`, B's whole Hoeflein component is still allowed to terminate, but
-no new later component is admitted afterward; already-running parallel
-components are joined and later work remains queued for a future resume. It does
-not perform producer-component cleanup and therefore preserves every existing
-successful descendant job. The start Hoeflein component's trace is always
-preserved. Descendant trace journals are cleared before the resume unless
-`--keeptrace` is supplied.
+`refuse B`, B's whole component is not started; if it is already terminal, the
+boundary is treated as already reached. With `refuseafter B`, B's component may
+terminate, but no new later component is admitted afterward. Both forms join
+already-running parallel components and retain later work for a future resume.
+Resumefrom does not perform producer-component cleanup and therefore preserves
+every existing successful descendant job. The start Hoeflein component's trace
+is always preserved. Descendant trace journals are cleared before the resume
+unless `--keeptrace` is supplied.
 """,
     "top": """
 Top is an event-driven, htop-style diagnostic view for a running or completed

@@ -37,6 +37,7 @@ class DagSchedulerMixin:
         ready_check: Callable[[str], bool] | None = None,
         *,
         refuse_after_component: tuple[str, ...] | None = None,
+        refuse_before_component: tuple[str, ...] | None = None,
         refusal_event: Event | None = None,
         wait_deadlock_resolver=None,
         wait_deadlock_blocked_components: set[tuple[str, ...]] | None = None,
@@ -61,6 +62,11 @@ class DagSchedulerMixin:
             if refuse_after_component is not None
             else None
         )
+        refuse_before = (
+            tuple(refuse_before_component)
+            if refuse_before_component is not None
+            else None
+        )
 
         def refusal_target_terminal() -> bool:
             if refuse_after is None:
@@ -69,6 +75,15 @@ class DagSchedulerMixin:
                 self.node_complete(node_name)
                 or self.storage.get_node_status(node_name) in {FAILED, CANCELLED}
                 for node_name in refuse_after
+            )
+
+        def refusal_before_already_reached() -> bool:
+            if refuse_before is None:
+                return False
+            return all(
+                self.node_complete(node_name)
+                or self.storage.get_node_status(node_name) in {FAILED, CANCELLED}
+                for node_name in refuse_before
             )
 
         def unit_ready(unit: tuple[str, ...]) -> bool:
@@ -95,6 +110,10 @@ class DagSchedulerMixin:
                     admission_stopped = True
                     if refusal_event is not None:
                         refusal_event.set()
+                if not admission_stopped and refusal_before_already_reached():
+                    admission_stopped = True
+                    if refusal_event is not None:
+                        refusal_event.set()
 
                 ready = [] if admission_stopped else [
                     unit
@@ -103,6 +122,17 @@ class DagSchedulerMixin:
                     and unit not in blocked_components
                     and unit_ready(unit)
                 ]
+
+                # ``refuse`` is a global exclusive boundary. The instant its
+                # component becomes startable, stop all new component
+                # admission before constructing this wave. Components already
+                # submitted in an earlier wave remain non-preemptive and are
+                # joined below.
+                if refuse_before is not None and refuse_before in ready:
+                    admission_stopped = True
+                    ready = []
+                    if refusal_event is not None:
+                        refusal_event.set()
 
                 # A later DAG branch may become ready while an independent
                 # component from an earlier wave is still running. Retain those

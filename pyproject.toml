@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "micro-workflow-manager"
-version = "0.5.9"
+version = "0.5.10"
 description = "A hybrid file-and-SQLite workflow manager for node-based Python jobs."
 requires-python = ">=3.10"
 dependencies = [

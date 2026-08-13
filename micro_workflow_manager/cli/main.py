@@ -234,12 +234,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "runfrom":
             if (args.refuse_mode is None) != (args.refuse_node is None):
                 raise RuntimeError(
-                    "Use: mwf runfrom <node> [refuseafter <node>] [--keeptrace]"
+                    "Use: mwf runfrom <node> [(refuse | refuseafter) <node>] [--keeptrace]"
                 )
             refuse_after_node = None
+            refuse_before_node = None
             if args.refuse_node is not None:
-                refuse_after_node = safe_node_name(args.refuse_node)
-                require_node(workflow, refuse_after_node)
+                refusal_node = safe_node_name(args.refuse_node)
+                require_node(workflow, refusal_node)
+                if args.refuse_mode == "refuse":
+                    refuse_before_node = refusal_node
+                else:
+                    refuse_after_node = refusal_node
             if args.plan:
                 return print_run_plan(
                     root,
@@ -248,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
                     node=node,
                     keep_trace=args.keeptrace,
                     refuse_after_node=refuse_after_node,
+                    refuse_before_node=refuse_before_node,
                 )
             return run_from(
                 root,
@@ -259,17 +265,23 @@ def main(argv: list[str] | None = None) -> int:
                 monitor_interval=args.monitor_interval,
                 keep_trace=args.keeptrace,
                 refuse_after_node=refuse_after_node,
+                refuse_before_node=refuse_before_node,
             )
 
         if args.command == "resumefrom":
             if (args.refuse_mode is None) != (args.refuse_node is None):
                 raise RuntimeError(
-                    "Use: mwf resumefrom <node> [refuseafter <node>] [--keeptrace]"
+                    "Use: mwf resumefrom <node> [(refuse | refuseafter) <node>] [--keeptrace]"
                 )
             refuse_after_node = None
+            refuse_before_node = None
             if args.refuse_node is not None:
-                refuse_after_node = safe_node_name(args.refuse_node)
-                require_node(workflow, refuse_after_node)
+                refusal_node = safe_node_name(args.refuse_node)
+                require_node(workflow, refusal_node)
+                if args.refuse_mode == "refuse":
+                    refuse_before_node = refusal_node
+                else:
+                    refuse_after_node = refusal_node
             if args.plan:
                 return print_run_plan(
                     root,
@@ -278,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
                     node=node,
                     keep_trace=args.keeptrace,
                     refuse_after_node=refuse_after_node,
+                    refuse_before_node=refuse_before_node,
                 )
             return resume_from(
                 root,
@@ -289,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
                 monitor_interval=args.monitor_interval,
                 keep_trace=args.keeptrace,
                 refuse_after_node=refuse_after_node,
+                refuse_before_node=refuse_before_node,
             )
 
     except Exception as error:

@@ -222,6 +222,7 @@ mwf graph --update
 mwf doctor
 mwf run START --plan
 mwf runfrom START
+mwf runfrom START refuse STOP
 mwf runfrom START refuseafter STOP
 mwf monitor --once
 mwf inspect NODE
@@ -240,11 +241,13 @@ successful jobs and their outputs are preserved while failed/cancelled jobs are
 requeued automatically. Use `restart` only from a second terminal to control a
 specific running or failed job inside the active sequence.
 
-Use `runfrom START refuseafter STOP` when the entire descendant reset must happen
-up front but component admission must end at a durable checkpoint in the graph.
-STOP selects its entire Hoeflein component. Once that component terminates, MWF
-does not start another component; already-running parallel components finish and
-newly produced downstream jobs remain queued.
+Both refusal forms select STOP's entire Hoeflein component and leave the ordinary
+full descendant reset/resume selection unchanged. Use `runfrom START refuse
+STOP` for an exclusive admission checkpoint: as soon as STOP's component becomes
+ready, MWF starts neither it nor any other newly ready component. Use `runfrom
+START refuseafter STOP` for an inclusive checkpoint: STOP's component is allowed
+to terminate before later admission stops. In both forms, parallel components
+that were already running finish non-preemptively and refused work remains queued.
 
 Fresh/destructive CLI operations clear their affected trace journals by default.
 Use `--keeptrace` when historical attempts must remain inspectable. `resume`

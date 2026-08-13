@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.5.9
+# micro-workflow-manager 0.5.10
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -17,6 +17,21 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.5.10
+
+- `mwf runfrom START refuse BOUNDARY` and `mwf resumefrom START refuse
+  BOUNDARY` add a global exclusive Hoeflein-component admission boundary. When
+  the named component first becomes ready, MWF starts neither that component
+  nor any other newly ready component. Components already running are joined,
+  and refused work remains queued for a later resume.
+- `refuse` is deliberately different from `refuseafter`: `refuse B` stops
+  before B's whole component starts, while `refuseafter B` lets B's component
+  terminate and then stops later admission. A boundary already terminal when a
+  resume begins is treated as already reached.
+- Fresh `runfrom` preparation still covers the complete selected descendant
+  set. The boundary limits execution admission, not reset scope, and its mode
+  and node are recorded in `.mwf/run.json`.
 
 ## What changed in 0.5.9
 

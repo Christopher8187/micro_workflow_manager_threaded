@@ -81,19 +81,22 @@ def run_from(
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
     refuse_after_node: str | None = None,
+    refuse_before_node: str | None = None,
 ) -> int:
     refuse_competing_run(workflow)
     start_component = workflow.component_for(node)
     start_nodes = _component_notice(workflow, node)
     components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
     nodes = [name for component in components for name in workflow.component_key(component)]
-    if refuse_after_node is not None:
-        refuse_component = workflow.component_for(refuse_after_node)
+    refusal_node = refuse_before_node or refuse_after_node
+    if refusal_node is not None:
+        refusal_mode = "refuse" if refuse_before_node is not None else "refuseafter"
+        refuse_component = workflow.component_for(refusal_node)
         if workflow.component_id(refuse_component) not in {
             workflow.component_id(component) for component in components
         }:
             raise RuntimeError(
-                f"refuseafter node {refuse_after_node!r} is not in the runfrom "
+                f"{refusal_mode} node {refusal_node!r} is not in the runfrom "
                 f"selection starting at {node!r}"
             )
     if _refuse_start_component_inputs(workflow, node, f"runfrom {node}"):
@@ -123,6 +126,7 @@ def run_from(
         stats=stats, stats_interval=stats_interval, monitor=monitor,
         monitor_interval=monitor_interval, prepare=prepare,
         refuse_after_node=refuse_after_node,
+        refuse_before_node=refuse_before_node,
     )
 
 def _recover_finished_before_resume(
@@ -205,18 +209,21 @@ def resume_from(
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
     refuse_after_node: str | None = None,
+    refuse_before_node: str | None = None,
 ) -> int:
     refuse_competing_run(workflow)
     start_component = workflow.component_for(node)
     components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
     nodes = [name for component in components for name in workflow.component_key(component)]
-    if refuse_after_node is not None:
-        refuse_component = workflow.component_for(refuse_after_node)
+    refusal_node = refuse_before_node or refuse_after_node
+    if refusal_node is not None:
+        refusal_mode = "refuse" if refuse_before_node is not None else "refuseafter"
+        refuse_component = workflow.component_for(refusal_node)
         if workflow.component_id(refuse_component) not in {
             workflow.component_id(component) for component in components
         }:
             raise RuntimeError(
-                f"refuseafter node {refuse_after_node!r} is not in the resumefrom "
+                f"{refusal_mode} node {refusal_node!r} is not in the resumefrom "
                 f"selection starting at {node!r}"
             )
     _recover_finished_before_resume(workflow, nodes)
@@ -248,4 +255,5 @@ def resume_from(
         prepare=prepare,
         require_start_queued=False,
         refuse_after_node=refuse_after_node,
+        refuse_before_node=refuse_before_node,
     )

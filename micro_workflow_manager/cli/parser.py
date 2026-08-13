@@ -331,15 +331,18 @@ def build_parser() -> argparse.ArgumentParser:
     runfrom_cmd.add_argument(
         "refuse_mode",
         nargs="?",
-        choices=("refuseafter",),
-        metavar="refuseafter",
-        help="Optional literal refuseafter followed by a stop-boundary node.",
+        choices=("refuseafter", "refuse"),
+        metavar="refuseafter|refuse",
+        help=(
+            "Optional boundary: refuse stops before the named component starts; "
+            "refuseafter stops after it terminates."
+        ),
     )
     runfrom_cmd.add_argument(
         "refuse_node",
         nargs="?",
         metavar="node",
-        help="Stop admitting new Hoeflein components after this node's component terminates.",
+        help="Hoeflein component used as the inclusive or exclusive admission boundary.",
     )
     runfrom_cmd.add_argument(
         "--runner",
@@ -356,15 +359,18 @@ def build_parser() -> argparse.ArgumentParser:
     resumefrom_cmd.add_argument(
         "refuse_mode",
         nargs="?",
-        choices=("refuseafter",),
-        metavar="refuseafter",
-        help="Optional literal refuseafter followed by a stop-boundary node.",
+        choices=("refuseafter", "refuse"),
+        metavar="refuseafter|refuse",
+        help=(
+            "Optional boundary: refuse stops before the named component starts; "
+            "refuseafter stops after it terminates."
+        ),
     )
     resumefrom_cmd.add_argument(
         "refuse_node",
         nargs="?",
         metavar="node",
-        help="Stop admitting new Hoeflein components after this node's component terminates.",
+        help="Hoeflein component used as the inclusive or exclusive admission boundary.",
     )
     resumefrom_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
     add_keeptrace_argument(resumefrom_cmd)

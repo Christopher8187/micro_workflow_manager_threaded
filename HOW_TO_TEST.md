@@ -1,6 +1,6 @@
 # How to test micro-workflow-manager
 
-This is the **authoritative execution order for testing MWF 0.5.9**.
+This is the **authoritative execution order for testing MWF 0.5.10**.
 
 AI coding agents and human contributors should follow this file before declaring a
 framework change verified. The important distinction is:
@@ -117,7 +117,8 @@ python -m pytest -q \
   tests/test_056_resumefrom_refuseafter_052.py \
   tests/test_057_hoeflein_live_sync_053.py \
   tests/test_058_http_fanout_scaling_054.py \
-  tests/test_060_network_manager_056.py
+  tests/test_060_network_manager_056.py \
+  tests/test_061_refuse_before_0510.py
 ```
 
 ```bash
@@ -209,7 +210,8 @@ python -m pytest -q \
   tests/test_055_threaded_prefetch_and_nofile.py \
   tests/test_056_resumefrom_refuseafter_052.py \
   tests/test_057_hoeflein_live_sync_053.py \
-  tests/test_058_http_fanout_scaling_054.py
+  tests/test_058_http_fanout_scaling_054.py \
+  tests/test_061_refuse_before_0510.py
 ```
 
 If the change has its own new regression file, run that focused file first,
