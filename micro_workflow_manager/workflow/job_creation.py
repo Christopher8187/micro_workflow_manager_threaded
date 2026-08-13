@@ -76,9 +76,26 @@ class JobCreationMixin:
                         for offset in range(number)
                     ]
 
-                for offset in range(number):
-                    job_id = start_job_id + offset
-                    existed = self.storage.job_exists(node_name, job_id)
+                requested_jobs = [
+                    Job(
+                        job_id=start_job_id + offset,
+                        node_name=node_name,
+                        params=dict(params),
+                        parent=None,
+                    )
+                    for offset in range(number)
+                ]
+                existing_ids = set(self.storage.list_job_ids(node_name))
+                missing_jobs = [
+                    job for job in requested_jobs if job.job_id not in existing_ids
+                ]
+                if missing_jobs:
+                    self.storage.create_jobs_batch(missing_jobs)
+                    changed_any_job = True
+
+                for job in requested_jobs:
+                    job_id = job.job_id
+                    existed = job_id in existing_ids
                     previous_params = None
                     previous_parent = None
                     previous_status = None
@@ -94,13 +111,13 @@ class JobCreationMixin:
                         previous_parent = previous_job_data.get("parent")
                         previous_status = self.storage.get_job_status(node_name, job_id)
 
-                    job = Job(
-                        job_id=job_id,
-                        node_name=node_name,
-                        params=dict(params),
-                        parent=None,
-                    )
-                    self.storage.ensure_job(job)
+                    if existed:
+                        if (
+                            previous_params != job.params
+                            or previous_parent is not None
+                            or previous_status is None
+                        ):
+                            self.storage.ensure_job(job)
                     created.append(job)
 
                     if (

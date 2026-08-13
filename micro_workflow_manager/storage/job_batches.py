@@ -36,19 +36,32 @@ class JobBatchStorageMixin:
         for job in jobs:
             self.json_text(Path("input.json"), job.params)
 
-        written_dirs: list[Path] = []
+        written_dirs = [self.job_dir(job.node_name, job.job_id) for job in jobs]
+
+        def write_job_payload(job: Job) -> None:
+            input_path = self.input_file(job.node_name, job.job_id)
+            input_text = self.json_text(input_path, job.params)
+
+            def write_new_payload():
+                with input_path.open("x", encoding="utf-8") as file:
+                    file.write(input_text)
+
+            self.retry_fs(write_new_payload)
+
         try:
-            for job in jobs:
-                job_dir = self.job_dir(job.node_name, job.job_id)
-                written_dirs.append(job_dir)
-                input_path = self.input_file(job.node_name, job.job_id)
-                input_text = self.json_text(input_path, job.params)
-
-                def write_new_payload():
-                    with input_path.open("x", encoding="utf-8") as file:
-                        file.write(input_text)
-
-                self.retry_fs(write_new_payload)
+            if len(jobs) < 8:
+                for job in jobs:
+                    write_job_payload(job)
+            else:
+                # Payload paths are disjoint and registration has not happened
+                # yet.  Serial tiny-file creation is particularly expensive on
+                # Windows and made a 2,400-job fan-out take about a minute even
+                # though its single SQLite commit was fast.
+                with ThreadPoolExecutor(
+                    max_workers=min(32, len(jobs)),
+                    thread_name_prefix="mwf-job-publish",
+                ) as executor:
+                    list(executor.map(write_job_payload, jobs))
         except BaseException:
             for job_dir in written_dirs:
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -157,6 +170,12 @@ class JobBatchStorageMixin:
                 "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
                 "updated_at=CURRENT_TIMESTAMP",
                 (node_name, QUEUED),
+            )
+            connection.execute(
+                "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET "
+                "next_job_id=MAX(job_sequences.next_job_id, excluded.next_job_id)",
+                (node_name, max(ids) + 1),
             )
         self.notify_queue_change(node_name)
         return jobs

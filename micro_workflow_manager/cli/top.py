@@ -81,7 +81,12 @@ def _event_rows(storage, nodes: list[str], limit: int) -> list[dict[str, Any]]:
     rows = storage.db_connection().execute(
         "SELECT e.event_id, e.node_name, e.job_id, e.time, e.event, "
         "e.data_json, j.created_at "
-        "FROM job_events AS e "
+        # The journal's INTEGER PRIMARY KEY is already chronological.  Without
+        # this hint SQLite prefers the (node_name, job_id, event_id) trace index,
+        # reads every event for every selected node, and builds a temporary sort
+        # merely to obtain the newest bounded tail.  A reverse table/rowid walk
+        # stops as soon as ``limit`` selected events have been found.
+        "FROM job_events AS e NOT INDEXED "
         "LEFT JOIN jobs AS j ON j.node_name=e.node_name AND j.job_id=e.job_id "
         f"WHERE e.node_name IN ({placeholders}) "
         "ORDER BY e.event_id DESC LIMIT ?",
@@ -167,7 +172,7 @@ def top_snapshot(
 
     # A bounded tail is enough for live rates while avoiding an O(all events)
     # scan in long-running cyclic workflows.
-    event_limit = max(2000, min(50000, recent_events * 1000))
+    event_limit = max(1000, min(10000, recent_events * 250))
     events = _event_rows(storage, normalized, event_limit)
     window_start = now_epoch - window_seconds
     recent_window = [event for event in events if (_epoch(event.get("time")) or 0) >= window_start]
@@ -390,8 +395,10 @@ def top_command(
             last_render = time.monotonic()
             wake.clear()
             wake.wait(interval)
-            # Coalesce terminal waves so htop-style rendering remains usable.
-            remaining = 0.1 - (time.monotonic() - last_render)
+            # State notifications are hints, not a request to redraw once per
+            # commit. Honour the requested interval under terminal waves so a
+            # diagnostic observer cannot compete with the workflow it measures.
+            remaining = interval - (time.monotonic() - last_render)
             if remaining > 0:
                 time.sleep(remaining)
     except KeyboardInterrupt:

@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.5.7
+# micro-workflow-manager 0.5.8
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -18,6 +18,29 @@ command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
 
+## What changed in 0.5.8
+
+- HTTP/2 shards are selected round-robin and opened elastically after the
+  connection-local 32-stream safety width. There is no second aggregate
+  request gate: declared node concurrency and provider request pressure remain
+  unchanged.
+- JSON requests recover from two multiplexed HTTP/2 terminal defects without
+  replacing the caller's timeout. A complete checksum-valid JSON entity that
+  lacks `END_STREAM` is returned after a five-second terminal grace period. A
+  stream that remains nonterminal for five minutes while at least 16 newer
+  same-shard requests terminate is replayed on a fresh shard; this cohort proof
+  remains valid through the quiet tail of a run.
+- Live network futures cancel their underlying socket coroutines. TCP keepalive
+  detects connection-wide half-open VPN/TUN paths, while
+  `.mwf/network_manager.json` exposes shard, stream, job, phase, retirement,
+  terminal-recovery, and cohort-replay evidence.
+- Default multi-job declarations publish one prepared SQLite batch and write
+  disjoint payload files concurrently. `mwf monitor` bulk-reads all selected
+  node summaries, while `mwf top` uses a bounded reverse journal walk and
+  honors its redraw interval under terminal waves. Fan-out and observers no
+  longer compete unnecessarily with dense API work as the done-job journal
+  grows.
+
 ## What changed in 0.5.7
 
 - Simultaneously runnable API nodes now receive a shared controller-pump vector.
@@ -34,7 +57,7 @@ manager, and a Pygame state machine.
   The latest checkpoint stays inspectable, timeouts remain durable, and
   admission, successful terminal publication, and failed terminal publication
   all remain in the same priority-5 runtime-critical class.
-- API networking now has an explicit backend `NetworkManager`: one process-wide event loop owns persistent HTTPX client shards and all socket I/O. Node fibers enqueue lightweight requests; dense cross-thread submissions are coalesced before asyncio task creation instead of calling `run_coroutine_threadsafe` once per request. HTTP/2 connection width is safely capped at 32 streams by default, and at most 1,024 requests are actively dispatched while excess node work waits inside the manager. Both defaults are observable and explicitly overrideable. Existing `shared_http_transport` application code remains unchanged.
+- API networking now has an explicit backend `NetworkManager`: one process-wide event loop owns persistent HTTPX client shards and all socket I/O. Node fibers enqueue lightweight requests; dense cross-thread submissions are coalesced before asyncio task creation instead of calling `run_coroutine_threadsafe` once per request. Existing `shared_http_transport` application code remains unchanged.
 - Network-manager state is aggregated in memory and bulk-upserted into the new SQLite `network_state` table at most every two seconds. This observability path is low-priority and non-fatal. SQLite schema version is 4.
 - Adds the requested 22-node skew A/B benchmark: two 2,000-job nodes plus twenty 100-job nodes with 512 proportionally allocated API slots. In the observed unlimited-bandwidth H2 sample, the manager improved runner throughput ~6.5%, durable workflow throughput ~6.4%, and the durable big:small ratio from 11.69:1 to 13.16:1. See `NETWORK_MANAGER_ARCHITECTURE_056.md`.
 - Retains the 0.5.5 queue-scan and dense-refill optimizations: refreshable queues use monotonic direct rowid range scans without a temporary ORDER BY tree, queue hints are bounded, and dense API nodes avoid repeated tiny durable refills.
@@ -279,9 +302,9 @@ manager, and a Pygame state machine.
   shift a growing list on every resume.
 - The framework HTTP transport supports connection sharding with `http2=` and
   `streams_per_connection=`. Per-node `max_threads` remains the exact job
-  concurrency control. The manager separately bounds active socket work so
-  very large declared node concurrency cannot create an unbounded provider
-  queue; jobs waiting for that transport capacity remain admitted/running.
+  concurrency control. The manager does not impose a second aggregate request
+  limit: every admitted API request is dispatched, with connection-local width
+  bounded by the HTTP/2 stream safety cap.
 
 ### HTTP/2 connection sharding
 
@@ -293,7 +316,6 @@ configure_shared_http_transport(
     streams_per_connection=80,
     # Optional explicit overrides of the measured safe defaults:
     http2_stream_safety_cap=32,
-    active_request_limit=1024,
 )
 ```
 
@@ -301,16 +323,19 @@ For HTTP/2, the effective per-connection assignment is
 `min(streams_per_connection, http2_stream_safety_cap)`. The default safety cap
 is 32 because high stream widths caused severe long-tail collapse under
 thousand-request provider loads. Once a shard is full, another connection is
-created until `active_request_limit` requests are dispatched; later requests
-wait inside the central manager. These are transport-pressure controls,
-not workflow admission controls: node concurrency, pump allocation, and job
-lifecycle remain unchanged.
+created immediately. This is a connection-local safety control, not a workflow
+admission control: node concurrency, pump allocation, provider request pressure,
+and job lifecycle remain unchanged.
 
-The environment equivalents are `MWF_HTTP2_STREAM_SAFETY_CAP` (default `32`)
-and `MWF_NETWORK_ACTIVE_REQUEST_LIMIT` (default `1024`). The manager snapshot
-reports requested/effective stream width, the cap, active request limit, client
-count, and current in-flight requests. HTTP/1.1 keeps its independent
-`MWF_HTTP1_CONNECTIONS_PER_SHARD` setting.
+The environment equivalent is `MWF_HTTP2_STREAM_SAFETY_CAP` (default `32`).
+`MWF_JSON_TERMINAL_GRACE_SECONDS` (default `5`),
+`MWF_HTTP2_COHORT_STALL_SECONDS` (default `300`),
+`MWF_HTTP2_COHORT_TERMINALS` (default `16`), and
+`MWF_HTTP2_COHORT_RETRIES` (default `2`) control terminal recovery without
+replacing the caller's request timeout. The manager snapshot reports
+requested/effective stream width, the cap, client count, current in-flight
+requests, active stream phases, and recovery/retirement evidence. HTTP/1.1 keeps
+its independent `MWF_HTTP1_CONNECTIONS_PER_SHARD` setting.
 
 ## What changed in 0.3.16
 

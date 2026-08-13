@@ -5,6 +5,15 @@ class NetworkStateStorageMixin:
     """Batched observability snapshots from the process-wide NetworkManager."""
 
     def publish_network_manager_snapshot(self, rows: list[dict[str, Any]], updated_at: float) -> None:
+        manager = next(
+            (row.get("_manager") for row in rows if isinstance(row.get("_manager"), dict)),
+            None,
+        )
+        if manager is not None:
+            self.atomic_write_json(
+                self.project_dir / ".mwf" / "network_manager.json",
+                {"updated_at": float(updated_at), **manager},
+            )
         normalized = []
         for row in rows:
             node = self.validate_node_name(str(row.get("node_name") or ""))

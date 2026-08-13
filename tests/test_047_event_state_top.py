@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from micro_workflow_manager import cli
+from micro_workflow_manager.cli.top import _event_rows
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
 
@@ -154,6 +155,29 @@ def test_top_help_and_text_surface_htop_style_fields(capsys, tmp_path, monkeypat
     assert "writer source=" in output
     assert "START/s" in output
     assert "TERM95" in output
+
+
+def test_top_event_tail_walks_chronological_rowid_instead_of_sorting_node_history(tmp_path):
+    storage = FileStorage(tmp_path)
+    for job_id in range(1, 301):
+        node = "A" if job_id % 3 else "B"
+        storage.create_job(Job(node_name=node, job_id=job_id, params={}))
+
+    statements = []
+    connection = storage.db_connection()
+    connection.set_trace_callback(statements.append)
+    try:
+        rows = _event_rows(storage, ["A", "B"], 25)
+    finally:
+        connection.set_trace_callback(None)
+
+    assert len(rows) == 25
+    assert [row["event_id"] for row in rows] == sorted(
+        (row["event_id"] for row in rows), reverse=True
+    )
+    event_queries = [sql for sql in statements if "FROM job_events AS e" in sql]
+    assert len(event_queries) == 1
+    assert "FROM job_events AS e NOT INDEXED" in event_queries[0]
 
 
 def test_mutation_writer_retires_immediately_after_draining_queue(tmp_path):

@@ -722,21 +722,30 @@ its exact generation and execution ID while holding the per-job filesystem lock.
 This preserves second-terminal restart semantics without an O(active jobs)
 database-query loop.
 
-The network runtime has distinct job-admission and transport-pressure planes.
+The network runtime has distinct job-admission and connection-sharding planes.
 Node `max_threads` continues to define exactly how many jobs may be running.
-Those jobs submit into the process-wide manager, which dispatches at most
-`active_request_limit` requests to sockets and lets excess work wait without
-creating more provider-side queue pressure. With HTTP/2 enabled, one client owns
-one connection and accepts at most the smaller of `streams_per_connection` and
+Those jobs submit into the process-wide manager without a second aggregate
+request gate. With HTTP/2 enabled, one client owns one connection and accepts at
+most the smaller of `streams_per_connection` and
 `http2_stream_safety_cap` assignments before another client is created.
 HTTP/1.1 uses its configured connection-pool capacity per client.
 
-The defaults (32 HTTP/2 streams per connection, 1,024 active requests) are
-measured safety boundaries rather than node concurrency overrides. They can be
-changed per provider through configuration or environment, and every requested,
-effective, and active value is reported by the manager snapshot. Network-state
+The default 32 HTTP/2 streams per connection is a measured connection-local
+safety boundary rather than a node-concurrency override. Shards are selected
+round-robin and opened elastically, so large nodes do not monopolize the oldest
+connection and every admitted request reaches socket dispatch. Network-state
 high-water fields are overwritten when a new manager run starts so monitor does
 not confuse a previous run's peaks with current activity.
+
+JSON terminal recovery distinguishes connection failure from a poisoned stream.
+TCP keepalive handles connection-wide half-open paths. A complete compressed JSON
+entity is accepted only after its coding trailer/checksum and JSON document both
+validate; if the stream then omits its terminal event, the connection is drained
+and replaced. An incomplete stream is replayed only after it remains nonterminal
+for five minutes while a configured same-shard cohort terminates after that
+attempt began. This proof is monotonic through the quiet tail of a workflow and
+the original scheduler/request lease continues measuring the entire operation.
+No recovery changes node concurrency or provider request admission.
 
 
 ## High-fanout component admission and completion (0.3.18)

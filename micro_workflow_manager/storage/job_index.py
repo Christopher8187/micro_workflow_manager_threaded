@@ -111,6 +111,77 @@ class JobIndexStorageMixin:
             "completed_last_60_seconds": int(recent["count"] or 0),
         }
 
+    def node_job_summaries(self, node_names) -> dict[str, dict[str, Any]]:
+        """Read monitor summaries for many nodes with two bounded SQL scans.
+
+        The prior monitor called ``node_job_summary`` independently for each
+        node. Every refresh therefore re-read terminal ``status_json`` once per
+        node for durations and once again for the 60-second rate. A single
+        grouped pass keeps the same public values while making observer cost
+        proportional to the selected job rows, not selected nodes times rows.
+        """
+        normalized = list(dict.fromkeys(
+            self.validate_node_name(name) for name in node_names
+        ))
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        summaries = {
+            node_name: {
+                "total": 0,
+                "counts": {status: 0 for status in sorted(JOB_VALID_STATUSES)},
+                "running_jobs": {},
+                "avg_duration_seconds": None,
+                "completed_last_60_seconds": 0,
+                "_duration_total": 0.0,
+                "_duration_count": 0,
+            }
+            for node_name in normalized
+        }
+        rows = self.db_connection().execute(
+            "SELECT node_name, status, COUNT(*) AS count, "
+            "COALESCE(SUM(CASE WHEN status IN ('done','failed','skipped','cancelled') "
+            "AND json_type(status_json, '$.duration_seconds') IN ('integer','real') "
+            "THEN CAST(json_extract(status_json, '$.duration_seconds') AS REAL) ELSE 0 END), 0) "
+            "AS duration_total, "
+            "SUM(CASE WHEN status IN ('done','failed','skipped','cancelled') "
+            "AND json_type(status_json, '$.duration_seconds') IN ('integer','real') "
+            "THEN 1 ELSE 0 END) AS duration_count, "
+            "SUM(CASE WHEN status IN ('done','skipped') "
+            "AND julianday(json_extract(status_json, '$.finished_at')) "
+            ">= julianday('now', '-60 seconds') THEN 1 ELSE 0 END) AS recent "
+            f"FROM jobs WHERE node_name IN ({placeholders}) GROUP BY node_name, status",
+            normalized,
+        ).fetchall()
+        for row in rows:
+            summary = summaries[str(row["node_name"])]
+            status = str(row["status"])
+            count = int(row["count"])
+            if status in summary["counts"]:
+                summary["counts"][status] = count
+            summary["total"] += count
+            summary["_duration_total"] += float(row["duration_total"] or 0.0)
+            summary["_duration_count"] += int(row["duration_count"] or 0)
+            summary["completed_last_60_seconds"] += int(row["recent"] or 0)
+
+        running = self.db_connection().execute(
+            "SELECT node_name, job_id, json_extract(status_json, '$.started_at') AS started_at "
+            f"FROM jobs WHERE node_name IN ({placeholders}) AND status=? ORDER BY node_name, job_id",
+            [*normalized, RUNNING],
+        ).fetchall()
+        for row in running:
+            summaries[str(row["node_name"])]["running_jobs"][str(int(row["job_id"]))] = {
+                "started_at": row["started_at"]
+            }
+
+        for summary in summaries.values():
+            duration_count = summary.pop("_duration_count")
+            duration_total = summary.pop("_duration_total")
+            summary["avg_duration_seconds"] = (
+                duration_total / duration_count if duration_count else None
+            )
+        return summaries
+
     def register_job_created(self, node_name: str, job_id: int, status: str = QUEUED):
         return None
 

@@ -7,7 +7,36 @@ from pathlib import Path
 from micro_workflow_manager import cli
 from micro_workflow_manager import monitor as monitor_module
 from micro_workflow_manager.monitor import InlineMonitorReporter
+from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
+
+
+def test_bulk_node_summaries_match_individual_summaries(tmp_path):
+    storage = FileStorage(tmp_path)
+    for node_name in ("A", "B"):
+        for job_id in range(1, 4):
+            storage.create_job(Job(node_name=node_name, job_id=job_id, params={}))
+        storage.set_job_status(
+            node_name,
+            1,
+            "done",
+            duration_seconds=2.5,
+            finished_at="2999-01-01T00:00:00",
+        )
+        storage.set_job_status(
+            node_name,
+            2,
+            "failed",
+            duration_seconds=1.5,
+            finished_at="2999-01-01T00:00:00",
+        )
+
+    bulk = storage.node_job_summaries(["A", "B"])
+
+    assert bulk == {
+        node_name: storage.node_job_summary(node_name)
+        for node_name in ("A", "B")
+    }
 
 
 def make_monitor_project(tmp_path: Path, monkeypatch):

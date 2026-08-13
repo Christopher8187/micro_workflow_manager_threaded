@@ -8,7 +8,55 @@ from concurrent.futures import ThreadPoolExecutor
 
 from micro_workflow_manager import NodeInputFileSystem, cli
 from micro_workflow_manager.cli.cleanup import prepare_fresh_components
+from micro_workflow_manager.models import Job
 from micro_workflow_manager.system import MicroWorkflow
+
+
+def test_prepared_job_payloads_are_written_concurrently(tmp_path, monkeypatch):
+    workflow = MicroWorkflow(project_dir=tmp_path)
+    workflow.graph([])
+    jobs = [Job(node_name="sink", job_id=index, params={"value": index}) for index in range(1, 65)]
+    thread_names = set()
+    guard = threading.Lock()
+    original_retry = workflow.storage.retry_fs
+
+    def observed_retry(action, *args, **kwargs):
+        with guard:
+            thread_names.add(threading.current_thread().name)
+        time.sleep(0.005)
+        return original_retry(action, *args, **kwargs)
+
+    monkeypatch.setattr(workflow.storage, "retry_fs", observed_retry)
+    workflow.storage.prepare_jobs_batch(jobs)
+
+    publish_threads = {name for name in thread_names if name.startswith("mwf-job-publish")}
+    assert len(publish_threads) > 1
+    assert all(
+        workflow.storage.input_file("sink", job.job_id).is_file()
+        for job in jobs
+    )
+
+
+def test_default_job_declaration_uses_one_prepared_batch(tmp_path, monkeypatch):
+    workflow = MicroWorkflow(project_dir=tmp_path)
+    workflow.graph([])
+
+    @workflow.task("seed")
+    def seed(ctx, value):
+        return value
+    commit_sizes = []
+    original_commit = workflow.storage.commit_prepared_jobs_batch
+
+    def observed_commit(jobs, **kwargs):
+        commit_sizes.append(len(jobs))
+        return original_commit(jobs, **kwargs)
+
+    monkeypatch.setattr(workflow.storage, "commit_prepared_jobs_batch", observed_commit)
+    jobs = workflow.create_jobs("seed", number=64, params={"value": 1})
+
+    assert len(jobs) == 64
+    assert commit_sizes == [64]
+    assert workflow.storage.job_status_counts("seed")["queued"] == 64
 
 
 def test_concurrent_single_job_routes_share_publish_group_and_keep_idempotency(tmp_path, monkeypatch):

@@ -1,9 +1,13 @@
 import asyncio
+import gzip
+import json
+import socket
 import ssl
 import threading
 import time
 
 import httpx
+import pytest
 
 from benchmarks.local_http_delay_server import H2Session, h1_transfer
 from micro_workflow_manager import MicroWorkflow, NodeRouter
@@ -36,6 +40,297 @@ def test_network_manager_reuses_one_default_ssl_context_for_every_client_shard(m
     finally:
         asyncio.run(first.client.aclose())
         asyncio.run(second.client.aclose())
+
+
+def test_http_clients_enable_fast_tcp_keepalive_without_changing_request_timeout():
+    manager = NetworkManager()
+    manager.configure(http2=True, streams_per_connection=32)
+    shard = manager._new_client_shard()
+    try:
+        options = shard.client._transport._pool._socket_options
+        assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in options
+        expected = {
+            name: value
+            for name, value in (
+                ("TCP_KEEPIDLE", 30),
+                ("TCP_KEEPINTVL", 10),
+                ("TCP_KEEPCNT", 3),
+            )
+            if hasattr(socket, name)
+        }
+        for name, value in expected.items():
+            assert (socket.IPPROTO_TCP, getattr(socket, name), value) in options
+        snapshot = manager.snapshot()
+        assert snapshot["tcp_keepalive"] is True
+        assert snapshot["tcp_keepalive_idle_seconds"] == 30
+        assert snapshot["tcp_keepalive_interval_seconds"] == 10
+        assert snapshot["tcp_keepalive_probes"] == 3
+    finally:
+        asyncio.run(shard.client.aclose())
+
+
+def test_available_http2_shards_are_selected_round_robin():
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=4,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)),
+    )
+    first = manager._new_client_shard()
+    second = manager._new_client_shard()
+
+    async def acquire_four():
+        return [await manager._acquire_client() for _ in range(4)]
+
+    selected = asyncio.run(acquire_four())
+    try:
+        assert [shard.shard_id for shard in selected] == [1, 2, 1, 2]
+    finally:
+        asyncio.run(first.client.aclose())
+        asyncio.run(second.client.aclose())
+
+
+def test_complete_json_recovers_from_missing_stream_terminal(monkeypatch):
+    monkeypatch.setenv("MWF_JSON_TERMINAL_GRACE_SECONDS", "0.02")
+    stream_closed = threading.Event()
+
+    class MissingTerminal(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"ok":true}'
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            stream_closed.set()
+
+    async def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=MissingTerminal(),
+            request=request,
+        )
+
+    manager = NetworkManager()
+    manager.configure(
+        transport=httpx.MockTransport(handler),
+        streams_per_connection=4,
+    )
+    future = manager.submit_request(
+        "POST", "https://example.test/", expect_json=True
+    )
+    try:
+        response = future.result(timeout=2)
+        snapshot = manager.snapshot()
+        assert response.json() == {"ok": True}
+        assert stream_closed.wait(1)
+        assert snapshot["json_stream_recoveries"] == 1
+        assert snapshot["retired_shards"] == 1
+        assert snapshot["client_count"] == 0
+        assert snapshot["json_terminal_grace_seconds"] == 0.02
+    finally:
+        manager.close()
+
+
+def test_normally_terminated_json_keeps_connection_reusable(monkeypatch):
+    monkeypatch.setenv("MWF_JSON_TERMINAL_GRACE_SECONDS", "0.02")
+
+    class NormalTerminal(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            encoded = gzip.compress(b'{"ok":true}')
+            yield encoded[: len(encoded) // 2]
+            yield encoded[len(encoded) // 2 :]
+
+    async def handler(request):
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+            },
+            stream=NormalTerminal(),
+            request=request,
+        )
+
+    manager = NetworkManager()
+    manager.configure(
+        transport=httpx.MockTransport(handler),
+        streams_per_connection=4,
+    )
+    future = manager.submit_request(
+        "POST", "https://example.test/", expect_json=True
+    )
+    try:
+        assert future.result(timeout=2).json() == {"ok": True}
+        snapshot = manager.snapshot()
+        assert snapshot["json_stream_recoveries"] == 0
+        assert snapshot["retired_shards"] == 0
+        assert snapshot["client_count"] == 1
+    finally:
+        manager.close()
+
+
+def test_expect_json_accepts_already_buffered_custom_transport_response():
+    manager = NetworkManager()
+    manager.configure(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"ok": True}, request=request)
+        ),
+        streams_per_connection=4,
+    )
+    future = manager.submit_request(
+        "POST", "https://example.test/", expect_json=True
+    )
+    try:
+        assert future.result(timeout=2).json() == {"ok": True}
+        snapshot = manager.snapshot()
+        assert snapshot["json_stream_recoveries"] == 0
+        assert snapshot["retired_shards"] == 0
+    finally:
+        manager.close()
+
+
+def test_cohort_stalled_stream_retries_on_fresh_shard_without_failing_job(monkeypatch):
+    monkeypatch.setenv("MWF_HTTP2_COHORT_STALL_SECONDS", "0.05")
+    monkeypatch.setenv("MWF_HTTP2_COHORT_TERMINALS", "2")
+    monkeypatch.setenv("MWF_HTTP2_COHORT_RETRIES", "1")
+    first_attempt_started = threading.Event()
+    stalled_calls = 0
+
+    class NeverResponds(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            first_attempt_started.set()
+            await asyncio.Event().wait()
+            yield b""  # pragma: no cover
+
+    class HealthyJSON(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"ok":true}'
+
+    async def handler(request):
+        nonlocal stalled_calls
+        if request.url.path == "/stalled":
+            stalled_calls += 1
+            stream = NeverResponds() if stalled_calls == 1 else HealthyJSON()
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=stream,
+                request=request,
+            )
+        return httpx.Response(200, content=b"ok", request=request)
+
+    manager = NetworkManager()
+    manager.configure(
+        transport=httpx.MockTransport(handler),
+        streams_per_connection=8,
+    )
+    stalled = manager.submit_request(
+        "POST", "https://example.test/stalled", expect_json=True
+    )
+    try:
+        assert first_attempt_started.wait(1)
+        siblings = [
+            manager.submit_request("GET", f"https://example.test/fast/{index}")
+            for index in range(4)
+        ]
+        assert [item.result(timeout=2).status_code for item in siblings] == [200] * 4
+        assert stalled.result(timeout=2).json() == {"ok": True}
+        snapshot = manager.snapshot()
+        assert stalled_calls == 2
+        assert snapshot["cohort_stream_retries"] == 1
+        assert snapshot["retired_shards"] == 1
+        assert snapshot["client_count"] == 1
+        assert snapshot["shards"][0]["requests_failed"] == 0
+    finally:
+        manager.close()
+
+
+def test_cohort_stall_uses_nonterminal_age_despite_irrelevant_socket_progress(monkeypatch):
+    """Sibling HTTP/2 frames must not make an old stream look healthy.
+
+    A read on one multiplexed stream can keep waking as the connection receives
+    frames for other streams.  The poisoned stream is identified by remaining
+    nonterminal while its newer same-shard cohort finishes, not by a quiet read
+    iterator.
+    """
+    monkeypatch.setenv("MWF_HTTP2_COHORT_STALL_SECONDS", "0.05")
+    monkeypatch.setenv("MWF_HTTP2_COHORT_TERMINALS", "2")
+    monkeypatch.setenv("MWF_HTTP2_COHORT_RETRIES", "1")
+    first_attempt_started = threading.Event()
+    stalled_calls = 0
+
+    class IrrelevantProgress(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            first_attempt_started.set()
+            while True:
+                await asyncio.sleep(0.005)
+                yield b" "
+
+    class HealthyJSON(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"ok":true}'
+
+    async def handler(request):
+        nonlocal stalled_calls
+        if request.url.path == "/stalled":
+            stalled_calls += 1
+            stream = IrrelevantProgress() if stalled_calls == 1 else HealthyJSON()
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=stream,
+                request=request,
+            )
+        return httpx.Response(200, content=b"ok", request=request)
+
+    manager = NetworkManager()
+    manager.configure(
+        transport=httpx.MockTransport(handler),
+        streams_per_connection=8,
+    )
+    stalled = manager.submit_request(
+        "POST", "https://example.test/stalled", expect_json=True
+    )
+    try:
+        assert first_attempt_started.wait(1)
+        siblings = [
+            manager.submit_request("GET", f"https://example.test/fast/{index}")
+            for index in range(4)
+        ]
+        assert [item.result(timeout=2).status_code for item in siblings] == [200] * 4
+        assert stalled.result(timeout=2).json() == {"ok": True}
+        snapshot = manager.snapshot()
+        assert stalled_calls == 2
+        assert snapshot["cohort_stream_retries"] == 1
+        assert snapshot["retired_shards"] == 1
+        assert snapshot["client_count"] == 1
+        assert snapshot["shards"][0]["requests_failed"] == 0
+    finally:
+        manager.close()
+
+
+def test_cohort_evidence_does_not_expire_during_quiet_workflow_tail():
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=8,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, request=request)
+        ),
+    )
+    shard = manager._new_client_shard()
+    shard.requests_completed = 16
+    shard.last_terminal_at = 110.0
+    active = {
+        "attempt_started_at": 100.0,
+        "cohort_terminal_baseline": 0,
+    }
+    try:
+        reason = manager._cohort_stream_stall_reason(active, shard, 401.0)
+        assert reason is not None
+        assert "16 newer sibling requests terminated" in reason
+    finally:
+        asyncio.run(shard.client.aclose())
 
 
 def test_http2_stream_width_is_safely_capped_and_observable(monkeypatch):
@@ -142,6 +437,43 @@ def test_network_manager_is_default_and_coalesces_ingress_wakeups():
     assert 0 < snapshot["ingress_wakeups"] <= 128
 
 
+def test_cancelling_running_network_future_aborts_underlying_http_task():
+    started = threading.Event()
+    aborted = threading.Event()
+
+    async def handler(request):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            aborted.set()
+
+    manager = NetworkManager()
+    manager.configure(
+        transport=httpx.MockTransport(handler),
+        streams_per_connection=4,
+    )
+    future = manager.submit_request(
+        "GET",
+        "https://example.test/",
+        project_key="probe",
+        node_name="A",
+    )
+    try:
+        assert started.wait(2)
+        snapshot = manager.snapshot()
+        assert snapshot["active_phase_counts"] == {"client_acquired": 1}
+        assert snapshot["shards"][0]["in_flight"] == 1
+        assert snapshot["shards"][0]["active_nodes"] == {"A": 1}
+
+        future.cancel()
+        assert aborted.wait(2)
+        with pytest.raises(asyncio.CancelledError):
+            future.result(timeout=2)
+    finally:
+        manager.close()
+
+
 def test_network_manager_snapshot_is_batched_into_sqlite(tmp_path):
     workflow = MicroWorkflow(tmp_path, runner="api")
     workflow.graph([])
@@ -166,6 +498,11 @@ def test_network_manager_snapshot_is_batched_into_sqlite(tmp_path):
             "max_request_seconds": 1.0,
             "average_request_seconds": 0.4,
             "last_error": "boom",
+            "_manager": {
+                "active_phase_counts": {"http2.receive_response_body.started": 2},
+                "oldest_active_seconds": 12.5,
+                "shards": [{"shard_id": 1, "in_flight": 2}],
+            },
         }],
         123.0,
     )
@@ -175,6 +512,12 @@ def test_network_manager_snapshot_is_batched_into_sqlite(tmp_path):
     assert row["completed"] == 9
     assert row["failed"] == 1
     assert row["updated_at"] == 123.0
+    diagnostic = json.loads(
+        (tmp_path / ".mwf" / "network_manager.json").read_text(encoding="utf-8")
+    )
+    assert diagnostic["updated_at"] == 123.0
+    assert diagnostic["oldest_active_seconds"] == 12.5
+    assert diagnostic["shards"] == [{"shard_id": 1, "in_flight": 2}]
 
     # A fresh process/run starts manager counters from zero. Persist that fresh
     # high-water state instead of leaking the previous run's peaks into monitor.

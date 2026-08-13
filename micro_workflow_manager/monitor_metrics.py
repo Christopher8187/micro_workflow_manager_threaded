@@ -58,12 +58,12 @@ def _max_parallel_jobs(workflow, node_name: str) -> int:
         return 1
     return workflow.effective_max_threads(node_name)
 
-def node_stats(workflow, node_name: str) -> dict[str, Any]:
+def node_stats(workflow, node_name: str, *, summary: dict[str, Any] | None = None) -> dict[str, Any]:
     # Fast path: use FileStorage's per-node job index. This makes monitor
     # snapshots O(number of nodes + running jobs), not O(all job folders/status
     # files). On large cyclic autostart runs, the old monitor could itself
     # compete with the runner by rereading 10k+ status files every refresh.
-    summary = workflow.storage.node_job_summary(node_name)
+    summary = summary or workflow.storage.node_job_summary(node_name)
     counts = {status: 0 for status in STATUSES}
     counts.update(summary.get("counts") or {})
 
@@ -142,7 +142,11 @@ def node_stats(workflow, node_name: str) -> dict[str, Any]:
 def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any]:
     selected = list(nodes) if nodes is not None else list(workflow.graph_obj.nodes)
     run_state = workflow.storage.get_run_state()
-    node_rows = [node_stats(workflow, node) for node in selected]
+    summaries = workflow.storage.node_job_summaries(selected)
+    node_rows = [
+        node_stats(workflow, node, summary=summaries.get(node))
+        for node in selected
+    ]
 
     totals = {
         "nodes": len(node_rows),

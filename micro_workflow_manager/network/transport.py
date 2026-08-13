@@ -38,12 +38,20 @@ def configure_shared_http_transport(*, http2=False, streams_per_connection=100,
                                     http2_stream_safety_cap=None,
                                     http1_connections_per_shard=None,
                                     architecture=None, state_flush_interval=2.0,
+                                    tcp_keepalive=None,
+                                    tcp_keepalive_idle_seconds=None,
+                                    tcp_keepalive_interval_seconds=None,
+                                    tcp_keepalive_probes=None,
                                     **client_kwargs):
     """Configure the backend manager; ordinary MWF applications need no manager wiring."""
     network_manager.configure(http2=http2, streams_per_connection=streams_per_connection,
         http2_stream_safety_cap=http2_stream_safety_cap,
         http1_connections_per_shard=http1_connections_per_shard,
-        architecture=architecture, state_flush_interval=state_flush_interval, **client_kwargs)
+        architecture=architecture, state_flush_interval=state_flush_interval,
+        tcp_keepalive=tcp_keepalive,
+        tcp_keepalive_idle_seconds=tcp_keepalive_idle_seconds,
+        tcp_keepalive_interval_seconds=tcp_keepalive_interval_seconds,
+        tcp_keepalive_probes=tcp_keepalive_probes, **client_kwargs)
 
 class SharedHTTPTransport:
     def snapshot(self): return network_manager.snapshot()
@@ -51,19 +59,28 @@ class SharedHTTPTransport:
     @staticmethod
     def _metadata():
         attempt = _CURRENT_NETWORK_ATTEMPT.get()
-        if attempt is None: return None, None, None, None
+        if attempt is None: return None, None, None, None, None
         workflow, ctx, watch = attempt
-        return attempt, str(workflow.storage.project_dir), getattr(ctx, "current_node", None), getattr(workflow.storage, "publish_network_manager_snapshot", None)
+        return (
+            attempt,
+            str(workflow.storage.project_dir),
+            getattr(ctx, "current_node", None),
+            getattr(ctx, "job_id", None),
+            getattr(workflow.storage, "publish_network_manager_snapshot", None),
+        )
 
     def request(self, method, url, *, timeout=30, heartbeat_callback: Callable[[float], None] | None=None,
-                heartbeat_interval=15.0, wait_name=None, **kwargs):
+                heartbeat_interval=15.0, wait_name=None, expect_json=False, **kwargs):
         timeout_obj = normalize_httpx_timeout(timeout); kwargs["timeout"] = timeout_obj
-        attempt, project, node, sink = self._metadata()
+        attempt, project, node, job_id, sink = self._metadata()
         if attempt is not None:
             workflow, _ctx, watch = attempt
             workflow.scheduler_supervisor.begin_external_wait(watch,
                 name=wait_name or f"HTTP {method.upper()} {url}", timeout=timeout_budget_seconds(timeout_obj))
-        future = network_manager.submit_request(method, url, project_key=project, node_name=node, state_sink=sink, **kwargs)
+        future = network_manager.submit_request(
+            method, url, project_key=project, node_name=node, job_id=job_id,
+            expect_json=expect_json, state_sink=sink, **kwargs
+        )
         started = time.monotonic(); interval = max(0.1, float(heartbeat_interval))
         try:
             while True:
@@ -78,12 +95,15 @@ class SharedHTTPTransport:
                 workflow.scheduler_supervisor.end_external_wait(watch)
 
     def request_json(self, method, url, **kwargs):
-        response = self.request(method, url, **kwargs); response.raise_for_status(); return response.json()
+        response = self.request(method, url, expect_json=True, **kwargs); response.raise_for_status(); return response.json()
     def post_json(self, url, **kwargs): return self.request_json("POST", url, **kwargs)
-    async def async_request(self, method, url, *, timeout=30, **kwargs):
+    async def async_request(self, method, url, *, timeout=30, expect_json=False, **kwargs):
         kwargs["timeout"] = normalize_httpx_timeout(timeout)
-        _attempt, project, node, sink = self._metadata()
-        future = network_manager.submit_request(method, url, project_key=project, node_name=node, state_sink=sink, **kwargs)
+        _attempt, project, node, job_id, sink = self._metadata()
+        future = network_manager.submit_request(
+            method, url, project_key=project, node_name=node, job_id=job_id,
+            expect_json=expect_json, state_sink=sink, **kwargs
+        )
         return await asyncio.wrap_future(future)
 
 shared_http_transport = SharedHTTPTransport()
