@@ -120,6 +120,15 @@ class NetworkDiagnosticsMixin:
                 "oldest_node": oldest.get("node_name") if oldest else None,
                 "oldest_job_id": oldest.get("job_id") if oldest else None,
                 "oldest_stream_id": oldest.get("stream_id") if oldest else None,
+                "oldest_physical_attempt": (
+                    oldest.get("physical_attempt") if oldest else None
+                ),
+                "oldest_replay_reason": (
+                    oldest.get("replay_reason") if oldest else None
+                ),
+                "oldest_generation_id": (
+                    oldest.get("generation_id") if oldest else None
+                ),
                 "oldest_phase_seconds": (
                     max(0.0, now_value - oldest["phase_at"]) if oldest else None
                 ),
@@ -153,6 +162,9 @@ class NetworkDiagnosticsMixin:
             "idle_client_count": sum(shard.in_flight == 0 for shard in self._clients),
             "in_flight": len(active),
             "active_phase_counts": dict(Counter(str(item["phase"]) for item in active)),
+            "active_physical_attempt_counts": dict(Counter(
+                str(item.get("physical_attempt") or 1) for item in active
+            )),
             "oldest_active_seconds": max(
                 (now_value - item["started_at"] for item in active), default=0.0
             ),

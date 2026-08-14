@@ -268,6 +268,7 @@ class ComponentSchedulerMixin:
             )
             stop_event = Event()
             wake_event = Event()
+            live_start_event = Event()
 
             is_live_hoeflein = (
                 len(component_nodes) > 1 or self.component_is_cyclic(component_set)
@@ -279,6 +280,10 @@ class ComponentSchedulerMixin:
                 and not self.nodes[node_name].waiting
                 and (self.nodes[node_name].runner_override or self.runner)
                 in {"threaded", "api"}
+            }
+            live_ready_events = {
+                node_name: Event()
+                for node_name in live_nodes
             }
 
             def wake_live_sources() -> None:
@@ -295,6 +300,8 @@ class ComponentSchedulerMixin:
                         True,
                         _stop_event=stop_event,
                         _live_until_event=(stop_event if node_name in live_nodes else None),
+                        _live_ready_event=live_ready_events.get(node_name),
+                        _live_start_event=(live_start_event if node_name in live_nodes else None),
                         _defer_final_status_refresh=True,
                         _api_startup_lanes=api_pump_allocations.get(node_name),
                     )
@@ -320,6 +327,19 @@ class ComponentSchedulerMixin:
             for node_name in component_nodes:
                 if node_name in live_nodes:
                     submit_node(node_name)
+
+            # Do not let a fast producer outrun a consumer that has been
+            # submitted but has not yet installed its node-scoped queue
+            # subscription. If source construction fails, release every peer;
+            # the ordinary Future error path below publishes component failure.
+            while live_ready_events and not all(
+                ready.is_set() for ready in live_ready_events.values()
+            ):
+                if any(future.done() for future in futures):
+                    break
+                wake_event.wait(0.01)
+                wake_event.clear()
+            live_start_event.set()
 
             try:
                 while True:

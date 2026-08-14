@@ -189,13 +189,34 @@ class JobEventStorageMixin:
         if not normalized:
             return 0
 
+        # Live jobs are removed/reset immediately after this call by the
+        # indexed batch cleanup paths, which clear their journals directly.
+        # Inspect only orphan journals here.  The old query grouped every
+        # created event in the database, including all live jobs, and on a
+        # trace-heavy run SQLite spent minutes walking pages containing large
+        # LLM payloads before any fresh task could start.
         rows = self.db_connection().execute(
+            "WITH orphan_keys AS ("
+            "  SELECT events.node_name, events.job_id "
+            "  FROM job_events AS events INDEXED BY job_events_job_idx "
+            "  LEFT JOIN jobs ON jobs.node_name=events.node_name "
+            "    AND jobs.job_id=events.job_id "
+            "  WHERE jobs.job_id IS NULL "
+            "  GROUP BY events.node_name, events.job_id"
+            ") "
             "SELECT events.node_name, events.job_id, events.data_json "
-            "FROM job_events AS events "
-            "JOIN ("
-            "  SELECT node_name, job_id, MAX(event_id) AS event_id "
-            "  FROM job_events WHERE event='created' GROUP BY node_name, job_id"
-            ") AS latest ON latest.event_id=events.event_id"
+            "FROM orphan_keys "
+            "JOIN job_events AS events INDEXED BY job_events_job_idx "
+            "  ON events.node_name=orphan_keys.node_name "
+            "  AND events.job_id=orphan_keys.job_id "
+            "WHERE events.event='created' "
+            "  AND events.event_id=("
+            "    SELECT MAX(previous.event_id) "
+            "    FROM job_events AS previous INDEXED BY job_events_job_idx "
+            "    WHERE previous.node_name=orphan_keys.node_name "
+            "      AND previous.job_id=orphan_keys.job_id "
+            "      AND previous.event='created'"
+            "  )"
         ).fetchall()
         targets: dict[str, list[int]] = {}
         for row in rows:

@@ -212,6 +212,7 @@ class SupervisorAttemptMixin:
         name: str,
         timeout: float | int,
         cleanup_grace: float = 30.0,
+        defer_lease_start: bool = False,
     ) -> None:
         """Suspend checkpoint expiry while a framework-managed network call is live.
 
@@ -230,11 +231,57 @@ class SupervisorAttemptMixin:
                 if error is not None:
                     raise error
                 return
+            outermost_wait = watch.external_wait_depth == 0
+            if outermost_wait:
+                watch.external_wait_attempt = 1
+                watch.external_wait_renewals = 0
+                watch.external_wait_last_renewal_reason = None
             watch.external_wait_depth += 1
             watch.external_wait_name = str(name)
             watch.external_wait_timeout = timeout_value + grace
-            deadline = now_value + timeout_value + grace
-            watch.external_wait_deadline = max(watch.external_wait_deadline or 0.0, deadline)
+            if defer_lease_start and outermost_wait:
+                watch.external_wait_attempt = 0
+                watch.external_wait_deadline = None
+            else:
+                watch.external_wait_attempt = 1
+                deadline = now_value + timeout_value + grace
+                watch.external_wait_deadline = max(
+                    watch.external_wait_deadline or 0.0,
+                    deadline,
+                )
+            watch.revision += 1
+            self._schedule_watch_locked(watch)
+            self._compact_deadlines_locked()
+            self._ensure_thread_locked()
+            self._condition.notify_all()
+
+    def renew_external_wait(
+        self,
+        watch: AttemptWatch,
+        *,
+        reason: str,
+    ) -> None:
+        """Start a fresh bounded lease for a framework-level physical replay.
+
+        The configured per-attempt lease value is unchanged. Only an actual
+        transport replay may renew its deadline; user-space heartbeats cannot.
+        The task's total timeout remains active across every renewal.
+        """
+        now_value = monotonic()
+        with self._condition:
+            if watch.state != "active":
+                error = self.timeout_error(watch) or self.execution_cancel_error(watch)
+                if error is not None:
+                    raise error
+                return
+            if watch.external_wait_depth <= 0 or watch.external_wait_timeout is None:
+                raise RuntimeError("cannot renew an inactive external wait")
+            first_physical_attempt = watch.external_wait_attempt == 0
+            watch.external_wait_attempt += 1
+            if not first_physical_attempt:
+                watch.external_wait_renewals += 1
+                watch.external_wait_last_renewal_reason = str(reason)
+            watch.external_wait_deadline = now_value + watch.external_wait_timeout
             watch.revision += 1
             self._schedule_watch_locked(watch)
             self._compact_deadlines_locked()

@@ -70,7 +70,7 @@ def test_http_clients_enable_fast_tcp_keepalive_without_changing_request_timeout
         asyncio.run(shard.client.aclose())
 
 
-def test_available_http2_shards_are_selected_round_robin():
+def test_available_http2_shards_pack_work_before_using_idle_connection():
     manager = NetworkManager()
     manager.configure(
         http2=True,
@@ -85,7 +85,9 @@ def test_available_http2_shards_are_selected_round_robin():
 
     selected = asyncio.run(acquire_four())
     try:
-        assert [shard.shard_id for shard in selected] == [1, 2, 1, 2]
+        assert [shard.shard_id for shard in selected] == [1, 1, 1, 1]
+        assert first.in_flight == 4
+        assert second.in_flight == 0
     finally:
         asyncio.run(first.client.aclose())
         asyncio.run(second.client.aclose())
@@ -187,6 +189,57 @@ def test_expect_json_accepts_already_buffered_custom_transport_response():
         assert snapshot["json_stream_recoveries"] == 0
         assert snapshot["retired_shards"] == 0
     finally:
+        manager.close()
+
+
+def test_json_response_exposes_openrouter_generation_id_in_diagnostics():
+    release = threading.Event()
+
+    class DelayedJSON(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+            yield b'{"ok":true}'
+
+    async def handler(request):
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "x-generation-id": "gen-test-123",
+            },
+            stream=DelayedJSON(),
+            request=request,
+        )
+
+    manager = NetworkManager()
+    manager.configure(
+        transport=httpx.MockTransport(handler),
+        streams_per_connection=4,
+    )
+    future = manager.submit_request(
+        "POST",
+        "https://example.test/model",
+        expect_json=True,
+        node_name="A",
+        job_id=7,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        snapshot = manager.snapshot()
+        while (
+            not snapshot["shards"]
+            or snapshot["shards"][0]["oldest_generation_id"] != "gen-test-123"
+        ):
+            if time.monotonic() >= deadline:
+                pytest.fail("generation id did not become observable")
+            time.sleep(0.01)
+            snapshot = manager.snapshot()
+        release.set()
+        response = future.result(timeout=2)
+        assert response.extensions["mwf_generation_id"] == "gen-test-123"
+    finally:
+        release.set()
         manager.close()
 
 
@@ -351,6 +404,171 @@ def test_cohort_recovery_reuses_an_existing_healthy_shard(monkeypatch):
         assert snapshot["client_count"] == 1
         assert snapshot["recovery_shard_reuses"] == 1
         assert snapshot["recovery_shards_created"] == 0
+    finally:
+        manager.close()
+
+
+def test_client_selection_packs_quiet_tail_onto_busiest_healthy_shard():
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=8,
+        http2_stream_safety_cap=8,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"ok", request=request)
+        ),
+    )
+    sparse = manager._new_client_shard()
+    busiest = manager._new_client_shard()
+    idle = manager._new_client_shard()
+    sparse.in_flight = 1
+    busiest.in_flight = 5
+
+    try:
+        selected = asyncio.run(manager._acquire_client())
+        assert selected is busiest
+        assert busiest.in_flight == 6
+        assert sparse.in_flight == 1
+        assert idle.in_flight == 0
+    finally:
+        manager.close()
+
+
+def test_quiet_tail_cohort_uses_all_available_same_shard_peers():
+    manager = NetworkManager()
+    manager._cohort_stall_seconds = 300.0
+    manager._cohort_terminal_evidence = 16
+    shard = type(
+        "Shard",
+        (),
+        {
+            "in_flight": 1,
+            "requests_completed": 5,
+            "requests_failed": 0,
+            "last_terminal_at": 250.0,
+            "shard_id": 7,
+        },
+    )()
+    active = {
+        "attempt_started_at": 0.0,
+        "cohort_terminal_baseline": 0,
+    }
+
+    reason = manager._cohort_stream_stall_reason(active, shard, 301.0)
+
+    assert reason is not None
+    assert "5 newer sibling requests terminated" in reason
+
+
+def test_single_tail_peer_is_not_enough_for_early_cohort_replay():
+    manager = NetworkManager()
+    manager._cohort_stall_seconds = 300.0
+    manager._cohort_terminal_evidence = 16
+    shard = type(
+        "Shard",
+        (),
+        {
+            "in_flight": 1,
+            "requests_completed": 1,
+            "requests_failed": 0,
+            "last_terminal_at": 250.0,
+            "shard_id": 7,
+        },
+    )()
+    active = {
+        "attempt_started_at": 0.0,
+        "cohort_terminal_baseline": 0,
+    }
+
+    assert manager._cohort_stream_stall_reason(active, shard, 301.0) is None
+
+
+def test_silent_json_stream_replays_at_existing_read_timeout(monkeypatch):
+    monkeypatch.setenv("MWF_HTTP_TRANSPORT_RETRIES", "1")
+    calls = 0
+    attempts = []
+
+    class NeverResponds(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await asyncio.Event().wait()
+            yield b""
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        stream = (
+            NeverResponds()
+            if calls == 1
+            else httpx.ByteStream(b'{"ok":true}')
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=stream,
+            request=request,
+        )
+
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=4,
+        transport=httpx.MockTransport(handler),
+    )
+    future = manager.submit_request(
+        "POST",
+        "https://example.test/model",
+        timeout=httpx.Timeout(0.05),
+        expect_json=True,
+        attempt_callback=lambda attempt, reason: attempts.append(
+            (attempt, reason)
+        ),
+    )
+    try:
+        assert future.result(timeout=2).json() == {"ok": True}
+        snapshot = manager.snapshot()
+        assert calls == 2
+        assert attempts == [(1, None), (2, "transport_error")]
+        assert snapshot["transport_error_retries"] == 1
+    finally:
+        manager.close()
+
+
+def test_network_manager_reports_each_physical_replay_for_lease_renewal(monkeypatch):
+    """A hidden transport replay must be visible to the scheduler lease owner."""
+    monkeypatch.setenv("MWF_HTTP2_COHORT_RETRIES", "1")
+    manager = NetworkManager()
+    manager.configure(
+        http2=True,
+        streams_per_connection=4,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"ok", request=request)
+        ),
+    )
+    observed_attempts = []
+
+    async def fail_once(request, shard, kwargs, active):
+        if active["cohort_retries"] == 0:
+            raise CohortStreamStall("synthetic poisoned cohort")
+        return httpx.Response(
+            200,
+            content=b"ok",
+            request=httpx.Request(request.method, request.url),
+        )
+
+    monkeypatch.setattr(manager, "_request_with_progress", fail_once)
+    future = manager.submit_request(
+        "GET",
+        "https://example.test/",
+        attempt_callback=lambda attempt, reason: observed_attempts.append(
+            (attempt, reason)
+        ),
+    )
+    try:
+        assert future.result(timeout=2).status_code == 200
+        assert observed_attempts == [
+            (1, None),
+            (2, "cohort_stream_stall"),
+        ]
     finally:
         manager.close()
 

@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from .models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, WAITING
+from .api_limits import allocate_api_capacity
 
 STATUSES = [QUEUED, RUNNING, DONE, FAILED, SKIPPED, CANCELLED]
 TERMINAL = {DONE, FAILED, SKIPPED, CANCELLED}
@@ -58,7 +59,13 @@ def _max_parallel_jobs(workflow, node_name: str) -> int:
         return 1
     return workflow.effective_max_threads(node_name)
 
-def node_stats(workflow, node_name: str, *, summary: dict[str, Any] | None = None) -> dict[str, Any]:
+def node_stats(
+    workflow,
+    node_name: str,
+    *,
+    summary: dict[str, Any] | None = None,
+    max_parallel_jobs: int | None = None,
+) -> dict[str, Any]:
     # Fast path: use FileStorage's per-node job index. This makes monitor
     # snapshots O(number of nodes + running jobs), not O(all job folders/status
     # files). On large cyclic autostart runs, the old monitor could itself
@@ -84,7 +91,11 @@ def node_stats(workflow, node_name: str, *, summary: dict[str, Any] | None = Non
     remaining = counts.get(QUEUED, 0) + counts.get(RUNNING, 0)
     failed = counts.get(FAILED, 0)
     avg_duration = summary.get("avg_duration_seconds")
-    max_parallel = _max_parallel_jobs(workflow, node_name)
+    max_parallel = (
+        _max_parallel_jobs(workflow, node_name)
+        if max_parallel_jobs is None
+        else max(1, int(max_parallel_jobs))
+    )
     eta_seconds = None
 
     if avg_duration is not None and remaining > 0:
@@ -143,8 +154,38 @@ def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any
     selected = list(nodes) if nodes is not None else list(workflow.graph_obj.nodes)
     run_state = workflow.storage.get_run_state()
     summaries = workflow.storage.node_job_summaries(selected)
+    api_node_names = {
+        node_name
+        for node_name in selected
+        if node_name in workflow.nodes
+        and (workflow.nodes[node_name].runner_override or workflow.runner) == "api"
+    }
+    api_total = workflow.api_total_limit_override()
+    requested_api_limits = {
+        node_name: workflow.requested_max_threads(node_name)
+        for node_name in api_node_names
+    }
+    active_api_nodes = {
+        node_name
+        for node_name in api_node_names
+        if int(((summaries.get(node_name) or {}).get("counts") or {}).get(RUNNING, 0)) > 0
+        or workflow.storage.get_node_status(node_name) == RUNNING
+    }
+    active_api_limits = allocate_api_capacity(
+        {name: requested_api_limits[name] for name in active_api_nodes},
+        api_total,
+    )
     node_rows = [
-        node_stats(workflow, node, summary=summaries.get(node))
+        node_stats(
+            workflow,
+            node,
+            summary=summaries.get(node),
+            max_parallel_jobs=(
+                active_api_limits.get(node, requested_api_limits[node])
+                if node in api_node_names
+                else None
+            ),
+        )
         for node in selected
     ]
 
@@ -171,17 +212,12 @@ def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any
 
     running_nodes = [row["node"] for row in node_rows if row["running"] > 0 or row["status"] == RUNNING]
     waiting_nodes = [row["node"] for row in node_rows if row["status"] == WAITING]
-    api_node_names = {
-        node_name
-        for node_name in selected
-        if node_name in workflow.nodes
-        and (workflow.nodes[node_name].runner_override or workflow.runner) == "api"
-    }
     api_rows = [row for row in node_rows if row["node"] in api_node_names]
     api_runtime = {
         "mode": "cooperative",
-        "aggregate_limit": None,
-        "declared_capacity": sum(int(row["max_parallel_jobs"]) for row in api_rows),
+        "aggregate_limit": api_total,
+        "declared_capacity": sum(requested_api_limits.values()),
+        "active_capacity": sum(active_api_limits.values()),
         "running": sum(row["running"] for row in api_rows),
         "queued": sum(row["queued"] for row in api_rows),
         "completed_last_60_seconds": sum(

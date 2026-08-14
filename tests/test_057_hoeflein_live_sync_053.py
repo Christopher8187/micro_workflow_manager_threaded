@@ -230,6 +230,45 @@ def test_ordinary_hoeflein_members_are_resident_before_first_feedback(tmp_path):
     assert workflow.storage.job_status_counts("B").get("done", 0) == 1
 
 
+def test_live_consumer_subscribes_before_sibling_handler_is_released(tmp_path):
+    workflow = MicroWorkflow(tmp_path, runner="threaded")
+    workflow.graph([("producer", "consumer"), ("consumer", "producer")])
+    consumer_subscribed = threading.Event()
+    producer_observed: list[bool] = []
+
+    original_subscribe = workflow.storage.subscribe_queue_changes
+
+    def observed_subscribe(callback, *, node_name=None):
+        unsubscribe = original_subscribe(callback, node_name=node_name)
+        if node_name == "consumer":
+            consumer_subscribed.set()
+        return unsubscribe
+
+    workflow.storage.subscribe_queue_changes = observed_subscribe  # type: ignore[method-assign]
+
+    producer = NodeRouter("producer", runner="threaded", max_threads=1)
+    producer.create_job(params={"value": 1})
+
+    @producer.task
+    def run_producer(ctx, value):
+        producer_observed.append(consumer_subscribed.is_set())
+        ctx.node("consumer").add(value=value)
+        return value
+
+    consumer = NodeRouter("consumer", runner="api", max_threads=4)
+
+    @consumer.task
+    def run_consumer(ctx, value):
+        return value
+
+    workflow.include_router(producer)
+    workflow.include_router(consumer)
+    workflow.run_component({"producer", "consumer"}, ignore_readiness=True)
+
+    assert producer_observed == [True]
+    assert workflow.storage.job_status_counts("consumer").get("done", 0) == 1
+
+
 def test_threaded_payload_loader_oserror_propagates_and_component_joins(tmp_path):
     """EMFILE in a threaded source is never converted into a phantom job."""
     workflow = MicroWorkflow(tmp_path, runner="threaded")

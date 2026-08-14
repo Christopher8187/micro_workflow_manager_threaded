@@ -9,6 +9,8 @@ from micro_workflow_manager.runners.threaded import (
     MAX_RUNTIME_THREADS,
 )
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.api_limits import allocate_api_capacity
+from micro_workflow_manager.models import RUNNING
 
 from .active_run import live_active_run
 from .layout import ensure_runtime_layout
@@ -20,40 +22,7 @@ RESET_WORDS = {"reset", "default", "clear"}
 
 
 def _proportional_api_limits(requested: dict[str, int], total: int) -> dict[str, int]:
-    if not requested or total >= sum(requested.values()):
-        return requested
-    if total < len(requested):
-        return {name: 1 for name in requested}
-    requested_total = sum(requested.values())
-    shares = {
-        name: max(1, (total * value) // requested_total)
-        for name, value in requested.items()
-    }
-    used = sum(shares.values())
-    order = sorted(
-        requested,
-        key=lambda name: (-((total * requested[name]) % requested_total), name),
-    )
-    while used < total:
-        changed = False
-        for name in order:
-            if shares[name] >= requested[name]:
-                continue
-            shares[name] += 1
-            used += 1
-            changed = True
-            if used == total:
-                break
-        if not changed:
-            break
-    while used > total:
-        for name in reversed(order):
-            if shares[name] > 1:
-                shares[name] -= 1
-                used -= 1
-                if used == total:
-                    break
-    return shares
+    return allocate_api_capacity(requested, total)
 
 
 def _node_schema(storage: FileStorage, node: str) -> dict:
@@ -166,10 +135,23 @@ def list_thread_statuses(root: Path, storage: FileStorage) -> int:
     statuses = [thread_status(root, storage, node) for node in nodes]
     api_total = storage.read_api_total_limit()
     if api_total is not None:
+        active_run = next((status.get("run") for status in statuses if status.get("run")), None)
+        active_run_nodes = set((active_run or {}).get("nodes") or [])
+        active_api_nodes = {
+            status["node"]
+            for status in statuses
+            if status["runner"] == "api"
+            and status["node"] in active_run_nodes
+            and (
+                int((storage.node_job_summary(status["node"]).get("counts") or {}).get(RUNNING, 0)) > 0
+                or storage.get_node_status(status["node"]) == RUNNING
+            )
+        }
         requested = {
             status["node"]: status["effective"]
             for status in statuses
             if status["runner"] == "api"
+            and (not active_run_nodes or status["node"] in active_api_nodes)
         }
         allocated = _proportional_api_limits(requested, api_total)
         for status in statuses:
@@ -180,7 +162,10 @@ def list_thread_statuses(root: Path, storage: FileStorage) -> int:
     if api_total is None:
         print("API aggregate admission budget: (none)")
     else:
-        print(f"API aggregate admission budget: {api_total} (proportional by node request)")
+        print(
+            f"API aggregate admission budget: {api_total} "
+            "(reallocated across running API nodes by request weight)"
+        )
     print("node                     runner    declared  override  effective")
     print("-----------------------  --------  --------  --------  ---------")
     for status in statuses:

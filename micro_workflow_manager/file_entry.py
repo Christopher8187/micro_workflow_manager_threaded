@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
@@ -15,6 +16,12 @@ from .file_helpers import (
     _write_text_file,
 )
 from .paths import relative_path
+
+
+def _read_json_path(path: Path, encoding: str) -> Any:
+    """Read one already-contained immutable bulk-input path."""
+
+    return json.loads(path.read_text(encoding=encoding))
 
 
 def _is_node_input_filesystem(filesystem: Any) -> bool:
@@ -145,6 +152,67 @@ class FileSystemEntry(os.PathLike[str]):
 
     def read_json(self, *, encoding: str | None = None) -> Any:
         return json.loads(self.read_text(encoding=encoding))
+
+    def read_jsons(
+        self,
+        pattern: str = "*.json",
+        *,
+        recursive: bool = True,
+        encoding: str | None = None,
+    ) -> list[tuple[str, Any]]:
+        """Read a bounded JSON set under one execution-generation check.
+
+        Calling ``entry.read_json()`` thousands of times is correct but each
+        path resolution repeats the scheduler cancellation/generation check.
+        A fan-in stage already owns one immutable input frontier, so validate
+        it once before and after a bulk read. Every candidate is still resolved
+        and checked against the bound root to reject symlink/path escapes.
+        Returned paths are relative POSIX names, sorted deterministically.
+        """
+
+        _relative_parts(pattern.replace("*", "x").replace("?", "x"))
+        # Resolving the bound root performs the pre-read execution check.
+        root = self.path
+        root_resolved = root.resolve()
+        paths: Iterator[Path] = (
+            root.rglob(pattern) if recursive else root.glob(pattern)
+        )
+        contained: list[tuple[str, Path]] = []
+        for path in sorted(paths):
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            try:
+                relative = relative_path(resolved, root_resolved)
+            except ValueError:
+                continue
+            contained.append((PurePosixPath(*relative.parts).as_posix(), resolved))
+        read_encoding = encoding or self.filesystem.encoding
+        # Windows security/VPN filesystem filters can add latency to each open
+        # even when the disk and Python process are otherwise idle. A bounded
+        # bulk pool overlaps that independent per-file wait without retaining
+        # handles after the call or weakening deterministic result order.
+        workers = min(32, max(1, len(contained)))
+        if workers == 1:
+            values = [
+                _read_json_path(path, read_encoding)
+                for _relative, path in contained
+            ]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="mwf-json-read",
+            ) as executor:
+                values = list(executor.map(
+                    lambda item: _read_json_path(item[1], read_encoding),
+                    contained,
+                ))
+        results = [
+            (relative, value)
+            for (relative, _path), value in zip(contained, values)
+        ]
+        self.ctx.raise_if_cancelled()
+        return results
 
     def write_text(
         self,

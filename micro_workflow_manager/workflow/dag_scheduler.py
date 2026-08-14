@@ -1,17 +1,14 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import ExitStack
 from threading import Event
 from typing import Callable
 
 from ..errors import InvalidGraphError
 from ..models import CANCELLED, FAILED, RUNNING, Job
+from ..storage.job_sources import LiveRefreshableQueuedJobObjectSource, PrefetchingQueuedJobObjectSource
 from .admission_sources import ClaimedJob, ClaimedQueuedJobSource, StoppingJobSource
 from .component_scheduler import allocate_api_pumps
-from ..storage.job_sources import (
-    LiveRefreshableQueuedJobObjectSource,
-    PrefetchingQueuedJobObjectSource,
-)
-
-
+from .live_start import wait_for_live_component_release
 class DagSchedulerMixin:
     def run(self):
         if self.runner in {"threaded", "api", "process"}:
@@ -99,10 +96,14 @@ class DagSchedulerMixin:
         future_api_pumps: dict[object, dict[str, int]] = {}
         admission_stopped = False
 
-        with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="mwf-unit",
-        ) as executor:
+        previous_active_api_nodes = self.active_api_admission_nodes()
+        self.set_active_api_admission_nodes(set())
+        with ExitStack() as cleanup:
+            cleanup.callback(self.set_active_api_admission_nodes, previous_active_api_nodes)
+            executor = cleanup.enter_context(ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="mwf-unit",
+            ))
             while True:
                 self.finalize_ready_nodes(skip_components=in_flight)
 
@@ -147,12 +148,12 @@ class DagSchedulerMixin:
                     for node_name, pumps in allocation.items()
                 }
                 active_api_nodes = {
-                    node_name: self.effective_max_threads(node_name)
+                    node_name: self.requested_max_threads(node_name)
                     for node_name in active_api_pumps
                 }
                 ready_api_by_unit = {
                     unit: {
-                        node_name: self.effective_max_threads(node_name)
+                        node_name: self.requested_max_threads(node_name)
                         for node_name in unit
                         if (self.nodes[node_name].runner_override or self.runner) == "api"
                     }
@@ -192,6 +193,10 @@ class DagSchedulerMixin:
                 else:
                     wave_api_pumps = {}
 
+                self.set_active_api_admission_nodes(
+                    set(active_api_pumps) | set(launch_api_nodes)
+                )
+
                 for unit in launch:
                     unit_api_pumps = {
                         node_name: wave_api_pumps[node_name]
@@ -217,6 +222,11 @@ class DagSchedulerMixin:
                     unit = futures.pop(future)
                     future_api_pumps.pop(future, None)
                     in_flight.remove(unit)
+                    self.set_active_api_admission_nodes({
+                        node_name
+                        for allocation in future_api_pumps.values()
+                        for node_name in allocation
+                    })
 
                     if refuse_after is not None and unit == refuse_after:
                         admission_stopped = True
@@ -254,6 +264,8 @@ class DagSchedulerMixin:
         *,
         _stop_event: Event | None = None,
         _live_until_event: Event | None = None,
+        _live_ready_event: Event | None = None,
+        _live_start_event: Event | None = None,
         _defer_final_status_refresh: bool = False,
         _api_startup_lanes: int | None = None,
     ):
@@ -345,6 +357,10 @@ class DagSchedulerMixin:
 
         if _stop_event is not None:
             job_source = StoppingJobSource(job_source, _stop_event)
+
+        wait_for_live_component_release(
+            _live_ready_event, _live_start_event, _stop_event
+        )
 
         def run_source_item(item):
             # A sibling node may fail after this item was pulled but before its
@@ -475,9 +491,7 @@ class DagSchedulerMixin:
         Unlike run_node(...), this does not gather every queued job. It loads the
         exact job IDs requested by the caller and runs only those jobs.
         """
-        if not job_ids:
-            return []
-
+        if not job_ids: return []
         jobs = [self.storage.load_job(node_name, job_id) for job_id in job_ids]
         return self.run_node_jobs(
             node_name=node_name,

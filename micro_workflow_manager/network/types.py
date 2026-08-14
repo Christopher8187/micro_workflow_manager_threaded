@@ -70,6 +70,7 @@ class NetworkRequest:
     job_id: int | None = None
     expect_json: bool = False
     state_sink: Callable[[list[dict[str, Any]], float], None] | None = None
+    attempt_callback: Callable[[int, str | None], None] | None = None
 
 
 class CohortStreamStall(RuntimeError):

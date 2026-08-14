@@ -122,6 +122,93 @@ def test_output_entry_append_glob_and_delete_are_generation_guarded(tmp_path: Pa
     assert not (tmp_path / "node" / "A" / "output" / "reports" / "b.txt").exists()
 
 
+def test_input_entry_bulk_json_read_is_sorted_scoped_and_fenced_once(tmp_path: Path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    root = tmp_path / "node" / "A" / "input" / "book"
+    (root / "s1" / "items").mkdir(parents=True)
+    (root / "s1" / "history").mkdir(parents=True)
+    (root / "s2" / "items").mkdir(parents=True)
+    (root / "s1" / "items" / "b.json").write_text('{"value":2}')
+    (root / "s1" / "items" / "a.json").write_text('{"value":1}')
+    (root / "s1" / "history" / "old.json").write_text('{"value":0}')
+    (root / "s2" / "items" / "c.json").write_text('{"value":3}')
+    checks = 0
+
+    @workflow.task("A")
+    def run(ctx):
+        nonlocal checks
+        original = ctx.raise_if_cancelled
+
+        def counted_check():
+            nonlocal checks
+            checks += 1
+            return original()
+
+        ctx.raise_if_cancelled = counted_check
+        return InputFileSystem(base="book").bind(ctx).read_jsons(
+            "*/items/*.json"
+        )
+
+    workflow.start("A")
+    assert workflow.run_job("A", 1, ignore_readiness=True) == [
+        ("s1/items/a.json", {"value": 1}),
+        ("s1/items/b.json", {"value": 2}),
+        ("s2/items/c.json", {"value": 3}),
+    ]
+    assert checks == 2
+
+
+def test_input_entry_bulk_json_read_overlaps_independent_file_waits(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import threading
+    import time
+
+    import micro_workflow_manager.file_entry as file_entry_module
+
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    root = tmp_path / "node" / "A" / "input" / "book"
+    root.mkdir(parents=True)
+    for index in range(8):
+        (root / f"{index}.json").write_text(f'{{"value":{index}}}')
+
+    original = file_entry_module._read_json_path
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def delayed_read(path, encoding):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.02)
+            return original(path, encoding)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(file_entry_module, "_read_json_path", delayed_read)
+
+    @workflow.task("A")
+    def run(ctx):
+        return InputFileSystem(base="book").bind(ctx).read_jsons(
+            "*.json",
+            recursive=False,
+        )
+
+    workflow.start("A")
+    result = workflow.run_job("A", 1, ignore_readiness=True)
+    assert [relative for relative, _value in result] == [
+        f"{index}.json" for index in range(8)
+    ]
+    assert peak > 1
+
+
 def test_base_filesystem_is_exported_for_readable_subclasses():
     class ReviewInputFileSystem(NodeInputFileSystem):
         def __init__(self):

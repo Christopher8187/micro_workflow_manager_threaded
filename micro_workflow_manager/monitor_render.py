@@ -65,7 +65,8 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
             f"queued={api.get('queued', 0)} "
             f"done_60s={api.get('completed_last_60_seconds', 0)} "
             f"declared_capacity={api.get('declared_capacity', 0)} "
-            "aggregate_limit=none"
+            f"active_capacity={api.get('active_capacity', api.get('declared_capacity', 0))} "
+            f"aggregate_limit={api.get('aggregate_limit') or 'none'}"
         )
     lines.append(f"running nodes: {running_text}")
     waiting_nodes = snapshot.get("waiting_nodes") or []

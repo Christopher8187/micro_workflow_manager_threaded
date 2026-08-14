@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import textwrap
 from pathlib import Path
 
@@ -334,6 +335,45 @@ def test_default_fresh_run_clears_orphan_trace_left_by_prior_keeptrace(
     assert cli.main(["runfrom", "A"]) == 0
     capsys.readouterr()
     assert [event["content"] for event in _trace_events(storage, "B", 1)] == [2]
+
+
+def test_orphan_trace_scan_leaves_live_job_journals_for_batch_cleanup(
+    tmp_path, monkeypatch, capsys
+):
+    _write_project(
+        tmp_path,
+        monkeypatch,
+        edges="EDGES = [('A', 'sink')]",
+        behaviors={
+            "A": """
+                from micro_workflow_manager import NodeRouter
+                router = NodeRouter("A")
+                router.create_job(number=1)
+                @router.task
+                def run(ctx):
+                    ctx.trace("large live trace", content="x" * 100000)
+            """,
+            "sink": """
+                from micro_workflow_manager import NodeRouter
+                router = NodeRouter("sink")
+                @router.task
+                def run(ctx): return None
+            """,
+        },
+    )
+    capsys.readouterr()
+    assert cli.main(["run", "A"]) == 0
+    capsys.readouterr()
+    storage = FileStorage(tmp_path)
+
+    before = storage.read_job_events("A", 1)
+    assert any(event.get("name") == "large live trace" for event in before)
+    assert storage.clear_job_events_produced_by_components({("A",)}) == 0
+    after = storage.read_job_events("A", 1)
+    assert after == before
+    source = inspect.getsource(storage.clear_job_events_produced_by_components)
+    assert "INDEXED BY job_events_job_idx" in source
+    assert "WITH orphan_keys" in source
 
 
 def test_resumefrom_preserves_start_trace_and_clears_descendant_trace_by_default(

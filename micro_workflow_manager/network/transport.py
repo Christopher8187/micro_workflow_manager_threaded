@@ -75,20 +75,39 @@ class SharedHTTPTransport:
         attempt, project, node, job_id, sink = self._metadata()
         if attempt is not None:
             workflow, _ctx, watch = attempt
-            workflow.scheduler_supervisor.begin_external_wait(watch,
-                name=wait_name or f"HTTP {method.upper()} {url}", timeout=timeout_budget_seconds(timeout_obj))
-        future = network_manager.submit_request(
-            method, url, project_key=project, node_name=node, job_id=job_id,
-            expect_json=expect_json, state_sink=sink, **kwargs
-        )
+            workflow.scheduler_supervisor.begin_external_wait(
+                watch,
+                name=wait_name or f"HTTP {method.upper()} {url}",
+                timeout=timeout_budget_seconds(timeout_obj),
+                defer_lease_start=True,
+            )
+
+        def physical_attempt(attempt_number: int, reason: str | None) -> None:
+            if attempt is None:
+                return
+            workflow, _ctx, watch = attempt
+            workflow.scheduler_supervisor.renew_external_wait(
+                watch,
+                reason=reason or "initial_transport_attempt",
+            )
+
+        future = None
         started = time.monotonic(); interval = max(0.1, float(heartbeat_interval))
         try:
+            future = network_manager.submit_request(
+                method, url, project_key=project, node_name=node, job_id=job_id,
+                expect_json=expect_json, state_sink=sink,
+                attempt_callback=physical_attempt if attempt is not None else None,
+                **kwargs
+            )
             while True:
                 try: return future.result(timeout=interval if heartbeat_callback else None)
                 except FutureTimeoutError:
                     if heartbeat_callback is not None: heartbeat_callback(time.monotonic() - started)
         except BaseException:
-            future.cancel(); raise
+            if future is not None:
+                future.cancel()
+            raise
         finally:
             if attempt is not None:
                 workflow, _ctx, watch = attempt
@@ -98,12 +117,42 @@ class SharedHTTPTransport:
         response = self.request(method, url, expect_json=True, **kwargs); response.raise_for_status(); return response.json()
     def post_json(self, url, **kwargs): return self.request_json("POST", url, **kwargs)
     async def async_request(self, method, url, *, timeout=30, expect_json=False, **kwargs):
-        kwargs["timeout"] = normalize_httpx_timeout(timeout)
-        _attempt, project, node, job_id, sink = self._metadata()
-        future = network_manager.submit_request(
-            method, url, project_key=project, node_name=node, job_id=job_id,
-            expect_json=expect_json, state_sink=sink, **kwargs
-        )
-        return await asyncio.wrap_future(future)
+        timeout_obj = normalize_httpx_timeout(timeout); kwargs["timeout"] = timeout_obj
+        attempt, project, node, job_id, sink = self._metadata()
+        if attempt is not None:
+            workflow, _ctx, watch = attempt
+            workflow.scheduler_supervisor.begin_external_wait(
+                watch,
+                name=f"HTTP {method.upper()} {url}",
+                timeout=timeout_budget_seconds(timeout_obj),
+                defer_lease_start=True,
+            )
+
+        def physical_attempt(attempt_number: int, reason: str | None) -> None:
+            if attempt is None:
+                return
+            workflow, _ctx, watch = attempt
+            workflow.scheduler_supervisor.renew_external_wait(
+                watch,
+                reason=reason or "initial_transport_attempt",
+            )
+
+        future = None
+        try:
+            future = network_manager.submit_request(
+                method, url, project_key=project, node_name=node, job_id=job_id,
+                expect_json=expect_json, state_sink=sink,
+                attempt_callback=physical_attempt if attempt is not None else None,
+                **kwargs
+            )
+            return await asyncio.wrap_future(future)
+        except BaseException:
+            if future is not None:
+                future.cancel()
+            raise
+        finally:
+            if attempt is not None:
+                workflow, _ctx, watch = attempt
+                workflow.scheduler_supervisor.end_external_wait(watch)
 
 shared_http_transport = SharedHTTPTransport()

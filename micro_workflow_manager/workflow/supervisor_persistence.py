@@ -61,6 +61,11 @@ class SupervisorPersistenceMixin:
             "external_wait_active": watch.external_wait_depth > 0,
             "external_wait_name": watch.external_wait_name,
             "external_wait_timeout_seconds": watch.external_wait_timeout,
+            "external_wait_attempt": watch.external_wait_attempt,
+            "external_wait_renewals": watch.external_wait_renewals,
+            "external_wait_last_renewal_reason": (
+                watch.external_wait_last_renewal_reason
+            ),
         }
         if error is not None:
             payload["error"] = error
@@ -115,6 +120,11 @@ class SupervisorPersistenceMixin:
             checkpoint=watch.checkpoint_name,
             progress=watch.progress,
             progress_detail=watch.progress_detail,
+            external_wait_attempt=watch.external_wait_attempt,
+            external_wait_renewals=watch.external_wait_renewals,
+            external_wait_last_renewal_reason=(
+                watch.external_wait_last_renewal_reason
+            ),
             attempt=watch.attempt,
             repeat_index=watch.repeat_index,
         )

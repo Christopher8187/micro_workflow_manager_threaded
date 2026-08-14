@@ -4,7 +4,7 @@ import socket
 from datetime import datetime
 from typing import Any
 
-from micro_workflow_manager.processes import process_is_alive
+from micro_workflow_manager.processes import process_identity, process_is_alive
 
 
 DEFAULT_HEARTBEAT_STALE_SECONDS = 15.0
@@ -36,6 +36,17 @@ def run_state_liveness(
     same_host = recorded_host in {None, "", current_host}
     pid = state.get("pid")
     pid_live = process_is_alive(pid) if same_host else None
+    recorded_identity = state.get("process_identity")
+    current_identity = (
+        process_identity(pid)
+        if same_host and pid_live and isinstance(recorded_identity, str)
+        else None
+    )
+    identity_matches = (
+        current_identity == recorded_identity
+        if isinstance(recorded_identity, str)
+        else None
+    )
 
     heartbeat = _parse_time(state.get("heartbeat_at") or state.get("started_at"))
     heartbeat_age = None
@@ -45,12 +56,27 @@ def run_state_liveness(
         heartbeat_age = max(0.0, (now - heartbeat).total_seconds())
         heartbeat_fresh = heartbeat_age <= stale_after_seconds
 
-    if same_host and pid_live:
+    if same_host and pid_live and identity_matches is True:
         return {
             "live": True,
-            "reason": "the recorded process is alive",
+            "reason": "the recorded process instance is alive",
             "same_host": True,
             "pid_live": True,
+            "process_identity_matches": True,
+            "heartbeat_age_seconds": heartbeat_age,
+        }
+    if (
+        same_host
+        and pid_live
+        and recorded_identity is None
+        and (heartbeat is None or heartbeat_fresh)
+    ):
+        return {
+            "live": True,
+            "reason": "the legacy run PID is alive and its heartbeat is not stale",
+            "same_host": True,
+            "pid_live": True,
+            "process_identity_matches": None,
             "heartbeat_age_seconds": heartbeat_age,
         }
     if not same_host and heartbeat_fresh:
@@ -61,7 +87,11 @@ def run_state_liveness(
             "pid_live": None,
             "heartbeat_age_seconds": heartbeat_age,
         }
-    if same_host and pid_live is False:
+    if same_host and pid_live and identity_matches is False:
+        reason = "the recorded PID belongs to a different process instance"
+    elif same_host and pid_live and recorded_identity is None and not heartbeat_fresh:
+        reason = "the legacy run heartbeat is stale; PID existence alone is ambiguous"
+    elif same_host and pid_live is False:
         reason = "the recorded process is no longer alive"
     elif not same_host:
         reason = "the other host heartbeat is stale"
@@ -72,6 +102,7 @@ def run_state_liveness(
         "reason": reason,
         "same_host": same_host,
         "pid_live": pid_live,
+        "process_identity_matches": identity_matches,
         "heartbeat_age_seconds": heartbeat_age,
     }
 

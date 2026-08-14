@@ -77,6 +77,9 @@ class AttemptWatch:
     external_wait_name: str | None = None
     external_wait_timeout: float | None = None
     external_wait_deadline: float | None = None
+    external_wait_attempt: int = 0
+    external_wait_renewals: int = 0
+    external_wait_last_renewal_reason: str | None = None
 
     @property
     def supervised(self) -> bool:

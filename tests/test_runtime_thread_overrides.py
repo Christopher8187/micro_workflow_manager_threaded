@@ -213,6 +213,52 @@ def test_api_total_budget_is_proportional_refreshable_and_run_scoped(tmp_path):
     assert workflow.effective_max_threads("A") == 200
 
 
+def test_api_total_budget_reallocates_over_only_live_api_nodes(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="api")
+    workflow.graph([("A", "B"), ("B", "C")])
+
+    @workflow.task("A", max_threads=1000)
+    def a(ctx):
+        return None
+
+    @workflow.task("B", max_threads=1000)
+    def b(ctx):
+        return None
+
+    @workflow.task("C", max_threads=1000)
+    def c(ctx):
+        return None
+
+    workflow.allowed_run_nodes = {"A", "B", "C"}
+    workflow.storage.set_api_total_limit(600)
+    workflow.set_active_api_admission_nodes({"A", "B", "C"})
+    assert [workflow.effective_max_threads(name) for name in ("A", "B", "C")] == [200, 200, 200]
+
+    workflow.set_active_api_admission_nodes({"A", "B"})
+    assert workflow.effective_max_threads("A") == 300
+    assert workflow.effective_max_threads("B") == 300
+    assert workflow.effective_max_threads("C") == 1
+
+    workflow.set_active_api_admission_nodes({"B"})
+    assert workflow.effective_max_threads("B") == 600
+    assert workflow.effective_api_total_limit() == 600
+
+    workflow.set_active_api_admission_nodes(None)
+    assert [workflow.effective_max_threads(name) for name in ("A", "B", "C")] == [200, 200, 200]
+
+
+def test_api_total_smaller_than_live_node_count_preserves_one_slot_each(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="api")
+    workflow.graph([("A", "B"), ("B", "C")])
+
+    for name in ("A", "B", "C"):
+        workflow.task(name, max_threads=100)(lambda ctx: None)
+
+    workflow.storage.set_api_total_limit(2)
+    workflow.set_active_api_admission_nodes({"A", "B", "C"})
+    assert [workflow.effective_max_threads(name) for name in ("A", "B", "C")] == [1, 1, 1]
+
+
 def test_threads_cli_sets_and_clears_pending_api_total_budget(
     tmp_path,
     monkeypatch,

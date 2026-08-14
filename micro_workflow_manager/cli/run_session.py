@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from micro_workflow_manager import __version__
 from micro_workflow_manager.monitor import InlineMonitorReporter, InlineStatsReporter, now_iso
+from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.system import MicroWorkflow
 
 from .active_run import refuse_competing_run
@@ -64,6 +65,7 @@ def active_workflow_run(
         "started_at": now_iso(),
         "heartbeat_at": now_iso(),
         "pid": os.getpid(),
+        "process_identity": process_identity(os.getpid()),
         "hostname": socket.gethostname(),
         "mwf_version": __version__,
         "api_startup_strategy": api_startup_strategy,

@@ -170,16 +170,23 @@ class NetworkManager(
         capacity = self._shard_capacity()
         shard = None
         count = len(self._clients)
+        start_index = self._next_client_index
+        selected_index = None
         for offset in range(count):
-            index = (self._next_client_index + offset) % count
+            index = (start_index + offset) % count
             candidate = self._clients[index]
-            if not candidate.retiring and candidate.in_flight < capacity:
+            if (
+                not candidate.retiring
+                and candidate.in_flight < capacity
+                and (shard is None or candidate.in_flight > shard.in_flight)
+            ):
                 shard = candidate
-                self._next_client_index = (index + 1) % count
-                break
+                selected_index = index
         if shard is None:
             shard = self._new_client_shard()
             self._next_client_index = 0
+        elif count:
+            self._next_client_index = (int(selected_index) + 1) % count
         return self._claim_shard(shard)
 
     async def _release_client(self, shard: ClientShard) -> None:
@@ -237,10 +244,14 @@ class NetworkManager(
                 "phase_at": time.monotonic(),
                 "cohort_retries": 0,
                 "transport_error_retries": 0,
+                "physical_attempt": 0,
+                "replay_reason": None,
         }
         self._active_requests[active_key] = active
         cohort_retries = 0
         transport_error_retries = 0
+        physical_attempt = 0
+        replay_reason = None
         try:
             kwargs = dict(request.kwargs)
             extensions = dict(kwargs.get("extensions") or {})
@@ -260,6 +271,13 @@ class NetworkManager(
             extensions["trace"] = trace
             kwargs["extensions"] = extensions
             while True:
+                physical_attempt += 1
+                active.update(
+                    physical_attempt=physical_attempt,
+                    replay_reason=replay_reason,
+                )
+                if request.attempt_callback is not None:
+                    request.attempt_callback(physical_attempt, replay_reason)
                 # A recovery request needs a different connection, not a
                 # dedicated client.  Its poisoned source shard is retiring and
                 # therefore excluded by _acquire_client; normal capacity-aware
@@ -305,7 +323,12 @@ class NetworkManager(
                         raise
                     cohort_retries += 1
                     active["cohort_retries"] = cohort_retries
-                except (httpx.NetworkError, httpx.ProtocolError) as error:
+                    replay_reason = "cohort_stream_stall"
+                except (
+                    httpx.NetworkError,
+                    httpx.ProtocolError,
+                    httpx.TimeoutException,
+                ) as error:
                     # A connection-level read/write/protocol failure poisons
                     # the shard for future work.  Replay on the shared healthy
                     # pool; do not turn every failed stream into its own client.
@@ -322,6 +345,7 @@ class NetworkManager(
                     transport_error_retries += 1
                     self._transport_error_retries += 1
                     active["transport_error_retries"] = transport_error_retries
+                    replay_reason = "transport_error"
         except BaseException as error:
             future.completed_at = time.monotonic()
             if shard is not None:
@@ -378,7 +402,8 @@ class NetworkManager(
 
     def submit_request(self, method: str, url: str, *, project_key=None,
                        node_name=None, job_id=None, expect_json=False,
-                       state_sink=None, **kwargs: Any) -> NetworkFuture:
+                       state_sink=None, attempt_callback=None,
+                       **kwargs: Any) -> NetworkFuture:
         loop = self.ensure_started()
         future = NetworkFuture()
         future.node_name = node_name
@@ -386,7 +411,7 @@ class NetworkManager(
         future.project_key = project_key
         request = NetworkRequest(
             method, url, kwargs, future, project_key, node_name, job_id,
-            expect_json, state_sink
+            expect_json, state_sink, attempt_callback
         )
         with self._lock:
             self._requests_enqueued += 1

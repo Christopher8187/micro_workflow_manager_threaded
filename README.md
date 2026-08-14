@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.5.10
+# micro-workflow-manager 0.5.11
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -17,6 +17,54 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.5.11
+
+- A run-scoped aggregate API budget is allocated over API nodes that are
+  actually running, not every selected descendant. When one parallel node
+  drains, its slots are redistributed by declared/overridden request weight to
+  the remaining live nodes; every live node retains at least one slot. The
+  scheduler, `mwf threads`, and `mwf monitor` now distinguish requested,
+  active, and aggregate API capacity.
+- DAG nodes and Hoeflein components use the same API transport; 0.5.11 does
+  not add a second protocol circuit, specialize networking by graph shape, or
+  change caller-configured timeout values. It fixes the boundary between the
+  accepted Explode recovery layer and the scheduler watchdog: ingress wait no
+  longer consumes a transport attempt's lease, and a bounded hidden
+  cohort/connection replay receives a fresh lease with the same configured
+  duration. The task's total timeout remains active across every replay.
+- The shared transport now packs a draining workload onto the busiest healthy
+  shard before reusing idle connections. At peak width, the configured
+  same-shard terminal evidence remains 16; when a quiet tail contains fewer
+  peers, MWF requires every available same-shard peer (and at least two) to
+  terminate before declaring the remaining stream an outlier. A JSON response
+  body that silently ignores HTTPX's timer is also checked against the caller's
+  existing read timeout inside MWF and transparently replayed before the
+  supervisor's unchanged cleanup-grace lease expires. No timeout is extended
+  and no provider admission gate is added.
+- Physical transport attempt, renewal count/reason, and OpenRouter's documented
+  `X-Generation-Id` are observable in live runtime/network diagnostics. This
+  allows a provider generation to be correlated without browser automation.
+- Every ordinary member of a live Hoeflein component now constructs and
+  subscribes its refreshable queue source before sibling handlers are released.
+  This makes the existing "resident before first feedback" guarantee literal
+  under a busy interpreter: a fast router cannot fan out before its API
+  consumers are listening. The gate runs only once at component startup and
+  changes neither job concurrency nor steady-state pump allocation.
+- Active run records carry an OS process-start identity in addition to a PID.
+  A recycled Windows PID can no longer make an abandoned run appear live; for
+  legacy records without an identity, a stale heartbeat is not rescued merely
+  because an unrelated process later receives the same PID.
+- `FileSystemEntry.read_jsons(pattern)` supports large immutable fan-in
+  frontiers without repeating the scheduler execution check for every file.
+  MWF checks the execution generation before and after the bounded batch,
+  resolves and containment-checks every candidate path (including symlinks),
+  and returns deterministically sorted relative-path/value pairs. A bounded
+  32-worker reader overlaps independent Windows security/VPN filter latency
+  across small immutable files without retaining handles after the call. This
+  keeps fan-in inside the framework filesystem contract while avoiding both
+  thousands of redundant supervisor/database checks and serial per-file filter
+  stalls.
 
 ## What changed in 0.5.10
 
@@ -361,12 +409,22 @@ The environment equivalent is `MWF_HTTP2_STREAM_SAFETY_CAP` (default `32`).
 `MWF_HTTP2_COHORT_TERMINALS` (default `16`), and
 `MWF_HTTP2_COHORT_RETRIES` (default `2`) control terminal recovery without
 replacing the caller's request timeout. `MWF_HTTP_TRANSPORT_RETRIES` (default
-`2`) bounds transparent read/write/protocol recovery. Replays use available
+`2`) bounds transparent read/write/protocol recovery. Each physical attempt
+gets the same caller-configured bounded lease; ingress wait does not consume
+that lease, and the task's total timeout continues to bound the whole task.
+At peak width, the cohort threshold is the configured value. If fewer peers
+share a quiet tail shard, MWF waits for every available peer to terminate and
+requires at least two terminals before replaying the remaining outlier. For
+JSON response bodies, MWF independently enforces the caller's existing HTTPX
+read-idle timeout between body chunks; this covers a poisoned HTTP/2 stream
+whose underlying iterator never raises its own timeout. The resulting bounded
+physical replay receives the same configured lease. Replays use available
 capacity on previous healthy shards before opening another shared shard; the
 poisoned source shard is excluded and drained. The manager snapshot reports
 requested/effective stream width, the cap, client count, current in-flight
-requests, active stream phases, healthy-shard reuse, new recovery shards, and
-recovery/retirement evidence. HTTP/1.1 keeps
+requests, active stream phases, physical-attempt counts, replay reason,
+OpenRouter generation ID when supplied, healthy-shard reuse, new recovery
+shards, and recovery/retirement evidence. HTTP/1.1 keeps
 its independent `MWF_HTTP1_CONNECTIONS_PER_SHARD` setting.
 
 ## What changed in 0.3.16

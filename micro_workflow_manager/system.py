@@ -14,6 +14,7 @@ from .workflow.supervisor import SchedulerSupervisor
 from .storage import FileStorage
 from .workflow.workflow_registration import WorkflowRegistrationMixin
 from .fibers import FiberLocal
+from .api_limits import allocate_api_capacity
 
 
 class MicroWorkflow(
@@ -63,6 +64,10 @@ class MicroWorkflow(
         self._thread_override_signature: tuple[int, int, int, int] | None | object = object()
         self._thread_overrides: dict[str, int] = {}
         self._api_total_limit: int | None = None
+        # Exact API nodes admitted by the live DAG scheduler. This is narrower
+        # than allowed_run_nodes: completed and not-yet-started nodes must not
+        # retain a share of a run-scoped aggregate admission budget.
+        self._active_api_admission_nodes: frozenset[str] | None = None
 
         # CLI safety controls. Normal library use keeps immediate autostarts.
         self.allowed_run_nodes: set[str] | None = None
@@ -117,11 +122,22 @@ class MicroWorkflow(
         limits = self._effective_api_node_limits()
         return max(1, sum(limits.values()))
 
+    def active_api_admission_nodes(self) -> frozenset[str] | None:
+        with self._thread_override_lock:
+            return self._active_api_admission_nodes
+
+    def set_active_api_admission_nodes(self, nodes) -> None:
+        with self._thread_override_lock:
+            self._active_api_admission_nodes = (
+                None if nodes is None else frozenset(nodes)
+            )
+
     def _effective_api_node_limits(self) -> dict[str, int]:
-        overrides = self._refresh_runtime_limits()
-        allowed = self.allowed_run_nodes
+        self._refresh_runtime_limits()
+        active = self.active_api_admission_nodes()
+        allowed = active if active is not None else self.allowed_run_nodes
         requested = {
-            name: overrides.get(name, node.max_threads)
+            name: self.requested_max_threads(name)
             for name, node in self.nodes.items()
             if (node.runner_override or self.runner) == "api"
             and (allowed is None or name in allowed)
@@ -129,53 +145,16 @@ class MicroWorkflow(
         if not requested:
             return {}
 
-        configured = self._api_total_limit
-        requested_total = sum(requested.values())
-        if configured is None or configured >= requested_total:
-            return requested
-        if configured < len(requested):
-            raise ValueError(
-                "aggregate API limit must be at least the number of active API nodes "
-                f"({len(requested)})"
-            )
+        return allocate_api_capacity(requested, self._api_total_limit)
 
-        shares = {
-            name: max(1, (configured * value) // requested_total)
-            for name, value in requested.items()
-        }
-        used = sum(shares.values())
-        remainders = sorted(
-            requested,
-            key=lambda name: (
-                -((configured * requested[name]) % requested_total),
-                name,
-            ),
-        )
-        while used < configured:
-            changed = False
-            for name in remainders:
-                if shares[name] >= requested[name]:
-                    continue
-                shares[name] += 1
-                used += 1
-                changed = True
-                if used == configured:
-                    break
-            if not changed:
-                break
-        while used > configured:
-            changed = False
-            for name in reversed(remainders):
-                if shares[name] <= 1:
-                    continue
-                shares[name] -= 1
-                used -= 1
-                changed = True
-                if used == configured:
-                    break
-            if not changed:
-                break
-        return shares
+    def requested_max_threads(self, node_name: str) -> int:
+        """Return a node's requested limit before aggregate API allocation."""
+        node = self.nodes[node_name]
+        effective_runner = node.runner_override or self.runner
+        if effective_runner == "direct":
+            return 1
+        override = self.thread_override(node_name)
+        return override if override is not None else node.max_threads
 
     def effective_max_threads(self, node_name: str) -> int:
         node = self.nodes[node_name]
@@ -183,9 +162,11 @@ class MicroWorkflow(
         if effective_runner == "direct":
             return 1
         if effective_runner == "api" and self.api_total_limit_override() is not None:
+            active = self.active_api_admission_nodes()
+            if active is not None and node_name not in active:
+                return 1
             return self._effective_api_node_limits().get(node_name, node.max_threads)
-        override = self.thread_override(node_name)
-        return override if override is not None else node.max_threads
+        return self.requested_max_threads(node_name)
 
     def invalidate_thread_override_cache(self) -> None:
         with self._thread_override_lock:

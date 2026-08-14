@@ -121,8 +121,11 @@ framework poison.
   shards are reused first; simultaneous replays share replacement shards up to
   the normal 32-stream connection width. The evidence is monotonic through a
   quiet tail.
-- A request can receive at most two cohort replays, all within the original
-  caller lease. The 930-second transport lease itself is untouched.
+- A request can receive at most two cohort replays. MWF 0.5.11 applies the same
+  caller-configured lease value to each physical transport attempt instead of
+  silently making later replays consume only the first attempt's remainder.
+  Time in MWF ingress does not consume a physical attempt's lease, and the
+  task's total timeout remains active across all attempts.
 - Connection-level read/write/protocol failures retire the affected shard and
   receive the same capacity-aware shared-pool treatment rather than leaving a
   known-bad client eligible for new jobs.
@@ -130,9 +133,30 @@ framework poison.
 - A shared SSL context and TCP keepalive defaults (30-second idle, 10-second
   interval, three probes) cover connection-wide half-open VPN/TUN failures.
 - `.mwf/network_manager.json` reports active request phase, shard, stream, node,
-  job ID, byte progress, newer sibling terminal evidence, shard retirement,
-  complete-JSON recovery, cohort replay counters, healthy-shard reuse, and new
-  recovery-shard creation.
+  job ID, byte progress, physical-attempt count, replay reason, OpenRouter
+  `X-Generation-Id` when supplied, newer sibling terminal evidence, shard
+  retirement, complete-JSON recovery, cohort replay counters, healthy-shard
+  reuse, and new recovery-shard creation.
+
+### Redistribute multi-node acceptance diagnosis (0.5.11)
+
+The clean `runfrom redistribute refuse embed` run exposed a lease-accounting
+defect that Explode's shorter common-case requests did not exercise. At stop,
+the manager had 1,557 requests in flight, 69 clients, 43 retiring clients, 409
+cohort replays, and 2,277 connection-error replays. The SQLite writer had only
+six pending mutations, ruling out done-job scanning or mutation publication as
+the synchronized failure source. Some requests had also spent up to about 69
+seconds in manager ingress before dispatch.
+
+MWF previously began one external scheduler lease before manager submission.
+When a five-minute cohort proof or connection error caused a hidden physical
+replay, the replay inherited only the original lease's remainder. Hundreds of
+valid bounded recoveries therefore entered the hook fallback layer together at
+the unchanged 450/550-second outer deadline. MWF 0.5.11 separates the states:
+submission immediately suspends checkpoint expiry, physical dispatch arms the
+configured attempt lease, and each bounded physical replay re-arms that same
+duration. No model, node concurrency, stream width, retry limit, or caller
+timeout value is changed.
 
 A deterministic 64-request mass-stall regression proves that all 64 replays can
 be active simultaneously while occupying 8 shared eight-stream shards. The old
@@ -143,6 +167,39 @@ In the real recovery run, four requests crossed the 300-second cohort boundary
 and were transparently replayed with zero job failures. Examples had 261, 221,
 235, and 126 newer sibling terminals. The initial run also recovered 40 complete
 JSON bodies that lacked a proper stream terminal and drained 25 affected shards.
+
+Hoeflein component startup was also tightened after the full one-process suite
+reproduced delayed Redistribute-style consumer admission. Submitting all member
+controllers to an executor did not prove that every empty consumer had already
+constructed and subscribed its live queue source; under accumulated CPU load a
+fast producer could publish first. MWF 0.5.11 now gates the first handler until
+all ordinary live members report their complete source stack ready. This is a
+one-time component-start barrier, not a concurrency gate, and it leaves the
+steady-state pump vector unchanged.
+
+### 0.5.11 local transport and release evidence
+
+The required localhost HTTP/2/TLS benchmark separated provider behavior from
+framework overhead. With 64 jobs, 32 concurrency, four nodes, 64 KiB responses,
+262,144 bytes/s per stream, and three repeats, the medians were 96.27 jobs/s for
+direct `httpx`, 94.09 jobs/s for `ApiRunner` plus MWF's shared transport, and
+35.19 jobs/s for the full durable workflow. The runner retained **97.7%** of
+direct transport throughput with zero failures. The workflow control includes
+payload files, generation fencing, SQLite claims/runtime/terminal events, and
+node lifecycle writes.
+
+A second real HTTP/2 cell used 20 simultaneous fan-out nodes, concurrency 512,
+1,024 jobs, 1 KiB responses, and three repeats. It completed with zero failures
+at a 120.23 jobs/s median. The mutation queue briefly reached 512 objects during
+the wave and then drained normally; transient writer backlog did not become a
+freeze or a terminal-publication failure.
+
+The exact 0.5.11 source then passed 340 ordinary tests in one process (the cycle
+file intentionally excluded), all four required cycle tests in four fresh
+Python processes, the explicit marked stress test, 34 networking/watchdog tests,
+and the final 73-test scheduler/lifecycle repeat batch. All 270 Python files
+compiled before the final startup-gate helper was added; the final candidate is
+compiled again during packaging verification.
 
 ### Fan-out persistence and observer overhead
 
@@ -232,6 +289,73 @@ request, so those numbers are intentionally not presented as 0.5.8 performance.
 The current design preserves the requested provider pressure. Remaining mixed
 stage duration is dominated by real model generation, semantic fallbacks, and
 explicit remote resets rather than local fan-out or undetected poisoned streams.
+
+### MWF 0.5.11 Redistribute/hook acceptance
+
+The Redistribute acceptance used the framework in its real DAG shape rather
+than a synthetic request loop. `redistribute` was already durable, and the
+controller resumed 2,128 unfinished hook jobs while preserving 412 completed
+hook results. `refhook`, `loosehook`, and `summaryhook` retained their declared
+concurrency of 1,000, shared the same transport used by Explode, and ran the
+April DeepSeek V4 Flash primary, the same Flash repair, and DeepSeek V4 Pro
+final repair. `refuse embed` remained an exclusive boundary throughout.
+
+The initial ramp demonstrated that neither DAG admission nor SQLite terminal
+publication was the bottleneck:
+
+| Time | Durable command `done` count | Increment from 413 | Mean increment rate |
+|---|---:|---:|---:|
+| 20:26:06 | 413 | 0 | - |
+| 20:29:25 | 1,778 | 1,365 | 6.86 jobs/s |
+| 20:31:41 | 2,435 | 2,022 | 6.04 jobs/s |
+
+At peak observation, 1,217 provider requests were in flight while the controller
+used 453.69 MiB. As demand fell, memory fell to approximately 388-400 MiB rather
+than continuing the former 4 MiB/s climb. Forty-five five-minute cohort stalls
+were transparently replayed; all 45 reused existing healthy capacity, no
+recovery-only shard was created, and no client-per-replay growth returned.
+
+The run then exposed a distinct quiet-tail defect. Six remaining requests were
+spread across six of 25 mostly idle clients by the old round-robin selector.
+Each request therefore lacked the fixed 16 same-shard terminals needed for the
+early cohort proof. HTTPX's poisoned HTTP/2 body iterator also failed to raise
+its configured 500-second read timeout, so the scheduler emitted five
+550-second transport-lease errors. The controller was killed immediately under
+the testing rule at 2,534 completed hook jobs, preserving the final six.
+
+MWF 0.5.11 closes that gap without changing the 500-second HTTP timeout, the
+550-second supervisor lease, declared concurrency, or provider pressure:
+
+- draining requests are packed onto the busiest healthy shard rather than
+  scattered across idle connections;
+- when a shard has fewer than 16 available peers, every available peer must
+  terminate and at least two terminals are still required for an early
+  cohort-outlier replay; and
+- the JSON reader independently applies the existing read-idle timeout between
+  body chunks, converting a silent iterator into the same bounded transparent
+  transport replay before the supervisor lease expires.
+
+The preserved six-job resume ran from 03:33:52 to 03:36:43. All six requests
+shared one shard, completed on physical attempt 1, and produced zero new cohort,
+transport, JSON-terminal, network-debug, or credit errors. The controller exited
+normally with `refhook` 482/482, `loosehook` 1,691/1,691, and `summaryhook`
+367/367 done; failed and running counts were zero; `embed` was the sole queued
+boundary job and `storedatabase` remained queued downstream.
+
+An exhaustive post-run audit parsed all 2,540 result JSON files and checked
+their hook identity, nonempty unique integer orders, model-validation
+provenance, durable job counts, refusal boundary, and post-fix debug interval.
+It found zero issues across 12,987 enriched updates. Model outcomes were 2,269
+primary Flash results, 261 Flash-repair results, and 10 DeepSeek Pro final
+repairs. Thus model enrichment remained mandatory, while 10.28% of results
+needed the first repair and 0.39% needed the final repair.
+
+Stopping the earlier controller also exposed Windows PID reuse: its dead PID
+33248 was later assigned to an Edge renderer, and a PID-only run guard treated
+that unrelated process as the controller. New run records now include the OS
+process-start identity. A legacy record with a stale heartbeat cannot be revived
+by bare PID existence, so safe resume no longer requires manually altering
+`.mwf/run.json`.
 
 ## Pump allocation retained
 
@@ -362,3 +486,15 @@ same SHA-256:
 Kaicenat's completed Explode SQLite state and generated outputs were deliberately
 left untouched after verification. No reset or paste was performed, so the
 finished state remains available for the user's subsequent `redistribute` run.
+
+### MWF 0.5.11 final verification
+
+The exact 0.5.11 source, including quiet-tail recovery and process-identity run
+ownership, passed 350 ordinary tests with only the marked stress case
+deselected. The marked stress test passed separately, all four autostart-cycle
+tests passed in independent Python processes, the final networking/watchdog set
+passed 38/38, and the post-PID-change active-run/restart/resume set passed 17/17.
+The Kaicenat vendored and installed 0.5.11 wheel used for the successful final
+resume has SHA-256
+`343fb57256c21d37bf4b77b9135c7881d88e7e0228c7e92208ed56ea4de6812c`.
+No Explode or Redistribute reset/paste was performed after acceptance.

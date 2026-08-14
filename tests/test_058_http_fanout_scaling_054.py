@@ -361,6 +361,7 @@ def test_later_dag_wave_remains_inside_running_nodes_global_pump_budget(monkeypa
     class Scheduler(DagSchedulerMixin):
         runner = "api"
         storage = Storage()
+        _active_api_nodes = None
         nodes = {
             name: SimpleNamespace(runner_override=None, waiting=False)
             for name in queued
@@ -377,6 +378,18 @@ def test_later_dag_wave_remains_inside_running_nodes_global_pump_budget(monkeypa
         @staticmethod
         def effective_max_threads(_node_name):
             return 1400
+
+        @staticmethod
+        def requested_max_threads(_node_name):
+            return 1400
+
+        @classmethod
+        def active_api_admission_nodes(cls):
+            return cls._active_api_nodes
+
+        @classmethod
+        def set_active_api_admission_nodes(cls, nodes):
+            cls._active_api_nodes = None if nodes is None else frozenset(nodes)
 
         @staticmethod
         def finalize_ready_nodes(skip_components=None):
