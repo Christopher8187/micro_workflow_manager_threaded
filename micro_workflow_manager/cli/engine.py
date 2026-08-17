@@ -262,6 +262,13 @@ class _EngineHandler(BaseHTTPRequestHandler):
     server: _EngineServer
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if self.path == "/":
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", f"/{self.server.token}/")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         if self.path == f"/{self.server.token}/":
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -291,10 +298,9 @@ def engine_command(root: Path) -> int:
     token = secrets.token_urlsafe(24)
     server = _EngineServer(("127.0.0.1", 0), _EngineHandler, token=token, html=html)
     port = int(server.server_address[1])
-    url = f"http://127.0.0.1:{port}/{token}/"
-    opened = webbrowser.open(url, new=2)
-    if not opened:
-        print(url)
+    url = f"http://127.0.0.1:{port}/"
+    print(url)
+    webbrowser.open(url, new=2)
     print("MWF engine is displaying the graph. Press Ctrl+C to close it.")
     try:
         server.serve_forever(poll_interval=0.2)

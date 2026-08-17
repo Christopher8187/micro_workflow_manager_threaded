@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import importlib
 import json
+import threading
 from pathlib import Path
 
 from micro_workflow_manager import cli
-from micro_workflow_manager.cli.engine import build_engine_snapshot, render_engine_html
+from micro_workflow_manager.cli.engine import (
+    _EngineHandler,
+    _EngineServer,
+    build_engine_snapshot,
+    engine_command,
+    render_engine_html,
+)
 from micro_workflow_manager.cli.project import load_workflow
 from micro_workflow_manager.cli.sampling import plan_sample
 from micro_workflow_manager.storage import FileStorage
@@ -98,6 +106,85 @@ def test_engine_dispatches_before_runtime_layout(tmp_path, monkeypatch):
 
     assert dispatch(["engine"]) == 0
     assert observed == [tmp_path]
+
+
+def test_engine_root_redirects_to_token_and_http_surface_stays_read_only():
+    token = "focused-engine-test-token"
+    html = b"<!doctype html><title>graph only</title>"
+    server = _EngineServer(("127.0.0.1", 0), _EngineHandler, token=token, html=html)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+    try:
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        assert response.status == 302
+        assert response.getheader("Location") == f"/{token}/"
+        assert response.getheader("Cache-Control") == "no-store"
+        assert response.read() == b""
+
+        connection.request("GET", f"/{token}/")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "text/html; charset=utf-8"
+        assert response.read() == html
+
+        connection.request("GET", "/unknown")
+        response = connection.getresponse()
+        assert response.status == 404
+        response.read()
+
+        connection.request("POST", f"/{token}/")
+        response = connection.getresponse()
+        assert response.status == 405
+        response.read()
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_engine_command_prints_and_opens_bare_loopback_root(tmp_path, monkeypatch, capsys):
+    observed = {}
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 43123)
+
+        def __init__(self, address, handler, *, token, html):
+            observed.update(address=address, handler=handler, token=token, html=html)
+
+        def serve_forever(self, *, poll_interval):
+            observed["poll_interval"] = poll_interval
+            raise KeyboardInterrupt
+
+        def shutdown(self):
+            observed["shutdown"] = True
+
+        def server_close(self):
+            observed["server_close"] = True
+
+    monkeypatch.setattr(
+        "micro_workflow_manager.cli.engine.build_engine_snapshot",
+        lambda root: {"nodes": [], "edges": [], "canvas": {}},
+    )
+    monkeypatch.setattr(
+        "micro_workflow_manager.cli.engine.render_engine_html",
+        lambda snapshot: "graph-only",
+    )
+    monkeypatch.setattr("micro_workflow_manager.cli.engine._EngineServer", FakeServer)
+    monkeypatch.setattr(
+        "micro_workflow_manager.cli.engine.webbrowser.open",
+        lambda url, new: observed.update(url=url, new=new) or True,
+    )
+
+    assert engine_command(tmp_path) == 0
+    assert observed["url"] == "http://127.0.0.1:43123/"
+    assert observed["new"] == 2
+    assert observed["shutdown"] is True
+    assert observed["server_close"] is True
+    output = capsys.readouterr().out
+    assert output.splitlines()[0] == "http://127.0.0.1:43123/"
 
 
 def _make_sample_project(tmp_path: Path, monkeypatch) -> FileStorage:
