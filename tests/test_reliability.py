@@ -98,15 +98,30 @@ def test_cancelled_jobs_do_not_count_as_successful_completion():
 
 
 def test_threaded_runner_runs_multiple_jobs_inside_one_node_at_once():
-    import time
+    import threading
 
     with tempfile.TemporaryDirectory() as project_dir:
         workflow = MicroWorkflow(project_dir=project_dir, runner="threaded")
         workflow.graph([("A", "B")])
 
+        lock = threading.Lock()
+        release = threading.Event()
+        pair_started = threading.Event()
+        overlap_observed: list[bool] = []
+        active = 0
+        max_active = 0
+
         @workflow.task("A", max_threads=2)
         def a(ctx):
-            time.sleep(1.00)
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                if active == 2:
+                    pair_started.set()
+            assert release.wait(15), "threaded overlap guard was not released"
+            with lock:
+                active -= 1
             return ctx.job_id
 
         @workflow.task("B")
@@ -116,13 +131,23 @@ def test_threaded_runner_runs_multiple_jobs_inside_one_node_at_once():
         workflow.start("A", job_id=1)
         workflow.start("A", job_id=2)
 
-        started = time.perf_counter()
-        workflow.run_node("A")
-        elapsed = time.perf_counter() - started
+        def observe_overlap_then_release() -> None:
+            overlap_observed.append(pair_started.wait(10))
+            release.set()
+
+        observer = threading.Thread(target=observe_overlap_then_release)
+        observer.start()
+        try:
+            workflow.run_node("A")
+        finally:
+            release.set()
+        observer.join(timeout=1)
 
         node_complete = workflow.node_complete("A")
         workflow.storage.close_database_connections()
-        assert elapsed < 1.70
+        assert not observer.is_alive()
+        assert overlap_observed == [True]
+        assert max_active == 2
         assert node_complete
 
 
