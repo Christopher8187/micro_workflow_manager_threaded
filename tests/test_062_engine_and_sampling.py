@@ -5,8 +5,11 @@ import http.client
 import importlib
 import json
 import threading
+from http import HTTPStatus
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import micro_workflow_manager.cli.engine as engine_module
 from micro_workflow_manager import cli
 from micro_workflow_manager.cli.engine import (
     _EngineHandler,
@@ -114,49 +117,75 @@ def test_engine_root_redirects_to_token_and_http_surface_stays_read_only():
     server = _EngineServer(("127.0.0.1", 0), _EngineHandler, token=token, html=html)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+    port = int(server.server_address[1])
+
+    def request(method: str, path: str, *, host: str | None = None):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {} if host is None else {"Host": host}
+        try:
+            connection.request(method, path, headers=headers)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
     try:
-        connection.request("GET", "/")
-        response = connection.getresponse()
-        assert response.status == 302
-        assert response.getheader("Location") == f"/{token}/"
-        assert response.getheader("Cache-Control") == "no-store"
-        assert response.read() == b""
+        root_status, root_headers, root_body = request(
+            "GET",
+            "/",
+            host="attacker.invalid",
+        )
+        assert root_status in {
+            HTTPStatus.MOVED_PERMANENTLY,
+            HTTPStatus.FOUND,
+            HTTPStatus.SEE_OTHER,
+            HTTPStatus.TEMPORARY_REDIRECT,
+            HTTPStatus.PERMANENT_REDIRECT,
+        }
+        assert root_headers["Cache-Control"] == "no-store"
+        assert root_body == b""
 
-        connection.request("GET", f"/{token}/")
-        response = connection.getresponse()
-        assert response.status == 200
-        assert response.getheader("Content-Type") == "text/html; charset=utf-8"
-        assert response.read() == html
+        target = urlsplit(root_headers["Location"])
+        assert target.path == f"/{token}/"
+        assert not target.query
+        assert not target.fragment
+        if target.scheme or target.netloc:
+            assert target.scheme == "http"
+            assert target.hostname == "127.0.0.1"
+            assert target.port == port
 
-        connection.request("GET", "/unknown")
-        response = connection.getresponse()
-        assert response.status == 404
-        response.read()
+        token_status, token_headers, token_body = request("GET", target.path)
+        assert token_status == HTTPStatus.OK
+        assert token_headers["Content-Type"] == "text/html; charset=utf-8"
+        assert token_headers["Cache-Control"] == "no-store"
+        assert token_headers["X-Content-Type-Options"] == "nosniff"
+        assert "default-src 'none'" in token_headers["Content-Security-Policy"]
+        assert token_body == html
 
-        connection.request("POST", f"/{token}/")
-        response = connection.getresponse()
-        assert response.status == 405
-        response.read()
+        assert request("GET", "/unknown/")[0] == HTTPStatus.NOT_FOUND
+        assert request("GET", f"/{token}/unknown")[0] == HTTPStatus.NOT_FOUND
+        assert request("POST", "/")[0] == HTTPStatus.METHOD_NOT_ALLOWED
+        assert request("POST", f"/{token}/")[0] == HTTPStatus.METHOD_NOT_ALLOWED
     finally:
-        connection.close()
         server.shutdown()
         server.server_close()
-        thread.join(timeout=2)
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
 
 
 def test_engine_command_prints_and_opens_bare_loopback_root(tmp_path, monkeypatch, capsys):
-    observed = {}
+    _make_engine_project(tmp_path)
+    before = _tree_digest(tmp_path)
+    observed: dict[str, object] = {}
 
     class FakeServer:
-        server_address = ("127.0.0.1", 43123)
-
         def __init__(self, address, handler, *, token, html):
             observed.update(address=address, handler=handler, token=token, html=html)
+            self.server_address = ("127.0.0.1", 43123)
 
-        def serve_forever(self, *, poll_interval):
+        def serve_forever(self, poll_interval):
             observed["poll_interval"] = poll_interval
-            raise KeyboardInterrupt
 
         def shutdown(self):
             observed["shutdown"] = True
@@ -164,27 +193,25 @@ def test_engine_command_prints_and_opens_bare_loopback_root(tmp_path, monkeypatc
         def server_close(self):
             observed["server_close"] = True
 
+    monkeypatch.setattr(engine_module, "_EngineServer", FakeServer)
+    monkeypatch.setattr(engine_module.secrets, "token_urlsafe", lambda size: "qa-fixed-token")
     monkeypatch.setattr(
-        "micro_workflow_manager.cli.engine.build_engine_snapshot",
-        lambda root: {"nodes": [], "edges": [], "canvas": {}},
-    )
-    monkeypatch.setattr(
-        "micro_workflow_manager.cli.engine.render_engine_html",
-        lambda snapshot: "graph-only",
-    )
-    monkeypatch.setattr("micro_workflow_manager.cli.engine._EngineServer", FakeServer)
-    monkeypatch.setattr(
-        "micro_workflow_manager.cli.engine.webbrowser.open",
+        engine_module.webbrowser,
+        "open",
         lambda url, new: observed.update(url=url, new=new) or True,
     )
 
     assert engine_command(tmp_path) == 0
     assert observed["url"] == "http://127.0.0.1:43123/"
     assert observed["new"] == 2
+    assert observed["address"] == ("127.0.0.1", 0)
+    assert observed["token"] == "qa-fixed-token"
     assert observed["shutdown"] is True
     assert observed["server_close"] is True
     output = capsys.readouterr().out
     assert output.splitlines()[0] == "http://127.0.0.1:43123/"
+    assert "qa-fixed-token" not in output
+    assert _tree_digest(tmp_path) == before
 
 
 def _make_sample_project(tmp_path: Path, monkeypatch) -> FileStorage:
