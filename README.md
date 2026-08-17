@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.5.11
+# micro-workflow-manager 0.6.0
 
 A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
 
@@ -17,6 +17,22 @@ See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
 command workflows, provenance guidance, and runnable examples covering adapted
 `src/` + `utils/` pipelines, five common agentic patterns, a database change
 manager, and a Pygame state machine.
+
+## What changed in 0.6.0
+
+- `mwf engine` opens a strictly read-only, graph-only loopback view from the
+  synchronized project metadata. It collapses nontrivial Hoeflein components
+  into scheduling units, reveals their members on demand, imports no project
+  code, exposes no mutation endpoint, and loads no external browser assets.
+- `mwf run NODE sample COUNT` performs deterministic isolated partial-node
+  runs. A SHA-256-ranked population, explicit seed/status filter, no-write plan,
+  population-drift guard, selected-input digest, and active-run manifest make
+  the sample reproducible. Unselected jobs, descendants, and Hoeflein
+  circulation remain untouched.
+- The root `AGENTS.md` now gives coding agents a complete framework command,
+  architecture, workflow-design, fallback/validation, and release-testing
+  contract. No transport, timeout, admission, or provider-networking behavior
+  changed in this release.
 
 ## What changed in 0.5.11
 
