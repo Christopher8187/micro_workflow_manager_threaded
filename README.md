@@ -954,6 +954,26 @@ update and leaves the disk unchanged.
 A leftover `node_behavior/*.py` file whose router name is no longer in the graph
 is ignored; importing the project will not recreate that old node folder.
 
+## Graph-only engine view
+
+Open the synchronized graph in a clean local browser canvas:
+
+```bash
+mwf engine
+```
+
+The view contains only the graph. It lays out the quotient DAG from left to
+right, collapses each nontrivial Hoeflein component into one scheduling card,
+and reveals that component's members when selected. Pan and zoom are built into
+the canvas. There are no runtime, contract, editing, or execution controls in
+this first version.
+
+Engine is read-only: it consumes the stored synchronized edges plus statically
+detected `autostart=True` relationships without importing project code,
+initializing SQLite, migrating project layout, or creating files. Its temporary
+HTTP server binds only to `127.0.0.1`, uses an unguessable session path, has no
+mutation endpoint or external web dependency, and exits with Ctrl+C.
+
 ## Compact directed fans in `graph.py`
 
 A lowercase name can represent one node and an uppercase variable can represent
@@ -1077,6 +1097,34 @@ def split(ctx, message):
 ```
 
 `number=2` creates jobs 1 and 2 with the same params. Multiple `router.create_job(...)` calls are allocated deterministic job ids in the order they appear. These declarations are idempotent when the CLI imports node files repeatedly.
+
+### Deterministic partial node runs
+
+Run a reproducible subset of one node's existing jobs with `sample`:
+
+```bash
+mwf run explodeexercise sample 100 --seed 20260817 --plan
+mwf run explodeexercise sample 100 --seed 20260817
+mwf run explodeexercise sample 100 --seed 20260817 --status failed,done
+```
+
+The default population is every existing job in the named node, including done
+jobs. `--status` narrows it. MWF assigns each candidate a portable SHA-256 score
+from the algorithm version, seed, node name, and job ID, then chooses exactly the
+lowest `COUNT` scores. The same population and seed therefore produce the same
+job IDs across supported operating systems and Python versions.
+
+`--plan` prints the population digest, seed, selected IDs, and a guarded replay
+command. The replay uses `--expect-population sha256:...` and refuses if a
+candidate's status, execution generation, or input content has changed. A seed
+is generated and printed when omitted.
+
+A sample resets and executes only its selected jobs. Unselected jobs and their
+outputs remain untouched. It deliberately bypasses predecessor readiness and
+disables component circulation and descendant execution, so it is an isolated
+prompt/model/validation test—not an end-to-end acceptance run for a Hoeflein
+component or workflow branch. The selection manifest is retained in
+`.mwf/run.json` with the run record.
 
 ## Passing files forward
 
@@ -1382,6 +1430,7 @@ Execution commands provide `--plan` instead of pretending to run:
 
 ```bash
 mwf run A --plan
+mwf run A sample 25 --seed acceptance-1 --plan
 mwf runfrom A --plan
 mwf runfrom A refuseafter C --plan
 mwf resume A --plan

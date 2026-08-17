@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import sys
 
 from .cleanup import resolve_node_targets
@@ -7,6 +8,7 @@ from .destructive import execute_destructive_command
 from .describe import describe_command
 from .files import find_root, safe_node_name
 from .doctor import doctor_command
+from .engine import engine_command
 from .filter import inspect_filter
 from .inspect import inspect_command
 from .trace import trace_command
@@ -23,7 +25,8 @@ from .project import init_project, load_workflow, setup_graph
 from .restart import restart_active_jobs, restart_active_scope
 from .threads import threads_command, update_declared_threads
 from .deploy import deploy_command
-from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs
+from .run import resume_from, resume_node, run_from, run_node, run_sampled_jobs, run_selected_jobs
+from .sampling import parse_sample_count, parse_sample_statuses, plan_sample, print_sample_plan
 from .validation import require_node
 from .node_clipboard import copy_node_to_clipboard, paste_node_from_clipboard
 from .resource_limits import raise_open_file_limit
@@ -48,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
             return init_project(args.archive)
 
         root = find_root()
+        # Engine is a strictly read-only visualization path. Dispatch it before
+        # layout migration, SQLite initialization, or user graph imports.
+        if args.command == "engine":
+            return engine_command(root)
         # Migration previews must be strictly read-only, including for projects
         # that still contain legacy runtime layout or lock directories.
         if args.command == "migrate" and args.dry_run:
@@ -178,6 +185,37 @@ def main(argv: list[str] | None = None) -> int:
         require_node(workflow, node)
 
         if args.command == "run":
+            if args.job_mode == "sample":
+                count = parse_sample_count(args.job_specs)
+                statuses = parse_sample_statuses(args.sample_status)
+                seed = args.seed or secrets.token_hex(16)
+                if args.plan:
+                    plan = plan_sample(
+                        workflow,
+                        node,
+                        count,
+                        seed=seed,
+                        statuses=statuses,
+                        expected_population=args.expect_population,
+                    )
+                    print_sample_plan(plan)
+                    return 0
+                return run_sampled_jobs(
+                    root,
+                    workflow,
+                    node,
+                    count,
+                    seed=seed,
+                    statuses=statuses,
+                    expected_population=args.expect_population,
+                    stats=args.stats,
+                    stats_interval=args.stats_interval,
+                    monitor=args.monitor,
+                    monitor_interval=args.monitor_interval,
+                    keep_trace=args.keeptrace,
+                )
+            if args.seed is not None or args.sample_status is not None or args.expect_population is not None:
+                raise RuntimeError("--seed, --status, and --expect-population require: mwf run <node> sample <count>")
             job_ids = selected_job_ids_from_args(args.job_mode, args.job_specs)
             if args.plan:
                 return print_run_plan(

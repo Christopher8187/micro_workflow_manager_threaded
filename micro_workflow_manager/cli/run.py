@@ -10,7 +10,7 @@ from .run_commands import (
     run_node,
 )
 from .run_orchestration import run_nodes
-from .run_selected import run_selected_jobs
+from .run_selected import run_sampled_jobs, run_selected_jobs
 from .run_session import active_workflow_run
 
 __all__ = [
@@ -20,5 +20,6 @@ __all__ = [
     "run_from",
     "run_node",
     "run_nodes",
+    "run_sampled_jobs",
     "run_selected_jobs",
 ]

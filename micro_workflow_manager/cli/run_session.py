@@ -5,6 +5,7 @@ import socket
 import sys
 import time
 from contextlib import contextmanager
+from typing import Callable
 from uuid import uuid4
 
 from micro_workflow_manager import __version__
@@ -23,6 +24,7 @@ def active_workflow_run(
     start_node: str,
     nodes: list[str],
     selected_jobs: list[int] | None = None,
+    selection_builder: Callable[[], dict] | None = None,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
     stats: bool = False,
@@ -59,7 +61,7 @@ def active_workflow_run(
             node_name: list(workflow.component_key(workflow.component_for(node_name)))
             for node_name in nodes
         },
-        "selected_jobs": list(selected_jobs or []),
+        "selected_jobs": [],
         "refuse_after_node": refuse_after_node,
         "refuse_before_node": refuse_before_node,
         "started_at": now_iso(),
@@ -86,6 +88,10 @@ def active_workflow_run(
     # claim this slot; it only controls a job already owned by this run.
     with workflow.storage.interprocess_lock("active-run-state"):
         refuse_competing_run(workflow)
+        selection = selection_builder() if selection_builder is not None else None
+        data["selected_jobs"] = list(selected_jobs or [])
+        if selection is not None:
+            data["selection"] = selection
         # Bind the pending override before publishing a running sequence. If
         # lock acquisition itself fails, no fresh stale run record is left
         # behind for the next command to recover.

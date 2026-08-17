@@ -12,6 +12,7 @@ Extended command descriptions:
 Common flow:
   mwf init
   mwf graph src/graph.py
+  mwf engine
   mwf doctor
   mwf migrate --dry-run
   mwf run A --plan
@@ -41,6 +42,7 @@ for a longer essay explaining behavior, file effects, and abstract examples.
 COMMAND_HELP_DESCRIPTIONS = {
     "init": "Initialize the current folder as an MWF project. This creates .mwf/project.json, .mwf/state.sqlite3, and lightweight editor/git sidecars but does not load task code.",
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
+    "engine": "Open the synchronized workflow as a read-only, graph-only local browser view. Hoeflein components are collapsed into scheduling units.",
     "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
     "migrate": "Upgrade MWF-owned JSON and SQLite state schemas. User inputs, outputs, returned files, and provenance are never rewritten.",
     "inspect": "Inspect a node/job, list failed job IDs, or show node debug output.",
@@ -99,6 +101,11 @@ edited configurations containing src\\graph.py are also accepted, so the same
 project folder can move between Linux and Windows without rewriting .mwf/project.json first.
 Deleting or renaming a graph node during --update deletes that node's folder, so
 copy any data you still need before synchronizing.
+""",
+    "engine": """
+`mwf engine` opens the synchronized workflow graph in a pan-and-zoom local browser; select a collapsed Hoeflein component to reveal its members. The
+read-only loopback viewer has no external assets or mutation endpoints and does not
+import/run project code or modify project state. Stop it with Ctrl+C.
 """,
     "doctor": """
 Doctor is a read-only diagnostic pass. It builds on ordinary help by explaining
@@ -296,6 +303,8 @@ Examples:
   mwf run make_number --monitor
   mwf run double_number job 2 --monitor
   mwf run process_number jobs 1 3-5
+  mwf run process_number sample 100 --seed 20260817 --plan
+  mwf run process_number sample 100 --seed 20260817
   mwf run process_number --keeptrace
 
 `--monitor` prints the full timestamped dashboard in this terminal without
@@ -308,6 +317,11 @@ uses the configured threaded, API, process, or direct runner and refuses to star
 another CLI sequence already owns the project. To preserve completed work after
 a failure, use resume rather than run. Fresh runs clear affected trace journals
 unless `--keeptrace` is supplied.
+
+Sample mode deterministically ranks existing jobs with SHA-256, runs COUNT in
+isolation, and leaves unselected jobs untouched. It bypasses readiness and
+disables circulation and descendants. Use `--status` to narrow candidates;
+`--plan` and `--expect-population` provide a no-write, drift-guarded replay.
 """,
     "restart": """
 Restart is a second-terminal control for the workflow sequence that is currently

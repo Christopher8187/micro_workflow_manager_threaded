@@ -85,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     commands.add_parser(
+        "engine",
+        help="Open a read-only, graph-only workflow view in the browser.",
+        description=COMMAND_HELP_DESCRIPTIONS["engine"],
+    )
+
+    commands.add_parser(
         "doctor",
         help="Run read-only project health checks.",
         description=COMMAND_HELP_DESCRIPTIONS["doctor"],
@@ -219,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
         "job_mode",
         nargs="?",
         metavar="job",
-        help="Optional literal 'job' or 'jobs' to run selected job IDs only.",
+        help="Optional literal job/jobs for explicit IDs, or sample for a deterministic partial run.",
     )
     run_cmd.add_argument(
         "job_specs",
@@ -231,6 +237,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--runner",
         choices=RUNNER_CHOICES,
         help="Temporarily override the workflow runner for this run.",
+    )
+    run_cmd.add_argument(
+        "--seed",
+        help="Deterministic seed for `mwf run NODE sample COUNT`.",
+    )
+    run_cmd.add_argument(
+        "--status",
+        dest="sample_status",
+        help="Comma-separated sample population statuses, such as failed,done.",
+    )
+    run_cmd.add_argument(
+        "--expect-population",
+        help="Refuse a sample run unless the current population has this SHA-256 digest.",
     )
     add_keeptrace_argument(run_cmd)
 
