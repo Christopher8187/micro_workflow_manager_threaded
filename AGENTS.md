@@ -1,20 +1,22 @@
 # MWF instructions for coding agents
 
-## Product Workspace definitions
+## Product Workspace context
 
-Read `C:\Business\product\docs\definitions.md` before planning Product Workspace
+Read `C:\Business\product\CONTEXT.md` before planning Product Workspace
 directory or multi-repository work, referring to another Product Workspace
-repository, changing Agentic File System Routing, or interpreting an unfamiliar
-Product Workspace term.
+repository, changing Agentic File System Routing, or preparing a reply about
+Product Workspace filesystem or multi-repository changes.
+
+Read `C:\Business\product\docs\DEFINITION.md` before using or interpreting an
+unfamiliar shared Product Workspace term.
 
 A narrow MWF implementation, diagnosis, or bug fix may stay inside this
-repository without loading the shared definitions when its source changes and
-verification remain here and no shared term is unclear. When uncertain, read
-the definitions.
+repository without loading either file when its source changes, verification,
+and reply remain here and no shared term is unclear. When uncertain, read both
+files.
 
-If MWF work requires a change in another Product Workspace repository, stop
-before editing that repository and ask Christopher. Name this repository, the
-additional repository, why it is needed, and the exact action proposed.
+Follow `C:\Business\product\CONTEXT.md` when MWF work needs another Product
+Workspace repository or production permission.
 
 These instructions govern the whole `micro-workflow-manager` repository. Read
 this file before designing an MWF workflow or changing framework behavior. Read
