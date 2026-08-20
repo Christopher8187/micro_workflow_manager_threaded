@@ -2,20 +2,20 @@
 
 ## Product Workspace context
 
-Read `C:\Business\product\CONTEXT.md` before planning Product Workspace
+Read `C:\Business\product\CONTEXT-MAP.md` before planning Product Workspace
 directory or multi-repository work, referring to another Product Workspace
 repository, changing Agentic File System Routing, or preparing a reply about
 Product Workspace filesystem or multi-repository changes.
 
-Read `C:\Business\product\docs\DEFINITION.md` before using or interpreting an
-unfamiliar shared Product Workspace term.
+Read this repository's `CONTEXT.md` before changing MWF domain behavior or
+using an unfamiliar MWF term.
 
 A narrow MWF implementation, diagnosis, or bug fix may stay inside this
 repository without loading either file when its source changes, verification,
 and reply remain here and no shared term is unclear. When uncertain, read both
 files.
 
-Follow `C:\Business\product\CONTEXT.md` when MWF work needs another Product
+Follow `C:\Business\product\CONTEXT-MAP.md` when MWF work needs another Product
 Workspace repository or production permission.
 
 These instructions govern the whole `micro-workflow-manager` repository. Read
