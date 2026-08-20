@@ -1,38 +1,34 @@
-# MWF context
+# MWF
 
-Shared Product Workspace relationships and terms live in
-`C:\Business\product\CONTEXT-MAP.md`.
+This context defines Micro Workflow Manager language. Shared Product Workspace
+relationships and terms live in `C:\Business\product\CONTEXT-MAP.md`.
 
-## MWF terms
+## Language
 
-### MWF
-
+**MWF**:
 Micro Workflow Manager, a hybrid file and SQLite workflow manager for directed
 graphs of work.
+_Avoid_: Workflow engine, micro-workflow-manager
 
-### MWF project
-
+**MWF project**:
 A directory containing an MWF graph, node behavior modules, node input and
 output directories, and MWF-managed runtime state.
+_Avoid_: Scenario, workflow copy
 
-### MWF node
-
+**MWF node**:
 A named unit of work with one main task, optional fallbacks, jobs, inputs,
 outputs, and routing behavior.
+_Avoid_: Agent, step
 
-### MWF NodeRouter
+**MWF NodeRouter**:
+The Python router declared for one MWF node.
+_Avoid_: Agent router, Agentic File System Router
 
-The Python router declared for one MWF node. It defines that node's tasks,
-fallbacks, concurrency, waiting rules, and dynamic routing behavior.
+**Hoeflein component**:
+An MWF scheduling group whose nodes communicate through ordinary and autostart
+graph relationships.
+_Avoid_: Cycle, branch
 
-### Hoeflein component
-
-An MWF scheduling group computed from the graph after autostart relationships
-add their reverse communication direction. MWF schedules every member of a
-nontrivial Hoeflein component as one communicating unit.
-
-### Project provenance
-
-User-owned files that record the inputs, decisions, tools, models, parameters,
-validation, or attempts used to produce a durable result. Project provenance is
-separate from scheduler diagnostics in `.mwf`.
+**Project provenance**:
+User-owned files that record how an MWF project produced a durable result.
+_Avoid_: Artifact, returned evidence
