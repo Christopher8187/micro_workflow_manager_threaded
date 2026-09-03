@@ -93,6 +93,8 @@ def test_monitor_once_prints_workflow_counts(tmp_path, monkeypatch, capsys):
     assert "jobs=2" in out
     assert "A" in out
     assert "queued" in out
+    assert "mwf threads --api-total" in out
+    assert "no workflow-wide aggregate API cap" not in out
 
 
 def test_run_stats_and_monitor_json_include_timing_metadata(tmp_path, monkeypatch, capsys):

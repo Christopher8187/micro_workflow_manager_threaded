@@ -3,12 +3,10 @@ Command help:
   mwf clean --help
   mwf run --help
   mwf resumefrom --help
-
 Extended command descriptions:
   mwf --describe run
   mwf --describe runfrom
   mwf --describe resumefrom
-
 Common flow:
   mwf init
   mwf graph src/graph.py
@@ -26,7 +24,6 @@ Common flow:
   mwf deploy remote
   mwf resumefrom A
   mwf monitor
-
 Destructive preparation and cleanup:
   mwf reset A --dry-run
   mwf reset * --yes
@@ -34,16 +31,15 @@ Destructive preparation and cleanup:
   mwf clean * --yes
   mwf wipe * --yes
   mwf wipefrom A --yes
-
-Use 'mwf <command> --help' for syntax. Use 'mwf --describe <command>'
-for a longer essay explaining behavior, file effects, and abstract examples.
+Use 'mwf <command> --help' for syntax. Use 'mwf --describe <command>' for a longer essay explaining behavior, file effects, and abstract examples.
 """
-
 COMMAND_HELP_DESCRIPTIONS = {
     "init": "Initialize the current folder as an MWF project. This creates .mwf/project.json, .mwf/state.sqlite3, and lightweight editor/git sidecars but does not load task code.",
+    "copy": "Save a node folder and its SQLite job and trace state under clipboard/<node>, replacing an older saved copy.",
+    "paste": "Replace a node folder and its SQLite job and trace state from clipboard/<node>, then reconcile restored jobs for use.",
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "engine": "Open the synchronized workflow as a read-only, graph-only local browser view. Hoeflein components are collapsed into scheduling units.",
-    "doctor": "Run read-only project health checks for graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges.",
+    "doctor": "Check graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges without executing jobs or applying repairs; normal CLI bootstrap may still migrate old runtime layout.",
     "migrate": "Upgrade MWF-owned JSON and SQLite state schemas. User inputs, outputs, returned files, and provenance are never rewritten.",
     "inspect": "Inspect a node/job, list failed job IDs, or show node debug output.",
     "trace": "Render one job's chronological origin, task/fallback starts, ctx.trace objects, outputs, forwarded inputs, downstream jobs, and terminal state.",
@@ -55,30 +51,34 @@ COMMAND_HELP_DESCRIPTIONS = {
     "resetfrom": "Perform the same producer-aware fresh descendant preparation as mwf runfrom, but do not execute task code.",
     "wipe": "Delete every job, generated output, and input file in selected Hoeflein components.",
     "wipefrom": "Delete every job, generated output, and input file from one component through all descendants.",
-    "run": "Reset and run one ready node or selected jobs; --monitor prints the full timestamped dashboard in the same terminal.",
+    "run": "Reset and run the ready Hoeflein component selected by one node, or selected jobs in a singleton node; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control that restarts running and failed/cancelled jobs in the selected active Hoeflein component; it never starts another scheduler.",
-    "threads": "View or change run-scoped per-node max_threads overrides. API values are cooperative fiber counts with no aggregate framework cap; active nodes scale live.",
+    "threads": "View or change run-scoped per-node max_threads overrides and the optional aggregate API admission budget; active threaded and API nodes scale live.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
-    "resume": "Register output-backed finished jobs, then continue unsuccessful or queued work for one node without resetting done or skipped jobs.",
-    "runfrom": "Reset and run one node and its descendants; optional refuse stops before a boundary and refuseafter stops after it, without shrinking reset scope.",
-    "resumefrom": "Continue work through descendants; optional refuse stops before a boundary and refuseafter stops after it, retaining queued work.",
-    "monitor": "Show live or one-shot node/job statistics without running task code; completed sequences report active run: none.",
+    "resume": "Register output-backed finished jobs, then continue unsuccessful or queued work for the Hoeflein component selected by one node without resetting done or skipped jobs.",
+    "runfrom": "Reset and run the Hoeflein component selected by one node and its quotient-DAG descendants; optional refuse stops before a boundary and refuseafter stops after it.",
+    "resumefrom": "Continue a selected Hoeflein component and its quotient-DAG descendants; optional refuse stops before a boundary and refuseafter stops after it, retaining queued work.",
+    "monitor": "Show live or one-shot node/job statistics without running task code; normal CLI bootstrap and router mounting may still update framework state.",
     "top": "Show event-driven htop-style scheduler, latency, process, database, and mutation-writer diagnostics.",
 }
-
 COMMAND_DESCRIPTIONS = {
     "init": """
 The help text tells you that init creates an MWF project. In practical terms,
 this command creates `.mwf/project.json`, initializes the transactional `.mwf/state.sqlite3` scheduler database, and writes editor/git sidecars. Later commands can find the project root from any subfolder. It does not import graph.py, create
 workflow nodes, or execute functions. That separation is useful because you can
 prepare a clean project shell before deciding what the graph should contain.
-
 A minimal beginning is:
   mkdir simple_flow
   cd simple_flow
   mwf init
 
 Afterward, create a graph file and register it with mwf graph. If `.mwf/project.json` already exists, init preserves its configuration, upgrades sidecars, and ensures the SQLite schema is ready.
+""",
+    "copy": """
+`mwf copy classify` saves the complete `node/classify` tree and a matching SQLite job, status, and trace snapshot under `clipboard/classify`. It replaces an older saved copy without changing the live node or running task code. Use it as a project-scoped restoration point, not a source-control substitute or cross-project interchange format.
+""",
+    "paste": """
+`mwf paste classify` replaces `node/classify`, restores its saved SQLite state, and reconciles job payloads and terminal statuses without executing jobs. The saved node must belong to this project's clipboard and should match the synchronized graph. Inspect or resume it after restoration.
 """,
     "graph": """
 The help text describes graph as the explicit synchronization point. This means
@@ -108,8 +108,8 @@ read-only loopback viewer has no external assets or mutation endpoints and does 
 import/run project code or modify project state. Stop it with Ctrl+C.
 """,
     "doctor": """
-Doctor is a read-only diagnostic pass. It builds on ordinary help by explaining
-why a project may fail before you spend time running it. It compares graph nodes,
+Doctor is a diagnostic pass that does not execute jobs or apply repairs. Normal
+CLI bootstrap may still migrate an old runtime layout. It compares graph nodes,
 node folders, and node_behavior filenames; checks SQLite integrity and on-disk payload/config JSON; checks whether a recorded run is live or stale; and warns about literal
 ctx.node("B") calls whose A -> B edge is absent.
 
@@ -117,7 +117,7 @@ Run it after editing the graph or moving the project between machines:
   mwf doctor
 
 For example, if graph.py contains A -> B but src/node_behavior/B.py is missing,
-doctor reports that mismatch without creating the file or changing any status.
+doctor reports that mismatch without creating the file or changing job status.
 A warning does not necessarily make the project unusable, while an ERROR causes
 a nonzero exit status suitable for a simple test script.
 """,
@@ -126,8 +126,8 @@ Migrate upgrades low-churn MWF JSON metadata and the SQLite scheduler schema.
 On the first 0.3.4 migration it imports legacy job identity/status, queue markers,
 events, checkpoints, execution generations, idempotency keys, default-job
 manifests, and summary indexes into `.mwf/state.sqlite3`. User `input.json`,
-`output.json`, returned files, node input/output folders, and project provenance
-are never moved into the framework database.
+`output.json`, node input/output folders, and historical per-job file trees are
+never moved into the framework database.
 
 Preview without creating the database or deleting legacy sidecars:
   mwf migrate --dry-run
@@ -167,11 +167,11 @@ which fallback ran afterward.
 Trace renders the append-only event journal for one job as a chronological,
 human-readable execution transcript. Node code can append arbitrary structured
 records with `ctx.trace(name, content=..., input=..., output=..., status=...)`.
-MWF automatically records task and fallback starts, framework-aware output
-writes, forwarded node inputs, downstream job creation, and terminal state.
+MWF records task/fallback starts, failed attempts, framework-aware output writes,
+forwarded inputs, downstream jobs, and terminal state.
 
-Example:
-  mwf trace classify_document job 17
+Example: `mwf trace classify_document job 17 [--errors]`
+Use `--errors` for identity, origin, ordered failures, attempt details, terminal state, and terminal error.
 
 Trace values are serialized defensively, and displayed file contents are
 truncated so a diagnostic command cannot flood the terminal. Event ordering is
@@ -179,10 +179,10 @@ the order in which the task called each operation; there is no fixed section
 ordering for output, forwarding, job creation, and custom traces.
 """,
     "filter": """
-Filter reconstructs the current execution funnel from each job's append-only
-lifecycle events. It shows how many jobs entered, succeeded at, and remained
-after every main retry and fallback retry without adding scheduler hot-path
-writes or a separate provenance manifest.
+Filter reconstructs the current execution funnel from append-only lifecycle
+events without extra scheduler writes or a separate output manifest. It
+shows entry, success, and remaining counts after each retry. Stage errors use
+durable failed-attempt events; older terminal journals fall back to stored data.
 
 Examples:
   mwf filter process_number
@@ -318,10 +318,10 @@ another CLI sequence already owns the project. To preserve completed work after
 a failure, use resume rather than run. Fresh runs clear affected trace journals
 unless `--keeptrace` is supplied.
 
-Sample mode deterministically ranks existing jobs with SHA-256, runs COUNT in
-isolation, and leaves unselected jobs untouched. It bypasses readiness and
-disables circulation and descendants. Use `--status` to narrow candidates;
-`--plan` and `--expect-population` provide a no-write, drift-guarded replay.
+Sample mode provides deterministic SHA-256 ranking of existing jobs and preservation
+of unselected jobs. Use `--status` to narrow candidates and `--expect-population`
+to detect drift. Current tests do not yet establish descendant or component-circulation isolation. `--plan` does not apply the sample run, but normal CLI
+bootstrap and router mounting may still update framework state.
 """,
     "restart": """
 Restart is a second-terminal control for the workflow sequence that is currently
@@ -367,7 +367,7 @@ within roughly 0.2 seconds. Decreasing it never kills jobs already running; MWF
 stops launching replacements until active concurrency falls to the new limit.
 For example, a node declared with `max_threads=2` can be raised to 5 during a test.
 API node values are cooperative fiber counts. They may be set into the thousands
-without one OS thread per job, and there is no workflow-wide aggregate API cap.
+without one OS thread per job. `mwf threads --api-total 500` sets a run-scoped aggregate API admission budget across API nodes; `reset` restores the default.
 Per-node overrides are scoped to the active or next run and are cleared when that
 run finishes. Process pools read overrides when created, while a direct runner
 always executes one job at a time.
@@ -394,7 +394,7 @@ paths are overwritten, while unrelated remote files are left alone. Review
 .env files, API keys, large node outputs, or local credentials.
 """,
     "resume": """
-Resume continues one node without erasing successful work. Before selecting any
+Resume continues the Hoeflein component selected by one node without erasing successful work. Before selecting any
 retries, it reconciles terminal `output.json` files for the selected Hoeflein
 component and waits for those SQLite updates to become durable. It then fences
 and requeues failed, cancelled, or genuinely stale-running jobs; already queued
@@ -474,14 +474,14 @@ process's mutation-writer queue, active batch, and durability backlog.
 
 Examples:
   mwf top
-  mwf top explodeclaim explodecontext
+  mwf top api_a api_b
   mwf top --once
   mwf top --once --json
 """,
     "monitor": """
-Monitor is a read-only live view over SQLite node/job summaries plus the
-low-churn `.mwf/run.json` ownership record. It is safe to run in another
-terminal because WAL readers do not claim the run slot or call node functions.
+Monitor displays SQLite node/job summaries plus the low-churn `.mwf/run.json`
+ownership record. It does not execute jobs or claim the run slot. Normal CLI
+bootstrap and router mounting may still update framework state.
 
 Examples:
   mwf monitor

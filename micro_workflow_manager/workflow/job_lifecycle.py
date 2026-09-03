@@ -11,6 +11,7 @@ from ..errors import (
     JobFailedError,
     JobRestartedError,
     JobTimeoutError,
+    safe_exception_repr,
 )
 from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
 from ..fibers import cancellation_scope, in_fiber_runtime
@@ -103,13 +104,11 @@ class JobLifecycleMixin:
                 self._job_context.generation = previous_generation
                 self._job_context.execution_id = previous_execution_id
 
-            stored_files = self.storage.store_returned_files(node_name, job_id, result)
             self.storage.write_output(
                 node_name,
                 job_id,
                 {
                     "status": DONE,
-                    "stored_files": stored_files,
                     "result_type": type(result).__name__,
                     "result_repr": repr(result),
                 },
@@ -135,7 +134,7 @@ class JobLifecycleMixin:
             self.storage.write_output(
                 node_name,
                 job_id,
-                {"status": FAILED, "error": repr(error)},
+                {"status": FAILED, "error": safe_exception_repr(error)},
             )
             self.storage.set_job_status(
                 node_name,
@@ -247,15 +246,11 @@ class JobLifecycleMixin:
                         node_name, job_id, generation, execution_id
                     ):
                         result = payload
-                        stored_files = self.storage.store_returned_files(
-                            node_name, job_id, result
-                        )
                         self.storage.write_output(
                             node_name,
                             job_id,
                             {
                                 "status": DONE,
-                                "stored_files": stored_files,
                                 "result_type": type(result).__name__,
                                 "result_repr": repr(result),
                                 "generation": generation,
@@ -284,7 +279,7 @@ class JobLifecycleMixin:
                             job_id,
                             {
                                 "status": FAILED,
-                                "error": repr(error),
+                                "error": safe_exception_repr(error),
                                 "generation": generation,
                             },
                         )

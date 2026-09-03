@@ -8,7 +8,14 @@ def plan_work(ctx, topic):
     items=["timeouts","idempotency","inspection"]
     OUTPUT.file(ctx,"plan.json").write_json(items,overwrite=True)
     record_provenance(ctx,OUTPUT,artifact="plan",inputs=topic,decisions={"decomposition":"three independent sections"},result=items)
-    with ctx.transaction():
-        for index,item in enumerate(items,1):
-            ctx.node("execute_work_item").add(autostart=True,index=index,item=item,topic=topic)
+    children=[
+        ({"index":index,"item":item,"topic":topic},f"plan-work:{ctx.job_id}:{index}")
+        for index,item in enumerate(items,1)
+    ]
+    for params,key in children:
+        ctx.node("execute_work_item").add(
+            **params,
+            autostart=True,
+            idempotency_key=key,
+        )
     return items

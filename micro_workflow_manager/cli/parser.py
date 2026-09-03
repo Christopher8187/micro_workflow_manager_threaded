@@ -7,7 +7,7 @@ from .constants import RUNNER_CHOICES
 from .descriptions import COMMAND_HELP_DESCRIPTIONS, HELP_EPILOG
 
 def add_destructive_arguments(command) -> None:
-    command.add_argument("--dry-run", action="store_true", help="Describe the destructive operation without changing state.")
+    command.add_argument("--dry-run", action="store_true", help="Describe the requested operation without applying it; normal CLI bootstrap and router mounting may still update framework state.")
     command.add_argument("--yes", action="store_true", help="Acknowledge the danger and skip the interactive typed confirmation.")
     add_keeptrace_argument(command)
 
@@ -48,16 +48,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional deployment.zip path. If omitted, mwf checks common local deployment archive locations.",
     )
 
-
     copy_cmd = commands.add_parser(
         "copy",
         help="Save one node folder into the sibling clipboard folder.",
+        description=COMMAND_HELP_DESCRIPTIONS["copy"],
     )
     copy_cmd.add_argument("node", help="Node folder name to copy into clipboard/<node>.")
-
     paste_cmd = commands.add_parser(
         "paste",
         help="Replace one node folder with its saved clipboard copy.",
+        description=COMMAND_HELP_DESCRIPTIONS["paste"],
     )
     paste_cmd.add_argument("node", help="Node folder name to restore from clipboard/<node>.")
 
@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     graph_cmd.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show graph/node-folder changes without writing .mwf or changing folders.",
+        help="Show graph/node-folder changes without applying them; normal CLI bootstrap may still migrate framework state.",
     )
     graph_cmd.add_argument(
         "--runner",
@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser(
         "doctor",
-        help="Run read-only project health checks.",
+        help="Check project health without executing jobs or applying repairs; normal CLI bootstrap may still migrate framework state.",
         description=COMMAND_HELP_DESCRIPTIONS["doctor"],
     )
 
@@ -126,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     trace_cmd.add_argument("node", help="Node name containing the job.")
     trace_cmd.add_argument("job_mode", choices=("job",), metavar="job", help="Literal job.")
     trace_cmd.add_argument("job_id", type=int, metavar="id", help="Job ID to trace.")
+    trace_cmd.add_argument("--errors", action="store_true", help="Show only job identity, ordered task failures, and terminal details.")
 
 
     filter_cmd = commands.add_parser(
@@ -216,7 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_cmd = commands.add_parser(
         "run",
-        help="Run one ready node, or selected jobs in that node.",
+        help="Run the ready Hoeflein component selected by one node, or selected jobs in a singleton node.",
         description=COMMAND_HELP_DESCRIPTIONS["run"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -256,13 +257,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume_cmd = commands.add_parser(
         "resume",
-        help="Continue one node without resetting done jobs.",
+        help="Continue the Hoeflein component selected by one node without resetting done jobs.",
         description=COMMAND_HELP_DESCRIPTIONS["resume"],
     )
-    resume_cmd.add_argument("node", help="Node name to resume.")
+    resume_cmd.add_argument("node", help="Node selecting the Hoeflein component to resume.")
     resume_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
     add_keeptrace_argument(resume_cmd)
-    resume_cmd.add_argument("--plan", action="store_true", help="Show the resume selection without changing or running anything.")
+    resume_cmd.add_argument("--plan", action="store_true", help="Show the resume selection without applying it or running tasks; normal CLI bootstrap and router mounting may still update framework state.")
     add_stats_arguments(resume_cmd)
 
 
@@ -342,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     runfrom_cmd = commands.add_parser(
         "runfrom",
-        help="Run a node and its descendants safely.",
+        help="Run a selected Hoeflein component and its quotient-DAG descendants safely.",
         description=COMMAND_HELP_DESCRIPTIONS["runfrom"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -371,7 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_keeptrace_argument(runfrom_cmd)
     resumefrom_cmd = commands.add_parser(
         "resumefrom",
-        help="Continue a node and descendants without resetting done jobs.",
+        help="Continue a selected Hoeflein component and its quotient-DAG descendants without resetting done jobs.",
         description=COMMAND_HELP_DESCRIPTIONS["resumefrom"],
     )
     resumefrom_cmd.add_argument("node", help="Start node for the resumed partial workflow.")
@@ -394,9 +395,9 @@ def build_parser() -> argparse.ArgumentParser:
     resumefrom_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
     add_keeptrace_argument(resumefrom_cmd)
 
-    run_cmd.add_argument("--plan", action="store_true", help="Show the run selection and reset effects without changing or running anything.")
-    runfrom_cmd.add_argument("--plan", action="store_true", help="Show the descendant run selection without changing or running anything.")
-    resumefrom_cmd.add_argument("--plan", action="store_true", help="Show the resumed descendant selection without changing or running anything.")
+    run_cmd.add_argument("--plan", action="store_true", help="Show run selection and reset effects without applying them or running tasks; normal CLI bootstrap and router mounting may still update framework state.")
+    runfrom_cmd.add_argument("--plan", action="store_true", help="Show descendant run selection without applying it or running tasks; normal CLI bootstrap and router mounting may still update framework state.")
+    resumefrom_cmd.add_argument("--plan", action="store_true", help="Show resumed descendant selection without applying it or running tasks; normal CLI bootstrap and router mounting may still update framework state.")
     add_stats_arguments(run_cmd)
     add_stats_arguments(runfrom_cmd)
     add_stats_arguments(resumefrom_cmd)

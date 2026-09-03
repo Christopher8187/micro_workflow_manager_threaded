@@ -5,7 +5,7 @@ This is the first example to copy for a new MWF 0.5.2 project. It demonstrates:
 - `runner="api"` nodes using the framework-owned pooled HTTP transport;
 - finite connect/read timeouts and deterministic offline behavior;
 - local JSON validation, retries, and named fallbacks;
-- transactional fan-out with stable idempotency keys;
+- precomputed cross-node fan-out with stable idempotency keys;
 - a durable file-based fan-in;
 - a bounded `{review_candidate, revise_candidate}` Hoeflein component; and
 - user-owned provenance beside every material result.

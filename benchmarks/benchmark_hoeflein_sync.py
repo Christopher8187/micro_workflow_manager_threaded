@@ -36,7 +36,7 @@ def args():
     return p.parse_args()
 
 
-def main():
+def main() -> int:
     a = args()
     root = Path(tempfile.mkdtemp(prefix="mwf-hoeflein-sync-"))
     workflow = MicroWorkflow(root, runner="threaded")
@@ -149,7 +149,8 @@ def main():
         "peak_explode_running": state["peak_r"],
         "error": error,
     }, sort_keys=True))
+    return 1 if error is not None else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

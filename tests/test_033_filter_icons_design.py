@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from micro_workflow_manager import cli
+from micro_workflow_manager.storage import FileStorage
 
 
 def _write_filter_project(root: Path) -> None:
@@ -61,6 +62,23 @@ def test_filter_command_reconstructs_funnel_and_stage_boundaries(
 
     assert cli.main(["run", "filter_numbers"]) == 1
     capsys.readouterr()
+
+    storage = FileStorage(tmp_path)
+    storage.append_job_event(
+        "filter_numbers",
+        5,
+        "retry_started",
+        task="filter_numbers",
+        attempt=2,
+        attempts=2,
+        previous_error="transition data must not win",
+    )
+    storage.write_output(
+        "filter_numbers",
+        10,
+        {"status": "failed", "error": "output data must not win"},
+    )
+
     assert cli.main(["filter", "filter_numbers"]) == 0
     output = capsys.readouterr().out
 
@@ -84,6 +102,7 @@ def test_filter_command_reconstructs_funnel_and_stage_boundaries(
     assert "6: ValueError('main rejected 6 on attempt 1')" in stage_one
     assert "7: ValueError('main rejected 7 on attempt 1')" in stage_one
     assert "8:" not in stage_one
+    assert "transition data must not win" not in stage_one
 
     assert cli.main(["filter", "filter_numbers", "stage", "4"]) == 0
     final_stage = capsys.readouterr().out
@@ -91,6 +110,7 @@ def test_filter_command_reconstructs_funnel_and_stage_boundaries(
     assert final_stage.rstrip().endswith(
         "10: ValueError('fallback rejected 10 on attempt 2')"
     )
+    assert "output data must not win" not in final_stage
 
     assert cli.main(["inspect", "filter_numbers", "filter"]) == 1
     assert "Use: mwf inspect" in capsys.readouterr().err
@@ -141,23 +161,43 @@ def test_init_gitignore_and_material_icons_cover_runtime_structure(
     assert folders["publish"] == "flow"
 
 
-def test_readme_links_design_and_requires_output_provenance():
+def test_readme_routes_documentation_and_requires_output_provenance():
     root = Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
-    design = (root / "DESIGN.md").read_text(encoding="utf-8")
-    assert "# micro-workflow-manager 0.6.0" in readme
-    assert "[DESIGN.md](DESIGN.md)" in readme
-    assert "provenance" in readme.lower()
-    assert "## Advice first" in design
-    assert "Prompt chaining" in design
-    assert "Database change manager" in design
-    assert "Pygame state machine" in design
-    agent = (root / "AGENT.md").read_text(encoding="utf-8")
-    assert "mwf run NODE --monitor" in agent
-    assert "Reduce concurrency first" in agent
-    assert "test-code freezing from framework freezing" in agent
-    assert "Repeat-use matrix" in agent
-    assert "STUBBORN_ISSUE.md" in agent
+    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+    task = (root / "docs" / "architecture" / "task.md").read_text(
+        encoding="utf-8"
+    )
+    assert "# micro-workflow-manager 0.6.1" in readme
+    for target in (
+        "CONTEXT.md",
+        "docs/architecture/graph.md",
+        "docs/architecture/node.md",
+        "docs/architecture/task.md",
+        "docs/operations.md",
+        "docs/installation.md",
+        "docs/testing.md",
+        "tests/README.md",
+        "benchmarks/README.md",
+        "docs/release-history.md",
+        "docs/plans/0.6.4.md",
+    ):
+        assert (root / target).is_file()
+        assert f"]({target})" in readme
+    for skill in (
+        "mwf-design-new-architecture",
+        "mwf-modify-architecture",
+        "mwf-analyze-architecture",
+        "mwf-test",
+        "mwf-document-workflow",
+    ):
+        assert (root / ".agents" / "skills" / skill / "SKILL.md").is_file()
+        assert f"`{skill}`" in agents
+    assert "## Durable result and output provenance" in task
+    assert "Every node has one framework output prefix" in task
+    assert "Project provenance" not in task
+    for legacy in ("AGENT.md", "DESIGN.md", "HOW_TO_TEST.md"):
+        assert not (root / legacy).exists()
 
 
 EXAMPLE_STARTS = {

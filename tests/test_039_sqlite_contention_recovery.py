@@ -173,7 +173,7 @@ def test_execution_fence_uses_filesystem_lock_not_sqlite_advisory_rows(tmp_path,
     generation, execution_id = storage.claim_job_execution(
         "merge", 1, started_at="2026-07-19T12:00:00"
     )
-    target = tmp_path / "node" / "merge" / "jobs" / "1" / "files" / "command.txt"
+    target = tmp_path / "node" / "merge" / "output" / "jobs" / "1" / "command.txt"
     storage.run_guarded_job_side_effect(
         "merge",
         1,
@@ -201,7 +201,7 @@ def test_repeated_api_rounds_release_worker_connections_and_do_not_slow_progress
     def merge(ctx, round_number):
         ctx.checkpoint("loading")
         ctx.checkpoint("preparing")
-        ctx.write("command.txt", f"{round_number}:{ctx.job_id}")
+        ctx.write_output(f"jobs/{ctx.job_id}/command.txt", f"{round_number}:{ctx.job_id}")
         ctx.checkpoint("writing")
         return ctx.job_id
 
@@ -247,7 +247,7 @@ def test_cli_repeated_merge_runs_with_threads_override_and_monitor(tmp_path, mon
             def run(ctx):
                 ctx.checkpoint("merge: loading section")
                 ctx.checkpoint("merge: preparing model decision")
-                ctx.write("command.txt", str(ctx.job_id))
+                ctx.write_output(f"jobs/{ctx.job_id}/command.txt", str(ctx.job_id))
                 ctx.checkpoint("merge: writing command")
                 return ctx.job_id
             """

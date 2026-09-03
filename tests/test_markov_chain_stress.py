@@ -77,7 +77,7 @@ def _write_project(tmp_path: Path, monkeypatch):
         def run(ctx, hop, deadline, root):
             deadline = next_deadline(deadline)
             root = root or ctx.job_id
-            ctx.write(f"A_{{ctx.job_id}}.txt", f"hop={{hop}} root={{root}}")
+            ctx.write_output(f"A_{{ctx.job_id}}.txt", f"hop={{hop}} root={{root}}")
             if still_open(deadline):
                 target = choose_target(ctx.job_id, hop)
                 ctx.node(target).add(autostart=True, hop=hop + 1, deadline=deadline, root=root)
@@ -106,7 +106,7 @@ def _write_project(tmp_path: Path, monkeypatch):
 
         @router.task
         def run(ctx, hop, deadline, root):
-            ctx.write(f"B_{ctx.job_id}.txt", f"hop={hop} root={root}")
+            ctx.write_output(f"B_{ctx.job_id}.txt", f"hop={hop} root={root}")
             if still_open(deadline):
                 target = choose_target(ctx.job_id, hop)
                 ctx.node(target).add(autostart=True, hop=hop + 1, deadline=deadline, root=root)
@@ -128,7 +128,7 @@ def _write_project(tmp_path: Path, monkeypatch):
         @router.task
         def run(ctx, hop, deadline, root):
             # Deterministic transition table for C: A = 1.0.
-            ctx.write(f"C_{ctx.job_id}.txt", f"hop={hop} root={root}")
+            ctx.write_output(f"C_{ctx.job_id}.txt", f"hop={hop} root={root}")
             if still_open(deadline):
                 ctx.node("A").add(autostart=True, hop=hop + 1, deadline=deadline, root=root)
             return hop
@@ -149,7 +149,7 @@ def _write_project(tmp_path: Path, monkeypatch):
         @router.task
         def run(ctx, hop, deadline, root):
             # Deterministic transition table for D: A = 1.0.
-            ctx.write(f"D_{ctx.job_id}.txt", f"hop={hop} root={root}")
+            ctx.write_output(f"D_{ctx.job_id}.txt", f"hop={hop} root={root}")
             if still_open(deadline):
                 ctx.node("A").add(autostart=True, hop=hop + 1, deadline=deadline, root=root)
             return hop

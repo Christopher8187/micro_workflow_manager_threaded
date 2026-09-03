@@ -19,12 +19,18 @@ def plan_request(ctx, request_id: str, question: str):
         decisions={"fan_out": branches},
         result=plan,
     )
-    with ctx.transaction():
-        for branch in branches:
-            ctx.node(branch).add(
-                autostart=True,
-                idempotency_key=f"{request_id}:{branch}",
-                request_id=request_id,
-                question=question,
-            )
+    child_specs = [
+        {
+            "node": branch,
+            "params": {"request_id": request_id, "question": question},
+            "idempotency_key": f"{request_id}:{branch}",
+        }
+        for branch in branches
+    ]
+    for child in child_specs:
+        ctx.node(child["node"]).add(
+            autostart=True,
+            idempotency_key=child["idempotency_key"],
+            **child["params"],
+        )
     return plan

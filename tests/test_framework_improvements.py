@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -161,7 +162,7 @@ def test_timeout_moves_to_fallback_and_blocks_late_context_write(tmp_path):
     @workflow.task("A", timeout=0.03)
     def slow(ctx):
         time.sleep(0.08)
-        ctx.write("late.txt", "must not commit")
+        ctx.write_output("late.txt", "must not commit")
         return "late"
 
     @workflow.fallback("A", name="quick")
@@ -175,7 +176,7 @@ def test_timeout_moves_to_fallback_and_blocks_late_context_write(tmp_path):
     job = workflow.start("A")
     assert workflow.run_job("A", job.job_id, ignore_readiness=True) == "fallback"
     time.sleep(0.1)
-    assert not (workflow.storage.files_dir("A", job.job_id) / "late.txt").exists()
+    assert not (tmp_path / "node" / "A" / "output" / "late.txt").exists()
     events = workflow.storage.read_job_events("A", job.job_id)
     assert any(event.get("event") == "timeout" for event in events)
     assert any(event.get("event") == "fallback_started" for event in events)
@@ -210,6 +211,433 @@ def test_all_failed_fallbacks_report_the_terminal_error(tmp_path):
     assert "primary validation error" not in output["error"]
 
 
+def test_initial_attempt_receives_empty_fresh_failure_history(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    observed = {}
+
+    @workflow.task("A")
+    def primary(ctx, errors):
+        ctx_errors = ctx.errors
+        assert ctx_errors == []
+        assert errors == []
+        assert ctx_errors is not errors
+
+        ctx_errors.append(ValueError("local ctx mutation"))
+        errors.append(ValueError("local parameter mutation"))
+        observed["fresh_ctx_errors"] = ctx.errors
+        return "ok"
+
+    job = workflow.start("A")
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == "ok"
+    assert observed["fresh_ctx_errors"] == []
+
+
+def test_main_retry_receives_ordered_failure_history(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    first_error = ValueError("first attempt failed")
+    attempts = []
+
+    @workflow.task("A", retries=1)
+    def primary(ctx, errors):
+        ctx_errors = ctx.errors
+        attempts.append(ctx.attempt)
+
+        if ctx.attempt == 1:
+            assert ctx.error is None
+            assert ctx_errors == errors == []
+            raise first_error
+
+        assert ctx.error is first_error
+        assert ctx_errors == [first_error]
+        assert errors == [first_error]
+        assert ctx_errors[0] is first_error
+        assert errors[0] is first_error
+        assert ctx_errors is not errors
+        return "recovered"
+
+    job = workflow.start("A")
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == "recovered"
+    assert attempts == [1, 2]
+
+
+def test_repeated_attempt_failure_enters_ordered_history(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    repeated_error = ValueError("second repetition failed")
+    observations = []
+
+    @workflow.task("A", repeats=2, retries=1)
+    def primary(ctx, errors):
+        ctx_errors = ctx.errors
+        observations.append((ctx.attempt, ctx.repeat_index))
+
+        if ctx.attempt == 1 and ctx.repeat_index == 1:
+            assert ctx.error is None
+            assert ctx_errors == errors == []
+            return "first repetition"
+
+        if ctx.attempt == 1 and ctx.repeat_index == 2:
+            assert ctx.error is None
+            assert ctx_errors == errors == []
+            raise repeated_error
+
+        assert ctx.error is repeated_error
+        assert ctx_errors == [repeated_error]
+        assert errors == [repeated_error]
+        assert ctx_errors[0] is repeated_error
+        assert errors[0] is repeated_error
+        assert ctx_errors is not errors
+        return f"recovered-{ctx.repeat_index}"
+
+    job = workflow.start("A")
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == [
+        "recovered-1",
+        "recovered-2",
+    ]
+    assert observations == [(1, 1), (1, 2), (2, 1), (2, 2)]
+
+
+def test_multiple_fallbacks_receive_ordered_failure_history(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    main_error = ValueError("main failed")
+    first_fallback_error = RuntimeError("first fallback failed")
+    calls = []
+
+    @workflow.task("A")
+    def primary(ctx, errors):
+        calls.append("main")
+        assert ctx.error is None
+        assert ctx.errors == errors == []
+        raise main_error
+
+    @workflow.fallback("A", name="first")
+    def first(ctx, errors):
+        ctx_errors = ctx.errors
+        calls.append("first")
+        assert ctx.error is main_error
+        assert ctx_errors == [main_error]
+        assert errors == [main_error]
+        assert ctx_errors[0] is main_error
+        assert errors[0] is main_error
+        assert ctx_errors is not errors
+        raise first_fallback_error
+
+    @workflow.fallback("A", name="second")
+    def second(ctx, errors):
+        ctx_errors = ctx.errors
+        calls.append("second")
+        assert ctx.error is first_fallback_error
+        assert ctx_errors == [main_error, first_fallback_error]
+        assert errors == [main_error, first_fallback_error]
+        assert ctx_errors[0] is main_error
+        assert ctx_errors[1] is first_fallback_error
+        assert errors[0] is main_error
+        assert errors[1] is first_fallback_error
+        assert ctx_errors is not errors
+        return "recovered"
+
+    job = workflow.start("A")
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == "recovered"
+    assert calls == ["main", "first", "second"]
+
+
+def test_fallback_retry_receives_ordered_failure_history(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    main_error = ValueError("main failed")
+    fallback_attempt_error = RuntimeError("fallback attempt failed")
+    observations = []
+
+    @workflow.task("A")
+    def primary(ctx, errors):
+        assert ctx.error is None
+        assert ctx.errors == errors == []
+        raise main_error
+
+    @workflow.fallback("A", name="retrying", retries=1)
+    def retrying(ctx, errors):
+        ctx_errors = ctx.errors
+        observations.append(
+            {
+                "attempt": ctx.attempt,
+                "error": ctx.error,
+                "ctx_errors": ctx_errors,
+                "errors": errors,
+                "same_list": ctx_errors is errors,
+            }
+        )
+        if ctx.attempt == 1:
+            raise fallback_attempt_error
+        return "recovered"
+
+    job = workflow.start("A")
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == "recovered"
+    assert [item["attempt"] for item in observations] == [1, 2]
+
+    first, second = observations
+    assert first["error"] is main_error
+    assert first["ctx_errors"] == [main_error]
+    assert first["errors"] == [main_error]
+    assert first["ctx_errors"][0] is main_error
+    assert first["errors"][0] is main_error
+    assert first["same_list"] is False
+
+    assert second["error"] is fallback_attempt_error
+    assert second["ctx_errors"] == [main_error, fallback_attempt_error]
+    assert second["errors"] == [main_error, fallback_attempt_error]
+    assert second["ctx_errors"][0] is main_error
+    assert second["ctx_errors"][1] is fallback_attempt_error
+    assert second["errors"][0] is main_error
+    assert second["errors"][1] is fallback_attempt_error
+    assert second["same_list"] is False
+
+
+def test_local_error_list_mutation_does_not_enter_failure_history(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    first_error = ValueError("first attempt failed")
+    second_error = RuntimeError("second attempt failed")
+    local_ctx_error = LookupError("local ctx mutation")
+    local_parameter_error = LookupError("local parameter mutation")
+    attempt_observations = []
+    fallback_observations = []
+
+    @workflow.task("A", retries=1)
+    def primary(ctx, errors):
+        ctx_errors = ctx.errors
+        attempt_observations.append(
+            {
+                "attempt": ctx.attempt,
+                "error": ctx.error,
+                "ctx_errors": ctx_errors,
+                "errors": errors,
+                "same_list": ctx_errors is errors,
+            }
+        )
+        if ctx.attempt == 1:
+            raise first_error
+
+        ctx_errors.append(local_ctx_error)
+        errors.append(local_parameter_error)
+        raise second_error
+
+    @workflow.fallback("A", name="recover")
+    def recover(ctx, errors):
+        ctx_errors = ctx.errors
+        fallback_observations.append(
+            {
+                "error": ctx.error,
+                "ctx_errors": ctx_errors,
+                "errors": errors,
+                "same_list": ctx_errors is errors,
+            }
+        )
+        return "recovered"
+
+    job = workflow.start("A")
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == "recovered"
+
+    first, second = attempt_observations
+    assert first["attempt"] == 1
+    assert first["error"] is None
+    assert first["ctx_errors"] == []
+    assert first["errors"] == []
+    assert first["same_list"] is False
+
+    assert second["attempt"] == 2
+    assert second["error"] is first_error
+    assert second["ctx_errors"] == [first_error, local_ctx_error]
+    assert second["errors"] == [first_error, local_parameter_error]
+    assert second["same_list"] is False
+
+    [fallback] = fallback_observations
+    assert fallback["error"] is second_error
+    assert fallback["ctx_errors"] == [first_error, second_error]
+    assert fallback["errors"] == [first_error, second_error]
+    assert fallback["ctx_errors"][0] is first_error
+    assert fallback["ctx_errors"][1] is second_error
+    assert fallback["errors"][0] is first_error
+    assert fallback["errors"][1] is second_error
+    assert local_ctx_error not in fallback["ctx_errors"]
+    assert local_parameter_error not in fallback["errors"]
+    assert fallback["same_list"] is False
+
+
+def test_failure_history_is_scoped_to_one_job_execution(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+    execution_number = 0
+    execution_errors = []
+    a_observations = []
+    b_observations = []
+
+    @workflow.task("A", retries=1)
+    def a(ctx, errors):
+        nonlocal execution_number
+        if ctx.attempt == 1:
+            execution_number += 1
+            execution_errors.append(ValueError(f"execution {execution_number} failed"))
+
+        current_error = execution_errors[-1]
+        ctx_errors = ctx.errors
+        a_observations.append(
+            (
+                execution_number,
+                ctx.attempt,
+                ctx.error,
+                ctx_errors,
+                errors,
+                ctx_errors is errors,
+            )
+        )
+        if ctx.attempt == 1:
+            raise current_error
+
+        ctx.node("B").add(source_execution=execution_number)
+        return execution_number
+
+    @workflow.task("B")
+    def b(ctx, errors, source_execution):
+        ctx_errors = ctx.errors
+        b_observations.append(
+            (
+                source_execution,
+                ctx.error,
+                ctx_errors,
+                errors,
+                ctx_errors is errors,
+            )
+        )
+        return source_execution
+
+    job = workflow.start("A")
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == 1
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == 2
+    assert workflow.storage.list_job_ids("B") == [1, 2]
+    assert workflow.run_job("B", 1, ignore_readiness=True) == 1
+    assert workflow.run_job("B", 2, ignore_readiness=True) == 2
+
+    assert [(item[0], item[1]) for item in a_observations] == [
+        (1, 1),
+        (1, 2),
+        (2, 1),
+        (2, 2),
+    ]
+    first_start, first_retry, second_start, second_retry = a_observations
+
+    for start in (first_start, second_start):
+        assert start[2] is None
+        assert start[3] == start[4] == []
+        assert start[5] is False
+
+    for retry, expected_error in zip(
+        (first_retry, second_retry), execution_errors, strict=True
+    ):
+        assert retry[2] is expected_error
+        assert retry[3] == retry[4] == [expected_error]
+        assert retry[3][0] is expected_error
+        assert retry[4][0] is expected_error
+        assert retry[5] is False
+
+    assert [item[0] for item in b_observations] == [1, 2]
+    for _, error, ctx_errors, errors, same_list in b_observations:
+        assert error is None
+        assert ctx_errors == errors == []
+        assert same_list is False
+
+
+def test_failed_task_attempts_record_ordered_durable_events(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    main_repeat_error = ValueError("main repetition failed")
+    main_retry_error = RuntimeError("main retry failed")
+    fallback_retry_error = LookupError("fallback retry failed")
+
+    @workflow.task("A", repeats=2, retries=1)
+    def primary(ctx):
+        if ctx.attempt == 1 and ctx.repeat_index == 1:
+            return "partial"
+        if ctx.attempt == 1:
+            raise main_repeat_error
+        raise main_retry_error
+
+    @workflow.fallback("A", name="recover", retries=1)
+    def recover(ctx):
+        if ctx.attempt == 1:
+            raise fallback_retry_error
+        return "recovered"
+
+    job = workflow.start("A")
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == "recovered"
+
+    events = workflow.storage.read_job_events("A", job.job_id)
+    failure_events = [event for event in events if event["event"] == "task_failed"]
+    assert [
+        (
+            event["task"],
+            event["task_role"],
+            event["attempt"],
+            event["repeat_index"],
+            event["error"],
+        )
+        for event in failure_events
+    ] == [
+        ("primary", "main", 1, 2, repr(main_repeat_error)),
+        ("primary", "main", 2, 1, repr(main_retry_error)),
+        ("recover", "fallback", 1, 1, repr(fallback_retry_error)),
+    ]
+
+    for event in failure_events:
+        assert isinstance(event["time"], str)
+        datetime.fromisoformat(event["time"])
+
+    relevant_events = [
+        event["event"]
+        for event in events
+        if event["event"] in {"task_failed", "retry_started", "fallback_started"}
+    ]
+    assert relevant_events == [
+        "task_failed",
+        "retry_started",
+        "task_failed",
+        "fallback_started",
+        "task_failed",
+        "retry_started",
+    ]
+
+
+def test_failed_task_event_survives_an_exception_with_broken_repr(tmp_path):
+    class BrokenReprError(Exception):
+        def __repr__(self):
+            raise RuntimeError("repr exploded")
+
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    workflow.active_job_restart_enabled = True
+    original_error = BrokenReprError("original handler failure")
+
+    @workflow.task("A")
+    def primary(ctx):
+        raise original_error
+
+    job = workflow.start("A")
+    with pytest.raises(Exception) as raised:
+        workflow.run_job("A", job.job_id, ignore_readiness=True)
+
+    assert raised.value.__cause__ is original_error
+    [failure] = [
+        event
+        for event in workflow.storage.read_job_events("A", job.job_id)
+        if event["event"] == "task_failed"
+    ]
+    assert failure["error"] == "BrokenReprError('original handler failure')"
+    output = workflow.storage.read_json(workflow.storage.output_file("A", job.job_id))
+    assert output["error"] == "BrokenReprError('original handler failure')"
+
+
 def test_context_sleep_and_cancellation_alias(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
     workflow.graph([("A", "B")])
@@ -228,52 +656,41 @@ def test_context_sleep_and_cancellation_alias(tmp_path):
     assert workflow.run_one("A") == "ok"
 
 
-def test_transaction_stages_jobs_and_idempotency_prevents_duplicates(tmp_path):
+def test_job_context_has_no_public_transaction_helper():
+    from micro_workflow_manager.context import JobContext
+
+    assert not hasattr(JobContext, "transaction")
+
+
+def test_explicit_cross_node_idempotency_keys_reuse_precomputed_children(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
-    workflow.graph([("A", "B")])
+    workflow.graph([("A", "B"), ("A", "C")])
 
     @workflow.task("A")
     def a(ctx):
-        with ctx.transaction():
-            first = ctx.node("B").add(value=1)
-            second = ctx.node("B").add(value=2)
-            assert not first.committed
-            assert not second.committed
-        assert first.committed and second.committed
-        return [first.job_id, second.job_id]
+        children = [
+            ("B", {"value": 1}, "a-to-b:1"),
+            ("C", {"value": 2}, "a-to-c:2"),
+        ]
+        return [
+            ctx.node(node).add(idempotency_key=key, **params).job_id
+            for node, params, key in children
+        ]
 
     @workflow.task("B")
     def b(ctx, value):
         return value
 
-    first_parent = workflow.start("A")
-    assert workflow.run_job("A", first_parent.job_id, ignore_readiness=True) == [1, 2]
-    assert workflow.storage.list_job_ids("B") == [1, 2]
-
-    # A resume/restart generation must reuse the same deterministic transaction
-    # keys, including jobs committed before a previous attempt failed.
-    workflow.storage.request_job_restart("A", first_parent.job_id, reason="test resume")
-    assert workflow.run_job("A", first_parent.job_id, ignore_readiness=True) == [1, 2]
-    assert workflow.storage.list_job_ids("B") == [1, 2]
-
-
-def test_transaction_aborts_before_creating_downstream_jobs(tmp_path):
-    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
-    workflow.graph([("A", "B")])
-
-    @workflow.task("A")
-    def a(ctx):
-        with ctx.transaction():
-            ctx.node("B").add(value=1)
-            raise ValueError("stop")
-
-    @workflow.task("B")
-    def b(ctx, value):
+    @workflow.task("C")
+    def c(ctx, value):
         return value
 
-    with pytest.raises(Exception):
-        workflow.run_one("A")
-    assert workflow.storage.list_job_ids("B") == []
+    parent = workflow.start("A")
+    assert workflow.run_job("A", parent.job_id, ignore_readiness=True) == [1, 1]
+    workflow.storage.request_job_restart("A", parent.job_id, reason="repeat parent")
+    assert workflow.run_job("A", parent.job_id, ignore_readiness=True) == [1, 1]
+    assert workflow.storage.list_job_ids("B") == [1]
+    assert workflow.storage.list_job_ids("C") == [1]
 
 
 def test_resumefrom_preserves_done_jobs_and_continues_failed_descendant(tmp_path, monkeypatch, capsys):
@@ -406,7 +823,7 @@ def test_active_run_state_contains_ownership_and_heartbeat(tmp_path, monkeypatch
     assert state["hostname"]
     assert state["pid"] > 0
     assert state["heartbeat_at"]
-    assert state["mwf_version"] == "0.6.0"
+    assert state["mwf_version"] == "0.6.1"
     assert state["status"] == "done"
 
 
@@ -451,7 +868,9 @@ def test_runfrom_plan_is_read_only(tmp_path, monkeypatch, capsys):
     assert cli.main(["runfrom", "A", "--plan"]) == 0
     out = capsys.readouterr().out
     assert "Plan for: mwf runfrom A" in out
-    assert "no state, jobs, inputs, outputs, or node folders were changed" in out
+    assert "planned runfrom was not applied" in out
+    assert "bootstrap and router mounting may already have updated framework state" in out
+    assert "no state, jobs, inputs, outputs, or node folders were changed" not in out
     assert config_path.read_bytes() == config_before
     assert storage.list_job_ids("A") == jobs_before
     assert storage.read_job_status_data("A", 1) == status_before
@@ -469,6 +888,9 @@ def test_graph_update_dry_run_does_not_add_or_delete_nodes(tmp_path, monkeypatch
     out = capsys.readouterr().out
     assert "nodes to add: C" in out
     assert "nodes to delete: B" in out
+    assert "graph synchronization was not applied" in out
+    assert "normal CLI bootstrap may already have migrated framework state" in out
+    assert "no configuration or node folders were changed" not in out
     assert (tmp_path / ".mwf" / "project.json").read_bytes() == config_before
     assert (tmp_path / "node" / "B").is_dir()
     assert not (tmp_path / "node" / "C").exists()
@@ -515,8 +937,13 @@ def test_cleanup_and_recover_dry_runs_do_not_mutate(tmp_path, monkeypatch, capsy
 
 def test_every_describe_page_extends_help_with_abstract_examples(capsys):
     from micro_workflow_manager.cli.constants import COMMAND_NAMES
+    from micro_workflow_manager.cli.descriptions import (
+        COMMAND_DESCRIPTIONS,
+        COMMAND_HELP_DESCRIPTIONS,
+    )
 
     forbidden = ("explode", "tagify", "attachfragment", "preexplode", "ocr_pages", "zoning")
+    assert set(COMMAND_NAMES) == set(COMMAND_HELP_DESCRIPTIONS) == set(COMMAND_DESCRIPTIONS)
     for command in COMMAND_NAMES:
         assert cli.main(["--describe", command]) == 0
         text = capsys.readouterr().out
@@ -526,6 +953,57 @@ def test_every_describe_page_extends_help_with_abstract_examples(capsys):
         lowered = text.lower()
         for term in forbidden:
             assert term not in lowered
+
+
+def test_execution_help_names_component_selection_and_descendants(capsys):
+    expected = {
+        "run": "Hoeflein component",
+        "resume": "Hoeflein component",
+        "runfrom": "quotient-DAG descendants",
+        "resumefrom": "quotient-DAG descendants",
+    }
+    for command, phrase in expected.items():
+        with pytest.raises(SystemExit) as exit_info:
+            cli.main([command, "--help"])
+        assert exit_info.value.code == 0
+        assert phrase in capsys.readouterr().out
+
+
+def test_threads_help_describes_api_total_as_an_aggregate_budget(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["threads", "--help"])
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "aggregate API admission budget" in output
+    assert "no aggregate framework cap" not in output
+
+    assert cli.main(["--describe", "threads"]) == 0
+    description = capsys.readouterr().out
+    assert "aggregate API admission budget" in description
+    assert "no workflow-wide aggregate API cap" not in description
+
+
+def test_preview_and_observer_help_scopes_bootstrap_effects(capsys):
+    for command in ("graph", "doctor", "run", "resume", "runfrom", "resumefrom"):
+        with pytest.raises(SystemExit) as exit_info:
+            cli.main([command, "--help"])
+        assert exit_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "bootstrap" in output.lower()
+
+    assert cli.main(["--describe", "run"]) == 0
+    run_description = capsys.readouterr().out
+    normalized_run = " ".join(run_description.split())
+    assert "preservation of unselected jobs" in normalized_run
+    assert "do not yet establish descendant or component-circulation isolation" in normalized_run
+    assert "bootstrap" in run_description.lower()
+    assert "no-write" not in run_description
+
+    assert cli.main(["--describe", "monitor"]) == 0
+    monitor_description = capsys.readouterr().out
+    assert "does not execute jobs or claim the run slot" in monitor_description
+    assert "bootstrap" in monitor_description.lower()
+    assert "read-only live view" not in monitor_description
 
 
 def test_checkpoint_watchdog_refreshes_at_each_progress_checkpoint(tmp_path):
@@ -565,7 +1043,7 @@ def test_checkpoint_watchdog_fails_stalled_section_and_blocks_late_write(tmp_pat
     def a(ctx):
         ctx.checkpoint("waiting for service", progress=0.25)
         time.sleep(0.08)
-        ctx.write("late.txt", "must be fenced")
+        ctx.write_output("late.txt", "must be fenced")
         return "late"
 
     @workflow.fallback("A", name="quick")
@@ -578,7 +1056,7 @@ def test_checkpoint_watchdog_fails_stalled_section_and_blocks_late_write(tmp_pat
 
     assert workflow.run_one("A") == "fallback"
     time.sleep(0.1)
-    assert not (workflow.storage.files_dir("A", 1) / "late.txt").exists()
+    assert not (tmp_path / "node" / "A" / "output" / "late.txt").exists()
     runtime = workflow.storage.read_job_runtime("A", 1)
     assert runtime["state"] == "timed_out"
     assert runtime["timeout_kind"] == "checkpoint"
@@ -753,7 +1231,7 @@ router.create_job(number=1)
 def run(ctx):
     ctx.checkpoint("remote wait", progress=0.2)
     time.sleep(0.15)
-    ctx.write("late.txt", "bad")
+    ctx.write_output("late.txt", "bad")
     return "late"
 @router.fallback(name="quick")
 def quick(ctx, error=None):
@@ -778,7 +1256,7 @@ def run(ctx):
     capsys.readouterr()
     output = json.loads((tmp_path / "node" / "A" / "jobs" / "1" / "output.json").read_text())
     assert output["result_repr"] == "'fallback'"
-    assert not (tmp_path / "node" / "A" / "jobs" / "1" / "files" / "late.txt").exists()
+    assert not (tmp_path / "node" / "A" / "output" / "late.txt").exists()
     events = FileStorage(tmp_path).read_job_events("A", 1)
     assert any(
         event.get("event") == "timeout" and event.get("timeout_kind") == "checkpoint"

@@ -163,7 +163,7 @@ class JobNode:
 
             allowed.add(name)
 
-            if param.default is Parameter.empty:
+            if param.default is Parameter.empty and name != "errors":
                 required.add(name)
 
         return allowed, required

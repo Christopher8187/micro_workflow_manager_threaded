@@ -51,12 +51,6 @@ class NodeFileStorageMixin:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def files_dir(self, node_name: str, job_id: int) -> Path:
-        job_id = self.validate_job_id(job_id)
-        path = self.jobs_dir(node_name) / str(job_id) / "files"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
     def debug_file(self, node_name: str) -> Path:
         return self.node_output_dir(node_name) / "debug.txt"
 

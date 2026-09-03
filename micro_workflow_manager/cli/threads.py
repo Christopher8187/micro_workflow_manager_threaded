@@ -315,7 +315,8 @@ def threads_cli(argv: list[str]) -> int:
         prog="mwf threads",
         description=(
             "View or change run-scoped concurrency controls. Per-node API values are "
-            "cooperative fiber counts; --api-total adds a proportional workflow budget."
+            "cooperative fiber counts; --api-total sets an aggregate API admission budget "
+            "allocated proportionally across running API nodes."
         ),
     )
     parser.add_argument(
@@ -331,7 +332,7 @@ def threads_cli(argv: list[str]) -> int:
     parser.add_argument(
         "--api-total",
         metavar="VALUE",
-        help="Set the aggregate API admission budget, or use reset/default/clear.",
+        help="Set the aggregate API admission budget allocated across running API nodes, or use reset/default/clear.",
     )
     parser.add_argument(
         "--update",

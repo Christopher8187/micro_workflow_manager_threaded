@@ -3,7 +3,9 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
-from micro_workflow_manager import cli
+import pytest
+
+from micro_workflow_manager import MicroWorkflow, NodeRouter, cli
 from micro_workflow_manager.cli.project import load_workflow
 from micro_workflow_manager.storage import FileStorage
 
@@ -51,7 +53,7 @@ def test_hoeflein_component_refuses_until_external_predecessor_is_done(tmp_path,
                 router = NodeRouter("C")
                 @router.task
                 def run(ctx, source, depth):
-                    ctx.write(f"{source}_{ctx.job_id}.txt", source)
+                    ctx.write_output(f"{source}_{ctx.job_id}.txt", source)
                     if source == "from-B" and depth == 0:
                         # This ordinary edge is internal to {B,C}, so MWF
                         # upgrades it to component-autostart automatically.
@@ -114,7 +116,7 @@ def test_runfrom_preserves_jobs_from_unselected_producer_component(tmp_path, mon
                 router = NodeRouter("C")
                 @router.task
                 def run(ctx, label):
-                    ctx.write(f"{label}.txt", label)
+                    ctx.write_output(f"{label}.txt", label)
                     return label
             ''',
         },
@@ -173,3 +175,33 @@ def test_one_job_failure_marks_whole_hoeflein_component_failed(tmp_path, monkeyp
     storage = FileStorage(tmp_path)
     assert storage.get_node_status("A") == "failed"
     assert storage.get_node_status("B") == "failed"
+
+
+def test_quiescence_join_surfaces_late_node_worker_failure(tmp_path, monkeypatch):
+    workflow = MicroWorkflow(tmp_path, runner="threaded")
+    workflow.graph([("A", "B"), ("B", "A")])
+    routers = []
+    for node_name in ("A", "B"):
+        router = NodeRouter(node_name, runner="threaded")
+        router.task(lambda ctx: None)
+        workflow.include_router(router)
+        routers.append(router)
+    workflow.add_job(None, "A")
+
+    def finish_after_quiescence(node_name, _ignore_readiness, **kwargs):
+        kwargs["_live_ready_event"].set()
+        assert kwargs["_live_start_event"].wait(1)
+        if node_name == "A":
+            workflow.storage.set_job_status("A", 1, "done")
+        assert kwargs["_stop_event"].wait(1)
+        if node_name == "A":
+            raise RuntimeError("late worker failure")
+        return []
+
+    monkeypatch.setattr(workflow, "run_queued_node_jobs", finish_after_quiescence)
+
+    with pytest.raises(RuntimeError, match="late worker failure"):
+        workflow.run_component({"A", "B"}, ignore_readiness=True)
+
+    assert workflow.storage.get_node_status("A") == "failed"
+    assert workflow.storage.get_node_status("B") == "failed"

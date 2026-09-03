@@ -99,7 +99,7 @@ def _run_job_in_initialized_process(node_name: str, job_id: int):
     except Exception as error:
         raise TypeError(
             "Process runner job results must be pickleable. "
-            "The job output files and output.json were already written, but the "
+            "The job output.json record was already written, but the "
             "Python return value could not be sent back to the parent process. "
             "Return a JSON-like value, string, number, list, dict, or Path instead."
         ) from error

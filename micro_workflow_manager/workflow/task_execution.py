@@ -11,6 +11,7 @@ from ..errors import (
     JobFailedError,
     JobRestartedError,
     JobTimeoutError,
+    safe_exception_repr,
 )
 from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
 from ..fibers import cancellation_scope, in_fiber_runtime
@@ -153,6 +154,7 @@ class MountedTaskExecutionMixin:
     ):
         node = self.nodes[job.node_name]
         assert node.main_task is not None
+        failure_history: list[Exception] = []
 
         try:
             return self.execute_mounted_task(
@@ -162,6 +164,7 @@ class MountedTaskExecutionMixin:
                 execution_id=execution_id,
                 task_role="main",
                 first_task_started_pre_recorded=first_task_started_pre_recorded,
+                failure_history=failure_history,
             )
 
         except JobRestartedError:
@@ -181,6 +184,7 @@ class MountedTaskExecutionMixin:
 
             for fallback_name in node.fallback_order:
                 fallback = node.fallbacks[fallback_name]
+                previous_error = failure_history[-1]
 
                 self.storage.write_debug(
                     job.node_name,
@@ -191,14 +195,15 @@ class MountedTaskExecutionMixin:
                     job.job_id,
                     "fallback_started",
                     fallback=fallback_name,
-                    previous_error=repr(main_error),
+                    previous_error=safe_exception_repr(main_error),
                 )
 
                 try:
                     return self.execute_mounted_task(
                         job,
                         fallback,
-                        previous_error=main_error,
+                        previous_error=previous_error,
+                        failure_history=failure_history,
                         execution_generation=execution_generation,
                         execution_id=execution_id,
                         task_role="fallback",
@@ -228,6 +233,7 @@ class MountedTaskExecutionMixin:
         job: Job,
         mounted,
         previous_error: Exception | None = None,
+        failure_history: list[Exception] | None = None,
         *,
         execution_generation: int,
         execution_id: str | None,
@@ -236,6 +242,8 @@ class MountedTaskExecutionMixin:
     ):
         attempts = mounted.retries + 1
         all_results = []
+        if failure_history is None:
+            failure_history = []
 
         for attempt in range(1, attempts + 1):
             try:
@@ -254,6 +262,8 @@ class MountedTaskExecutionMixin:
 
                     if "error" in mounted.allowed_params:
                         params["error"] = previous_error
+                    if "errors" in mounted.allowed_params:
+                        params["errors"] = list(failure_history)
 
                     missing = mounted.required_params - set(params)
                     if missing:
@@ -280,7 +290,7 @@ class MountedTaskExecutionMixin:
                             attempt=attempt,
                             repeat_index=repeat_index,
                             previous_error=(
-                                repr(previous_error)
+                                safe_exception_repr(previous_error)
                                 if previous_error is not None
                                 else None
                             ),
@@ -310,6 +320,7 @@ class MountedTaskExecutionMixin:
                         attempt=attempt,
                         repeat_index=repeat_index,
                         error=previous_error,
+                        errors=failure_history,
                         execution_generation=execution_generation,
                         execution_id=execution_id,
                         cancellation_event=cancellation_event,
@@ -332,6 +343,18 @@ class MountedTaskExecutionMixin:
             except JobRestartedError:
                 raise
             except Exception as error:
+                self.storage.append_job_event(
+                    job.node_name,
+                    job.job_id,
+                    "task_failed",
+                    task=mounted.name,
+                    task_role=task_role,
+                    attempt=attempt,
+                    repeat_index=repeat_index,
+                    error=safe_exception_repr(error),
+                )
+                failure_history.append(error)
+                previous_error = error
                 if attempt < attempts:
                     self.check_job_execution(
                         job.node_name,
@@ -351,7 +374,7 @@ class MountedTaskExecutionMixin:
                         task=mounted.name,
                         attempt=attempt + 1,
                         attempts=attempts,
-                        previous_error=repr(error),
+                        previous_error=safe_exception_repr(error),
                     )
                     continue
 

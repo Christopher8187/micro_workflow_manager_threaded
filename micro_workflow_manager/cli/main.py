@@ -134,7 +134,12 @@ def main(argv: list[str] | None = None) -> int:
             require_node(workflow, node)
             if args.job_mode != "job" or args.job_id < 1:
                 raise RuntimeError("Use: mwf trace <node> job <id>")
-            return trace_command(workflow, node, args.job_id)
+            return trace_command(
+                workflow,
+                node,
+                args.job_id,
+                errors_only=args.errors,
+            )
 
 
         if args.command == "filter":

@@ -113,10 +113,14 @@ def _filter_analysis(workflow, node: str) -> dict[str, Any]:
     entered: list[set[int]] = [set() for _ in stages]
     latest_stage: dict[int, int] = {}
     statuses: dict[int, str] = {}
-    transition_errors: dict[tuple[int, int], str] = {}
+    failure_errors: dict[tuple[int, int], str] = {}
 
-    lookup = {
-        (stage["kind"], stage["attempt"]): index
+    failure_lookup = {
+        (
+            "main" if stage["kind"] == "main" else "fallback",
+            stage["task"],
+            stage["attempt"],
+        ): index
         for index, stage in enumerate(stages)
     }
 
@@ -131,25 +135,21 @@ def _filter_analysis(workflow, node: str) -> dict[str, Any]:
             entered[index].add(job_id)
         latest_stage[job_id] = max(indexes)
 
-        current_kind = "main"
         for event in events[1:]:
-            event_name = event.get("event")
-            target_index = None
-            if event_name == "fallback_started":
-                fallback_name = event.get("fallback")
-                if isinstance(fallback_name, str):
-                    current_kind = fallback_name
-                    target_index = lookup.get((current_kind, 1))
-            elif event_name == "retry_started":
-                try:
-                    attempt = int(event.get("attempt"))
-                except (TypeError, ValueError):
-                    continue
-                target_index = lookup.get((current_kind, attempt))
-            if target_index is not None and target_index > 0:
-                previous_error = event.get("previous_error")
-                if previous_error:
-                    transition_errors[(job_id, target_index - 1)] = str(previous_error)
+            if event.get("event") != "task_failed":
+                continue
+            role = event.get("task_role")
+            task = event.get("task")
+            if not isinstance(role, str) or not isinstance(task, str):
+                continue
+            try:
+                attempt = int(event.get("attempt"))
+            except (TypeError, ValueError):
+                continue
+            stage_index = failure_lookup.get((role, task, attempt))
+            error = event.get("error")
+            if stage_index is not None and error:
+                failure_errors[(job_id, stage_index)] = str(error)
 
     return {
         "stages": stages,
@@ -157,7 +157,7 @@ def _filter_analysis(workflow, node: str) -> dict[str, Any]:
         "entered": entered,
         "latest_stage": latest_stage,
         "statuses": statuses,
-        "transition_errors": transition_errors,
+        "failure_errors": failure_errors,
     }
 
 
@@ -179,6 +179,7 @@ def inspect_filter(workflow, node: str, *, stage_number: int | None = None) -> i
     entered = analysis["entered"]
     latest_stage = analysis["latest_stage"]
     statuses = analysis["statuses"]
+    failure_errors = analysis["failure_errors"]
 
     if stage_number is not None:
         if not stages:
@@ -202,7 +203,10 @@ def inspect_filter(workflow, node: str, *, stage_number: int | None = None) -> i
                 print("  (none)")
                 return 0
             for job_id in selected:
-                print(f"  {job_id}: {_job_terminal_error(workflow, node, job_id)}")
+                error = failure_errors.get((job_id, index))
+                if error is None:
+                    error = _job_terminal_error(workflow, node, job_id)
+                print(f"  {job_id}: {_one_line(error)}")
             return 0
 
         selected = sorted(
@@ -214,9 +218,8 @@ def inspect_filter(workflow, node: str, *, stage_number: int | None = None) -> i
         if not selected:
             print("  (none)")
             return 0
-        transition_errors = analysis["transition_errors"]
         for job_id in selected:
-            error = transition_errors.get((job_id, index), "(error not recorded)")
+            error = failure_errors.get((job_id, index), "(error not recorded)")
             print(f"  {job_id}: {_one_line(error)}")
         return 0
 

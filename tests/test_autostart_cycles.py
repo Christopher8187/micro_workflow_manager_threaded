@@ -34,7 +34,7 @@ EDGES = [
 
             @router.task
             def run(ctx, kind, depth, trace):
-                ctx.write(f"A_{ctx.job_id}.txt", trace)
+                ctx.write_output(f"A_{ctx.job_id}.txt", trace)
                 ctx.node("D").add(from_a_job=ctx.job_id, kind=kind, depth=depth, trace=trace)
                 if kind == "seed":
                     ctx.node("A").add(autostart=True, kind="self", depth=depth + 1, trace=f"{trace}->A")
@@ -54,7 +54,7 @@ EDGES = [
 
             @router.task
             def run(ctx, depth, trace):
-                ctx.write(f"B_{ctx.job_id}.txt", trace)
+                ctx.write_output(f"B_{ctx.job_id}.txt", trace)
                 ctx.node("A").add(autostart=True, kind="from_B", depth=depth + 1, trace=f"{trace}->A")
                 return trace
             """
@@ -70,7 +70,7 @@ EDGES = [
 
             @router.task
             def run(ctx, depth, trace):
-                ctx.write(f"C_{ctx.job_id}.txt", trace)
+                ctx.write_output(f"C_{ctx.job_id}.txt", trace)
                 ctx.node("A").add(autostart=True, kind="from_C", depth=depth + 1, trace=f"{trace}->A")
                 return trace
             """
@@ -86,7 +86,7 @@ EDGES = [
 
             @router.task
             def run(ctx, from_a_job, kind, depth, trace):
-                ctx.write(f"D_{ctx.job_id}.txt", trace)
+                ctx.write_output(f"D_{ctx.job_id}.txt", trace)
                 return trace
             """
         ).strip(),
@@ -169,7 +169,7 @@ def test_threaded_diamond_cycle_spawns_100_seed_jobs_without_deadlock(tmp_path, 
                 def run(ctx, depth):
                     rng = random.Random(f"A-{ctx.job_id}-{depth}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"A_{ctx.job_id}.txt", str(depth))
+                    ctx.write_output(f"A_{ctx.job_id}.txt", str(depth))
                     if depth == 0:
                         ctx.node("B").add(autostart=True, depth=1)
                         ctx.node("C").add(autostart=True, depth=1)
@@ -186,7 +186,7 @@ def test_threaded_diamond_cycle_spawns_100_seed_jobs_without_deadlock(tmp_path, 
                 def run(ctx, depth):
                     rng = random.Random(f"B-{ctx.job_id}-{depth}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"B_{ctx.job_id}.txt", str(depth))
+                    ctx.write_output(f"B_{ctx.job_id}.txt", str(depth))
                     if depth == 1:
                         ctx.node("A").add(autostart=True, depth=2)
                     return depth
@@ -202,7 +202,7 @@ def test_threaded_diamond_cycle_spawns_100_seed_jobs_without_deadlock(tmp_path, 
                 def run(ctx, depth):
                     rng = random.Random(f"C-{ctx.job_id}-{depth}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"C_{ctx.job_id}.txt", str(depth))
+                    ctx.write_output(f"C_{ctx.job_id}.txt", str(depth))
                     if depth == 1:
                         ctx.node("A").add(autostart=True, depth=2)
                     return depth
@@ -241,7 +241,7 @@ def test_threaded_ring_cycle_spawns_100_seed_jobs_without_deadlock(tmp_path, mon
                 def run(ctx, depth):
                     rng = random.Random(f"A-{ctx.job_id}-{depth}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"A_{ctx.job_id}.txt", str(depth))
+                    ctx.write_output(f"A_{ctx.job_id}.txt", str(depth))
                     if depth == 0:
                         ctx.node("B").add(autostart=True, depth=1)
                     return depth
@@ -257,7 +257,7 @@ def test_threaded_ring_cycle_spawns_100_seed_jobs_without_deadlock(tmp_path, mon
                 def run(ctx, depth):
                     rng = random.Random(f"B-{ctx.job_id}-{depth}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"B_{ctx.job_id}.txt", str(depth))
+                    ctx.write_output(f"B_{ctx.job_id}.txt", str(depth))
                     if depth == 1:
                         ctx.node("C").add(autostart=True, depth=2)
                     return depth
@@ -273,7 +273,7 @@ def test_threaded_ring_cycle_spawns_100_seed_jobs_without_deadlock(tmp_path, mon
                 def run(ctx, depth):
                     rng = random.Random(f"C-{ctx.job_id}-{depth}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"C_{ctx.job_id}.txt", str(depth))
+                    ctx.write_output(f"C_{ctx.job_id}.txt", str(depth))
                     if depth == 2:
                         ctx.node("A").add(autostart=True, depth=3)
                     return depth
@@ -315,7 +315,7 @@ def test_threaded_stochastic_game_engine_spawn_cycle_finishes(tmp_path, monkeypa
                 def run(ctx, depth, seed):
                     rng = random.Random(f"A-{ctx.job_id}-{depth}-{seed}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"A_{ctx.job_id}.txt", f"{depth}:{seed}")
+                    ctx.write_output(f"A_{ctx.job_id}.txt", f"{depth}:{seed}")
                     if depth < 3:
                         for target in ["B", "C", "D"]:
                             if rng.random() < 0.10:
@@ -333,7 +333,7 @@ def test_threaded_stochastic_game_engine_spawn_cycle_finishes(tmp_path, monkeypa
                 def run(ctx, depth, seed):
                     rng = random.Random(f"B-{ctx.job_id}-{depth}-{seed}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"B_{ctx.job_id}.txt", f"{depth}:{seed}")
+                    ctx.write_output(f"B_{ctx.job_id}.txt", f"{depth}:{seed}")
                     if depth < 3 and rng.random() < 0.20:
                         ctx.node("A").add(autostart=True, depth=depth + 1, seed=f"{seed}->A")
                     return depth
@@ -349,7 +349,7 @@ def test_threaded_stochastic_game_engine_spawn_cycle_finishes(tmp_path, monkeypa
                 def run(ctx, depth, seed):
                     rng = random.Random(f"C-{ctx.job_id}-{depth}-{seed}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"C_{ctx.job_id}.txt", f"{depth}:{seed}")
+                    ctx.write_output(f"C_{ctx.job_id}.txt", f"{depth}:{seed}")
                     if depth < 3 and rng.random() < 0.20:
                         ctx.node("A").add(autostart=True, depth=depth + 1, seed=f"{seed}->A")
                     return depth
@@ -365,7 +365,7 @@ def test_threaded_stochastic_game_engine_spawn_cycle_finishes(tmp_path, monkeypa
                 def run(ctx, depth, seed):
                     rng = random.Random(f"D-{ctx.job_id}-{depth}-{seed}")
                     time.sleep(rng.random() * 0.002)
-                    ctx.write(f"D_{ctx.job_id}.txt", f"{depth}:{seed}")
+                    ctx.write_output(f"D_{ctx.job_id}.txt", f"{depth}:{seed}")
                     if depth < 3 and rng.random() < 0.20:
                         ctx.node("A").add(autostart=True, depth=depth + 1, seed=f"{seed}->A")
                     return depth

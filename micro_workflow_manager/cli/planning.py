@@ -106,5 +106,5 @@ def print_run_plan(
         external = direct_incomplete_inputs(workflow, set(nodes)) - blockers
         print("  incomplete external inputs on descendants: " + (", ".join(sorted(external)) if external else "(none; partial branches are otherwise preserved)"))
     print("  dynamic downstream jobs: determined when task functions run")
-    print("  no state, jobs, inputs, outputs, or node folders were changed")
+    print(f"  planned {command} was not applied; bootstrap and router mounting may already have updated framework state")
     return 0

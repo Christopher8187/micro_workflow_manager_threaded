@@ -121,7 +121,7 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
     lines.append("")
     lines.append("ETA is a rough estimate from completed job durations; it is unknown until at least one job has finished.")
     lines.append("threads marked with * use a runtime override from 'mwf threads'.")
-    lines.append("API max_threads values are cooperative fiber counts; there is no workflow-wide aggregate API cap.")
+    lines.append("API max_threads values are cooperative fiber counts; 'mwf threads --api-total' sets an optional run-scoped aggregate budget.")
     return "\n".join(lines)
 
 def print_snapshot(workflow, nodes: list[str] | None = None, *, json_output: bool = False):

@@ -9,6 +9,8 @@ from threading import Event
 import httpx
 import pytest
 
+import micro_workflow_manager.workflow.supervisor_attempts as supervisor_attempts_module
+
 from micro_workflow_manager import MicroWorkflow
 from micro_workflow_manager.networking import (
     close_shared_http_transport,
@@ -75,7 +77,10 @@ def test_framework_http_wait_suspends_checkpoint_watchdog(tmp_path):
     assert workflow.storage.job_status_counts("A").get("done") == 1
 
 
-def test_external_wait_replay_renews_same_per_attempt_transport_lease(tmp_path):
+def test_external_wait_replay_renews_same_per_attempt_transport_lease(
+    tmp_path,
+    monkeypatch,
+):
     workflow = MicroWorkflow(tmp_path, runner="api")
     workflow.graph([])
     watch = workflow.scheduler_supervisor.create_attempt(
@@ -99,6 +104,11 @@ def test_external_wait_replay_renews_same_per_attempt_transport_lease(tmp_path):
     )
     original_deadline = watch.external_wait_deadline
     original_lease = watch.external_wait_timeout
+    monkeypatch.setattr(
+        supervisor_attempts_module,
+        "monotonic",
+        lambda: original_deadline - original_lease + 0.001,
+    )
 
     supervisor.renew_external_wait(
         watch,

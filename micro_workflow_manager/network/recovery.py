@@ -193,7 +193,7 @@ class NetworkRecoveryMixin:
         if (
             age >= self._cohort_stall_seconds
             and sibling_terminals >= terminal_evidence
-            and shard.last_terminal_at > attempt_started
+            and shard.last_terminal_at >= attempt_started
         ):
             return (
                 f"stream remained nonterminal for {age:.1f}s while "

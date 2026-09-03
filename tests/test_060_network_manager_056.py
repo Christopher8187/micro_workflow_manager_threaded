@@ -460,6 +460,32 @@ def test_quiet_tail_cohort_uses_all_available_same_shard_peers():
     assert "5 newer sibling requests terminated" in reason
 
 
+def test_cohort_detection_accepts_newer_sibling_completion_in_same_clock_tick():
+    manager = NetworkManager()
+    manager._cohort_stall_seconds = 0.05
+    manager._cohort_terminal_evidence = 2
+    shard = type(
+        "Shard",
+        (),
+        {
+            "in_flight": 1,
+            "requests_completed": 2,
+            "requests_failed": 0,
+            "last_terminal_at": 100.0,
+            "shard_id": 7,
+        },
+    )()
+    active = {
+        "attempt_started_at": 100.0,
+        "cohort_terminal_baseline": 0,
+    }
+
+    reason = manager._cohort_stream_stall_reason(active, shard, 100.1)
+
+    assert reason is not None
+    assert "2 newer sibling requests terminated" in reason
+
+
 def test_single_tail_peer_is_not_enough_for_early_cohort_replay():
     manager = NetworkManager()
     manager._cohort_stall_seconds = 300.0

@@ -178,7 +178,7 @@ def _confirm(command: str, selection: DestructiveSelection, *, assume_yes: bool)
     except EOFError:
         answer = ""
     if answer != command:
-        print(f"Aborted mwf {command}; no state was changed.")
+        print(f"Aborted mwf {command}; requested {command} was not applied. CLI bootstrap and router mounting may already have updated framework state.")
         return False
     return True
 
@@ -217,7 +217,7 @@ def _print_plan(
         "  trace journals: "
         + ("would be preserved" if keep_trace else "would be cleared")
     )
-    print("  no files, jobs, inputs, outputs, or statuses were changed")
+    print(f"  requested {command} was not applied; bootstrap and router mounting may already have updated framework state")
 
 
 def execute_destructive_command(

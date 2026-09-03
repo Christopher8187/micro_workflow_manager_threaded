@@ -42,8 +42,6 @@ def seed_dirty_node(tmp_path: Path, node: str):
     (node_dir / "output" / "remove.txt").write_text("output", encoding="utf-8")
     state = seed_job(tmp_path, node, 1, "done", params={"value": node})
     state.write_output(node, 1, {"done": True})
-    files = state.files_dir(node, 1)
-    (files / "debug.txt").write_text("remove", encoding="utf-8")
 
 
 def test_top_level_help_points_to_command_help_and_describe(capsys):
@@ -114,7 +112,6 @@ def test_reset_star_preserves_job_definitions_and_requeues_jobs(tmp_path, monkey
         assert json.loads((job_dir / "input.json").read_text(encoding="utf-8")) == {"value": node}
         assert read_status_or_queued(job_dir / "status.json") == "queued"
         assert not (job_dir / "output.json").exists()
-        assert not (job_dir / "files" / "debug.txt").exists()
         assert FileStorage(tmp_path).get_node_status(node) == "queued"
 
 
@@ -275,7 +272,7 @@ router.create_job(number=1)
 @router.task
 def run(ctx):
     text = ctx.input_path("page.txt").read_text(encoding="utf-8")
-    ctx.write("combined.txt", text)
+    ctx.write_output("combined.txt", text)
     return text
 """.strip(),
         encoding="utf-8",
@@ -299,13 +296,13 @@ def test_runfrom_preserves_router_created_jobs_on_descendant_nodes(tmp_path, mon
     assert "  tagify" in out
     assert "  disintegrate" in out
     assert FileStorage(tmp_path).job_exists("disintegrate", 1)
-    assert (tmp_path / "node" / "disintegrate" / "jobs" / "1" / "files" / "combined.txt").read_text(encoding="utf-8") == "page 1"
+    assert (tmp_path / "node" / "disintegrate" / "output" / "combined.txt").read_text(encoding="utf-8") == "page 1"
     assert FileStorage(tmp_path).get_node_status("disintegrate") == "done"
 
     assert cli.main(["runfrom", "split", "--runner", "direct"]) == 0
     capsys.readouterr()
     assert len(list((tmp_path / "node" / "tagify" / "jobs").iterdir())) == 1
-    assert (tmp_path / "node" / "disintegrate" / "jobs" / "1" / "files" / "combined.txt").read_text(encoding="utf-8") == "page 1"
+    assert (tmp_path / "node" / "disintegrate" / "output" / "combined.txt").read_text(encoding="utf-8") == "page 1"
 
 
 def make_job_selection_project(tmp_path: Path, monkeypatch):
@@ -324,7 +321,7 @@ router = NodeRouter("work")
 router.create_job(number=10)
 @router.task
 def run(ctx):
-    ctx.write("job.txt", f"job {ctx.job_id}")
+    ctx.write_output(f"jobs/{ctx.job_id}/job.txt", f"job {ctx.job_id}")
     return ctx.job_id
 """.strip(),
         encoding="utf-8",
@@ -354,25 +351,25 @@ def test_run_job_selection_runs_individual_jobs_and_ranges_only(tmp_path, monkey
     assert "Ran jobs for work:" in out
     for job_id in [1, 3, 8, 9, 10]:
         assert f"  {job_id}" in out
-        assert (tmp_path / "node" / "work" / "jobs" / str(job_id) / "files" / "job.txt").read_text(encoding="utf-8") == f"job {job_id}"
+        assert (tmp_path / "node" / "work" / "output" / "jobs" / str(job_id) / "job.txt").read_text(encoding="utf-8") == f"job {job_id}"
 
     for job_id in [2, 4, 5, 6, 7]:
-        assert not (tmp_path / "node" / "work" / "jobs" / str(job_id) / "files" / "job.txt").exists()
+        assert not (tmp_path / "node" / "work" / "output" / "jobs" / str(job_id) / "job.txt").exists()
         status_path = tmp_path / "node" / "work" / "jobs" / str(job_id) / "status.json"
         assert read_status_or_queued(status_path) == "queued"
 
     assert FileStorage(tmp_path).get_node_status("work") == "queued"
 
 
-def test_run_job_selection_resets_only_selected_job_artifacts(tmp_path, monkeypatch, capsys):
+def test_run_job_selection_preserves_existing_node_output(tmp_path, monkeypatch, capsys):
     make_job_selection_project(tmp_path, monkeypatch)
     capsys.readouterr()
 
     assert cli.main(["run", "work", "job", "2", "--runner", "direct"]) == 0
     capsys.readouterr()
 
-    selected_file = tmp_path / "node" / "work" / "jobs" / "2" / "files" / "job.txt"
-    stale_file = tmp_path / "node" / "work" / "jobs" / "2" / "files" / "stale.txt"
+    selected_file = tmp_path / "node" / "work" / "output" / "jobs" / "2" / "job.txt"
+    stale_file = tmp_path / "node" / "work" / "output" / "jobs" / "2" / "stale.txt"
     other_status = tmp_path / "node" / "work" / "jobs" / "3" / "status.json"
     stale_file.write_text("old", encoding="utf-8")
 
@@ -380,7 +377,7 @@ def test_run_job_selection_resets_only_selected_job_artifacts(tmp_path, monkeypa
     capsys.readouterr()
 
     assert selected_file.read_text(encoding="utf-8") == "job 2"
-    assert not stale_file.exists()
+    assert stale_file.read_text(encoding="utf-8") == "old"
     assert read_status_or_queued(other_status) == "queued"
 
 

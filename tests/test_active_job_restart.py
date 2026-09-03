@@ -48,11 +48,11 @@ def run(ctx):
 
         # These happen only after the replacement generation has completed.
         # Both must be rejected by the execution-generation fence.
-        ctx.write("stale.txt", "stale")
+        ctx.write_output("stale.txt", "stale")
         ctx.node("B").add(value="stale")
         return "stale"
 
-    ctx.write("fresh.txt", "fresh")
+    ctx.write_output("fresh.txt", "fresh")
     ctx.node("B").add(value="fresh")
     return "fresh"
 '''.strip(),
@@ -66,7 +66,7 @@ router = NodeRouter("B")
 
 @router.task
 def run(ctx, value):
-    ctx.write("received.txt", value)
+    ctx.write_output("received.txt", value)
     return value
 '''.strip(),
         encoding="utf-8",
@@ -145,13 +145,13 @@ def test_restart_command_replaces_running_generation_inside_existing_runfrom(
     b_jobs = sorted((tmp_path / "node" / "B" / "jobs").glob("[0-9]*"))
     assert len(b_jobs) == 1
     assert json.loads((b_jobs[0] / "input.json").read_text(encoding="utf-8")) == {"value": "fresh"}
-    assert (b_jobs[0] / "files" / "received.txt").read_text(encoding="utf-8") == "fresh"
+    assert (tmp_path / "node" / "B" / "output" / "received.txt").read_text(encoding="utf-8") == "fresh"
 
     # Let the abandoned Python thread return. Its stale MWF writes and child-job
     # creation must remain rejected even though the larger run has completed.
     (tmp_path / "node" / "A" / "input" / "release_old.flag").write_text("release", encoding="utf-8")
     time.sleep(0.25)
-    assert not (tmp_path / "node" / "A" / "jobs" / "1" / "files" / "stale.txt").exists()
+    assert not (tmp_path / "node" / "A" / "output" / "stale.txt").exists()
     assert len(sorted((tmp_path / "node" / "B" / "jobs").glob("[0-9]*"))) == 1
 
 
@@ -320,11 +320,11 @@ def run(ctx):
         ctx.input_path("old_started.flag").write_text("started", encoding="utf-8")
         ctx.checkpoint("old generation waiting", progress=0.2)
         time.sleep(0.8)
-        ctx.write("stale.txt", "stale")
+        ctx.write_output("stale.txt", "stale")
         return "stale"
 
     ctx.checkpoint("replacement generation", progress=1.0)
-    ctx.write("fresh.txt", "fresh")
+    ctx.write_output("fresh.txt", "fresh")
     ctx.node("B").add(value="fresh")
     return "fresh"
 '''.strip(),
@@ -369,4 +369,4 @@ def run(ctx):
 
     events = state.read_job_events("A", 1)
     assert not any(event.get("event") == "timeout" for event in events)
-    assert not (tmp_path / "node" / "A" / "jobs" / "1" / "files" / "stale.txt").exists()
+    assert not (tmp_path / "node" / "A" / "output" / "stale.txt").exists()

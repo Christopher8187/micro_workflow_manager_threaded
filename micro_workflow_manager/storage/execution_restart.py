@@ -179,7 +179,6 @@ class JobRestartStorageMixin:
 
         base = self.job_base_dir(node_name, job_id)
         self._remove_restart_artifact(base / "output.json")
-        self._remove_restart_artifact(base / "files")
         return {
             "node": node_name,
             "job_id": job_id,

@@ -157,7 +157,7 @@ def setup_graph(
         print("  nodes to add: " + (", ".join(new_nodes) if new_nodes else "(none)"))
         print("  nodes to delete: " + (", ".join(stale_nodes) if stale_nodes else "(none)"))
         print("  edge list changed: " + ("yes" if stored_edges != edges else "no"))
-        print("  no configuration or node folders were changed")
+        print("  graph synchronization was not applied; normal CLI bootstrap may already have migrated framework state")
         return 0
 
     config["version"] = 4

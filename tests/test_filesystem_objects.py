@@ -4,15 +4,17 @@ import json
 from pathlib import Path
 
 import pytest
+import micro_workflow_manager as mwf_package
+import micro_workflow_manager.files as mwf_files
 
 from micro_workflow_manager import (
     FileSystem,
     InputFileSystem,
-    JobFileSystem,
     MicroWorkflow,
     NodeInputFileSystem,
     OutputFileSystem,
 )
+from micro_workflow_manager.context import JobContext
 
 
 def test_filesystem_objects_read_write_copy_and_route(tmp_path: Path):
@@ -21,7 +23,6 @@ def test_filesystem_objects_read_write_copy_and_route(tmp_path: Path):
 
     source_input = InputFileSystem("source input")
     prepared_output = OutputFileSystem("prepared output", base="{batch}")
-    job_files = JobFileSystem("job details")
     review_input = NodeInputFileSystem("review", "review input", base="{batch}")
 
     (tmp_path / "node" / "prepare" / "input" / "number.txt").write_text("4")
@@ -31,7 +32,6 @@ def test_filesystem_objects_read_write_copy_and_route(tmp_path: Path):
         number = int(source_input.file(ctx, "number.txt").read_text())
         result = prepared_output.file(ctx, "result.json", batch="one")
         result.write_json({"number": number + 1})
-        job_files.file(ctx, "note.txt").write_text("prepared")
         review_input.file(ctx, "result.json", batch="one").copy_from(
             result,
             overwrite=True,
@@ -48,8 +48,40 @@ def test_filesystem_objects_read_write_copy_and_route(tmp_path: Path):
     assert json.loads(
         (tmp_path / "node" / "review" / "input" / "one" / "result.json").read_text()
     ) == {"number": 5}
-    assert (tmp_path / "node" / "prepare" / "jobs" / "1" / "files" / "note.txt").read_text() == "prepared"
     assert workflow.storage.load_job("review", 1).params == {"result_file": "one/result.json"}
+
+
+def test_per_job_file_apis_are_not_public():
+    assert not hasattr(mwf_package, "JobFileSystem")
+    assert not hasattr(mwf_files, "JobFileSystem")
+    for name in ("write", "write_bytes", "files_dir", "storage_dir"):
+        assert not hasattr(JobContext, name)
+
+
+@pytest.mark.parametrize("return_form", ["path", "file_field"])
+def test_returned_paths_are_not_copied_into_job_storage(tmp_path: Path, return_form: str):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([])
+    output = OutputFileSystem("substantial results", base="reports")
+
+    @workflow.task("A")
+    def run(ctx):
+        report = output.file(ctx, f"{return_form}.bin")
+        report.write_bytes(b"durable report")
+        if return_form == "path":
+            return report.path
+        return {"file": str(report.path)}
+
+    workflow.start("A")
+    returned = workflow.run_job("A", 1, ignore_readiness=True)
+    report_path = tmp_path / "node" / "A" / "output" / "reports" / f"{return_form}.bin"
+    expected = report_path if return_form == "path" else {"file": str(report_path)}
+
+    assert returned == expected
+    assert report_path.read_bytes() == b"durable report"
+    job_dir = tmp_path / "node" / "A" / "jobs" / "1"
+    assert sorted(path.name for path in job_dir.iterdir()) == ["input.json", "output.json"]
+    assert "stored_files" not in json.loads((job_dir / "output.json").read_text())
 
 
 def test_filesystem_objects_are_human_readable_and_template_driven(tmp_path: Path):
@@ -253,22 +285,19 @@ def test_filesystem_files_convenience_encoding_and_declaration(tmp_path: Path):
     }
 
 
-def test_output_and_job_filesystem_copy_from_use_atomic_copy(tmp_path: Path):
+def test_output_filesystem_copy_from_uses_atomic_copy(tmp_path: Path):
     """Regression: 0.5.0 file_systems.py forgot to import _copy_file."""
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
     workflow.graph([])
     output = OutputFileSystem("copied output")
-    job_files = JobFileSystem("copied job files")
     source = tmp_path / "source.bin"
     source.write_bytes(b"post-api-payload")
 
     @workflow.task("organize")
     def organize(ctx):
         output.file(ctx, "images", "page.jpg").copy_from(source, overwrite=True)
-        job_files.file(ctx, "debug", "response.bin").copy_from(source, overwrite=True)
         return "copied"
 
     workflow.start("organize")
     assert workflow.run_job("organize", 1, ignore_readiness=True) == "copied"
     assert (tmp_path / "node" / "organize" / "output" / "images" / "page.jpg").read_bytes() == b"post-api-payload"
-    assert (tmp_path / "node" / "organize" / "jobs" / "1" / "files" / "debug" / "response.bin").read_bytes() == b"post-api-payload"

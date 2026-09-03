@@ -41,6 +41,25 @@ def _body_without(event: dict[str, Any], *keys: str) -> dict[str, Any]:
     return {key: value for key, value in event.items() if key not in excluded and value is not None}
 
 
+def _failed_task_label(event: dict[str, Any]) -> str:
+    role = str(event.get("task_role") or "")
+    task = str(event.get("task") or "")
+    if role == "fallback":
+        return f"FALLBACK {task}".rstrip()
+    if role == "main":
+        return f"MAIN TASK {task}".rstrip()
+    return task or "TASK"
+
+
+def _failed_task_body(event: dict[str, Any]) -> dict[str, Any]:
+    excluded = {"time", "event", "task", "task_role"}
+    return {
+        key: value
+        for key, value in event.items()
+        if key not in excluded and value is not None
+    }
+
+
 def _origin_label(parent: Any) -> str:
     if isinstance(parent, dict):
         from_node = parent.get("from_node")
@@ -72,7 +91,13 @@ def _origin_change_body(event: dict[str, Any]) -> str:
     return "\n".join(describe("Previous", previous) + describe("Current", current))
 
 
-def trace_command(workflow, node: str, job_id: int) -> int:
+def trace_command(
+    workflow,
+    node: str,
+    job_id: int,
+    *,
+    errors_only: bool = False,
+) -> int:
     storage = workflow.storage
     if not storage.job_exists(node, job_id):
         raise RuntimeError(f"Job does not exist: {node}/{job_id}")
@@ -82,13 +107,22 @@ def trace_command(workflow, node: str, job_id: int) -> int:
     control = storage.read_job_control(node, job_id)
 
     origin = _origin_label(job.parent)
-    _block("ORIGIN", origin)
+    origin_title = f"JOB {node}/{job_id} ORIGIN" if errors_only else "ORIGIN"
+    _block(origin_title, origin)
 
     current_task = "MAIN TASK"
     for event in events:
         kind = event.get("event")
         stamp = event.get("time", "?")
-        if kind == "task_started":
+        if kind == "task_failed":
+            label = _failed_task_label(event)
+            _block(
+                f"({stamp}) {node} {label} FAILED",
+                _json(_failed_task_body(event)),
+            )
+        elif errors_only:
+            continue
+        elif kind == "task_started":
             current_task = _task_label(event)
             if event.get("task_role") == "fallback":
                 title = f"({stamp}) {node} FALLBACK {event.get('task')} STARTED"
@@ -128,11 +162,11 @@ def trace_command(workflow, node: str, job_id: int) -> int:
             continue
 
     final_output = storage.read_json(storage.output_file(node, job_id), default=None)
-    if final_output is not None:
+    if final_output is not None and not errors_only:
         _block(
             f"OUTPUT FOR {current_task}",
             _json({
-                "path": f"output/jobs/{job_id}/output.json",
+                "path": f"jobs/{job_id}/output.json",
                 "content": final_output,
             }),
         )
@@ -149,5 +183,16 @@ def trace_command(workflow, node: str, job_id: int) -> int:
     }
     if isinstance(final_output, dict) and final_output.get("error"):
         terminal["error"] = final_output["error"]
+    elif terminal["state"] == "failed":
+        last_failure = next(
+            (
+                event
+                for event in reversed(events)
+                if event.get("event") == "task_failed" and event.get("error")
+            ),
+            None,
+        )
+        if last_failure is not None:
+            terminal["error"] = last_failure["error"]
     _block("JOB ENDED", _json({key: value for key, value in terminal.items() if value is not None}))
     return 0

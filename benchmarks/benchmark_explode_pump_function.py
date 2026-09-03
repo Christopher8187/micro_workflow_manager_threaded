@@ -236,7 +236,7 @@ def main() -> int:
     if args.jsonl:
         with args.jsonl.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(summary, sort_keys=True) + "\n")
-    return 0
+    return 1 if summary["max_failed"] else 0
 
 
 if __name__ == "__main__":

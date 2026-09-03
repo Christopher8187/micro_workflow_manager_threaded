@@ -8,7 +8,10 @@ def fan_out(ctx, question):
     branches=["collect_facts","generate_options","check_risks"]
     OUTPUT.file(ctx,"branches.json").write_json(branches,overwrite=True)
     record_provenance(ctx,OUTPUT,artifact="fan_out",inputs=question,decisions={"branches":branches},result=branches)
-    with ctx.transaction():
-        for branch in branches:
-            ctx.node(branch).add(autostart=True,question=question)
+    child_specs=[
+        (branch,{"question":question},f"fan-out:{ctx.job_id}:{branch}")
+        for branch in branches
+    ]
+    for branch,params,key in child_specs:
+        ctx.node(branch).add(autostart=True,idempotency_key=key,**params)
     return branches

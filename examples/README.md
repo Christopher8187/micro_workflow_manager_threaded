@@ -2,7 +2,7 @@
 
 Start with `agent_reference_architecture/` when building a new project. It shows
 the recommended 0.5.2 layout and combines pooled HTTP/API processing, validated
-agent responses, retries and named fallbacks, transactional fan-out, durable
+agent responses, retries and named fallbacks, idempotent fan-out, durable
 fan-in, provenance, and a bounded review/revise Hoeflein component.
 
 | Example | Primary pattern |
@@ -10,7 +10,7 @@ fan-in, provenance, and a bounded review/revise Hoeflein component.
 | `agent_reference_architecture` | Complete production-shaped reference |
 | `agent_prompt_chain` | Narrow typed stages and compact payloads |
 | `agent_router` | Route decision plus specialist fallback |
-| `agent_parallelization` | Transactional fan-out and explicit join |
+| `agent_parallelization` | Explicit idempotent cross-node fan-out and join |
 | `agent_orchestrator_workers` | Dynamic high fan-out and ordered fan-in |
 | `agent_evaluator_optimizer` | Bounded evaluator/optimizer protocol |
 | `document_refinery` | Durable file-oriented transformation |

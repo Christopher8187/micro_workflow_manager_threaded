@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 
 __all__ = [
@@ -25,7 +25,6 @@ __all__ = [
     "FileSystemEntry",
     "InputFileSystem",
     "OutputFileSystem",
-    "JobFileSystem",
     "NodeInputFileSystem",
     "SharedHTTPTransport",
     "shared_http_transport",
@@ -45,7 +44,6 @@ _EXPORTS = {
     "FileSystemEntry": (".files", "FileSystemEntry"),
     "InputFileSystem": (".files", "InputFileSystem"),
     "OutputFileSystem": (".files", "OutputFileSystem"),
-    "JobFileSystem": (".files", "JobFileSystem"),
     "NodeInputFileSystem": (".files", "NodeInputFileSystem"),
     "SharedHTTPTransport": (".networking", "SharedHTTPTransport"),
     "shared_http_transport": (".networking", "shared_http_transport"),

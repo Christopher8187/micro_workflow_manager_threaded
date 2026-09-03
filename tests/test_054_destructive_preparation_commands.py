@@ -62,7 +62,15 @@ def test_reset_requires_typed_confirmation_and_does_not_run(tmp_path, monkeypatc
 
     monkeypatch.setattr("builtins.input", lambda prompt: "no")
     assert cli.main(["reset", "A"]) == 1
-    assert "Aborted mwf reset" in capsys.readouterr().out
+    aborted = capsys.readouterr().out
+    assert "Aborted mwf reset; requested reset was not applied" in aborted
+    assert "bootstrap and router mounting may already have updated framework state" in aborted
+
+    assert cli.main(["reset", "A", "--dry-run"]) == 0
+    preview = capsys.readouterr().out
+    assert "requested reset was not applied" in preview
+    assert "bootstrap and router mounting may already have updated framework state" in preview
+    assert "no files, jobs, inputs, outputs, or statuses were changed" not in preview
 
     monkeypatch.setattr("builtins.input", lambda prompt: "reset")
     assert cli.main(["reset", "A"]) == 0

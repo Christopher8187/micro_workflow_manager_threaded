@@ -1,0 +1,7 @@
+include AGENTS.md CONTEXT.md README.md
+recursive-include .agents *.md
+recursive-include docs *.md
+recursive-include examples *.md *.py
+recursive-include benchmarks *.md *.py *.json *.jsonl
+recursive-include tests *.md *.py
+global-exclude __pycache__ *.py[cod]

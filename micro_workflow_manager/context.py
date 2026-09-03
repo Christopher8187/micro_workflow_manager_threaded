@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 import json
 from threading import Event
@@ -51,72 +50,6 @@ def _content_preview(content: Any, *, limit: int = 4000) -> dict[str, Any]:
 T = TypeVar("T")
 
 
-@dataclass
-class PendingJob:
-    """Handle returned by ``NodeHandle.add`` inside ``ctx.transaction()``."""
-
-    result: Any = None
-    committed: bool = False
-
-    @property
-    def job_id(self) -> int:
-        if not self.committed or self.result is None:
-            raise RuntimeError("The transactional job has not been committed yet")
-        return self.result.job_id
-
-
-class JobTransaction(AbstractContextManager):
-    """Stage downstream job creation and commit it after a successful block.
-
-    Staged operations use deterministic idempotency keys. If a filesystem error
-    interrupts a multi-job commit, rerunning the parent job can safely finish the
-    same transaction without creating duplicates.
-    """
-
-    def __init__(self, ctx: "JobContext"):
-        self.ctx = ctx
-        self.operations: list[tuple[Callable[[str], Any], str | None, PendingJob]] = []
-        self.closed = False
-
-    def stage_add(
-        self,
-        operation: Callable[[str], Any],
-        idempotency_key: str | None,
-    ) -> PendingJob:
-        if self.closed:
-            raise RuntimeError("Cannot add work to a closed transaction")
-        pending = PendingJob()
-        self.operations.append((operation, idempotency_key, pending))
-        return pending
-
-    def __enter__(self) -> "JobTransaction":
-        if self.ctx._transaction is not None:
-            raise RuntimeError("Nested job transactions are not supported")
-        self.ctx.checkpoint()
-        self.ctx._transaction = self
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> bool:
-        self.ctx._transaction = None
-        self.closed = True
-        if exc_type is not None:
-            return False
-
-        self.ctx.checkpoint()
-        for index, (operation, explicit_key, pending) in enumerate(self.operations, 1):
-            # Deliberately omit the execution generation. A failed or manually
-            # restarted parent receives a new generation, but must reuse any
-            # downstream jobs already committed by the same transaction before
-            # the failure. Fresh destructive run/runfrom cleanup removes those
-            # parented jobs, so stale idempotency entries naturally miss.
-            key = explicit_key or (
-                f"tx:{self.ctx.current_node}:{self.ctx.job_id}:{index}"
-            )
-            pending.result = operation(key)
-            pending.committed = True
-        return False
-
-
 class _ExecutionChecks:
     def __init__(
         self,
@@ -148,7 +81,6 @@ class NodeHandle(_ExecutionChecks):
         execution_id: str | None,
         *,
         cancellation_event: Event | None = None,
-        transaction_getter: Callable[[], JobTransaction | None] | None = None,
         task_name: str | None = None,
         task_role: str = "main",
         attempt: int | None = None,
@@ -162,7 +94,6 @@ class NodeHandle(_ExecutionChecks):
         self.to_node = to_node
         self.execution_generation = execution_generation
         self.execution_id = execution_id
-        self._transaction_getter = transaction_getter or (lambda: None)
         self.task_name = task_name
         self.task_role = task_role
         self.attempt = attempt
@@ -225,25 +156,18 @@ class NodeHandle(_ExecutionChecks):
         idempotency_key: str | None = None,
         **params,
     ):
-        def perform(key: str | None = idempotency_key):
-            result = self._guarded(
-                lambda: self.system.add_job(
-                    from_node=self.from_node,
-                    to_node=self.to_node,
-                    job_id=job_id,
-                    autostart=autostart,
-                    _parent_job_id=self.from_job_id,
-                    _parent_event_data=self._event_fields(),
-                    idempotency_key=key,
-                    **params,
-                )
+        return self._guarded(
+            lambda: self.system.add_job(
+                from_node=self.from_node,
+                to_node=self.to_node,
+                job_id=job_id,
+                autostart=autostart,
+                _parent_job_id=self.from_job_id,
+                _parent_event_data=self._event_fields(),
+                idempotency_key=idempotency_key,
+                **params,
             )
-            return result
-
-        transaction = self._transaction_getter()
-        if transaction is not None:
-            return transaction.stage_add(lambda key: perform(key), idempotency_key)
-        return perform()
+        )
 
     def add_many(
         self,
@@ -257,9 +181,6 @@ class NodeHandle(_ExecutionChecks):
         This is intended for high-fanout producers. It preserves one job per
         params object while paying execution-fence and node-lock overhead once.
         """
-        transaction = self._transaction_getter()
-        if transaction is not None:
-            raise RuntimeError("add_many is not supported inside ctx.transaction()")
         results = self._guarded(
             lambda: self.system.add_jobs(
                 from_node=self.from_node,
@@ -371,6 +292,7 @@ class JobContext(_ExecutionChecks):
         attempt: int,
         repeat_index: int,
         error: Exception | None = None,
+        errors: tuple[Exception, ...] = (),
         *,
         execution_generation: int,
         execution_id: str | None,
@@ -386,12 +308,16 @@ class JobContext(_ExecutionChecks):
         self.attempt = attempt
         self.repeat_index = repeat_index
         self.error = error
+        self._errors = tuple(errors)
         self.execution_generation = execution_generation
         self.execution_id = execution_id
         self._attempt_watch = attempt_watch
-        self._transaction: JobTransaction | None = None
         self.task_role = task_role
         self._pending_event_futures: list[Any] = []
+
+    @property
+    def errors(self) -> list[Exception]:
+        return list(self._errors)
 
     def _check_execution(self):
         """Validate cancellation/restart without reporting progress."""
@@ -492,11 +418,8 @@ class JobContext(_ExecutionChecks):
                 payload[f"trace_{reserved}"] = payload.pop(reserved)
         self._record_event("trace", name=trace_name, **payload)
 
-    def _record_output(self, path: Path, content: Any, *, scope: str = "output") -> None:
-        if scope == "job_files":
-            display_path = f"output/jobs/{self.job_id}/files/{relative_posix(path, self.files_dir)}"
-        else:
-            display_path = f"output/{relative_posix(path, self.output_dir)}"
+    def _record_output(self, path: Path, content: Any) -> None:
+        display_path = f"output/{relative_posix(path, self.output_dir)}"
         self._record_event("output_written", path=display_path, **_content_preview(content))
 
     def checkpoint(
@@ -570,10 +493,6 @@ class JobContext(_ExecutionChecks):
                 from time import sleep as _sleep
                 _sleep(wait_for)
 
-    def transaction(self) -> JobTransaction:
-        """Stage downstream ``ctx.node(...).add(...)`` calls until block success."""
-        return JobTransaction(self)
-
     @contextmanager
     def side_effects(self):
         """Group several restart-fenced file/queue mutations under one fence.
@@ -614,14 +533,6 @@ class JobContext(_ExecutionChecks):
     def output_dir(self) -> Path:
         return self._guarded(lambda: self.system.storage.node_output_dir(self.current_node))
 
-    @property
-    def storage_dir(self) -> Path:
-        return self._guarded(lambda: self.system.storage.job_dir(self.current_node, self.job_id))
-
-    @property
-    def files_dir(self) -> Path:
-        return self._guarded(lambda: self.system.storage.files_dir(self.current_node, self.job_id))
-
     def input_path(self, *parts: str) -> Path:
         self._check_execution()
         return self.system.storage.input_path(self.current_node, *parts)
@@ -641,20 +552,6 @@ class JobContext(_ExecutionChecks):
                 self.current_node, pattern=pattern, recursive=recursive, files_only=files_only
             )
         )
-
-    def write(self, filename: str, content: str) -> Path:
-        path = self._guarded(
-            lambda: self.system.storage.write_text(self.current_node, self.job_id, filename, content)
-        )
-        self._record_output(path, content, scope="job_files")
-        return path
-
-    def write_bytes(self, filename: str, content: bytes) -> Path:
-        path = self._guarded(
-            lambda: self.system.storage.write_bytes(self.current_node, self.job_id, filename, content)
-        )
-        self._record_output(path, content, scope="job_files")
-        return path
 
     def write_output(self, filename: str, content: str) -> Path:
         path = self._guarded(
@@ -684,7 +581,6 @@ class JobContext(_ExecutionChecks):
             execution_generation=self.execution_generation,
             execution_id=self.execution_id,
             cancellation_event=self._cancellation_event,
-            transaction_getter=lambda: self._transaction,
             task_name=self.current_task,
             task_role=self.task_role,
             attempt=self.attempt,

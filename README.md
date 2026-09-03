@@ -1,2011 +1,522 @@
-# micro-workflow-manager 0.6.0
-
-A small hybrid file/SQLite DAG workflow manager. User payloads stay inspectable in `input/`, `output/`, and `jobs/<id>/`, while high-churn scheduler state is stored transactionally in `.mwf/state.sqlite3`. Each node has one main task, optional fallbacks, explicit starter jobs, and APIRouter-style node modules.
-
-
-## Design requirement: durable result and debugging provenance
-
-The `output/` folder is not only a place for the final value. A well-designed
-node writes both the durable result that can be reused or reformatted **and**
-user-owned provenance that makes the result easier to debug and improve. Useful
-provenance includes the relevant inputs, algorithm/model/tool choice, attempt or
-fallback, validation evidence, and important parameters. Framework diagnostics in `.mwf/state.sqlite3` explain scheduler behavior and are shown by `mwf inspect`; they do not replace domain provenance written by the project.
-
-See [HOW_TO_TEST.md](HOW_TO_TEST.md) for the authoritative release-test order, including separate autostart-cycle processes and the localhost HTTP performance matrix.
-
-See [DESIGN.md](DESIGN.md) for design and code-architecture recommendations,
-command workflows, provenance guidance, and runnable examples covering adapted
-`src/` + `utils/` pipelines, five common agentic patterns, a database change
-manager, and a Pygame state machine.
-
-## What changed in 0.6.0
-
-- `mwf engine` opens a strictly read-only, graph-only loopback view from the
-  synchronized project metadata. It collapses nontrivial Hoeflein components
-  into scheduling units, reveals their members on demand, imports no project
-  code, exposes no mutation endpoint, and loads no external browser assets.
-- `mwf run NODE sample COUNT` performs deterministic isolated partial-node
-  runs. A SHA-256-ranked population, explicit seed/status filter, no-write plan,
-  population-drift guard, selected-input digest, and active-run manifest make
-  the sample reproducible. Unselected jobs, descendants, and Hoeflein
-  circulation remain untouched.
-- The root `AGENTS.md` now gives coding agents a complete framework command,
-  architecture, workflow-design, fallback/validation, and release-testing
-  contract. No transport, timeout, admission, or provider-networking behavior
-  changed in this release.
-
-## What changed in 0.5.11
-
-- A run-scoped aggregate API budget is allocated over API nodes that are
-  actually running, not every selected descendant. When one parallel node
-  drains, its slots are redistributed by declared/overridden request weight to
-  the remaining live nodes; every live node retains at least one slot. The
-  scheduler, `mwf threads`, and `mwf monitor` now distinguish requested,
-  active, and aggregate API capacity.
-- DAG nodes and Hoeflein components use the same API transport; 0.5.11 does
-  not add a second protocol circuit, specialize networking by graph shape, or
-  change caller-configured timeout values. It fixes the boundary between the
-  accepted Explode recovery layer and the scheduler watchdog: ingress wait no
-  longer consumes a transport attempt's lease, and a bounded hidden
-  cohort/connection replay receives a fresh lease with the same configured
-  duration. The task's total timeout remains active across every replay.
-- The shared transport now packs a draining workload onto the busiest healthy
-  shard before reusing idle connections. At peak width, the configured
-  same-shard terminal evidence remains 16; when a quiet tail contains fewer
-  peers, MWF requires every available same-shard peer (and at least two) to
-  terminate before declaring the remaining stream an outlier. A JSON response
-  body that silently ignores HTTPX's timer is also checked against the caller's
-  existing read timeout inside MWF and transparently replayed before the
-  supervisor's unchanged cleanup-grace lease expires. No timeout is extended
-  and no provider admission gate is added.
-- Physical transport attempt, renewal count/reason, and OpenRouter's documented
-  `X-Generation-Id` are observable in live runtime/network diagnostics. This
-  allows a provider generation to be correlated without browser automation.
-- Every ordinary member of a live Hoeflein component now constructs and
-  subscribes its refreshable queue source before sibling handlers are released.
-  This makes the existing "resident before first feedback" guarantee literal
-  under a busy interpreter: a fast router cannot fan out before its API
-  consumers are listening. The gate runs only once at component startup and
-  changes neither job concurrency nor steady-state pump allocation.
-- Active run records carry an OS process-start identity in addition to a PID.
-  A recycled Windows PID can no longer make an abandoned run appear live; for
-  legacy records without an identity, a stale heartbeat is not rescued merely
-  because an unrelated process later receives the same PID.
-- `FileSystemEntry.read_jsons(pattern)` supports large immutable fan-in
-  frontiers without repeating the scheduler execution check for every file.
-  MWF checks the execution generation before and after the bounded batch,
-  resolves and containment-checks every candidate path (including symlinks),
-  and returns deterministically sorted relative-path/value pairs. A bounded
-  32-worker reader overlaps independent Windows security/VPN filter latency
-  across small immutable files without retaining handles after the call. This
-  keeps fan-in inside the framework filesystem contract while avoiding both
-  thousands of redundant supervisor/database checks and serial per-file filter
-  stalls.
-
-## What changed in 0.5.10
-
-- `mwf runfrom START refuse BOUNDARY` and `mwf resumefrom START refuse
-  BOUNDARY` add a global exclusive Hoeflein-component admission boundary. When
-  the named component first becomes ready, MWF starts neither that component
-  nor any other newly ready component. Components already running are joined,
-  and refused work remains queued for a later resume.
-- `refuse` is deliberately different from `refuseafter`: `refuse B` stops
-  before B's whole component starts, while `refuseafter B` lets B's component
-  terminate and then stops later admission. A boundary already terminal when a
-  resume begins is treated as already reached.
-- Fresh `runfrom` preparation still covers the complete selected descendant
-  set. The boundary limits execution admission, not reset scope, and its mode
-  and node are recorded in `.mwf/run.json`.
-
-## What changed in 0.5.9
-
-- Cohort and connection-error replays reuse healthy existing HTTP/2 shards and
-  share capacity-required replacement shards. A recovery wave no longer opens
-  one `AsyncClient`, TLS pool, and socket pool per recovered stream. Provider
-  request concurrency and the caller's transport lease are unchanged.
-- Read, write, and protocol failures retire the exact affected shard before a
-  bounded transparent replay. Diagnostics distinguish healthy-shard reuse from
-  newly created recovery shards and report live, retiring, and idle clients.
-- Network diagnostics group active requests by shard in linear time. SQLite's
-  durability watermark now stores only genuinely pending serials, rather than
-  retaining every completed serial behind an older low-priority mutation.
-
-## What changed in 0.5.8
-
-- HTTP/2 shards are selected round-robin and opened elastically after the
-  connection-local 32-stream safety width. There is no second aggregate
-  request gate: declared node concurrency and provider request pressure remain
-  unchanged.
-- JSON requests recover from two multiplexed HTTP/2 terminal defects without
-  replacing the caller's timeout. A complete checksum-valid JSON entity that
-  lacks `END_STREAM` is returned after a five-second terminal grace period. A
-  stream that remains nonterminal for five minutes while at least 16 newer
-  same-shard requests terminate is replayed on another shard; this cohort proof
-  remains valid through the quiet tail of a run.
-- Live network futures cancel their underlying socket coroutines. TCP keepalive
-  detects connection-wide half-open VPN/TUN paths, while
-  `.mwf/network_manager.json` exposes shard, stream, job, phase, retirement,
-  terminal-recovery, and cohort-replay evidence.
-- Default multi-job declarations publish one prepared SQLite batch and write
-  disjoint payload files concurrently. `mwf monitor` bulk-reads all selected
-  node summaries, while `mwf top` uses a bounded reverse journal walk and
-  honors its redraw interval under terminal waves. Fan-out and observers no
-  longer compete unnecessarily with dense API work as the done-job journal
-  grows.
-
-## What changed in 0.5.7
-
-- Simultaneously runnable API nodes now receive a shared controller-pump vector.
-  Every node is guaranteed one pump; the host-bounded remainder is allocated by
-  marginal controller-load reduction. On the 16-logical-processor explode
-  shape, 21 pumps are allocated as `1,2,3,2,4,2,2,1,2,2` while every node's
-  configured concurrency remains exact and unchanged.
-- API-fiber trace, output, and input-forwarding events are generation-fenced and
-  enqueued asynchronously into the existing ordered SQLite group commit. Each
-  attempt flushes its event futures before fallback or terminal publication, so
-  provenance remains durable-before-terminal without one SQLite round trip per
-  observability record.
-- Not-yet-executing priority-20 checkpoint snapshots coalesce per job attempt.
-  The latest checkpoint stays inspectable, timeouts remain durable, and
-  admission, successful terminal publication, and failed terminal publication
-  all remain in the same priority-5 runtime-critical class.
-- API networking now has an explicit backend `NetworkManager`: one process-wide event loop owns persistent HTTPX client shards and all socket I/O. Node fibers enqueue lightweight requests; dense cross-thread submissions are coalesced before asyncio task creation instead of calling `run_coroutine_threadsafe` once per request. Existing `shared_http_transport` application code remains unchanged.
-- Network-manager state is aggregated in memory and bulk-upserted into the new SQLite `network_state` table at most every two seconds. This observability path is low-priority and non-fatal. SQLite schema version is 4.
-- Adds the requested 22-node skew A/B benchmark: two 2,000-job nodes plus twenty 100-job nodes with 512 proportionally allocated API slots. In the observed unlimited-bandwidth H2 sample, the manager improved runner throughput ~6.5%, durable workflow throughput ~6.4%, and the durable big:small ratio from 11.69:1 to 13.16:1. See `NETWORK_MANAGER_ARCHITECTURE_056.md`.
-- Retains the 0.5.5 queue-scan and dense-refill optimizations: refreshable queues use monotonic direct rowid range scans without a temporary ORDER BY tree, queue hints are bounded, and dense API nodes avoid repeated tiny durable refills.
-- The localhost delay server paces the final/only chunk correctly and no longer awaits H2 socket backpressure while holding the protocol-state lock. A 4 KiB response at 4 KiB/s now takes about one second.
-
-## What changed in 0.5.4
-
-- High-concurrency API admission records the first valid main-task `task_started` event in the existing grouped execution-claim transaction instead of submitting one extra synchronous SQLite mutation per job. Malformed jobs with missing required parameters retain the old trace semantics and are not falsely marked task-started.
-- Wide DAG finalization now bulk-reads node status, skips already-terminal and in-flight sibling components, and gives component execution one owner for `RUNNING`/`DONE` publication. This removes repeated sibling status rewrites as fan-out width grows into tens of nodes.
-- HTTP/1.1 shared transport now uses elastic 16-connection client shards by default; HTTP/2 keeps its stream-per-connection behavior unchanged. The localhost benchmark measured about 3.55x higher H1 runner throughput at 512 concurrent requests versus the previous 100-connection shards.
-- `include_router()` retains router objects instead of remembering only `id(router)`, preventing CPython object-id reuse from silently skipping short-lived programmatically generated routers in wide fan-outs.
-- Adds a real localhost HTTP delay/throttle service and a three-axis fan-out benchmark over concurrency, per-response transfer rate, and fan-out node count. See `HOW_TO_TEST.md` and `HTTP_FANOUT_BENCHMARKS_054.md`.
-- Retains all 0.5.3 Hoeflein live-pump, clean failure/join, EMFILE, threaded prefetch, FD-limit and `resumefrom ... refuseafter ...` behavior.
-
-## What changed in 0.5.3
-
-- Hoeflein components now keep every ordinary threaded/API member attached to a live, event-driven queue pump for the lifetime of the component. Temporary empty queues no longer tear down a member and turn internal feedback into a mini-DAG queue; explicit `wait_for` nodes remain phase-gated.
-- Threaded source advancement no longer holds peer workers behind payload I/O, and payload-loader failures such as `EMFILE` propagate as their original exception instead of creating a phantom `None` job.
-- Component failure is published only after all already-started member runners join. Output-backed terminal states are reconciled first and any remaining abandoned `running` leases are marked failed, so a failed Hoeflein component cannot retain ghost running jobs.
-- Retains 0.5.2 `resumefrom ... refuseafter ...`, automatic FD-limit raising, and bounded threaded payload prefetch.
-
-## What changed in 0.5.2
-
-- `mwf resumefrom START refuseafter BOUNDARY` now has the same inclusive Hoeflein-component admission boundary as `runfrom ... refuseafter ...`: the named boundary component may finish or fail, no new later component is admitted afterward, already-running parallel components are joined, and queued later work is retained for a future resume.
-- Retains the 0.5.1 threaded payload-prefetch and automatic open-file-limit improvements.
-
-## What changed in 0.5.1
-
-- `mwf reset` and `mwf resetfrom` now perform the exact fresh preparation
-  used by `run` and `runfrom` without starting a scheduler or executing tasks.
-- `mwf cleanfrom` deletes all jobs and generated output in the selected Hoeflein
-  component and quotient-DAG descendants; `mwf wipefrom` additionally deletes
-  their inputs. `clean` and `wipe` apply the same semantics to the current
-  component. All six destructive preparation commands require a typed
-  confirmation unless `--yes` is supplied, and all support `--dry-run`.
-- `AGENT.md`, `examples/README.md`, and the new
-  `examples/agent_reference_architecture` provide a standard project layout and
-  a complete API/HTTP, fallback, transactional fan-out, durable fan-in, and
-  bounded Hoeflein-component reference design.
-- `mwf runfrom START refuseafter STOP` performs the same full freshening as an
-  ordinary `runfrom`, but stops admitting new Hoeflein components as soon as
-  STOP's component completes or fails. Components already running at that
-  instant are joined; downstream jobs remain queued for a later command.
-- Fresh and destructive commands now clear affected job trace journals by
-  default. Add `--keeptrace` to `run`, `runfrom`, selected-job runs, `reset`,
-  `clean`, or `wipe` to retain the prior transcript.
-- `resume` always preserves the selected current component's trace. Default
-  `resumefrom` preserves its start component and clears descendant traces;
-  `resumefrom --keeptrace` retains the entire selected descendant history.
-- Preserved event journals survive node copy/paste and can remain attached to a
-  temporarily deleted job identity. When a recreated job keeps its node/job ID
-  but receives a different parent, producer component, or job kind, MWF appends
-  and renders a separate `ORIGIN CHANGED` subsection before the new execution
-  history.
-- Repeated CLI/storage churn no longer risks a same-thread SQLite registry
-  deadlock when cyclic garbage collection invokes an old storage finalizer
-  during connection setup.
-
-## What changed in 0.4.8
-
-- API nodes use **fixed-limit adaptive admission sharding** by default. Dense
-  nodes that become runnable together receive one shared pump vector. Every API
-  node is guaranteed one pump. The total is bounded by the smaller of the nodes'
-  isolated benefit ceilings and `max(12, logical_processors + 5)`; remaining
-  pumps are assigned by marginal benefit `n / (p * (p + 1))`, where `n` is the
-  declared concurrency and `p` is the node's current pump count. On the supplied
-  16-logical-processor explode workload this gives 21 pumps across ten handlers.
-  `_LaneCoordinator` keeps each node's lane-concurrency sum exactly equal to its
-  declared limit, so controller sharding never reduces or increases job
-  concurrency. Already-running pumps remain charged when later DAG branches
-  become ready, preventing successive waves from each consuming a fresh host
-  budget. Explicit `event`, `balanced`, `elastic`, and `lanes:N` strategies
-  remain available for controlled comparisons.
-- Simultaneous Hoeflein claim bursts are combined into one grouped SQLite
-  operation. The mutation writer also caps ordinary claim transactions at 192
-  job rows, so a multi-thousand-job admission wave cannot trap urgent terminal
-  publication behind one non-preemptible transaction.
-- Refreshable job sources reserve row IDs under a short lock while payload reads
-  and claims overlap. Windows share a bounded payload-read pool on Windows,
-  avoiding a fresh thread pool for every node and every admission slice.
-- `benchmarks/compare_job_loading_models.py` compares fixed ladders, source-aware
-  windows, elastic loading, and two/three/four-lane models on the supplied
-  explode shape plus uneven 11k–12k-job graphs. A model is eligible only with no
-  missing monitor rows, no final residue, and bounded output-to-terminal p95/max.
-- A bounded regression test now samples SQLite during uneven high-concurrency
-  execution and verifies exact output-write to durable-terminal latency. A
-  separate 27-job-tail test prevents a small final queue from waiting for the
-  next admission plateau.
-
-## What changed in 0.4.6
-
-- Durable `job_events` are now the workflow state stream. In-process schedulers
-  receive commit callbacks immediately, while second-terminal commands and
-  restart control use coalesced loopback wakeups plus an `event_id` cursor. A
-  five-second timeout remains only as a defensive fallback; normal lifecycle
-  progress is no longer discovered by frequent status polling.
-- `mwf top` adds an event-driven htop-style dashboard with per-node queue/run
-  counts, effective limits, starts/finishes per second, queue and terminal p95
-  latency, recent lifecycle events, process RSS/thread data, SQLite/WAL size,
-  and the active process's mutation-writer backlog and batch diagnostics.
-- The former production API startup strategy was `single`. It remains available
-  as `event` for controlled comparisons, but shared-budget adaptive sharding is
-  the default after single-controller scaling tests exposed a large throughput
-  penalty at high declared concurrency.
-- Retry/fallback inspection moved from `mwf inspect NODE filter` to
-  `mwf filter NODE`; `mwf filter NODE stage X` shows terminal failures at the
-  final stage or failures at X that succeeded at X+1.
-
-## What changed in 0.4.5
-
-- Dense API sources now admit at most 64 jobs per scheduler slice and service
-  completed futures every 16 starts. Fast provider responses can therefore
-  publish output and terminal state while a large Hoeflein component is still
-  filling, instead of waiting behind a 256/512/1024 start wave.
-- Supervised API attempt metadata is generation/execution fenced, grouped by
-  node, deduplicated within each writer batch, and written asynchronously below
-  terminal priority. Startup inspection writes no longer serialize every job,
-  and terminal rows remain the monitor source of truth.
-- Active-restart supervision polls one project revision row. It materializes
-  live execution leases only after an actual restart request, rather than
-  rereading every active job every 50 ms at high concurrency.
-- Hot filesystem and SQLite paths cache canonical project/node directories and
-  avoid repeated path resolution for validated node names and integer job IDs.
-  This removes substantial per-job queueing overhead without weakening path
-  traversal validation or generation fences.
-- `benchmarks/reproduce_explode_ghost.py` copies the ten-handler
-  `pdftostructureddata` explode component and uses a variable-latency mock HTTP
-  provider to measure provider completion, durable output, and monitor-visible
-  terminal state separately.
-
-## What changed in 0.4.3
-
-- Terminal job publication now enters the existing priority SQLite writer
-  directly. The writer groups related terminal records for at most 5 ms and
-  applies one bulk lease-fenced update/event operation; the redundant terminal
-  daemon queue has been removed.
-- A node or Hoeflein-component failure stops new admission but waits for every
-  already-started threaded, process, or API job to reach its terminal boundary.
-  Failure handling no longer scans output files or performs a special terminal
-  drain before marking the component failed.
-- `mwf resume NODE` and `mwf resumefrom START` first reconcile terminal
-  `output.json` files against stale `running` rows, cross the SQLite durability
-  barrier, and only then generation-fence and requeue the remaining unsuccessful
-  work. This preserves handlers that finished before a process interruption.
-- `mwf restart NODE` restarts every live-running and failed/cancelled job in the
-  node's active Hoeflein component (a DAG node is a singleton component).
-  `mwf restart NODE failed` limits that component-wide selection to
-  failed/cancelled jobs. The explicit `job` and `jobs` forms remain available.
-- A waiting node now requires every selected peer to have zero queued, running,
-  and failed jobs. The old queued-only cycle bootstrap has been removed, so the
-  declared gate is never bypassed.
-
-## What changed in 0.4.2
-
-- SQLite state handling is separated into connection/mutation, schema,
-  advisory-lock, and transfer modules. Job creation, batching, querying,
-  cleanup, execution claims, terminal publication, and restart recovery are
-  likewise isolated behind the existing `FileStorage` facade.
-- Terminal job updates are published by a dedicated fixed-cadence coordinator
-  and use batched conditional SQL updates/events. Hoeflein components also
-  reconcile terminal `output.json` files every 250 ms, recovering a completed
-  handler if its final SQLite mutation was interrupted.
-- A node failure urgently flushes all already-written terminal outcomes before
-  the shared Hoeflein stop signal is raised. Sibling queue admission stops at
-  that point, and API jobs preclaimed but not started are returned to `queued`
-  for a safe `mwf resume`.
-- Multi-concern production modules over 500 lines were split into focused
-  facades and implementation files. The remaining file above 500 lines is the
-  cohesive cooperative fiber runtime.
-
-## What changed in 0.4.1 (historical; dense growth superseded in 0.4.5)
-
-- Refreshable API admission then adapted across a wider range. It starts at 64,
-  drops to 16 after a partial or empty pull for sparse/trickling queues, and
-  grows geometrically to 1024 while pulls remain full for dense fixed queues.
-- At that release, a 2,000-job dense queue reached its final partial pull in six admission
-  rounds (`64, 128, 256, 512, 1024, 16`) instead of repeatedly claiming fixed
-  groups of 64.
-- Terminal completion batching remains independent of the API fiber scheduler,
-  so adaptive claims cannot prevent output-backed `done` updates from entering
-  the higher-priority SQLite mutation lane.
-
-## What changed in 0.4.0
-
-- Terminal job status/event commits and execution claims now share runtime-
-  critical priority 5. Success, failure, and admission therefore enter one FIFO
-  class; bounded claim batches and cooperative callback servicing supply the
-  fairness without making one outcome type outrank another.
-- A monitor-shaped regression verifies that a large supervised API node reports
-  every completion from SQLite and leaves no queued/running residue while its
-  claims and terminal outcomes use that same priority.
-
-## What changed in 0.3.18
-
-- Fresh Hoeflein cleanup now reads producer provenance in one SQLite snapshot,
-  deletes selected-producer jobs in node-sized batches, requeues retained jobs
-  in one transaction per node, and removes independent job artifacts with
-  bounded parallelism on Windows. Large components begin pumping instead of
-  spending tens of seconds in per-job preparation.
-- API fiber admission no longer scans every outstanding future and sleeper after
-  each 64-job burst. Future deadlines use a heap, while restart/cancellation
-  checks run at the configured polling cadence. Large typed nodes therefore
-  progress through claim, watchdog setup, and HTTP dispatch at the same rate as
-  small nodes.
-- Threaded and API queue pumps load one metadata snapshot per 64-job burst and
-  prefetch the independent payload files before execution claims. The grouped
-  writer now receives dense claim bursts instead of claims separated by
-  per-job metadata queries and file reads.
-- A one-child route stages its tiny input before entering SQLite, then allocates
-  the ID and publishes the payload, row, event, and node state in one mutation.
-  Queue publication, local threaded execution, and API execution use separate
-  writer priorities, and one commit never absorbs lower-priority consumer work.
-- Concurrent execution claims and terminal updates coalesce by node. This keeps
-  live API startup and large completion waves from paying one savepoint and one
-  scheduler round trip per job while preserving an independent restart lease
-  and outcome for every job.
-- Terminal job publication releases the generation fence before waiting for the
-  grouped SQLite commit, then uses a lease-conditional terminal update. A large
-  completion wave no longer retains one lock-file handle per yielding fiber.
-- Newly reserved, unpublished job inputs use a direct exclusive create instead
-  of a temporary file plus rename. Short local routers can also group several
-  file/queue mutations under `with ctx.side_effects():` to reuse one restart
-  fence without holding it across a network request.
-
-## What changed in 0.3.17
-
-- Live Hoeflein components now wake on committed queue changes and completed
-  node pumps. The one-second poll is only a cross-process recovery fallback, so
-  a handler can start immediately when a running router creates work.
-- Single-job routing no longer acquires and releases a SQLite advisory lock for
-  every handoff. Auto-ID reservation and prepared-job publication use grouped
-  commits; publication combines the job row, creation event, idempotency row,
-  node status, and sequence advancement.
-- Job start, completion, event, and checkpoint mutations share the same short
-  group-commit lane. Bursts of completions no longer become one durable commit
-  per state field per job.
-- Active-restart detection moved from one SQLite query per waiting job per poll
-  to one supervisor query for all active leases. Exact side-effect and final
-  publication fences remain per job.
-- API fibers receive future-completion callbacks and O(1) ready-queue pops.
-  Progressive completion waves no longer rescan all outstanding futures or
-  shift a growing list on every resume.
-- The framework HTTP transport supports connection sharding with `http2=` and
-  `streams_per_connection=`. Per-node `max_threads` remains the exact job
-  concurrency control. The manager does not impose a second aggregate request
-  limit: every admitted API request is dispatched, with connection-local width
-  bounded by the HTTP/2 stream safety cap.
-
-### HTTP/2 connection sharding
-
-```python
-from micro_workflow_manager import configure_shared_http_transport
-
-configure_shared_http_transport(
-    http2=True,
-    streams_per_connection=80,
-    # Optional explicit overrides of the measured safe defaults:
-    http2_stream_safety_cap=32,
-)
-```
-
-For HTTP/2, the effective per-connection assignment is
-`min(streams_per_connection, http2_stream_safety_cap)`. The default safety cap
-is 32 because high stream widths caused severe long-tail collapse under
-thousand-request provider loads. Once a shard is full, another connection is
-created immediately. This is a connection-local safety control, not a workflow
-admission control: node concurrency, pump allocation, provider request pressure,
-and job lifecycle remain unchanged.
-
-The environment equivalent is `MWF_HTTP2_STREAM_SAFETY_CAP` (default `32`).
-`MWF_JSON_TERMINAL_GRACE_SECONDS` (default `5`),
-`MWF_HTTP2_COHORT_STALL_SECONDS` (default `300`),
-`MWF_HTTP2_COHORT_TERMINALS` (default `16`), and
-`MWF_HTTP2_COHORT_RETRIES` (default `2`) control terminal recovery without
-replacing the caller's request timeout. `MWF_HTTP_TRANSPORT_RETRIES` (default
-`2`) bounds transparent read/write/protocol recovery. Each physical attempt
-gets the same caller-configured bounded lease; ingress wait does not consume
-that lease, and the task's total timeout continues to bound the whole task.
-At peak width, the cohort threshold is the configured value. If fewer peers
-share a quiet tail shard, MWF waits for every available peer to terminate and
-requires at least two terminals before replaying the remaining outlier. For
-JSON response bodies, MWF independently enforces the caller's existing HTTPX
-read-idle timeout between body chunks; this covers a poisoned HTTP/2 stream
-whose underlying iterator never raises its own timeout. The resulting bounded
-physical replay receives the same configured lease. Replays use available
-capacity on previous healthy shards before opening another shared shard; the
-poisoned source shard is excluded and drained. The manager snapshot reports
-requested/effective stream width, the cap, client count, current in-flight
-requests, active stream phases, physical-attempt counts, replay reason,
-OpenRouter generation ID when supplied, healthy-shard reuse, new recovery
-shards, and recovery/retirement evidence. HTTP/1.1 keeps
-its independent `MWF_HTTP1_CONNECTIONS_PER_SHARD` setting.
-
-## What changed in 0.3.16
-
-- `mwf clean`, `mwf reset`, and `mwf wipe` now treat a Hoeflein component as
-  the indivisible cleanup unit. Naming one member expands to every member of
-  that component; DAG nodes remain singleton components.
-- Nodes may declare an intra-component waiting gate with `waiting=True` and
-  `wait_for=...`. Queued jobs remain durably queued, but the node displays as
-  `waiting` and no new node pump starts until every selected peer has zero
-  queued, running, and failed jobs. A pump that already started continues
-  normally.
-- `wait_for=None` with `waiting=True` means all other vertices in the component.
-  A list selects a subset. Waiting targets outside the component are rejected.
-- Waiting on a singleton DAG component is allowed but has no effect; CLI loading
-  prints a reminder that ordinary DAG predecessor readiness is the available
-  queue-independent mechanism.
-- Waiting declarations are strict. A mutually waiting set with blocked work on
-  every side remains waiting until a restart, resume, or producer action clears
-  the declared queued/running/failed conditions.
-
-### Waiting-node example
-
-```python
-from micro_workflow_manager import NodeRouter
-
-router = NodeRouter(
-    "router",
-    runner="threaded",
-    waiting=True,
-    wait_for=["worker_a", "worker_b"],
-)
-
-# Equivalent fluent forms:
-# router.wait_for_nodes("worker_a", "worker_b")
-# router.wait_for_component()  # every other component member
-```
-
-Waiting is a node-pump admission rule, not a job-status rewrite. Jobs stay
-`queued` in SQLite so reset/resume semantics remain unchanged; `mwf monitor`
-shows the node lifecycle state as `waiting` and includes `waiting_on` in JSON.
-
-## What changed in 0.3.15
-
-- MWF now owns one process-wide pooled `httpx.AsyncClient`. Synchronous API tasks
-  call `shared_http_transport` and suspend cooperatively on the existing fiber
-  runtime; projects no longer need to embed an asyncio thread/client bridge.
-- Framework HTTP waits are explicit scheduler states. A bounded live transport
-  request suspends checkpoint-progress expiry, while the task total timeout and
-  the HTTP transport timeout remain active. This prevents synchronized watchdog
-  cancellation waves when hundreds of model requests are legitimately waiting.
-- Timed `concurrent.futures.Future.result(timeout=...)` retains its periodic
-  timeout behavior inside fibers, so heartbeat loops continue to run.
-- Fiber admission occurs in bounded bursts with scheduler servicing between
-  bursts. Starting thousands of jobs cannot starve earlier fibers for an entire
-  checkpoint window.
-- `ctx.sleep()` is cooperative in API fibers. Per-node API limits may be set into
-  the thousands; there is no workflow-wide aggregate API cap.
-
-### Framework-owned HTTP transport
-
-```python
-from micro_workflow_manager import shared_http_transport
-
-payload = shared_http_transport.post_json(
-    "https://api.example.com/v1/chat",
-    headers={"Authorization": "Bearer ..."},
-    json={"model": "...", "messages": [...]},
-    timeout=(30, 1800),
-    heartbeat_callback=lambda elapsed: ctx.checkpoint(
-        f"model request active for {elapsed:.0f}s", timeout=90
-    ),
-    heartbeat_interval=15,
-    wait_name="model request",
-)
-```
-
-The transport uses `httpx` connection pooling and integrates directly with the
-scheduler watchdog. In 0.3.17 it may own several automatically selected client
-shards. The checkpoint lease is suspended only while the bounded network
-operation is active.
-
-## What changed in 0.3.12
-
-- API-runner node pumps now refill from jobs committed after the pump starts. A
-  typed handler that begins with one routed job can grow toward its configured
-  concurrency while that first API request is still running, instead of waiting
-  for the initial static queue snapshot to finish.
-- Refreshable queued-job sources follow SQLite row insertion order, so concurrent
-  batch producers that reserve lower job IDs but commit after a higher range are
-  still discovered. Non-API runners retain the existing snapshot behavior and
-  deterministic job-ID ordering.
-- Added component and CLI `--monitor` regressions for gradual high-fanout routing,
-  including the former state where a handler displayed hundreds queued but only
-  one running.
-
-## What changed in 0.3.11
-
-- Hoeflein components now use live node pumps. While one member is still
-  processing its queue, the scheduler polls idle sibling queues and starts them
-  as soon as internal component jobs appear. A fast handler can drain and be
-  restarted repeatedly while a long-running router continues producing work.
-- Monitor rows now derive their display state from actual per-node job counts.
-  Queued component work is not reported as running before execution, idle
-  handlers remain queued while a router starts, and a handler with active jobs
-  is shown running even if a concurrent component refresh wrote a broader node
-  lifecycle state.
-- The adaptive threaded runner now exits after the first worker failure even
-  when its lazy source still contains unclaimed jobs. This fixes active runs
-  that remained stuck at `status=running`, `running=0`, with queued jobs left.
-- Windows safe-path validation now treats ordinary and extended-length
-  (`\\?\\`) spellings of the same resolved path as equivalent while retaining
-  the same descendant-only security check.
-- Fresh producer-scoped cleanup rewinds the quiescent target's job allocator so
-  deterministically recreated jobs keep their previous tail IDs.
-
-## What changed in 0.3.10
-
-- Added a high-fanout batch API: `NodeHandle.add_many`,
-  `NodeInputFileSystem.add_jobs`, and `NodeInputFileSystem.write_jsons`. One
-  downstream job is still created per parameter object, but payload files and
-  SQLite metadata are registered in batches rather than through one global lock
-  and transaction sequence per object.
-- Added transactional per-node job-ID sequences. Existing 0.3.9 databases are
-  migrated in place by initializing each sequence to `MAX(job_id) + 1`; existing
-  jobs, statuses, events, and payload folders are preserved.
-- Batch registration reserves IDs briefly, prepares disjoint payload files
-  outside the database transaction, and commits jobs, creation events,
-  idempotency rows, and node status in one transaction. Concurrent producers are
-  safe and duplicate idempotency keys resolve to the existing jobs.
-- Deterministic `overwrite=True` node-input batches use atomic replacement
-  without a global advisory lock. `overwrite=False` retains locked unique-name
-  allocation.
-- Added separate-component high-fanout regressions proving that a producer can
-  queue hundreds of jobs for a downstream Hoeflein component without autostarting
-  it or merging the two components.
-
-## What changed in 0.3.9
-
-- Framework-created API, threaded-runner, Hoeflein node, scheduler-supervisor,
-  and inline monitor threads now close their per-thread SQLite connection when
-  the thread or job finishes. Dead thread identifiers cannot inherit an older
-  connection if Python later reuses the numeric thread ID.
-- Same-process SQLite writers are serialized before `BEGIN IMMEDIATE`. SQLite
-  still provides cross-process coordination, but hundreds of local workers no
-  longer enter `busy_timeout` together. Commit failures now always roll back so
-  a persistent connection cannot retain a write transaction and poison later
-  scheduler rounds.
-- Checkpoint runtime persistence is one conditional `UPDATE` instead of a
-  database advisory-lock acquire, runtime update, and advisory-lock release.
-  Late checkpoints from a timed-out or restarted watch still cannot overwrite
-  its terminal runtime state.
-- Generation/restart-fenced file mutations now use per-job operating-system file
-  locks in `.mwf/execution-fences/`. This preserves second-terminal `restart`
-  ordering without writing SQLite advisory-lock rows around every file write.
-- Repeated high-concurrency API rounds and repeated CLI `run --monitor` rounds
-  now have regression coverage for connection cleanup, runtime writes, file
-  fencing, database integrity, and progressive slowdown.
-
-## What changed in 0.3.8
-
-- `mwf run NODE` is again a true fresh run even when NODE's jobs were created by
-  an external predecessor. Every remaining job in the explicitly selected
-  Hoeflein start component is requeued and its generated output/files are
-  cleared before scheduling.
-- `mwf runfrom NODE` applies that full reset to the selected start component,
-  then keeps producer-scoped cleanup for descendant merge components. Work from
-  unselected incoming branches is still preserved exactly as before.
-- `mwf resumefrom NODE` automatically generation-fences and requeues failed,
-  cancelled, and abandoned-running jobs throughout the selected descendant set.
-  A separate `mwf restart` step is not required after a completed partial run.
-- `mwf restart` is now strictly a second-terminal control for a live `run`,
-  `runfrom`, `resume`, or `resumefrom` sequence. It may replace a running attempt
-  or requeue a failed/cancelled job owned by that active sequence, but it no
-  longer edits failed jobs after the sequence has ended. Use `resume` or
-  `resumefrom` for post-failure continuation.
-- Fresh-run, branch-preservation, resumefrom, restart, and final run-state
-  behavior are covered by repeated CLI regression tests using `--monitor`.
-
-## What changed in 0.3.7
-
-- SQLite advisory locks now record the owning host and process and immediately
-  reclaim rows whose local owner process has exited. An interrupted or killed
-  `mwf threads`/`mwf run` command therefore cannot strand `thread-overrides`
-  behind its old 300-second lease and make the next run time out after 120
-  seconds.
-- A live local owner is no longer displaced merely because a long critical
-  section exceeded the nominal lease. Unknown or remote owners still use the
-  lease as the safe fallback.
-- Run startup binds temporary thread overrides before publishing `run.json` as
-  running. `mwf threads` serializes active-run discovery with that startup, so a
-  concurrent command cannot accidentally scope its value to the following run.
-  Run completion publishes its terminal state before best-effort override
-  cleanup, so an override cleanup problem cannot leave a completed run falsely
-  recorded as active.
-- `mwf threads NODE VALUE` prints a resource warning above 256 in-flight jobs.
-  CLI restart/timeout supervision can use roughly one controller and one handler
-  thread per active job, so settings such as 750 can put severe pressure on
-  Windows thread, memory, SQLite, socket, and API connection limits.
-
-## What changed in 0.3.6
-
-- Scheduling now uses **Hoeflein components**. Let `A ⊆ E` be the graph edges
-  explicitly used with `autostart=True` in node behavior code. MWF constructs
-  the augmented directed graph
-  `G_H = (V, E ∪ {(v, u) : (u, v) ∈ A})` and takes its strongly connected
-  components. The quotient keeps the direction of the original graph edges and
-  is the scheduler DAG, `HDAG(G)`.
-- Naming any node in a multi-node Hoeflein component with `mwf run`,
-  `mwf runfrom`, `mwf resume`, or `mwf resumefrom` selects the whole component.
-  MWF prints a reminder before execution. Every original graph edge whose ends
-  lie in the same component is automatically treated as component-autostart,
-  even when that particular `add(...)` call omits `autostart=True`.
-- A Hoeflein component is one lifecycle unit: its nodes enter running together,
-  become done together when quiescent, and become failed together if any job
-  fails. Live node pumps stop accepting newly discovered sibling work after the
-  first failure, and the component is published failed while active pumps wind
-  down.
-- Generated jobs retain their immediate parent node/job and also record a stable
-  producer-component identity plus whether they are a `dag` or `component` job.
-  Fresh runs remove only jobs produced by the selected Hoeflein components.
-  Jobs produced by unselected branches are preserved with their status, input,
-  output, returned files, and provenance.
-- `mwf runfrom A` may process A's branch through a later merge component while
-  another incoming branch is unfinished. A later `mwf runfrom B` removes and
-  rebuilds only B-produced work; it does not delete A-produced jobs already in
-  the shared descendant. By contrast, the *starting* component must have every
-  external predecessor complete. For `A -> C` and `B autostarts C`, the quotient
-  is `A -> {B,C}`, so `mwf run B` is refused until A has completed.
-- `mwf inspect NODE job ID` now shows the producer component and the job kind.
-  `--plan` explains component selection and producer-scoped cleanup.
-
-## What changed in 0.3.5
-
-- `mwf run NODE --monitor` and `mwf runfrom NODE --monitor` print the full
-  timestamped monitor dashboard in the execution terminal. Inline snapshots do
-  not clear task output; `--monitor-interval` controls their cadence. The same
-  option is available on resume forms and selected-job runs.
-- A terminal monitor snapshot reports `active run: none` after a sequence is
-  done, blocked, incomplete, or failed, and separately identifies the last run.
-- `AGENT.md` defines the required testing and failure-diagnosis protocol: focused
-  reproduction, concurrency and timeout experiments, freeze classification,
-  repeated command use, separate-process cyclic tests, test maintenance, and the
-  rare stubborn-issue escalation format.
-- Execution reporters are lifecycle-owned by the active run, preventing stale
-  inline reporter threads or final snapshots that still describe a finished run
-  as active.
-
-## What changed in 0.3.4
-
-- The synchronous execution stack is flatter. A runner worker is now the
-  attempt controller and invokes retry/fallback orchestration directly. For a
-  supervised or actively restartable attempt, it creates exactly one
-  abandonable `mwf-handler-*` thread for the current user handler; the old
-  worker -> attempt thread -> handler thread stack is gone.
-- The new `api` runner is designed for blocking network/API/I/O jobs. It fills
-  the requested concurrency immediately and intentionally keeps the familiar
-  `max_threads` setting, where the value means maximum in-flight API jobs.
-  `io` and `network` are accepted aliases.
-- `mwf init` creates `.mwf/state.sqlite3`. Job identity and status, queue
-  membership, node status, lifecycle events, retries/fallback diagnostics,
-  execution generations, checkpoints, idempotency keys, default-job
-  declarations, summary counts, and cross-process advisory locks now live in
-  SQLite with WAL enabled.
-- User data remains ordinary files: node `input/`, node `output/`, job
-  `input.json`, job `output.json`, and returned `jobs/<id>/files/` are not moved
-  into the database. Existing 0.3.3-and-earlier metadata is imported once and
-  removed only after it is durable in SQLite.
-- `mwf migrate --dry-run` remains read-only, while `doctor`, `monitor`,
-  `inspect`, restart/recovery, cleanup, clipboard, deployment, process running,
-  and filter-funnel inspection preserve their previous functionality against
-  the new state backend.
-- The generated Material Icon Theme settings no longer force the top-level
-  `node` folder to use the `flow` icon. Exact graph-node folder names still use
-  `flow`, and unrelated user associations remain untouched.
-
-
-## What changed in 0.3.2
-
-- When every fallback fails, the job output now records the **terminal fallback error** rather than the stale main-task error.
-- This makes `mwf inspect <node-name> job <id>` agree with the final timeout/event that actually caused the job to fail.
-- Existing task, retry, checkpoint, restart, deployment, and thread-override behavior is unchanged.
-
-
-- `mwf inspect <node-name> failed` prints failed job IDs, concise errors, and the appropriate resume/resumefrom command; during a live sequence it also shows the second-terminal restart form.
-- Extended CLI examples no longer use a node literally named `wait`; examples use neutral placeholders or simple operation names.
-
-## What changed in 0.3.0
-
-- Runtime `mwf threads` overrides are scoped to one workflow run. An override
-  configured before a run is claimed by that next run and deleted when the run
-  finishes; an override changed from a second terminal is deleted with the
-  active run. Stale overrides from a crashed older run are ignored.
-- `mwf restart` generation-fenced live attempts and originally allowed offline
-  failed/cancelled requeueing. Version 0.3.8 reserves restart for a live
-  second-terminal sequence; post-failure continuation now belongs directly to
-  `mwf resume` and `mwf resumefrom`.
-- `mwf deploy setup` explicitly prompts for the SSH port when `--port` is not
-  supplied.
-- `mwf init` merges Material Icon Theme settings into `.vscode/settings.json`
-  and associates `.mwfignore` with the `routing` icon. Existing unrelated VS
-  Code settings are preserved.
-
-
-## Client-facing filesystem architecture
-
-MWF 0.3.0 encourages node behavior files to describe their filesystem contract
-next to the router. A task should read like workflow logic, while reusable
-filesystem objects hold the stable information about where data comes from,
-where it is written, and which downstream node receives it.
-
-The four standard objects are:
-
-- `InputFileSystem`: the current node's read-only `input/` folder.
-- `OutputFileSystem`: the current node's persistent `output/` folder.
-- `JobFileSystem`: files returned by one job in `jobs/<id>/files/`.
-- `NodeInputFileSystem`: another node's `input/` folder and job-creation route.
-
-Each declaration has a human-readable label, an optional portable base-path
-template, and an encoding. `NodeInputFileSystem` also records the destination
-node. The object is only a declaration at import time; it resolves paths lazily
-when bound to a `JobContext`, so the same node file works on Windows and Linux.
-
-A representative node behavior file is:
-
-```python
-from micro_workflow_manager import (
-    InputFileSystem,
-    NodeInputFileSystem,
-    NodeRouter,
-    OutputFileSystem,
-)
-
-router = NodeRouter("add_numbers", max_threads=2)
-
-INPUT = InputFileSystem("number input")
-OUTPUT = OutputFileSystem("sum output", base="{batch}")
-REVIEW_INPUT = NodeInputFileSystem(
-    "review",
-    "review input",
-    base="{batch}",
-)
-
-
-@router.task(timeout=60)
-def add_numbers(ctx, batch, source_file):
-    # Load input through the declared filesystem contract.
-    numbers = INPUT.file(ctx, source_file).read_json()
-
-    ctx.checkpoint("numbers loaded", timeout=20, progress=0.25)
-
-    total = sum(numbers)
-
-    ctx.checkpoint("sum calculated", timeout=20, progress=0.75)
-
-    # Write output and carry it forward through filesystem objects.
-    result = OUTPUT.file(ctx, "sum.json", batch=batch)
-    result.write_json({"total": total})
-
-    review_copy = REVIEW_INPUT.file(ctx, "sum.json", batch=batch)
-    review_copy.copy_from(result, overwrite=True)
-    REVIEW_INPUT.add_job(
-        ctx,
-        batch=batch,
-        result_file=review_copy.relative_path,
-    )
-
-    return {"total": total}
-```
-
-This structure is deliberate:
-
-1. Imports state the external tools and MWF concepts used by the node.
-2. The router and filesystem declarations state the node's execution and data
-   contract before any task code.
-3. The task loads named inputs, performs domain subtasks, reports optional
-   checkpoints, then writes and routes named outputs.
-4. Helper functions can accept `FileSystemEntry` objects instead of rebuilding
-   project paths or calling low-level context methods repeatedly.
-
-### Binding and templates
-
-A filesystem object's `base` may use simple `str.format` placeholders:
-
-```python
-PAGES = OutputFileSystem("rendered pages", base="{book_name}")
-page = PAGES.file(ctx, "page_001.png", book_name=book_name)
-```
-
-`page` is a `FileSystemEntry`. It is path-like, so it can be passed to most
-libraries that accept `str`, `Path`, or `os.PathLike`, while also providing
-workflow-aware methods:
-
-```python
-page.exists()
-page.read_bytes()
-page.write_bytes(data)
-page.copy_to(destination, overwrite=True)
-page.parent.mkdir()
-PAGES.files(ctx, "*.png", book_name=book_name)
-```
-
-All relative paths are normalized to portable `/` form and reject absolute paths
-and `..`. Managed writes through `write_text`, `write_bytes`, `write_json`,
-`append_text`, `copy_from`, and `delete` use MWF's execution-generation guards.
-This prevents a restarted or timed-out stale attempt from committing through the
-framework.
-
-The `.path` property and writable `.open()` are available for third-party
-libraries that require an ordinary filesystem path. Direct writes made by such
-a library cannot be rolled back or fenced for the full duration of the open
-handle, so prefer the managed methods when possible and use checkpoints around
-long external operations.
-
-### Naming downstream filesystem types
-
-For a frequently used destination, a project may give its route a domain name:
-
-```python
-class ReviewInputFileSystem(NodeInputFileSystem):
-    def __init__(self):
-        super().__init__("review", "review input")
-
-REVIEW_INPUT = ReviewInputFileSystem()
-```
-
-This is optional. A plainly named instance such as
-`REVIEW_INPUT = NodeInputFileSystem("review", "review input")` is usually the
-smallest and clearest form.
-
-A complete runnable version of the simple addition example is included in
-`examples/filesystem_objects`.
-
-### Compatibility and philosophy
-
-The original `ctx.input_path()`, `ctx.write_output()`, `ctx.write()`, and
-`ctx.node()` methods remain supported. Filesystem objects are the recommended
-client-facing architecture, not a forced migration or a second storage system.
-They are thin declarations over the same hybrid storage, scheduler guards, transactions, and downstream job APIs. Payload paths remain files, while scheduler mutations use SQLite, so the declarations do not add project scans or per-file background work.
-
-## Consolidated project runtime directory
-
-Framework-owned project state is consolidated under `.mwf/`:
+# micro-workflow-manager 0.6.1
+
+Micro Workflow Manager (MWF) runs Python jobs through a directed graph while
+keeping user data visible on disk and high-churn scheduling state in SQLite. It
+supports ordinary acyclic workflows, bounded communicating components, direct
+and parallel runners, retries and fallbacks, durable inspection, and controlled
+restart and recovery.
+
+## Documentation
+
+This README is the current common-path guide. It is self-contained for the behavior a
+project author needs to create, run, inspect, and recover a workflow. The linked
+pages own deeper design or operating detail:
+
+- [CONTEXT.md](CONTEXT.md): MWF language and release boundaries.
+- [Graph architecture](docs/architecture/graph.md): raw graphs, Hoeflein
+  components, quotient-DAG scheduling, circulation, and semantic pathing.
+- [Node architecture](docs/architecture/node.md): tasks, fallbacks, validation,
+  failure lineage, runners, and node README guidance.
+- [Task architecture](docs/architecture/task.md): parameters, routing,
+  filesystems, validation, output provenance, and idempotency.
+- [Operations](docs/operations.md): command semantics, inspection, restart,
+  recovery, cleanup, clipboard use, and deployment.
+- [Installation](docs/installation.md): development installs, builds, wheels,
+  uninstalling, and persistence.
+- [Testing](docs/testing.md), [test modules](tests/README.md), and
+  [benchmarks](benchmarks/README.md): isolated verification and performance
+  programs.
+- [Release history](docs/release-history.md): version-by-version change notes.
+- [Provisional 0.6.4 planning](docs/plans/0.6.4.md): explicitly unsettled
+  future work, not current behavior.
+
+Repository procedures for agents live in [AGENTS.md](AGENTS.md) and the five
+instruction-only skills under `.agents/skills/`.
+
+## The model
+
+An MWF project has three design scales:
+
+1. The raw graph names nodes and directed routes.
+2. A node owns one main task, optional fallbacks, validation, and one runner.
+3. A task accepts one job's parameters and files, performs a transformation,
+   validates it, writes useful output, and routes accepted work onward.
+
+MWF contracts each communicating Hoeflein component into one vertex for
+dependency scheduling. The resulting quotient graph is acyclic. Ordinary DAG
+nodes are singleton components. Naming a node in a multi-node component for
+`run`, `resume`, restart, or cleanup selects the whole component.
+
+The filesystem and SQLite have separate responsibilities:
+
+- `.mwf/state.sqlite3` is authoritative for jobs, statuses, execution
+  generations, checkpoints, events, idempotency keys, default job declarations,
+  node state, and queueing.
+- `node/<name>/input/` is durable input visible to task code.
+- `node/<name>/output/` is the node's single user-owned output prefix.
+- `node/<name>/jobs/<id>/input.json` stores job parameters.
+- `node/<name>/jobs/<id>/output.json` stores the concise terminal return or
+  failure summary.
+
+MWF 0.6.1 does not provide per-job file storage. Substantial results,
+diagnostics, and intermediate files belong under the node output prefix, not
+under `jobs/<id>/`.
+
+## Recommended project layout
 
 ```text
-.mwf/
-  project.json       # graph path, stored edges, default runner, low-churn config
-  run.json           # active/recent CLI ownership and scheduler heartbeat
-  threads.json       # optional run-scoped node overrides and API total budget
-  state.sqlite3      # jobs, queue, events, checkpoints, idempotency, advisory locks
-  deploy/            # server setup and replaceable local deployment archive
+project/
+├── README.md
+├── src/
+│   ├── graph.py
+│   ├── README.md                     # optional source organization guide
+│   └── node_behavior/
+│       └── <node-name>.py
+├── node/
+│   └── <node-name>/
+│       ├── README.md
+│       ├── input/
+│       ├── output/
+│       └── jobs/
+│           └── <job-id>/
+│               ├── input.json
+│               └── output.json
+├── .mwf/
+│   ├── project.json
+│   ├── run.json
+│   ├── threads.json
+│   └── state.sqlite3
+├── .mwfignore
+└── .gitignore
 ```
 
-SQLite uses WAL mode so `monitor` and `inspect` readers do not block the
-scheduler's short writes. The database stores framework state only. Node
-`input/`, node `output/`, each job's `input.json` and `output.json`, and returned
-files remain ordinary files.
-
-Projects from older releases are migrated automatically. Legacy `.mwf` root
-JSON, `.mwf_run.json`, and `.mwf_threads.json` are consolidated; legacy
-`.mwf_locks/`, `queued/`, `idempotency/`, `node_state.json`, `job.json`,
-`status.json`, `execution.json`, `runtime.json`, `events.jsonl`, default-job
-manifests, and job indexes are imported into SQLite when applicable. User
-payload files are not rewritten. Migration is idempotent.
-
-The generated `.gitignore` ignores `.mwf/` and legacy runtime-only paths under
-node and clipboard snapshots. Direct files in
-`clipboard/<node>/input/` and `clipboard/<node>/output/` remain trackable.
-
-`mwf init` merges Material Icon Theme settings without replacing unrelated user
-settings:
-
-```json
-{
-  "workbench.iconTheme": "material-icon-theme",
-  "material-icon-theme.files.associations": {
-    ".mwfignore": "routing",
-    "graph.py": "routing"
-  },
-  "material-icon-theme.folders.associations": {
-    "clipboard": "archive",
-    "input": "input",
-    "output": "export",
-    "jobs": "tasks",
-    "queued": "queue",
-    "idempotency": "keys"
-  }
-}
-```
-
-The top-level `node` folder deliberately keeps the icon theme's native icon.
-After the graph is set, MWF associates each exact graph node name with `flow`.
-Because Material Icon Theme associations are name-based, the same mapping styles
-both `node/<name>/` and `clipboard/<name>/`. Install the Material Icon Theme VS
-Code extension to see these associations.
-
-## Explicit graph synchronization
-
-The graph definition and the top-level `node/` folders are synchronized only by
-the `graph` command. Ordinary commands such as `run`, `runfrom`, `clean`, and
-`monitor` do not silently add or remove node folders.
-
-Set the graph the first time:
-
-```bash
-mwf graph src/graph.py
-```
-
-After editing edges or renaming, adding, or removing nodes, preview and then
-explicitly apply the new graph state:
-
-```bash
-mwf graph --update --dry-run
-mwf graph --update
-```
-
-`mwf graph --update` uses the graph path already stored in `.mwf/project.json`. Relative graph
-paths are stored with `/`, even on Windows. When reading an older or manually
-edited project, MWF accepts both `src/graph.py` and `src\graph.py`, resolves the
-path inside the project root, and rewrites it to the portable `/` form on the
-next update. It creates folders for new nodes and permanently deletes folders
-for nodes no longer in the graph, including their inputs, outputs, jobs, and state. Back up or move any data
-you need before updating. If an ordinary command detects changed edges, missing
-new folders, or stale renamed folders, it exits with an instruction to run the
-update and leaves the disk unchanged.
-
-A leftover `node_behavior/*.py` file whose router name is no longer in the graph
-is ignored; importing the project will not recreate that old node folder.
-
-## Graph-only engine view
-
-Open the synchronized graph in a clean local browser canvas:
-
-```bash
-mwf engine
-```
-
-The view contains only the graph. It lays out the quotient DAG from left to
-right, collapses each nontrivial Hoeflein component into one scheduling card,
-and reveals that component's members when selected. Pan and zoom are built into
-the canvas. There are no runtime, contract, editing, or execution controls in
-this first version.
-
-Engine is read-only: it consumes the stored synchronized edges plus statically
-detected `autostart=True` relationships without importing project code,
-initializing SQLite, migrating project layout, or creating files. Its temporary
-HTTP server binds only to `127.0.0.1`, uses an unguessable session path, has no
-mutation endpoint or external web dependency, and exits with Ctrl+C.
-
-## Compact directed fans in `graph.py`
-
-A lowercase name can represent one node and an uppercase variable can represent
-a group. Put a collection on one side of an edge to express an `a-B` fan-out or
-an `A-b` fan-in:
-
-```python
-A = ["extract_text", "extract_images"]
-B = ["jsonify", "index"]
-
-EDGES = [
-    ("split", B),   # split -> jsonify, split -> index
-    (A, "merge"),   # extract_text -> merge, extract_images -> merge
-]
-```
-
-The explicit helper form is also supported:
-
-```python
-from micro_workflow_manager import fan
-
-EDGES = [
-    fan("split", ["jsonify", "index"]),
-    fan(["extract_text", "extract_images"], "merge"),
-]
-```
-
-A collection on both sides is rejected because that would describe a complete
-bipartite graph rather than one directed fan.
-
-## Hoeflein components and the quotient DAG
-
-A finished job is not the same thing as a finished scheduling component. MWF
-separates ordinary dependency direction from explicit autostart communication.
-Let `G = (V, E)` be the project graph and let `A ⊆ E` contain exactly the edges
-statically declared with `autostart=True`. Construct:
-
-```text
-G_H = (V, E union reverse(A))
-reverse(A) = {(v, u) : (u, v) in A}
-Hoeflein(G) = SCC(G_H)
-HDAG(G) = G / Hoeflein(G)
-```
-
-The quotient edges come from the original `E`, not from the synthetic reverse
-arcs. Therefore, with `A -> C` and `B autostarts C`, B and C form one component
-and the quotient is:
-
-```text
-A -> {B, C}
-```
-
-There is no reverse dependency from `{B,C}` to A. Running B or C selects the
-whole `{B,C}` component, but it is refused until A is complete.
-
-Within one Hoeflein component, every original directed edge behaves as
-component-autostart. Child work is queued and the component scheduler keeps one
-live pump per active member node. It polls idle sibling queues while other pumps
-are still running, so a newly routed handler job does not wait for the router's
-entire queue to drain. Work is never executed recursively inside the parent
-handler. Queued components remain queued before execution; once active, member
-nodes quiesce and fail as one lifecycle unit. A node that has no jobs is
-vacuously successful when the component's actual jobs all finish.
-
-A partial `runfrom` deliberately permits a later merge component to process the
-selected incoming branch while other incoming branches remain unfinished. That
-component may reactivate when another producer creates new jobs later. Starting
-component readiness is stricter: all external predecessors of the start
-component must already be complete.
-
-See `examples/autostart_cycle_lab` and the fan, K4, and C5 cyclic tests for
-runnable communicating-component examples.
-
-### Producer-component provenance and fresh-run cleanup
-
-Every generated job records:
-
-```text
-parent.from_node
-parent.from_job_id
-producer_component
-job_kind = dag | component
-```
-
-`component` jobs were generated inside their target Hoeflein component. `dag`
-jobs crossed a quotient-DAG edge. Root/default jobs have no producer.
-
-For a fresh `mwf run COMPONENT_MEMBER`, MWF first deletes every job produced by
-that component, including internal component jobs and jobs it produced in later
-components. It then requeues **every remaining job in the selected start
-component**, including jobs created there by an external predecessor. For
-`mwf runfrom`, that same full reset applies to the start component. Descendant
-merge components rebuild selected-producer and root/default work while preserving
-completed jobs produced by unselected incoming branches.
-
-Example with ordinary edges `A -> C` and `B -> C`:
-
-```bash
-mwf runfrom A   # creates and completes A-produced jobs in C
-mwf runfrom B   # preserves A-produced jobs; rebuilds only B-produced jobs
-```
-
-Node-level `output/` is preserved whenever a node still contains jobs from an
-unselected producer, because that directory may contain shared debugging
-provenance. Job-local outputs remain attributable and are removed only with the
-job that owns them.
-
-## Explicit jobs
-
-`mwf run` and `mwf runfrom` no longer invent a default starter job. Declare default jobs in the respective node file:
-
-```python
-from micro_workflow_manager import NodeRouter
-
-router = NodeRouter("split", max_threads=2)
-router.create_job(number=2, params={"message": "hello"})
-
-@router.task
-def split(ctx, message):
-    print(message, ctx.job_id)
-```
-
-`number=2` creates jobs 1 and 2 with the same params. Multiple `router.create_job(...)` calls are allocated deterministic job ids in the order they appear. These declarations are idempotent when the CLI imports node files repeatedly.
-
-### Deterministic partial node runs
-
-Run a reproducible subset of one node's existing jobs with `sample`:
-
-```bash
-mwf run explodeexercise sample 100 --seed 20260817 --plan
-mwf run explodeexercise sample 100 --seed 20260817
-mwf run explodeexercise sample 100 --seed 20260817 --status failed,done
-```
-
-The default population is every existing job in the named node, including done
-jobs. `--status` narrows it. MWF assigns each candidate a portable SHA-256 score
-from the algorithm version, seed, node name, and job ID, then chooses exactly the
-lowest `COUNT` scores. The same population and seed therefore produce the same
-job IDs across supported operating systems and Python versions.
-
-`--plan` prints the population digest, seed, selected IDs, and a guarded replay
-command. The replay uses `--expect-population sha256:...` and refuses if a
-candidate's status, execution generation, or input content has changed. A seed
-is generated and printed when omitted.
-
-A sample resets and executes only its selected jobs. Unselected jobs and their
-outputs remain untouched. It deliberately bypasses predecessor readiness and
-disables component circulation and descendant execution, so it is an isolated
-prompt/model/validation test—not an end-to-end acceptance run for a Hoeflein
-component or workflow branch. The selection manifest is retained in
-`.mwf/run.json` with the run record.
-
-## Passing files forward
-
-Use a `NodeInputFileSystem` to make the destination visible at the top of the
-node file and to route both files and job parameters:
-
-```python
-from micro_workflow_manager import NodeInputFileSystem, OutputFileSystem
-
-OUTPUT = OutputFileSystem("split pages")
-TAGIFY_INPUT = NodeInputFileSystem("tagify", "tagify page input")
-
-
-@router.task
-def split(ctx):
-    page = OUTPUT.file(ctx, "page_001.txt")
-    page.write_text("page text")
-
-    incoming = TAGIFY_INPUT.file(ctx, page.name)
-    incoming.copy_from(page, overwrite=True)
-    TAGIFY_INPUT.add_job(ctx, page_file=incoming.relative_path)
-```
-
-The downstream node reads `page_file` with its own `InputFileSystem`. Job
-creation remains explicit, so preparing a file never silently invents work.
-`ctx.transaction()` and idempotency keys continue to work because
-`NodeInputFileSystem.add_job()` delegates to the same guarded `NodeHandle.add()`
-operation.
-
-For high fan-out, batch publication without coarsening the downstream jobs:
-
-```python
-records = [(f"items/{i}.json", value) for i, value in enumerate(values, 1)]
-TAGIFY_INPUT.write_jsons(ctx, records, overwrite=True)
-TAGIFY_INPUT.add_jobs(
-    ctx,
-    [{"record_file": filename} for filename, _ in records],
-    autostart=False,
-    idempotency_keys=[f"record:{filename}" for filename, _ in records],
-)
-```
-
-This still creates one `tagify` job per record. With `autostart=False`, the
-producer and consumer remain separate Hoeflein components; the optimization is
-only in file and SQLite registration.
-
-## Deploying a filtered project copy
-
-Deployment is explicit and uses a project-root `.mwfignore`, similar in spirit
-to `.gitignore` and `.dockerignore`. Later rules override earlier rules and a
-leading `!` re-includes a path. Server passwords are never stored.
-
-Configure a server and create the default ignore file:
-
-```powershell
-mwf deploy setup
-```
-
-The default `.mwfignore` excludes Git/editor metadata, `.mwf/`, virtual
-environments, Python caches, build output, and `.env` files. Review it before
-every sensitive deployment. Password authentication uses PuTTY `pscp` and
-`plink`; key authentication normally uses OpenSSH `scp` and `ssh`, while `.ppk`
-keys use PuTTY. Setup stores connection metadata at `.mwf/deploy/server.json`.
-
-Build a local deployment:
-
-```powershell
-mwf deploy local
-```
-
-This command deletes the previous `.mwf/deploy/local/` copy, filters the project
-through `.mwfignore`, compresses every direct `node/<name>/` subfolder into its
-own ZIP, and creates one outer `deployment.zip`. If a node subfolder contains no
-ignored path, MWF zips it directly without staging every small file first. The
-command prints ongoing copy/ZIP counts and final sizes. Rebuilding overwrites the
-old local archive so repeated tests do not accumulate large deployments.
-
-Upload and extract it on the configured server:
-
-```powershell
-mwf deploy remote
-```
-
-If no local deployment exists, MWF asks whether to build one. If one does exist,
-it asks whether to deploy that archive or rebuild it first. It then asks for the
-server destination path, uploads one compressed file, and uses remote Python to
-extract the outer archive and each node archive. Files with matching paths are
-overwritten; unrelated files already on the server are left in place.
-
-Noninteractive setup fields are also available for scripts:
-
-```powershell
-mwf deploy setup --host 192.0.2.10 --user worker --port 22 --auth key --key C:\keys\server_key
-mwf deploy remote --path /home/worker/simple_flow --yes
-```
-
-## Runners
-
-The default runner is `threaded`.
-
-```bash
-mwf graph src/graph.py --runner threaded
-mwf runfrom start_node
-```
-
-`threaded` is dependency-free and uses Python's local thread pool. It runs:
-
-- multiple queued jobs inside the same node at the same time, capped by that node's `max_threads`
-- multiple ready nodes at the same time, while still respecting DAG predecessor completion
-- newly-ready downstream nodes while unrelated nodes are still running
-
-### API and blocking-I/O runner
-
-Use `api` for blocking HTTP clients, SDK calls, database drivers, filesystem
-waits, or other jobs whose wall time is mostly external latency:
-
-```bash
-mwf graph src/graph.py --runner api
-mwf runfrom fetch_requests
-```
-
-```python
-router = NodeRouter("fetch_requests", runner="api", max_threads=64)
-```
-
-For this runner, `max_threads=64` intentionally means at most 64 in-flight API
-jobs **for that node**. By default, independent API node limits add together.
-For a shared provider or account, set a run-scoped aggregate admission budget
-with `mwf threads --api-total N`. MWF divides that budget proportionally by the
-active API nodes' effective `max_threads` requests, while retaining each request
-as an upper bound. The familiar `max_threads` name is retained so router code,
-`mwf threads`, `monitor`, and `inspect` use one concurrency vocabulary. Unlike
-the adaptive `threaded` runner, `api` fills its available per-node slots
-immediately. Executor threads are still created lazily, and `io` and `network`
-are aliases.
-
-### Synchronous controller and abandonable handler
-
-The runner worker is the attempt controller. Retry, repeat, and fallback logic
-runs synchronously in that controller. Normal untimed programmatic direct calls
-execute the user handler in the caller thread. A timeout-supervised or
-CLI-restartable attempt creates only one extra daemon handler thread:
-
-```text
-runner worker/controller -> one mwf-handler-* user thread
-```
-
-There is no intermediate `mwf-attempt-*` thread. If a timeout or manual restart
-abandons the handler, generation fencing immediately prevents stale MWF-managed
-writes and downstream job creation while the controller proceeds to the next
-fallback, retry, or generation.
-
-### Change a node's concurrency while testing
-
-The router's `max_threads` value remains the readable source-code default. For
-local testing, use `mwf threads` to apply a temporary project-local override
-without editing the node behavior file or restarting an active workflow:
-
-```bash
-mwf threads                     # list declared, override, and effective values
-mwf threads explode            # inspect one node
-mwf threads explode 24         # set an absolute runtime limit
-mwf threads explode +8         # add eight slots
-mwf threads explode -4         # remove four slots
-mwf threads explode reset      # return to the router declaration
-mwf threads --api-total 512     # cap aggregate API admission proportionally
-mwf threads --api-total reset   # remove the aggregate API budget
-```
-
-The override is stored in `.mwf/threads.json`, which is ignored by the generated
-`.gitignore`. It is deliberately temporary: an override set before execution
-applies to the next run only, and an override changed during execution belongs
-to that active run. MWF removes the override when the run finishes, including
-failed runs. Stale values bound to an older crashed run are ignored and removed
-when a new run claims the project.
-
-For an active threaded or API node, an increase starts more queued jobs within
-roughly 0.2 seconds. A decrease never cancels jobs already running; the runner
-stops launching replacements until active concurrency falls to the new limit.
-
-API values are cooperative fiber counts. They may be set into the thousands
-without one controller or supervisor OS thread per request. Values from multiple
-API nodes add together unless the optional aggregate budget is set. The budget
-is applied before execution claims, so excess jobs remain truthfully queued
-instead of becoming `running` while waiting behind a late network semaphore.
-Provider, socket, memory, and rate limits still apply. Threaded and process
-runners retain their OS-worker safety ceiling and warnings.
-
-If a process is killed while changing the override, the next command detects
-that the advisory-lock owner is no longer alive and immediately reclaims the
-lock. It does not wait for the old five-minute lease to expire.
-
-`mwf inspect NODE` shows the declared, overridden, and effective values.
-`mwf monitor` shows the effective per-node value in its `threads` column and
-marks runtime overrides with `*`. Each API runner grows toward its proportional
-share when an aggregate budget is active, or toward its own node limit when it
-is not. The adaptive threaded runner grows toward its OS-worker limit. A process
-runner reads the override when its process pool is created; an already-created
-process pool is not resized live. The direct runner always remains at one job.
-
-For CPU-heavy work, use the process-pool runner:
-
-```bash
-mwf graph src/graph.py --runner process
-mwf runfrom start_node
-```
-
-`process` mirrors the threaded runner's workflow behavior, but jobs run in child Python processes through `ProcessPoolExecutor`. It still runs multiple ready nodes at the same time, streams large job queues lazily, respects DAG readiness, and uses each node's `max_threads` value as the process-worker cap for that node. `processes`, `process_pool`, and `processpool` are accepted aliases.
-
-Process mode is meant for normal CLI/router projects where child processes can rebuild the workflow from `src/graph.py` and `src/node_behavior/*.py`. Keep process-run node code in importable files, and return pickleable values such as strings, numbers, lists, dicts, or `Path` objects. On Windows, use the CLI or put programmatic runs behind `if __name__ == "__main__":`.
-
-A node can override the global runner:
-
-```python
-from micro_workflow_manager import NodeRouter
-
-router = NodeRouter("ocr_pages", max_threads=4, runner="process")
-router.create_job(number=8)
-
-@router.task
-def ocr_pages(ctx):
-    # CPU-heavy page work here. With runner="process", up to 4 jobs for
-    # this node run in separate Python processes.
-    text = f"processed page job {ctx.job_id}"
-    ctx.write(f"page_{ctx.job_id}.txt", text)
-    return text
-```
-
-For step-by-step debugging, use the direct runner:
-
-```bash
-mwf graph src/graph.py --runner direct
-mwf runfrom start_node
-```
-
-
-## Health checks, inspection, and job history
-
-Run a read-only project check before a long workflow or after changing files:
-
-```bash
-mwf doctor
-```
-
-`mwf doctor` compares the graph, node folders, and router files; checks important
-JSON state; reports stale active-run records and abandoned running jobs; and warns
-about simple literal `ctx.node("B")` calls without a declared edge. It also warns
-when MWF-owned metadata should be upgraded with `mwf migrate`. It does not repair
-or modify the project. Errors produce a nonzero exit status.
-
-Use `inspect` when you need an explanation rather than a raw directory listing:
-
-```bash
-mwf inspect A
-mwf filter A
-mwf inspect A failed
-mwf inspect A job 3
-```
-
-`mwf filter A` shows how many jobs entered, passed, and remained after
-each main retry and fallback retry. It derives the funnel on demand from the
-latest execution segment in each job's append-only events, so it adds no shared
-provenance manifest or scheduler hot-path writes. It intentionally does not
-append failed-job details. `mwf filter A stage 2` lists jobs that failed stage 2
-and then completed successfully at stage 3; selecting the final stage lists the
-terminally failed jobs in the same compact `job_id: error` format.
-
-Node inspection explains readiness, blockers, status counts, Hoeflein-component
-membership, runner, total timeout, checkpoint timeout, and fallbacks.
-Job inspection additionally shows the current/last handler, named checkpoint,
-checkpoint deadline, progress percentage, progress detail, execution generation,
-child jobs, and chronological lifecycle events. Checkpoint state and lifecycle events are stored in `.mwf/state.sqlite3`; they are scheduler diagnostics, not task output or a provenance manifest. `mwf inspect` renders records such as `created`, `started`, `fallback_started`, `timeout`, `restart_requested`, and `done`. `output.json` and job-local returned files remain the actual task result.
-
-## State schema migration and read-only previews
-
-Low-churn MWF JSON metadata such as `.mwf/project.json`, `.mwf/run.json`,
-`.mwf/threads.json`, and node `schema.json` carries an explicit
-`schema_version`. High-churn job and scheduler state has its own SQLite schema
-version. Neither scheme applies to user `input.json`, `output.json`, returned
-files, node `input/`, or node `output/`.
-
-Preview and apply an upgrade from an older project:
-
-```bash
-mwf migrate --dry-run
-mwf migrate
-```
-
-Migration upgrades low-churn JSON atomically and initializes/upgrades SQLite transactionally. A one-time importer reads legacy job metadata before deleting those framework-owned sidecars. `mwf migrate --dry-run` does not create the database or import/delete files. MWF refuses state that claims a newer incompatible schema.
-
-Several destructive commands support a read-only preview:
-
-```bash
-mwf graph --update --dry-run
-mwf clean A --dry-run
-mwf reset A --dry-run
-mwf wipe A --dry-run
-mwf recover --dry-run
-mwf restart <node-name> job 4 --dry-run
-```
-
-Execution commands provide `--plan` instead of pretending to run:
-
-```bash
-mwf run A --plan
-mwf run A sample 25 --seed acceptance-1 --plan
-mwf runfrom A --plan
-mwf runfrom A refuseafter C --plan
-mwf resume A --plan
-mwf resumefrom A --plan
-```
-
-A plan prints the selected nodes and jobs, reset-versus-resume semantics, detected
-static autostarts, external blockers, and current status counts. It does not claim
-the active-run slot or change state. Dynamic jobs created by task functions are
-reported as runtime-dependent rather than guessed.
-
-## Resume and crash recovery
-
-A CLI-owned run records its process ID, hostname, command, selected nodes, MWF
-version, and a lightweight heartbeat in `.mwf/run.json`. The same single
-scheduler-supervisor thread that manages timeout deadlines updates this run
-heartbeat. Run liveness and job progress remain separate signals: the run
-heartbeat proves the scheduler process is alive, while a job checkpoint proves
-that one handler reached a progress boundary. Normal scheduling does not scan
-the project for liveness.
-
-If the owning process has crashed, recover abandoned `running` jobs without
-resetting completed work:
-
-```bash
-mwf recover --dry-run
-mwf recover
-```
-
-Recovery refuses to compete with a demonstrably live owner. For each abandoned
-job it advances the execution generation before requeueing it, so a late stale
-process cannot commit afterward. Jobs already marked `done`, `skipped`, or
-`failed` are not reset by recovery.
-
-Continue a failed partial run while preserving successful jobs:
-
-```bash
-mwf resume B
-mwf resumefrom A
-```
-
-`resume` continues one node. `resumefrom` continues that node and its descendants.
-Both preserve `done` and `skipped` jobs and their outputs, leave queued jobs
-available, and requeue only failed, cancelled, or abandoned-running jobs. By
-contrast, `run` and `runfrom` retain their fresh-reset behavior.
-
-Trace retention is independent of output retention. Fresh/destructive commands
-clear the affected job transcript unless `--keeptrace` is supplied:
-
-```bash
-mwf run A --keeptrace
-mwf runfrom A refuseafter C --keeptrace
-mwf reset A --keeptrace
-mwf clean A --keeptrace
-mwf wipe A --keeptrace
-```
-
-`resume A` preserves the current Hoeflein component's trace without requiring
-the flag. Default `resumefrom A` also preserves that start component, but clears
-trace journals for selected descendants before continuing. Add `--keeptrace` to
-retain those descendant histories as well.
-
-## Centralized checkpoint watchdog, progress, and total timeouts
-
-MWF has a total handler timeout and dynamic checkpoint deadlines. Declare the
-hard upper bound with `timeout=` on the task or fallback, then choose the maximum
-allowed silence for each section in task code:
-
-```python
-from micro_workflow_manager import NodeRouter
-
-router = NodeRouter("process_number")
-
-@router.task(timeout=300)
-def process_number(ctx):
-    ctx.checkpoint(
-        "preparing request",
-        timeout=20,
-        progress=0.1,
-        detail="building parameters",
-    )
-    prepare()
-
-    ctx.checkpoint(
-        "waiting for service",
-        timeout=90,
-        progress=0.25,
-    )
-    call_service()
-
-    ctx.checkpoint(
-        "saving result",
-        timeout=15,
-        progress=0.8,
-    )
-    save_result()
-    return "finished"
-```
-
-Each `timeout=` passed to `ctx.checkpoint()` means the handler must either finish
-or reach another checkpoint before that many seconds pass. Reaching a checkpoint
-refreshes the scheduler-owned deadline. The task/fallback `timeout=` is still the
-hard upper bound for the whole attempt. The older router/task
-`checkpoint_timeout=` default remains accepted for compatibility, but dynamic
-checkpoint deadlines in task code are preferred.
-
-`progress` is a fraction from `0` to `1`. `detail` and the checkpoint name are
-optional human-readable values displayed by:
-
-```bash
-mwf inspect process_number failed
-mwf inspect process_number job 3
-```
-
-All configured total/checkpoint deadlines are managed by one workflow-owned
-scheduler supervisor using a deadline heap. There is no timer thread per job and
-no repeated scan of every job folder. Untimed handlers without checkpoints keep
-the original direct invocation path. An explicit progress checkpoint updates only that job row in SQLite on demand.
-
-When a watchdog deadline expires, MWF sets the attempt's cancellation fence,
-records one timeout event, wakes the normal fallback/retry path, and prevents the
-abandoned handler from using MWF-managed writes or downstream-job creation.
-Python still cannot force-kill an arbitrary thread blocked inside an external
-library, so external request timeouts remain useful and direct side effects made
-outside `ctx` helpers cannot be rolled back. The process runner can isolate such
-code more strongly.
-
-`ctx.raise_if_cancelled()` checks restart/timeout state without reporting
-progress. `ctx.sleep(seconds)` checks cancellation in short intervals but does
-not fabricate progress checkpoints.
-
-## Idempotent and transactional downstream jobs
-
-For a single downstream creation that may be retried, provide an idempotency key:
-
-```python
-@router.task
-def A(ctx):
-    return ctx.node("B").add(value=4, idempotency_key=f"A:{ctx.job_id}:B")
-```
-
-The same target node and key return the existing job instead of creating a
-duplicate. For several downstream jobs, stage them until a block succeeds:
-
-```python
-@router.task
-def A(ctx):
-    with ctx.transaction():
-        first = ctx.node("B").add(value=1)
-        second = ctx.node("B").add(value=2)
-    return [first.job_id, second.job_id]
-```
-
-Only `ctx.node(...).add(...)` operations are staged. If the block raises, none are
-created. Successful commits use deterministic per-parent-and-operation keys, so retries,
-resume, and manual restart generations complete a partially committed transaction
-without duplicate jobs. This is
-opt-in; ordinary downstream creation retains its existing fast path.
-
-## Cleanup previews
-
-The cleanup commands support `--dry-run` and preserve their existing semantics:
-
-```bash
-mwf clean A --dry-run   # would remove jobs/output, keep input
-mwf reset A --dry-run   # would keep jobs/input and requeue all jobs
-mwf wipe A --dry-run    # would remove jobs/output/input
-```
-
-The preview resolves `*` and validates node names but does not remove files or
-change statuses.
-
-## Monitoring and live statistics
-
-Use the full dashboard in the same terminal as an execution command:
-
-```bash
-mwf run start_node --monitor
-mwf runfrom start_node --monitor
-mwf runfrom start_node --monitor --monitor-interval 0.5
-```
-
-Inline monitoring prints timestamped snapshots without clearing earlier task or
-monitor output, making it suitable as a diagnostic timeline. The final snapshot
-is emitted after the run record becomes terminal and therefore says
-`active run: none`; the previous sequence is shown separately as the last run.
-
-For an independent observer, open a second terminal and use:
-
-```bash
-mwf monitor
-mwf monitor --once          # one snapshot
-mwf monitor A B             # monitor selected nodes only
-mwf monitor --json --once   # machine-readable snapshot
-```
-
-`mwf monitor` reads SQLite job/node summaries plus the low-churn run record. It
-shows running nodes, queued/running/done/failed counts, jobs left, progress,
-running job IDs, effective concurrency, average completed duration, and rough
-ETA without calling task code. For scheduler and startup debugging, use the
-event-driven htop-style view:
-
-```bash
-mwf top
-mwf top --once
-mwf top explodeclaim explodecontext
-mwf top --once --json
-```
-
-`mwf top` wakes on durable lifecycle commits rather than waiting for the redraw
-interval. It adds starts/finishes per second, queue/terminal p95 latency, recent
-events, active-process RSS and thread count, SQLite/WAL size, and the mutation
-writer's active batch and durability backlog. The interval is only a maximum
-redraw/fallback cadence. Compact same-terminal lines remain available:
-
-```bash
-mwf runfrom start_node --stats
-mwf run start_node --stats --stats-interval 10
-```
-
-`--monitor` and `--stats` may be combined. ETA is intentionally approximate and
-becomes more useful after at least one relevant job has finished. See
-[AGENT.md](AGENT.md) for using snapshots to separate resource pressure, timeout
-policy, test-code stalls, and scheduler defects.
-
-## Restart inside an active sequence
-
-Keep the original `mwf run`, `runfrom`, `resume`, or `resumefrom` terminal
-running and issue restart controls from a second terminal. Naming a node selects
-its whole active Hoeflein component; an ordinary DAG node selects only itself.
-
-```bash
-# Restart every live-running and failed/cancelled job in the component.
-mwf restart <node-name>
-
-# Restart failed/cancelled jobs only.
-mwf restart <node-name> failed
-
-# Retain precise job selection when needed.
-mwf restart <node-name> job 42
-mwf restart <node-name> jobs 42 57 80-82
-```
-
-Restart never launches a second scheduler. For each selected job it advances the
-execution generation, clears job-local `output.json` and generated files, and
-leaves the existing run in control. A stale generation cannot commit framework
-status, files, output, or downstream jobs. Already queued, done, and skipped jobs
-are not reset by the component-wide forms.
-
-The active run record stores component membership, so the second-terminal command
-does not need to import project graph or handler code. Run records from older
-versions fall back to singleton-node scope.
-
-After the owning sequence has ended, use:
-
-```bash
-mwf resume <node-name>
-mwf resumefrom <start-node>
-```
-
-Resume first registers output-backed terminal jobs that were still recorded as
-`running`, waits for those SQLite mutations to become durable, and only then
-requeues failed, cancelled, or genuinely abandoned-running work. Done and
-skipped work remains untouched.
-
-## Large-node performance and SQLite state
-
-MWF 0.3.4 no longer creates per-job queue markers, status files, execution
-files, runtime files, event logs, or a shared `job_index.json`. High-churn state
-is normalized into `.mwf/state.sqlite3`:
-
-- `jobs` stores job identity, status, execution generation/lease, and checkpoint runtime
-- `job_events` stores chronological lifecycle, retry, fallback, timeout, and restart records
-- `idempotency` stores downstream creation keys
-- `default_job_specs` stores idempotent router starter declarations
-- `nodes` stores node-level state
-- `advisory_locks` provides infrequent CLI-wide cross-process critical sections
-
-Per-job execution/restart fences are intentionally not database advisory rows.
-They use `.mwf/execution-fences/*.lock`, so a managed payload write does not add
-an advisory-lock acquire and release around its normal work. Checkpoints update
-their job runtime with one conditional SQLite statement. Framework-created
-worker, handler, component, supervisor, and inline-monitor threads close their
-connection at lifecycle end; same-process writers queue before entering SQLite,
-while WAL keeps monitor/inspect readers concurrent.
-
-The scheduler allocates dynamic job IDs and updates status counts with short
-transactions. WAL mode allows concurrent monitoring and inspection. This avoids
-thousands of tiny filesystem operations and removes contention on a shared
-index file for high-fan-in nodes.
-
-The user-visible source of payload truth stays on disk:
-
-- `node/<name>/input/` and `node/<name>/output/`
-- `node/<name>/jobs/<id>/input.json`
-- `node/<name>/jobs/<id>/output.json`
-- `node/<name>/jobs/<id>/files/` when the job returns or writes files
-
-A job that never creates returned files does not need an empty `files/` folder.
-Use `mwf inspect`, `mwf monitor`, and `mwf doctor` rather than querying SQLite
-directly in application code.
-
-## Install, uninstall, and persistence
-
-Use a project-local virtual environment so the package can be removed without
-changing the system Python installation.
-
-### Install from source for development
-
-From the framework source directory containing `pyproject.toml`, create and
-activate a virtual environment, then install an editable development copy:
+The root README should explain the project purpose, graph, component behavior,
+setup, execution, inspection, and important operating boundaries. Each node
+README should explain its role and Job Scope, task and fallback hierarchy,
+parameters, file inputs and outputs, routing, validation hierarchy,
+validator-fallback balancing, fallback context control, runner, concurrency,
+timeouts, and idempotency. Add `src/README.md` only when the source layout needs
+its own explanation.
+
+These README files are documentation standards, not framework validity checks.
+Current `mwf init` and `mwf graph` do not create them automatically.
+
+## Quick start
+
+From an MWF source checkout, create a virtual environment and install it in
+editable mode. See the installation guide for wheel and source-archive
+workflows.
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -e ".[test]"
 ```
 
-On Linux or WSL, activate with `source .venv/bin/activate` instead.
-
-An editable installation points Python at the source directory, so code changes
-are visible immediately. Use this form while developing MWF itself.
-
-### Build a wheel
-
-A wheel is an installation-ready `.whl` package. Build one from the framework
-source directory containing `pyproject.toml`:
+Keep that environment active, then create a separate workflow project:
 
 ```powershell
-python -m pip install --upgrade build
-python -m build --wheel
+cd ..
+mkdir first_mwf_project
+cd first_mwf_project
+mwf init
+New-Item -ItemType Directory -Force src\node_behavior
 ```
 
-The wheel is written to `dist/`. For version 0.4.3 the expected filename is:
-
-```text
-micro_workflow_manager-0.4.3-py3-none-any.whl
-```
-
-`py3-none-any` means the package is pure Python, supports Python 3, and does not
-contain operating-system-specific compiled code.
-
-To build both a wheel and a source archive, run:
-
-```powershell
-python -m build
-```
-
-This creates the wheel and a `.tar.gz` source distribution under `dist/`.
-
-### Install from a wheel
-
-Install the wheel by giving pip its actual file path. From the framework source
-directory after building:
-
-```powershell
-python -m pip install --force-reinstall .\dist\micro_workflow_manager-0.4.3-py3-none-any.whl
-```
-
-From Linux or WSL:
-
-```bash
-python -m pip install --force-reinstall ./dist/micro_workflow_manager-0.4.3-py3-none-any.whl
-```
-
-If the wheel is in Downloads or another directory, use its full path:
-
-```powershell
-python -m pip install --force-reinstall "C:\path\to\micro_workflow_manager-0.4.3-py3-none-any.whl"
-```
-
-Do not write `.micro-workflow-manager==0.4.3`; that is interpreted as a malformed
-package requirement rather than a file path. On PowerShell, a file in the
-current directory begins with `.\`, and the wheel filename uses underscores.
-
-Verify the installed version, module location, and CLI:
-
-```powershell
-python -c "import micro_workflow_manager; print(micro_workflow_manager.__version__); print(micro_workflow_manager.__file__)"
-mwf --help
-```
-
-A project can bundle the wheel in a directory such as `vendor/` and reference it
-from `requirements.txt`:
-
-```text
-./vendor/micro_workflow_manager-0.4.3-py3-none-any.whl
-```
-
-Then users can install the project and its framework together from the project
-root:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-### Uninstall and persistence
-
-The package installs no Windows service, daemon, scheduled task, registry entry,
-or background process. Runtime state stays in the project under the consolidated `.mwf/` directory and `node/`. Stop any active `mwf run`, `mwf runfrom`, `mwf resume`, `mwf resumefrom`,
-or `mwf monitor` process before uninstalling, especially on Windows where an
-active `mwf.exe` launcher can be locked.
-
-```powershell
-python -m pip uninstall micro-workflow-manager
-```
-
-Deleting the project-local `.venv` removes the entire isolated installation as
-an alternative. Deleting the Python package does not delete workflow project
-data; remove `.mwf/` and `node/` separately only
-when you intentionally want to remove that data.
-
-If an older interrupted pip operation reports an invalid distribution such as
-`~icro-workflow-manager`, close all Python/MWF processes and remove only the
-stale temporary entries from that virtual environment, then reinstall or
-uninstall normally:
-
-```powershell
-Get-ChildItem .\.venv\Lib\site-packages -Force |
-  Where-Object { $_.Name -like "~icro*" } |
-  Remove-Item -Recurse -Force
-Remove-Item .\.venv\Scripts\mwf.exe -Force -ErrorAction SilentlyContinue
-python -m pip install --force-reinstall .
-python -m pip uninstall micro-workflow-manager
-```
-
-## Run tests
-
-**Read [HOW_TO_TEST.md](HOW_TO_TEST.md) before running the suite.** It is the
-authoritative test execution order for this repository. In particular:
-
-- ordinary tests are run together as a batch with
-  `tests/test_autostart_cycles.py` excluded;
-- every test in `tests/test_autostart_cycles.py` listed by the runbook is run in
-  its **own fresh pytest/Python process** and must not be combined; and
-- the marked long stress test is run explicitly.
-
-[AGENT.md](AGENT.md) contains the broader contributor and diagnosis protocol,
-but agents must use `HOW_TO_TEST.md` for the exact release-verification
-commands and ordering.
-
-## Checkpoint API
-
-A supervised task can report progress and set the deadline for its next section:
+Create `src/graph.py` with a minimal runnable two-node graph:
 
 ```python
-@router.task(timeout=300)
-def work(ctx):
-    ctx.checkpoint("request started", timeout=60, progress=0.2)
-    result = call_service()
-    ctx.checkpoint("response received", timeout=20, progress=0.8, detail="validating")
-    return result
+EDGES = [
+    ("seed", "report"),
+]
 ```
 
-`JobContext.checkpoint()` accepts `name`, `timeout`, `progress`, and `detail`.
-The `timeout` value means that the handler must either finish or reach another
-checkpoint before that many seconds pass. Progress is a number from 0 through 1
-and is shown by `mwf inspect NODE job ID`. The total task/fallback `timeout=`
-keeps the handler on the centralized scheduler-supervised path; checkpoint
-timeouts may then be chosen dynamically in task code.
+Create `src/node_behavior/seed.py` with the initial job and its route:
 
-## Initialize from a deployment archive
+```python
+from micro_workflow_manager import NodeRouter
 
-A local or copied remote deployment may remain compressed as `deployment.zip`.
-MWF can unpack the main archive and all independently compressed `node/<name>.zip`
-folders during initialization:
+router = NodeRouter("seed")
+router.create_job(params={"question": "What changed?"})
 
-```bash
-mwf init deployment.zip
+
+@router.task
+def seed(ctx, question: str):
+    ctx.node("report").add(
+        question=question,
+        idempotency_key=f"seed:{ctx.job_id}:report",
+    )
+    return {"question": question}
 ```
 
-When no archive argument is supplied, `mwf init` checks these common locations:
+Create `src/node_behavior/report.py` with the receiving task:
 
-- `./deployment.zip`
-- `./mwf-deployment.zip`
-- `./.mwf/deploy/local/deployment.zip`
+```python
+from micro_workflow_manager import NodeRouter, OutputFileSystem
 
-Extraction rejects paths that escape the project directory. Initialization prints
-each major step and each node archive as it is unpacked.
+router = NodeRouter("report")
+OUTPUT = OutputFileSystem("reports")
 
-## Node clipboard
 
-Save a node's payload folder and a cold SQLite state snapshot beside `node/`:
-
-```bash
-mwf copy preprocess
+@router.task
+def report(ctx, question: str):
+    answer = f"Received: {question}"
+    OUTPUT.file(ctx, "answer.txt").write_text(answer, overwrite=True)
+    return answer
 ```
 
-This replaces `clipboard/preprocess` while leaving other saved nodes intact.
-Restore it later with:
+Preview and run:
 
-```bash
-mwf paste preprocess
+```powershell
+mwf graph src/graph.py
+mwf doctor
+mwf runfrom seed --plan
+mwf runfrom seed --monitor
 ```
 
-Paste replaces `node/preprocess` and restores that node's jobs, statuses, events, idempotency keys, and default-job declarations from `clipboard/preprocess/.mwf-node-state.sqlite3`. Pre-0.3.4 clipboard copies without a snapshot remain supported as payload-only copies. The default
-`.mwfignore` excludes `clipboard/`, `.mwf/`, `.venv/`, version-control metadata,
-editor metadata, caches, and build output.
+Graph synchronization is deliberate. After changing `src/graph.py`, use:
 
-The SQLite snapshot includes the complete trace journal for every copied job.
-After `mwf paste preprocess`, `mwf trace preprocess job ID` therefore renders the
-same preserved transcript that existed when the copy was made.
-
-## Inspect a node debug log
-
-```bash
-mwf inspect preprocess debug
+```powershell
+mwf graph --update --dry-run
+mwf graph --update
 ```
 
-This prints the node's `output/debug.txt` path and contents, or explains that the
-file does not exist yet.
+Removing a node during synchronization can remove its node directory. Preserve
+needed data before applying the update.
 
-### Refresh declared concurrency after editing node files
+## Graph and component behavior
 
-After changing `max_threads=` or a node-level `runner=` in `src/node_behavior/*.py`, refresh the mounted schemas without synchronizing the graph:
+MWF accepts an ordinary `(source, target)` edge, a one-to-many edge with a
+collection on the target side, and `fan(sources, target)` for many-to-one. A
+collection on both sides is rejected because it would silently imply a complete
+bipartite graph.
 
-```bash
+Autostarting relationships make work available within one communicating
+component instead of waiting for ordinary DAG completion. The raw edge still
+keeps its declared direction; the reverse relationship is used only when MWF
+builds component membership. The quotient DAG retains the original directions
+between components.
+
+Static component construction currently recognizes only the literal
+`ctx.node("...").add(..., autostart=True)` form. The runtime also accepts
+`add_many`, `add_job`, and `add_jobs`, but do not rely on those forms to declare
+component membership until the scanner supports them.
+
+A live Hoeflein component keeps ordinary threaded and API members available
+while peer work can still arrive. An internal `waiting=True` declaration is an
+exceptional admission gate. Waiting targets must be in the same component. A
+singleton waiting node has no additional DAG effect.
+
+`runfrom START` selects START's whole component and every quotient-DAG
+descendant. Its fresh preparation removes work produced by selected components
+while preserving merge work from unselected branches. `refuse BOUNDARY` stops
+before the boundary component starts. `refuseafter BOUNDARY` lets it terminate,
+then stops later admission. Already-running parallel components are joined and
+later queued work can be continued with `resumefrom`.
+
+## Jobs, parameters, and routing
+
+The first task parameter is `ctx`. Remaining Python parameters define accepted
+job parameters. Required parameters are required job inputs; Python defaults
+make them optional.
+
+The routing API reserves `job_id`, `autostart`, and `idempotency_key`. Task
+execution reserves `error` for the immediately preceding exception and `errors`
+for ordered failures from the current execution sequence. Do not use these
+names for unrelated project data.
+
+Create one child with `add()` and use an explicit key when a retry must reuse
+the same child:
+
+```python
+ctx.node("review").add(
+    document_id=document_id,
+    idempotency_key=f"extract:{ctx.job_id}:review:{document_id}",
+)
+```
+
+Create a same-node batch with `add_many()`:
+
+```python
+items = [{"section": section} for section in sections]
+keys = [f"split:{ctx.job_id}:{section}" for section in sections]
+ctx.node("process_section").add_many(items, idempotency_keys=keys)
+```
+
+For cross-node fan-out, precompute the child specifications and give each route
+an explicit stable key:
+
+```python
+children = [
+    ("research", {"question": question}, f"plan:{ctx.job_id}:research"),
+    ("risk", {"question": question}, f"plan:{ctx.job_id}:risk"),
+]
+for node, params, key in children:
+    ctx.node(node).add(idempotency_key=key, **params)
+```
+
+MWF 0.6.1 has no `ctx.transaction()` staging helper. Existing projects using it
+must finish or clear affected partial runs before upgrading, then use the two
+patterns above. The internal SQLite transaction machinery and generation fences
+remain framework implementation details.
+
+## Filesystems and output provenance
+
+MWF exposes three filesystem objects for task code:
+
+- `InputFileSystem` reads the current node's `input/` tree.
+- `OutputFileSystem` reads and writes within the current node's one `output/`
+  prefix.
+- `NodeInputFileSystem` writes to a connected node's `input/` tree and can route
+  jobs there.
+
+They provide contained path resolution, text and byte operations, JSON helpers,
+copying, listing, generation fencing, Windows extended-path handling, and trace
+events where appropriate. `ctx.input_path()`, `ctx.output_path()`,
+`ctx.write_output()`, and `ctx.write_output_bytes()` remain available for direct
+node-scoped access. `ctx.write()`, `ctx.write_bytes()`, `ctx.files_dir`,
+`ctx.storage_dir`, and `JobFileSystem` do not exist in 0.6.1.
+
+Generation fencing applies to framework-managed write and copy methods. A
+filesystem entry's `.path`, path-like conversion, `ctx.output_path()`, and a
+writable `.open()` handle are deliberate escape hatches for third-party
+libraries. MWF checks a writable handle before opening it, but cannot fence or
+roll back later writes made through a retained raw path or handle.
+
+Output provenance is the user-owned, navigable filesystem tree rooted at a node
+output prefix. It retains the node's results and enough useful intermediate
+information to inspect how those results developed. The tree may contain any
+file types and may combine work from many jobs. Output provenance is not a
+required file, record, manifest, schema, or filename.
+
+There is exactly one framework output prefix per node:
+
+```text
+node/<node-name>/output/
+```
+
+An `OutputFileSystem(base="...")` selects a subtree within that prefix; it does
+not create another framework output prefix. The tree may contain JSON, text,
+PDFs, images, video, office documents, archives, directories, or domain-specific
+formats. A task may organize stage results, diagnostics, and final results as
+needed. `output/debug.txt` is a convenient lightweight diagnostic file, not the
+definition of output provenance.
+
+Prefer similar relative organization between output and the input tree that
+receives it. Pass stable relative locators in job parameters instead of copying
+large data into every `input.json`. The sender must still route the exact path
+the receiver expects; node output is not transported automatically.
+
+Returning a `Path`, `{"file": ...}`, or `{"files": ...}` is ordinary return
+data. MWF does not copy the referenced file. On success, `output.json` records
+status and a concise `result_type` and `result_repr`, plus the execution
+generation when supervised. On failure, it records status, the terminal error,
+and generation when applicable. Historical `jobs/<id>/files/` trees are left
+untouched during upgrade but no new per-job file tree is created.
+
+## Retries, fallbacks, validation, and failure lineage
+
+A node's main task and fallbacks form its functional hierarchy. Retries repeat
+the same implementation. Moving to a fallback is an escalation and should
+change a meaningful implementation, model, configuration, or strategy.
+
+Validators form a separate validation hierarchy. Tune validation strictness,
+functional cost, retry counts, and fallback order together. A low pass rate is
+only an observation; it does not by itself show whether acceptances or
+rejections were correct.
+
+During one job execution sequence, MWF maintains ordered live failure history:
+
+- `ctx.error` and an optional `error` parameter receive the immediately
+  preceding exception;
+- `ctx.errors` and an optional `errors` parameter receive a fresh list of every
+  earlier main, retry, repeated, and fallback failure in order;
+- on every later attempt, `ctx.error == ctx.errors[-1]`;
+- a fresh run, resume, or restarted execution begins with an empty live history.
+
+The original exception objects are available only within that live sequence.
+MWF also records a durable `task_failed` event for each failed attempt, including
+task, role, attempt, repetition, rendered error, and time. Durable text is
+diagnostic history; it does not reconstruct Python exception objects after a
+restart.
+
+Tasks should use finite client timeouts for external calls. `ctx.checkpoint()`
+can report a name, progress, detail, and the deadline for the next section. A
+task or fallback `timeout=` remains the total attempt limit. When a deadline or
+restart replaces an execution generation, stale MWF-managed output, forwarded
+input, state updates, and child creation are rejected.
+
+## Runners and concurrency
+
+- `direct` runs one job at a time and is useful for deterministic debugging.
+- `threaded` handles blocking local I/O with bounded OS-thread concurrency.
+- `api` runs cooperative fibers for high-latency external calls and uses MWF's
+  shared HTTP transport.
+- `process` isolates CPU work whose imports, parameters, and results can cross a
+  process boundary.
+
+`max_threads` is the node's requested job concurrency, not a promise about
+provider, socket, database, or host capacity. Runtime overrides are run-scoped:
+
+```powershell
+mwf threads
+mwf threads classify 8
+mwf threads classify +2
+mwf threads classify reset
+mwf threads --api-total 256
+mwf threads --api-total reset
 mwf threads --update
 ```
 
-This reloads the synchronized node behavior files and updates their declared concurrency and runner values. It does not change graph edges, create/delete node folders, or clear runtime overrides. Use `mwf threads NODE reset` separately when an override should be removed.
+For API nodes, `--api-total` is an aggregate admission budget allocated
+proportionally across running API nodes. Per-node values remain weights and
+upper bounds. Raising a live threaded or API limit is observed within roughly
+0.2 seconds; lowering it does not cancel jobs already running. A process pool
+reads the value when created, and the direct runner remains single-job.
 
-### Clipboard restore consistency
+## Commands and lifecycle
 
-`mwf paste NODE` now synchronizes the restored payload folders with SQLite before returning. Clipboard snapshots made before 0.3.4 have their numeric `jobs/<id>/input.json` payloads rebuilt as queued database jobs. A snapshot captured while a job was running is treated as a cold restore: stale running leases are cleared and those jobs are immediately queued, so the node can be run or resumed without another migration command.
+Use `mwf <command> --help` for syntax and `mwf --describe <command>` for a longer
+explanation. Every executable command has both forms, including `copy`, `paste`,
+`filter`, and `top`.
 
+Current bootstrap behavior matters when interpreting observational commands and
+previews. Before most commands, MWF may migrate an older runtime layout. Commands
+that mount routers may also refresh schemas or create declared starter jobs.
+Only `engine` and `migrate --dry-run` bypass those bootstrap paths. A preview or
+observational command still avoids running jobs or applying its advertised
+mutation; it is not a promise that no framework-owned byte changes.
 
-## Component-level cleanup (0.3.16)
+| Intent | Commands | Current behavior |
+| --- | --- | --- |
+| Create and synchronize | `init`, `graph` | `init` creates framework state and sidecars. Only `graph` synchronizes edges and node folders. |
+| Check and observe | `doctor`, `engine`, `inspect`, `trace`, `filter`, `monitor`, `top` | Read current graph or state without running jobs. `engine` is graph-only and loopback. |
+| Execute fresh work | `run`, `runfrom` | Reset the selected component or selected descendant region before execution. |
+| Continue work | `resume`, `resumefrom` | Preserve done and skipped jobs and continue queued, failed, cancelled, or abandoned work. |
+| Control a live sequence | `restart`, `threads` | Fence selected active jobs or change run-scoped concurrency without starting another scheduler. |
+| Prepare or delete | `reset`, `resetfrom`, `clean`, `cleanfrom`, `wipe`, `wipefrom` | Previewable destructive operations with component-aware scope. |
+| Preserve node state | `copy`, `paste` | Save or restore a node tree with its SQLite node snapshot. |
+| Maintain state and deployment | `recover`, `migrate`, `deploy` | Recover a dead owner, update MWF-owned metadata, or build and transfer a filtered archive. |
 
-`mwf clean NODE`, `mwf reset NODE`, and `mwf wipe NODE` expand `NODE` to its
-whole Hoeflein component. Use `--dry-run` to see the expanded component before
-anything changes. Selecting several members of one component does not duplicate
-work. `*` still selects every graph node.
+`run NODE` selects NODE's Hoeflein component. Explicit `job` or `jobs` selection
+is supported for a singleton node. Deterministic `sample COUNT` runs are designed
+to isolate a SHA-256-ranked subset. Current tests establish deterministic
+selection, preservation of unselected work, and planning that does not apply the
+sample run. They do not yet establish routed-descendant or component-circulation
+isolation. Use `--plan` and `--expect-population` to review and guard a sample.
 
+`resume` and `resumefrom` preserve successful work. They reconcile terminal
+`output.json` records before requeueing eligible unsuccessful work. Use them
+after a partial failure when completed jobs should remain completed.
 
-## Ordered job traces (0.4.8)
+`restart` is a second-terminal control for an active sequence. It advances the
+execution generation of selected running or failed jobs and leaves the original
+scheduler in control. It removes the selected job's terminal `output.json`, but
+cannot infer which files under the shared node output prefix belong to that job.
+Task design therefore owns stable output paths and idempotent replacement.
 
-Inside a task or fallback, append structured trace objects with:
+`recover` acts only when the recorded CLI owner is dead. It fences and requeues
+abandoned running jobs while preserving done and failed jobs. Preview with
+`mwf recover --dry-run`.
 
-```python
-ctx.trace("model request", input=payload, output=reply, model=model)
-ctx.trace("validator", status="warning", content={"mismatches": mismatches})
+Fresh and destructive component operations clear their affected node output
+trees. Selected-job reruns do not delete node output because it has no per-job
+ownership. `clean` removes jobs and output but preserves input. `reset` preserves
+job identities and input, removes terminal job results, and requeues. `wipe`
+also removes input. The `*` and `from` variants expand these rules across their
+selected components; use `--dry-run` before applying them.
+
+## Inspection and diagnostics
+
+```powershell
+mwf doctor
+mwf inspect classify
+mwf inspect classify failed
+mwf inspect classify job 17
+mwf inspect classify debug
+mwf trace classify job 17
+mwf trace classify job 17 --errors
+mwf filter classify
+mwf filter classify stage 2
+mwf monitor --once
+mwf top --once
 ```
 
-Render the complete chronological transcript with:
+`inspect` combines graph, schema, job, checkpoint, and status data. `trace`
+renders chronological origin, task and fallback starts, custom traces,
+framework-aware file writes, forwarded inputs, child creation, failed attempts,
+and terminal state. `--errors` displays only identity, origin, ordered failures,
+attempt details, terminal state, and terminal error; recording is always on.
 
-```text
-mwf trace <node> job <id>
-```
+`filter` reconstructs the retry and fallback funnel from durable events. A
+specific non-final stage lists jobs rejected there and accepted at the next
+stage. The final stage lists terminal failures. `monitor` is the workflow status
+view; `top` adds event rates, queue and terminal latency, process, SQLite, and
+mutation-writer diagnostics.
 
-The transcript includes origin, main/fallback starts, custom traces, MWF-aware
-output writes, forwarded inputs, downstream job creation, and the terminal state.
-MWF supplies the canonical event timestamp and execution provenance automatically;
-reserved keys supplied by user code, such as `time`, are retained under a
-`trace_` prefix instead of replacing framework metadata.
+## Clipboard and deployment
 
-When `--keeptrace` preserves a transcript across deletion and recreation of the
-same node/job ID, the new creation is compared with the most recent preserved
-origin. A different parent, producer component, or job kind adds an
-`ORIGIN CHANGED` block containing the previous and current provenance before the
-new task/fallback events.
+`mwf copy NODE` saves `node/NODE` under `clipboard/NODE` with a cold SQLite
+snapshot. `mwf paste NODE` replaces the current node tree, restores that state,
+and reconciles payloads and stale running leases. It does not copy Python
+behavior or graph edges.
+
+`mwf deploy setup` records connection metadata and creates `.mwfignore`.
+`mwf deploy local` rebuilds a filtered local archive. `mwf deploy remote`
+uploads and extracts it. Passwords are not stored. Review `.mwfignore`, output
+size, credentials, and destination before deployment.
+
+## Current capability and verification map
+
+The following table makes the storage and lifecycle boundaries explicit. It is
+not a substitute for the full test guide.
+
+| Capability | Public surface | Primary regression area |
+| --- | --- | --- |
+| Read node input | `InputFileSystem`, `ctx.input_path()` | `test_filesystem_objects.py`, `test_file_entry_node_input_import.py` |
+| Write node output | `OutputFileSystem`, `ctx.write_output*()` | `test_filesystem_objects.py`, timeout and restart fencing tests |
+| Forward files and create jobs | `NodeInputFileSystem`, `ctx.node()` | filesystem, routing, and high-fan-out tests |
+| Store job parameters and terminal summary | `input.json`, `output.json` | SQLite/API runner and filesystem tests |
+| Reject per-job file storage | removed APIs and no automatic returned-file copy | `test_filesystem_objects.py` |
+| Batch or idempotent fan-out | `add_many()`, explicit idempotency keys | high-fan-out and framework-improvement tests |
+| Preserve failure lineage | `error`, `errors`, durable `task_failed` events | filter, trace, and framework-improvement tests |
+| Fence stale writes | execution generations and managed filesystem calls | timeout, active restart, and process-runner tests |
+| Schedule components | raw graph, Hoeflein components, quotient DAG | component, cycle, waiting, and reliability tests |
+| Observe and recover | inspect, trace, filter, monitor, top, restart, recover | command, restart, recovery, and event-state tests |
+
+## Install and test
+
+Use [docs/installation.md](docs/installation.md) for editable installs, wheel
+builds, source archives, uninstalling, and data persistence. MWF installs no
+service, daemon, scheduled task, or registry entry. Removing the package does
+not remove `.mwf/`, `node/`, or other project data.
+
+Use [docs/testing.md](docs/testing.md), [tests/README.md](tests/README.md),
+[benchmarks/README.md](benchmarks/README.md), and the `mwf-test` skill before
+running verification. Test MWF framework changes from an exact copied source
+tree under the sibling `test_area`, not from the durable development tree.
+
+When a task-owned diff contains only Markdown or instruction-only `SKILL.md`
+files, do not run pytest merely for ceremony. Check links, headings, paths,
+terminology, and inventories; compare current-behavior claims with source and
+tests; and ask an independent reviewer to look for mismatches when available.
+Any executable or runtime-configuration change uses the focused, adjacent, and
+release checks selected by the testing guide.
+
+## 0.6.1 upgrade boundaries
+
+- The public per-job file APIs and automatic copying of returned paths are
+  removed. Old per-job file trees remain on disk until an already-authorized
+  cleanup or manual migration.
+- `ctx.transaction()` is removed without an alias or deprecation period. Use
+  `add_many()` or explicit idempotency keys.
+- Node-output layout is project-owned. MWF enforces one node output prefix and
+  safe managed access, not a required result format.
+- Root and node READMEs are required by the documentation standard but not by
+  runtime validation, and MWF does not generate them in this release.
+- Public Python API compatibility beyond the documented current surface remains
+  unsettled. Check the installed version before relying on undocumented names.
+
+See [the release history](docs/release-history.md) for older changes and
+[the provisional 0.6.4 plan](docs/plans/0.6.4.md) for deferred work. Provisional
+planning is not a promise about the final 0.6.3 versus 0.6.4 boundary.

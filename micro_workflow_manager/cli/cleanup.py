@@ -180,7 +180,6 @@ def _remove_job_artifacts_batch(
     def remove_one(job_id: int) -> None:
         job_dir = workflow.storage.job_base_dir(node, job_id)
         remove_path(job_dir / "output.json")
-        remove_path(job_dir / "files")
 
     if os.name != "nt" or len(job_ids) < 8:
         for job_id in job_ids:
@@ -223,7 +222,6 @@ def _remove_reset_artifacts_batch(
 
     def clear_job_dir(path: Path) -> None:
         remove_path(path / "output.json")
-        remove_path(path / "files")
 
     tasks = [(clear_output_dir, path) for path in output_dirs]
     tasks.extend((clear_job_dir, path) for path in job_dirs)
@@ -402,7 +400,6 @@ def reset_job_for_run(
         raise RuntimeError(f"Job does not exist: {node}/{job_id}")
     job_dir = workflow.storage.job_base_dir(node, job_id)
     remove_path(job_dir / "output.json")
-    remove_path(job_dir / "files")
     if not keep_trace:
         workflow.storage.clear_job_events(node, [job_id])
     workflow.storage.set_job_status(node, job_id, QUEUED)

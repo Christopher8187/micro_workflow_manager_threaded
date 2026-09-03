@@ -440,19 +440,32 @@ class ComponentSchedulerMixin:
                     self._finalize_failed_component(component_set, first_error)
                 else:
                     executor.shutdown(wait=True)
-                    # Resident live pumps normally finish only after the
-                    # coordinator has already observed global quiescence, so
-                    # their Future may not pass through the per-iteration
-                    # ``done`` loop. Preserve the public run()/runfrom return
-                    # contract by reporting live members that actually owned at
-                    # least one job during this component execution.
-                    for node_name in component_nodes:
-                        if node_name in work_nodes and node_name not in ran:
-                            ran.append(node_name)
-                    self.refresh_component_status(
-                        component_set,
-                        allow_complete=not self.component_has_queued_jobs(component_set),
-                    )
+                    # Quiescence can become visible just before a node worker
+                    # publishes its exception to its Future. Joining alone does
+                    # not surface that exception, so inspect every worker before
+                    # treating the component as successful.
+                    for future in futures:
+                        try:
+                            future.result()
+                        except BaseException as error:
+                            first_error = error
+                            break
+                    if first_error is not None:
+                        self._finalize_failed_component(component_set, first_error)
+                    else:
+                        # Resident live pumps normally finish only after the
+                        # coordinator has already observed global quiescence, so
+                        # their Future may not pass through the per-iteration
+                        # ``done`` loop. Preserve the public run()/runfrom return
+                        # behavior by reporting live members that actually owned
+                        # at least one job during this component execution.
+                        for node_name in component_nodes:
+                            if node_name in work_nodes and node_name not in ran:
+                                ran.append(node_name)
+                        self.refresh_component_status(
+                            component_set,
+                            allow_complete=not self.component_has_queued_jobs(component_set),
+                        )
             if first_error is not None:
                 raise first_error
             return ran

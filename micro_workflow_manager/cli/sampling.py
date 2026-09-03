@@ -212,4 +212,4 @@ def print_sample_plan(plan: SamplePlan, *, executing: bool = False) -> None:
         replay.extend(["--status", ",".join(plan.statuses)])
     print("  guarded replay: " + shlex.join(replay))
     if not executing:
-        print("  no state, jobs, inputs, outputs, or node folders were changed")
+        print("  planned sample run was not applied; bootstrap and router mounting may already have updated framework state")

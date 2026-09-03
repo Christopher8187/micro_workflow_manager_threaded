@@ -6,7 +6,7 @@ from threading import Condition, Thread
 from time import monotonic
 from typing import Any
 
-from ..errors import JobTimeoutError
+from ..errors import JobTimeoutError, safe_exception_repr
 from ..fibers import in_fiber_runtime
 from ..monitor import now_iso
 from .supervisor_watch import AttemptWatch, _deadline_iso, _validate_progress, _validate_timeout
@@ -367,7 +367,7 @@ class SupervisorAttemptMixin:
             self._persist_runtime(
                 watch,
                 state=watch.state,
-                error=repr(error) if error is not None else None,
+                error=safe_exception_repr(error) if error is not None else None,
                 wait=not in_fiber_runtime(),
                 priority=20 if in_fiber_runtime() else 10,
             )

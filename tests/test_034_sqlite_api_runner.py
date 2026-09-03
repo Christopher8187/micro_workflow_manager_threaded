@@ -34,7 +34,7 @@ def _write_cli_project(root: Path, *, runner: str = "direct", max_threads: int =
             @router.task
             def run(ctx):
                 names = sorted(thread.name for thread in threading.enumerate())
-                ctx.write("thread-topology.json", json.dumps({{
+                ctx.write_output("thread-topology.json", json.dumps({{
                     "handler": threading.current_thread().name,
                     "all_threads": names,
                 }}))
@@ -73,7 +73,8 @@ def test_init_creates_sqlite_state_and_job_payloads_remain_files(tmp_path, monke
     job_dir = tmp_path / "node" / "A" / "jobs" / "1"
     assert (job_dir / "input.json").is_file()
     assert (job_dir / "output.json").is_file()
-    assert (job_dir / "files" / "thread-topology.json").is_file()
+    assert (tmp_path / "node" / "A" / "output" / "thread-topology.json").is_file()
+    assert sorted(path.name for path in job_dir.iterdir()) == ["input.json", "output.json"]
     for legacy_name in ("job.json", "status.json", "execution.json", "runtime.json", "events.jsonl"):
         assert not (job_dir / legacy_name).exists()
     assert not (tmp_path / "node" / "A" / "queued").exists()
@@ -91,7 +92,7 @@ def test_cli_thread_topology_is_controller_to_one_handler(tmp_path, monkeypatch)
     assert cli.main(["run", "A", "--runner", "threaded"]) == 0
 
     topology = json.loads(
-        (tmp_path / "node" / "A" / "jobs" / "1" / "files" / "thread-topology.json").read_text()
+        (tmp_path / "node" / "A" / "output" / "thread-topology.json").read_text()
     )
     assert topology["handler"].startswith("mwf-handler-A-1-")
     assert any(name.startswith("mwf-job-A-") for name in topology["all_threads"])

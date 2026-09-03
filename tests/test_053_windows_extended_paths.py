@@ -40,12 +40,6 @@ def test_job_context_records_extended_output_path_without_crashing():
         def output_dir(self):
             return Path(r"C:\Users\Chris\Desktop\Projects\kaicenat\node\explode\output")
 
-        @property
-        def files_dir(self):
-            return Path(
-                r"C:\Users\Chris\Desktop\Projects\kaicenat\node\explode\output\jobs\208\files"
-            )
-
         def _record_event(self, event, **data):
             events.append((event, data))
 
