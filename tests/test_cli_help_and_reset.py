@@ -49,11 +49,9 @@ def test_top_level_help_points_to_command_help_and_describe(capsys):
     out = capsys.readouterr().out
 
     assert "mwf <command> --help" in out
-    assert "mwf clean --help" in out
+    assert "mwf reset --help" in out
     assert "mwf --describe runfrom" in out
-    assert "mwf clean *" in out
     assert "mwf reset *" in out
-    assert "mwf wipe *" in out
     assert "mwf restart <node-name> job 42" in out
 
 
@@ -61,36 +59,19 @@ def test_describe_explains_command_context_and_current_project(tmp_path, monkeyp
     make_cli_project(tmp_path, monkeypatch)
     capsys.readouterr()
 
-    assert cli.main(["--describe", "clean"]) == 0
+    assert cli.main(["--describe", "reset"]) == 0
     out = capsys.readouterr().out
 
-    assert "mwf clean" in out
-    assert "Code context:" in out
-    assert "File-system context" in out
+    assert "mwf reset" in out
+    assert "retained jobs are requeued" in out
+    assert "generated output is cleared" in out
     assert "Current directory context:" in out
     assert f"project root: {tmp_path}" in out
     assert "graph path: src/graph.py" in out
     assert "nodes on disk: alpha, beta, gamma" in out
-    assert "More syntax help: mwf clean --help" in out
+    assert "More syntax help: mwf reset --help" in out
 
 
-def test_clean_star_cleans_all_nodes_but_preserves_inputs(tmp_path, monkeypatch, capsys):
-    make_cli_project(tmp_path, monkeypatch)
-    seed_dirty_node(tmp_path, "alpha")
-    seed_dirty_node(tmp_path, "beta")
-    capsys.readouterr()
-
-    assert cli.main(["clean", "*", "--yes"]) == 0
-    out = capsys.readouterr().out
-
-    assert "Cleaned all nodes: alpha, beta, gamma" in out
-    for node in ["alpha", "beta"]:
-        node_dir = tmp_path / "node" / node
-        assert (node_dir / "input" / "keep.txt").read_text(encoding="utf-8") == "input"
-        assert not (node_dir / "output" / "remove.txt").exists()
-        assert (node_dir / "jobs").is_dir()
-        assert not (node_dir / "jobs" / "1").exists()
-        assert FileStorage(tmp_path).get_node_status(node) == "queued"
 
 
 def test_reset_star_preserves_job_definitions_and_requeues_jobs(tmp_path, monkeypatch, capsys):
@@ -115,37 +96,8 @@ def test_reset_star_preserves_job_definitions_and_requeues_jobs(tmp_path, monkey
         assert FileStorage(tmp_path).get_node_status(node) == "queued"
 
 
-def test_wipe_star_wipes_all_nodes_and_removes_inputs(tmp_path, monkeypatch, capsys):
-    make_cli_project(tmp_path, monkeypatch)
-    seed_dirty_node(tmp_path, "alpha")
-    seed_dirty_node(tmp_path, "gamma")
-    capsys.readouterr()
-
-    assert cli.main(["wipe", "*", "--yes"]) == 0
-    out = capsys.readouterr().out
-
-    assert "Wiped all nodes: alpha, beta, gamma" in out
-    for node in ["alpha", "gamma"]:
-        node_dir = tmp_path / "node" / node
-        assert (node_dir / "input").is_dir()
-        assert not (node_dir / "input" / "keep.txt").exists()
-        assert not (node_dir / "output" / "remove.txt").exists()
-        assert (node_dir / "jobs").is_dir()
-        assert not (node_dir / "jobs" / "1").exists()
-        assert FileStorage(tmp_path).get_node_status(node) == "queued"
 
 
-def test_clean_star_also_works_when_shell_expands_star(tmp_path, monkeypatch, capsys):
-    make_cli_project(tmp_path, monkeypatch)
-    seed_dirty_node(tmp_path, "alpha")
-    capsys.readouterr()
-
-    expanded_star = sorted(path.name for path in tmp_path.iterdir() if not path.name.startswith("."))
-    assert cli.main(["clean", *expanded_star, "--yes"]) == 0
-    out = capsys.readouterr().out
-
-    assert "Cleaned all nodes: alpha, beta, gamma" in out
-    assert not (tmp_path / "node" / "alpha" / "output" / "remove.txt").exists()
 
 
 def make_chain_project(tmp_path: Path, monkeypatch):
@@ -212,17 +164,17 @@ def test_run_b_after_run_a_keeps_a_finished_status(tmp_path, monkeypatch, capsys
     assert FileStorage(tmp_path).get_node_status("B") == "done"
 
 
-def test_cleaning_a_removes_finished_status_and_blocks_b(tmp_path, monkeypatch, capsys):
+def test_resetting_a_removes_finished_status_and_blocks_b(tmp_path, monkeypatch, capsys):
     make_chain_project(tmp_path, monkeypatch)
     capsys.readouterr()
 
     assert cli.main(["run", "A", "--runner", "direct"]) == 0
     capsys.readouterr()
 
-    assert cli.main(["clean", "A", "--yes"]) == 0
+    assert cli.main(["reset", "A", "--yes"]) == 0
     capsys.readouterr()
     assert FileStorage(tmp_path).get_node_status("A") == "queued"
-    assert not (tmp_path / "node" / "A" / "jobs" / "1").exists()
+    assert FileStorage(tmp_path).job_exists("A", 1)
 
     assert cli.main(["run", "B", "--runner", "direct"]) == 1
     out = capsys.readouterr().out
@@ -537,19 +489,17 @@ def run(ctx): return "{node}"
     assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
 
 
-@pytest.mark.parametrize("command", ["clean", "reset", "wipe"])
-def test_cleanup_commands_expand_one_node_to_whole_hoeflein_component(
+def test_reset_expands_one_node_to_whole_hoeflein_component(
     tmp_path,
     monkeypatch,
     capsys,
-    command,
 ):
     make_cleanup_component_project(tmp_path, monkeypatch)
     for node in ["A", "B", "C", "D"]:
         seed_dirty_node(tmp_path, node)
     capsys.readouterr()
 
-    assert cli.main([command, "B", "--yes"]) == 0
+    assert cli.main(["reset", "B", "--yes"]) == 0
     out = capsys.readouterr().out
     assert "Hoeflein component(s) {B, C}" in out
 
@@ -557,16 +507,9 @@ def test_cleanup_commands_expand_one_node_to_whole_hoeflein_component(
     for node in ["B", "C"]:
         node_dir = tmp_path / "node" / node
         assert not (node_dir / "output" / "remove.txt").exists()
-        if command == "reset":
-            assert storage.job_exists(node, 1)
-            assert storage.get_job_status(node, 1) == "queued"
-            assert (node_dir / "input" / "keep.txt").exists()
-        else:
-            assert not storage.job_exists(node, 1)
-            if command == "wipe":
-                assert not (node_dir / "input" / "keep.txt").exists()
-            else:
-                assert (node_dir / "input" / "keep.txt").exists()
+        assert storage.job_exists(node, 1)
+        assert storage.get_job_status(node, 1) == "queued"
+        assert (node_dir / "input" / "keep.txt").exists()
 
     for node in ["A", "D"]:
         node_dir = tmp_path / "node" / node

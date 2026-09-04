@@ -48,11 +48,12 @@ the implementation task excludes implementation or repair of example graphs and 
 
 ## Stage placement and dependency adjustments
 
-The six implementation stages retain the implementation task's proposed order, with three recorded adjustments:
+The six implementation stages retain the implementation task's proposed order, with these recorded adjustments:
 
 1. S1 includes a read-only bootstrap seam before any preview implementation. A preview cannot be verified as read-only if storage migration, state mounting, starter-job creation, or session reservation still happens first.
 2. S2 moves component identity and alignment-generation storage ahead of S3. S3 needs exact component rows, generations, session ownership, and reservation or guard primitives before it can implement publication cleanup, misalignment, and membership repair safely.
 3. S5 owns live-session controls, but their storage and ownership prerequisites stay in S2. S5 adds interrupt semantics, transfers, holds, fences, restart, recovery, and thread behavior only after S2 establishes exact session and job ownership. S6 performs the final integration across these seams and updates all user and agent-facing text.
+4. [Command retirement](stage-retirement.md) moves 44-CMD-025 through 44-CMD-028 and 44-REC-041 ahead of the remaining S4/S6 work. Removing the four commands is independently settled and does not depend on blocked preview or migration work.
 
 No stage is accepted by this preparation. Implementation and review status is maintained in [requirements-audit.md](requirements-audit.md).
 

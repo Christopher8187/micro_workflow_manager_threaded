@@ -200,11 +200,8 @@ confirmation unless `--yes` is supplied.
 | Command | Jobs | Node output | Node input | Executes tasks |
 | --- | --- | --- | --- | --- |
 | `reset` | keep identities and parameters; requeue selected work | clear for whole-component scope | keep | no |
-| `clean` | delete | clear | keep | no |
-| `wipe` | delete | clear | clear | no |
 
-The `from` variants apply through quotient-DAG descendants. `cleanfrom` and
-`wipefrom` use the full selected descendant region. `resetfrom` uses the same
+The `resetfrom` command applies through quotient-DAG descendants. It uses the same
 producer-aware freshening as `runfrom`. Naming any member expands to its whole
 Hoeflein component, and `*` selects every graph node.
 

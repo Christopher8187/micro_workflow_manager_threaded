@@ -62,7 +62,7 @@ another.
 ## Working boundaries
 
 Preserve user data, dirty files, and linked-worktree state. Treat MWF project
-state as durable unless the user authorizes a reset, clean, wipe, paste, fresh
+state as durable unless the user authorizes a reset, paste, fresh
 run, deployment, or other mutation.
 
 Before editing MWF framework source, engine code, tests, benchmark programs or

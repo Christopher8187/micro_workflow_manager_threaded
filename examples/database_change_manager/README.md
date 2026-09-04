@@ -23,6 +23,4 @@ Before destructive work, preview the matching non-running command:
 
 ```bash
 mwf resetfrom <start-node> --dry-run
-mwf cleanfrom <start-node> --dry-run
-mwf wipefrom <start-node> --dry-run
 ```

@@ -28,5 +28,4 @@ node/<node>/input/          # prompts/static resources when needed
 ```
 
 Use `mwf init`, `mwf graph src/graph.py`, and the example README's run command.
-Before deleting state, use `mwf resetfrom ... --dry-run`,
-`mwf cleanfrom ... --dry-run`, or `mwf wipefrom ... --dry-run`.
+Before preparing a fresh run, use `mwf resetfrom ... --dry-run`.

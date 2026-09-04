@@ -280,7 +280,7 @@ class FileStorageBase:
             if directory is None:
                 directory = self.project_dir / ".mwf" / safe_namespace
                 self._filesystem_lock_dir_cache[safe_namespace] = directory
-        # A live storage object may survive a clean/wipe that removed .mwf.
+        # A live storage object may survive replacement of the .mwf directory.
         directory.mkdir(parents=True, exist_ok=True)
         return directory / f"{safe_name}.lock"
 

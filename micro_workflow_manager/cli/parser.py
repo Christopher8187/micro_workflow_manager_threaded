@@ -157,24 +157,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover_cmd.add_argument("--dry-run", action="store_true", help="Show jobs that would be recovered without changing them.")
 
-    clean_cmd = commands.add_parser(
-        "clean",
-        help="Delete every job and output in one or more selected Hoeflein components.",
-        description=COMMAND_HELP_DESCRIPTIONS["clean"].strip(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    clean_cmd.add_argument("nodes", nargs="+", metavar="node", help="One or more component members, or '*' for all nodes.")
-    add_destructive_arguments(clean_cmd)
-
-    cleanfrom_cmd = commands.add_parser(
-        "cleanfrom",
-        help="Delete every job and output from one component through all descendants.",
-        description=COMMAND_HELP_DESCRIPTIONS["cleanfrom"].strip(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    cleanfrom_cmd.add_argument("node", help="Start node for descendant cleanup, or '*' for all nodes.")
-    add_destructive_arguments(cleanfrom_cmd)
-
     reset_cmd = commands.add_parser(
         "reset",
         help="Perform run's fresh preparation without executing task code.",
@@ -196,24 +178,6 @@ def build_parser() -> argparse.ArgumentParser:
     resetfrom_cmd.add_argument("refuse_mode", nargs="?", choices=("refuseafter",), metavar="refuseafter", help="Optional compatibility boundary; reset scope remains the full descendant set.")
     resetfrom_cmd.add_argument("refuse_node", nargs="?", metavar="node", help="Boundary node to validate against the selection.")
     add_destructive_arguments(resetfrom_cmd)
-
-    wipe_cmd = commands.add_parser(
-        "wipe",
-        help="Delete every job, output, and input in selected Hoeflein components.",
-        description=COMMAND_HELP_DESCRIPTIONS["wipe"].strip(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    wipe_cmd.add_argument("nodes", nargs="+", metavar="node", help="One or more component members, or '*' for all nodes.")
-    add_destructive_arguments(wipe_cmd)
-
-    wipefrom_cmd = commands.add_parser(
-        "wipefrom",
-        help="Delete every job, output, and input from one component through descendants.",
-        description=COMMAND_HELP_DESCRIPTIONS["wipefrom"].strip(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    wipefrom_cmd.add_argument("node", help="Start node for descendant wipe, or '*' for all nodes.")
-    add_destructive_arguments(wipefrom_cmd)
 
     run_cmd = commands.add_parser(
         "run",

@@ -93,7 +93,6 @@ def test_descriptions_do_not_use_wait_as_a_node_name():
     forbidden = (
         "mwf inspect wait",
         "mwf run wait",
-        "mwf wipe wait",
         'NodeRouter("wait")',
     )
     for text in forbidden:

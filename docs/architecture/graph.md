@@ -142,7 +142,7 @@ already-started work before the component reaches a durable failed boundary.
 Waiting nodes gate admission based on the configured peer queues; they do not
 introduce a new job status.
 
-Fresh execution, resume, restart, reset, clean, and wipe have different data
+Fresh execution, resume, restart, and reset have different data
 boundaries. Consult [README.md](../../README.md) for command semantics and
 [testing.md](../testing.md) before exercising them.
 

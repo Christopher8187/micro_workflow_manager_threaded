@@ -19,7 +19,7 @@ class NodeFileStorageMixin:
                 # join is safe and avoids a realpath walk on every job operation.
                 path = self.project_dir / "node" / node_name
                 self._node_dir_cache[node_name] = path
-        # Clean/wipe operations may remove a previously cached directory while
+        # Graph updates may remove a previously cached directory while
         # the FileStorage object remains alive. Recreate the cached location
         # without repeating canonical path resolution.
         path.mkdir(parents=True, exist_ok=True)

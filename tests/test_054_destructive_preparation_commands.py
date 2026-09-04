@@ -109,23 +109,3 @@ def test_resetfrom_freshens_descendants_without_running(tmp_path, monkeypatch, c
     assert storage.list_job_ids("B") == []
     assert storage.list_job_ids("C") == []
     assert storage.list_job_ids("D") == []
-
-
-def test_cleanfrom_and_wipefrom_use_descendant_scope(tmp_path, monkeypatch, capsys):
-    _project(tmp_path, monkeypatch)
-    for node in ["A", "B", "C", "D"]:
-        node_dir = tmp_path / "node" / node
-        (node_dir / "input" / "keep.txt").write_text("input", encoding="utf-8")
-        (node_dir / "output" / "result.txt").write_text("output", encoding="utf-8")
-    capsys.readouterr()
-
-    assert cli.main(["cleanfrom", "B", "--yes"]) == 0
-    for node in ["B", "C", "D"]:
-        assert (tmp_path / "node" / node / "input" / "keep.txt").exists()
-        assert not (tmp_path / "node" / node / "output" / "result.txt").exists()
-    assert (tmp_path / "node" / "A" / "output" / "result.txt").exists()
-
-    assert cli.main(["wipefrom", "B", "--yes"]) == 0
-    for node in ["B", "C", "D"]:
-        assert not (tmp_path / "node" / node / "input" / "keep.txt").exists()
-    assert (tmp_path / "node" / "A" / "input" / "keep.txt").exists()

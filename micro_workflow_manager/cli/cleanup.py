@@ -96,27 +96,6 @@ def selected_component_labels(workflow: MicroWorkflow, nodes: list[str]) -> list
     return labels
 
 
-def clean_node(
-    root: Path,
-    workflow: MicroWorkflow,
-    node: str,
-    remove_input: bool = False,
-    *,
-    keep_trace: bool = False,
-):
-    node_dir = safe_node_dir(root, node)
-    remove_dir(node_dir / "output")
-    workflow.storage.delete_node_jobs(
-        node,
-        remove_payload=True,
-        preserve_events=keep_trace,
-    )
-    if remove_input:
-        remove_dir(node_dir / "input")
-    workflow.storage.init_node_folders(node)
-    workflow.storage.set_node_status(node, QUEUED)
-
-
 def job_producer_component(workflow: MicroWorkflow, metadata: dict) -> tuple[str, ...] | None:
     stored = metadata.get("producer_component")
     if isinstance(stored, tuple) and stored:

@@ -1,6 +1,6 @@
 HELP_EPILOG = """
 Command help:
-  mwf clean --help
+  mwf reset --help
   mwf run --help
   mwf resumefrom --help
 Extended command descriptions:
@@ -28,9 +28,6 @@ Destructive preparation and cleanup:
   mwf reset A --dry-run
   mwf reset * --yes
   mwf resetfrom A --dry-run
-  mwf clean * --yes
-  mwf wipe * --yes
-  mwf wipefrom A --yes
 Use 'mwf <command> --help' for syntax. Use 'mwf --describe <command>' for a longer essay explaining behavior, file effects, and abstract examples.
 """
 COMMAND_HELP_DESCRIPTIONS = {
@@ -45,12 +42,8 @@ COMMAND_HELP_DESCRIPTIONS = {
     "trace": "Render one job's chronological origin, task/fallback starts, ctx.trace objects, outputs, forwarded inputs, downstream jobs, and terminal state.",
     "filter": "Show the retry/fallback funnel, or list jobs at one stage boundary.",
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
-    "clean": "Delete every job and generated output in selected Hoeflein components while preserving node inputs; confirmation is required unless --yes is used.",
-    "cleanfrom": "Delete every job and generated output from one Hoeflein component through all quotient-DAG descendants while preserving inputs.",
     "reset": "Perform the same fresh preparation as mwf run, including selected-job mode, but do not execute task code.",
     "resetfrom": "Perform the same producer-aware fresh descendant preparation as mwf runfrom, but do not execute task code.",
-    "wipe": "Delete every job, generated output, and input file in selected Hoeflein components.",
-    "wipefrom": "Delete every job, generated output, and input file from one component through all descendants.",
     "run": "Reset and run the ready Hoeflein component selected by one node, or selected jobs in a singleton node; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control that restarts running and failed/cancelled jobs in the selected active Hoeflein component; it never starts another scheduler.",
     "threads": "View or change run-scoped per-node max_threads overrides and the optional aggregate API admission budget; active threaded and API nodes scale live.",
@@ -212,38 +205,6 @@ Recover leaves A done, requeues B, and records that the old run was recovered.
 You can then use mwf resume B or mwf resumefrom B. Recover refuses to operate
 while the recorded owner is still live.
 """,
-    "clean": """
-Code context:
-Clean is the non-executing destructive counterpart to run preparation and uses
-the same graph and Hoeflein-component selection rules.
-
-File-system context:
-Clean selects the same Hoeflein component unit as `mwf run`, but it deletes every
-job and generated output in that selection instead of requeueing jobs. Input files
-remain. Multiple named components and `*` remain available for administrative
-cleanup. The command prints a danger summary and requires typing `clean`; scripts
-must pass `--yes` explicitly.
-
-Examples:
-  mwf clean transform --dry-run
-  mwf clean transform
-  mwf clean A B --yes
-  mwf clean "*" --yes
-
-Use reset when job identities and payloads should be preserved for a fresh rerun.
-Use cleanfrom when all quotient-DAG descendants must also lose their jobs.
-""",
-    "cleanfrom": """
-Cleanfrom selects the named node's complete Hoeflein component and every
-quotient-DAG descendant. It deletes all jobs and generated output in those nodes,
-including work produced by unselected incoming branches, while preserving input
-files. This is intentionally broader than resetfrom's producer-aware cleanup.
-
-Examples:
-  mwf cleanfrom classify --dry-run
-  mwf cleanfrom classify
-  mwf cleanfrom classify --keeptrace --yes
-""",
     "reset": """
 Reset is `mwf run` without execution. Whole-node mode performs the exact fresh-run
 preparation for the selected Hoeflein component: retained jobs are requeued,
@@ -273,25 +234,6 @@ Examples:
 
 `refuseafter` is accepted for command symmetry and validated against the selected
 branch, but no admission occurs, so it never shrinks the reset scope.
-""",
-    "wipe": """
-Wipe selects one or more Hoeflein components and deletes every job, generated
-output, and input file in them. It requires typing `wipe` unless `--yes` is used.
-This is a destructive local rebuild operation, not ordinary failure recovery.
-
-Examples:
-  mwf wipe temporary_result --dry-run
-  mwf wipe temporary_result
-  mwf wipe "*" --yes
-""",
-    "wipefrom": """
-Wipefrom applies wipe to the named Hoeflein component and every quotient-DAG
-descendant. All selected jobs, generated output, and inputs are deleted. Use
-`--dry-run` first and `--yes` only in reviewed automation.
-
-Examples:
-  mwf wipefrom import_book --dry-run
-  mwf wipefrom import_book
 """,
     "run": """
 Run deliberately starts fresh work for one node. In normal node mode it resets

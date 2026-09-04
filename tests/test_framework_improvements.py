@@ -929,7 +929,7 @@ def test_cleanup_and_recover_dry_runs_do_not_mutate(tmp_path, monkeypatch, capsy
     assert (tmp_path / ".mwf" / "run.json").read_bytes() == run_before
 
     node_before = sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node" / "A").rglob("*"))
-    assert cli.main(["clean", "A", "--dry-run"]) == 0
+    assert cli.main(["reset", "A", "--dry-run"]) == 0
     assert "Dry run" in capsys.readouterr().out
     node_after = sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node" / "A").rglob("*"))
     assert node_after == node_before

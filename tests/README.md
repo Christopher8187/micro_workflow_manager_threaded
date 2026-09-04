@@ -30,7 +30,7 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_051_refuseafter_trace_retention.py` | Inclusive admission boundaries, trace clearing and retention, orphan journals, copy/paste, and changed job origin. |
 | `test_052_sqlite_finalizer_reentrancy.py` | Same-thread connection-registry behavior during storage finalization. |
 | `test_053_windows_extended_paths.py` | Windows extended-length aliases, sibling-path rejection, and context output recording. |
-| `test_054_destructive_preparation_commands.py` | Confirmation and scope for reset, resetfrom, cleanfrom, and wipefrom without execution. |
+| `test_054_destructive_preparation_commands.py` | Confirmation and scope for reset and resetfrom without execution. |
 | `test_055_threaded_prefetch_and_nofile.py` | Threaded payload prefetch, bounded source reservations, file-descriptor limit handling, and CLI setup order. |
 | `test_056_resumefrom_refuseafter_052.py` | Inclusive `resumefrom` boundaries, component expansion, planning, and invalid-boundary behavior. |
 | `test_057_hoeflein_live_sync_053.py` | Resident component members, late feedback, source loading, startup subscription, failure joining, cleanup, wakeup scope, and mutation-lane use. |
@@ -39,11 +39,12 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_061_refuse_before_0510.py` | Exclusive refusal boundaries for run and resume, global admission stops, component naming, planning, and invalid selections. |
 | `test_062_engine_and_sampling.py` | Graph-only engine boundaries and deterministic sampled runs. It does not establish human layout readability or descendant and component-circulation isolation. |
 | `test_063_quotient_selection.py` | Half-open quotient intervals, endpoint rejection, whole-component expansion, deterministic ordering, unchanged stored state, and overlapping directed routes. |
+| `test_065_removed_commands.py` | Rejection of retired commands before project bootstrap, with no description, help example, or filesystem mutation. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and checkpoint replacement. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status when Hoeflein synchronization raises or an explode-pump sample reports failed jobs. |
 | `test_checkpoint_keyword_api.py` | Keyword checkpoint fields, persistence, validation, dynamic deadlines, fallbacks, and router schema. |
-| `test_cli_help_and_clean_wipe.py` | Help and describe output, reset/clean/wipe semantics, selected-job runs, initialization sidecars, and component-expanded cleanup. |
+| `test_cli_help_and_reset.py` | Help and describe output, reset semantics, selected-job runs, initialization sidecars, and component-expanded preparation. |
 | `test_cli_monitor.py` | Bulk summaries, inline and standalone monitoring, timing metadata, reuse, combined statistics, and diagnostic monitor failure. |
 | `test_deploy.py` | Legacy state consolidation, deployment setup, ignore rules, local archives, remote extraction, PuTTY use, and clean SQLite reinitialization. |
 | `test_file_entry_node_input_import.py` | Binding a node-input filesystem entry during directory creation. |

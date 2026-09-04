@@ -5,6 +5,11 @@ Later releases may supersede behavior described in an earlier entry. Use the
 [current README](../README.md) and linked architecture and operations guides for
 current behavior.
 
+The 0.6.2 development branch removes `clean`, `cleanfrom`, `wipe`, and `wipefrom`.
+Older entries below describe the releases in which those commands existed.
+Use `reset` or `resetfrom` to prepare retained work for execution; these commands
+preserve input and retained job definitions.
+
 ## What changed in 0.6.1
 
 - Reorganized current documentation around the root README, authoritative

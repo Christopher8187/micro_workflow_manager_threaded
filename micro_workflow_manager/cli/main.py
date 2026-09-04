@@ -177,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
                 recent_events=args.events,
             )
 
-        if args.command in {"clean", "cleanfrom", "reset", "resetfrom", "wipe", "wipefrom"}:
+        if args.command in {"reset", "resetfrom"}:
             if args.command == "resetfrom" and (
                 (args.refuse_mode is None) != (args.refuse_node is None)
             ):

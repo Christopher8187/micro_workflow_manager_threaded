@@ -394,7 +394,7 @@ mutation; it is not a promise that no framework-owned byte changes.
 | Execute fresh work | `run`, `runfrom` | Reset the selected component or selected descendant region before execution. |
 | Continue work | `resume`, `resumefrom` | Preserve done and skipped jobs and continue queued, failed, cancelled, or abandoned work. |
 | Control a live sequence | `restart`, `threads` | Fence selected active jobs or change run-scoped concurrency without starting another scheduler. |
-| Prepare or delete | `reset`, `resetfrom`, `clean`, `cleanfrom`, `wipe`, `wipefrom` | Previewable destructive operations with component-aware scope. |
+| Prepare a rerun | `reset`, `resetfrom` | Fresh preparation without task execution, with component-aware scope. |
 | Preserve node state | `copy`, `paste` | Save or restore a node tree with its SQLite node snapshot. |
 | Maintain state and deployment | `recover`, `migrate`, `deploy` | Recover a dead owner, update MWF-owned metadata, or build and transfer a filtered archive. |
 
@@ -421,9 +421,8 @@ abandoned running jobs while preserving done and failed jobs. Preview with
 
 Fresh and destructive component operations clear their affected node output
 trees. Selected-job reruns do not delete node output because it has no per-job
-ownership. `clean` removes jobs and output but preserves input. `reset` preserves
-job identities and input, removes terminal job results, and requeues. `wipe`
-also removes input. The `*` and `from` variants expand these rules across their
+ownership. `reset` preserves retained job identities and input, removes terminal
+job results, and requeues. The `*` and `from` variants expand these rules across their
 selected components; use `--dry-run` before applying them.
 
 ## Inspection and diagnostics
