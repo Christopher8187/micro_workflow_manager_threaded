@@ -9,6 +9,9 @@ from micro_workflow_manager.paths import state_database_file
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION, STATE_SCHEMA_FIELD
 from micro_workflow_manager.storage import FileStorage
 
+from .active_run import refuse_live_legacy_migration
+from .layout import ensure_runtime_layout
+
 
 _METADATA_PATTERNS = (
     ".mwf/project.json",
@@ -66,6 +69,9 @@ def _read_only_database_integrity(path: Path) -> str:
 
 
 def migrate_command(root: Path, *, dry_run: bool = False) -> int:
+    if not dry_run:
+        refuse_live_legacy_migration(root)
+        ensure_runtime_layout(root)
     plan = migration_plan(root)
     if plan["malformed"]:
         names = ", ".join(path.relative_to(root).as_posix() for path in plan["malformed"])

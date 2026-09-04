@@ -55,10 +55,10 @@ def main(argv: list[str] | None = None) -> int:
         # layout migration, SQLite initialization, or user graph imports.
         if args.command == "engine":
             return engine_command(root)
-        # Migration previews must be strictly read-only, including for projects
-        # that still contain legacy runtime layout or lock directories.
-        if args.command == "migrate" and args.dry_run:
-            return migrate_command(root, dry_run=True)
+        # Migration checks legacy liveness before changing layout or storage.
+        # Its preview also bypasses every mutating bootstrap operation.
+        if args.command == "migrate":
+            return migrate_command(root, dry_run=args.dry_run)
         ensure_runtime_layout(root)
 
         if args.command == "copy":
@@ -72,9 +72,6 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "graph":
             return setup_graph(root, args.path, args.runner, update=args.update, dry_run=args.dry_run)
-
-        if args.command == "migrate":
-            return migrate_command(root, dry_run=args.dry_run)
 
         if args.command == "threads":
             if args.update:

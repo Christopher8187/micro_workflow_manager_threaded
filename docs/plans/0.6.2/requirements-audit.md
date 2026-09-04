@@ -1,6 +1,6 @@
 # MWF 0.6.2 requirement audit
 
-Status: implementation in progress. The [interval calculation](stage-s1a.md), [command retirement](stage-retirement.md), and [shared topology](stage-topology.md) are accepted; full stages and final review remain pending.
+Status: implementation in progress. The [interval calculation](stage-s1a.md), [command retirement](stage-retirement.md), [shared topology](stage-topology.md), and [legacy migration preflight](stage-migration-guard.md) are accepted within their recorded boundaries; full stages and final review remain pending.
 
 [Architectural questions](architectural-questions.md) record the blocked live
 SQLite preview and legacy component migration work, including dependent
@@ -410,8 +410,8 @@ Every implementation, verification, stage-review, and disposition field began as
 | 44-SES-030 | Replace authoritative `.mwf/run.json` state with one SQLite execution-session registry. | 44-FCR, `Several execution sessions and ownership` | published 0.6.1 storage | S2 | pending | pending | pending | pending |
 | 44-SES-031 | The registry represents the main session, every interrupt session, actual parent relationships, IDs, commands, starting and selected components, selected jobs, reservations, holds, heartbeats, terminal outcomes, and failures. | 44-FCR, `Several execution sessions and ownership` | 44-SES-030 | S2 | pending | pending | pending | pending |
 | 44-SES-032 | SQLite is the only writable session-state source. | 44-FCR, `Several execution sessions and ownership` | 44-SES-030 | S2 | pending | pending | pending | pending |
-| 44-SES-033 | Import safe legacy run information once during migration. | 44-FCR, `Several execution sessions and ownership` | 44-SES-030 | S2 | pending | pending | pending | pending |
-| 44-SES-034 | Never migrate session state underneath a live legacy process. | 44-FCR, `Several execution sessions and ownership` | 44-SES-033 | S2 | pending | pending | pending | pending |
+| 44-SES-033 | Import safe legacy run information once during migration. | 44-FCR, `Several execution sessions and ownership` | 44-SES-030 | S2 | pending | pending | pending | complete legacy import blocked by [AQ4](architectural-questions.md#aq4-excluding-older-processes-during-migration); independent new-project session foundations pending |
+| 44-SES-034 | Never migrate session state underneath a live legacy process. | 44-FCR, `Several execution sessions and ownership` | 44-SES-033 | S2 | [accepted preflight only](stage-migration-guard.md) | [fourteen guard cases and retained checks](stage-migration-guard.md#test-first-record) | [safety](migration-safety-review.md), [compatibility](migration-compatibility-review.md) | partial; complete legacy admission exclusion blocked by [AQ4](architectural-questions.md#aq4-excluding-older-processes-during-migration); direct loading and two-record validation remain independent implementation work |
 | 44-SES-035 | An API defined to read the main session returns the main session or no result. | 44-FCR, `Several execution sessions and ownership` | 44-SES-030 | S2 | pending | pending | pending | pending |
 | 44-SES-036 | A legacy generic single-session reader returns a live main session when one exists. | 44-FCR, `Several execution sessions and ownership` | 44-SES-035 | S2 | pending | pending | pending | pending |
 | 44-SES-037 | With no main and exactly one live interrupt, the legacy generic reader returns that interrupt. | 44-FCR, `Several execution sessions and ownership` | 44-SES-036 | S2 | pending | pending | pending | pending |

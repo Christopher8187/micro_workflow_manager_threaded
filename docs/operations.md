@@ -224,6 +224,16 @@ it. `mwf migrate` updates low-churn JSON and SQLite schemas and can import older
 framework-owned status, queue, event, execution, idempotency, default-job, and
 node-summary records.
 
+Applied migration checks both `.mwf_run.json` and `.mwf/run.json` before changing
+layout, locks, JSON, or SQLite state. It refuses while either legacy run is
+observed alive. Automatic conversion of an older runtime layout uses the same check.
+Initialization checks before extracting a deployment archive. An unreadable or
+non-object run file also prevents migration.
+Wait for the recorded run to finish or become stale before migrating; a fresh
+heartbeat from another host also counts as live.
+This preflight does not prevent an older process from starting after the check.
+Concurrent-start exclusion and safe session import remain unfinished.
+
 Migration does not rewrite `input.json`, `output.json`, node input, node output,
 or old per-job file trees. It refuses to downgrade state created by a newer,
 incompatible schema.

@@ -11,7 +11,7 @@ later corrections. The relevant approvals are Q1 and Q2 on dependent work and
 stage ordering, Q6 on factual disagreements, Q8 and Q9 on authorization and
 preservation, and the later requirement to read the full preparation before
 deferral. Those turns establish the decision procedure. They do not answer the
-three behavior questions below. Sol xhigh reviewers also read the complete
+initial three behavior questions below. Sol xhigh reviewers also read the complete
 preparation before reporting these questions.
 
 An [independent Sol xhigh review](architecture-questions-review.md) checked
@@ -109,7 +109,38 @@ The exact sorted-member key calculation itself is already specified.
 
 The local S2 investigation is
 `testing_ground/issue-45/state-migration-review.md` in the Parent Repo. It records
-the safe loading order and separate settled session tests. Liveness refusal
-before any legacy migration, SQLite-only session writes, one main with several
+the safe loading order and separate settled session tests. Observed live-run
+refusal before legacy migration, SQLite-only session writes, one main with several
 interrupts, exact new job ownership, and non-guessing readers are settled and
 remain eligible for independent implementation.
+
+## AQ4: Excluding older processes during migration
+
+What may migration require to prevent an older MWF process from starting after
+the live-run check and before the migration finishes?
+
+The final resolution and Christopher's Q112 approval require that migration
+never occur underneath a live legacy process. The new preflight checks both run
+files before mutation, but it cannot exclude a subsequent start. The safety
+reviewer's controlled ordering publishes a fresh live record immediately after
+the final check. Applied migration then creates SQLite and stamps the live JSON
+record. The [migration preflight record](stage-migration-guard.md) preserves this
+limit. The experiment demonstrates the ordering, without estimating its frequency.
+
+Requiring externally established project quiescence would give the operator a
+new prerequisite. Defining an admission barrier requires stating which older
+writers it must support and how those writers honor it. Repeating the liveness
+check alone leaves a window. Neither an external prerequisite nor a supported
+old-writer boundary has been approved.
+
+Root checked the final resolution, the complete Q112 exchange, current loading
+and run-claim code, and the safety review. Root then re-read the complete local
+preparation task, including all later corrections, before deferring this choice.
+That conversation specifies how to defer ambiguity but supplies no migration
+quiescence or older-writer admission rule.
+
+Complete legacy session import and exclusion under 44-SES-033/034 are blocked
+on this answer. New-project SQLite session records, reservations, ownership,
+and session readers remain independent. Direct storage loading and validation
+of both legacy run records are known implementation work; the concurrency
+choice does not excuse those remaining changes.

@@ -16,6 +16,7 @@ from micro_workflow_manager.paths import config_file, mwf_dir
 from .extras.scaffold import ensure_project_sidecars, ensure_vscode_settings
 from .files import find_root, read_config, safe_node_name, write_json
 from .layout import ensure_runtime_layout
+from .active_run import refuse_live_legacy_migration
 
 
 def init_project(archive_path: str | None = None) -> int:
@@ -23,6 +24,7 @@ def init_project(archive_path: str | None = None) -> int:
     print("MWF project initialization")
     print(f"  working directory: {root}")
 
+    refuse_live_legacy_migration(root)
     archive = _resolve_init_archive(root, archive_path)
     if archive is not None:
         print(f"  deployment archive: {archive}")

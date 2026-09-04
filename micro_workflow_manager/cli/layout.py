@@ -16,6 +16,8 @@ from micro_workflow_manager.paths import (
     threads_file,
 )
 
+from .active_run import refuse_live_legacy_migration
+
 
 def has_project_marker(root: Path) -> bool:
     legacy = root / LEGACY_CONFIG_NAME
@@ -34,6 +36,15 @@ def ensure_runtime_layout(root: Path) -> bool:
     target_dir = mwf_dir(root)
     target_config = config_file(root)
     migrated = False
+
+    legacy_paths = (
+        root / LEGACY_RUN_NAME,
+        root / LEGACY_THREADS_NAME,
+        root / LEGACY_LOCKS_NAME,
+        locks_dir(root),
+    )
+    if legacy_config.is_file() or any(path.exists() for path in legacy_paths):
+        refuse_live_legacy_migration(root)
 
     if legacy_config.is_file():
         try:

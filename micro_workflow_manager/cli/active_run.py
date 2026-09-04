@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import socket
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from micro_workflow_manager.processes import process_identity, process_is_alive
+from micro_workflow_manager.paths import LEGACY_RUN_NAME, run_file
 
 
 DEFAULT_HEARTBEAT_STALE_SECONDS = 15.0
@@ -111,6 +114,25 @@ def live_active_run(storage_or_workflow) -> dict[str, Any] | None:
     storage = _storage(storage_or_workflow)
     state = storage.get_run_state()
     return state if run_state_liveness(state)["live"] else None
+
+
+def refuse_live_legacy_migration(root: Path) -> None:
+    """Check both legacy run locations before layout or database writes."""
+    for path in (root / LEGACY_RUN_NAME, run_file(root)):
+        if not path.is_file():
+            continue
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"Cannot inspect legacy run before migration: {path}") from error
+        if not isinstance(state, dict):
+            raise RuntimeError(f"Cannot inspect legacy run before migration: expected a JSON object in {path}")
+        if run_state_liveness(state)["live"]:
+            raise RuntimeError(
+                f"Cannot perform migration while legacy run {state.get('run_id', '?')} "
+                f"is alive ({path.relative_to(root).as_posix()}). "
+                "Wait for that run to finish or become stale before migrating."
+            )
 
 
 def refuse_competing_run(storage_or_workflow):
