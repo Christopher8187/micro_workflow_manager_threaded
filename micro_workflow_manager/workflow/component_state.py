@@ -98,6 +98,23 @@ class ComponentStateMixin:
         descendants = nx.descendants(dag, key)
         return [item for item in nx.topological_sort(dag) if item in descendants]
 
+    def component_interval(self, start_node: str, end_node: str) -> list[tuple[str, ...]]:
+        """Return the half-open directed quotient interval [start, end)."""
+        for name in (start_node, end_node):
+            if name not in self.graph_obj:
+                raise InvalidGraphError(f"Unknown interval endpoint node {name!r}")
+        dag = self.component_dag()
+        start = self.component_id(start_node)
+        end = self.component_id(end_node)
+        descendants = nx.descendants(dag, start)
+        if end not in descendants:
+            raise InvalidGraphError(
+                f"End component {end!r} must be a strict directed descendant of {start!r}"
+            )
+        selected = ({start} | descendants) & ({end} | nx.ancestors(dag, end))
+        selected.discard(end)
+        return list(nx.lexicographical_topological_sort(dag.subgraph(selected)))
+
     def component_is_cyclic(self, component: set[str]) -> bool:
         return len(component) > 1 or any(
             self.graph_obj.has_edge(node_name, node_name)

@@ -79,6 +79,23 @@ communicating subsystem. A normal edge between separate components retains DAG
 readiness. Use an internal waiting relationship only for a narrow gate. If most
 work waits, separate components will usually express the design more clearly.
 
+## Quotient intervals
+
+`workflow.component_interval(A, B)` returns the half-open quotient interval
+`[C_A, C_B)`, where each endpoint names a raw node and selects its whole
+Hoeflein component. B must be a strict directed descendant of A. Endpoints in
+one component, reversed endpoints, and undirected-only connections are invalid.
+
+The calculation intersects descendants-or-self of A with ancestors-or-self of
+B, then excludes B's entire component. It includes every directed route between
+the endpoints without enumerating paths. Components contain sorted raw-node
+names and appear in deterministic topological order. Calculating the interval
+does not prepare or execute work or change stored state.
+
+For `A -> B -> D` and `A -> C -> D`, the interval from A to D contains A, B,
+and C. A separate branch from A that never reaches D is excluded. This graph
+calculation is the basis for the MWF 0.6.2 between-command work.
+
 ## Circulation and termination
 
 A cycle is topology. Decide whether its circulation makes a meaningful

@@ -1,7 +1,6 @@
 # Test modules
 
-This file explains the 49 `test_*.py` modules and the shared helper present at
-the MWF 0.6.1 documentation pass. Update it whenever a test module is added,
+This file explains the test modules and the shared helper. Update it whenever a test module is added,
 renamed, removed, or changes purpose. Read [the testing model](../docs/testing.md)
 and use the `mwf-test` skill for execution order and isolation.
 
@@ -39,6 +38,7 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_060_network_manager_056.py` | Shared network-manager dispatch, HTTP/2 terminal recovery, shard retirement and reuse, quiet-tail evidence, diagnostics, cancellation, persistence, and local pacing. |
 | `test_061_refuse_before_0510.py` | Exclusive refusal boundaries for run and resume, global admission stops, component naming, planning, and invalid selections. |
 | `test_062_engine_and_sampling.py` | Graph-only engine boundaries and deterministic sampled runs. It does not establish human layout readability or descendant and component-circulation isolation. |
+| `test_063_quotient_selection.py` | Half-open quotient intervals, endpoint rejection, whole-component expansion, deterministic ordering, unchanged stored state, and overlapping directed routes. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and checkpoint replacement. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status when Hoeflein synchronization raises or an explode-pump sample reports failed jobs. |
