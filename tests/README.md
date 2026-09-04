@@ -40,6 +40,7 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_062_engine_and_sampling.py` | Graph-only engine boundaries and deterministic sampled runs. It does not establish human layout readability or descendant and component-circulation isolation. |
 | `test_063_quotient_selection.py` | Half-open quotient intervals, endpoint rejection, whole-component expansion, deterministic ordering, unchanged stored state, and overlapping directed routes. |
 | `test_065_removed_commands.py` | Rejection of retired commands before project bootstrap, with no description, help example, or filesystem mutation. |
+| `test_066_shared_topology.py` | Runtime and engine agreement on autostart components and quotient edges, plus updated selections after autostart registration or replacement. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and checkpoint replacement. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status when Hoeflein synchronization raises or an explode-pump sample reports failed jobs. |

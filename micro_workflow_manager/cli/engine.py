@@ -11,6 +11,7 @@ from pathlib import Path
 import networkx as nx
 
 from micro_workflow_manager.paths import LEGACY_CONFIG_NAME, config_file
+from micro_workflow_manager.topology import ComponentTopology
 
 from .autostart_scan import scan_autostarts
 from .files import safe_node_name
@@ -88,25 +89,9 @@ def build_engine_snapshot(root: Path) -> dict:
         raise RuntimeError("The synchronized graph has no nodes to display")
 
     autostart_edges = _read_autostart_edges(root, config, edges)
-    augmented = graph.copy()
-    for start, end in autostart_edges:
-        augmented.add_edge(end, start)
-
-    components = [tuple(sorted(component)) for component in nx.strongly_connected_components(augmented)]
-    components.sort()
-    component_for = {
-        node: component
-        for component in components
-        for node in component
-    }
-
-    quotient = nx.DiGraph()
-    quotient.add_nodes_from(components)
-    for start, end in edges:
-        source = component_for[start]
-        target = component_for[end]
-        if source != target:
-            quotient.add_edge(source, target)
+    topology = ComponentTopology(graph, autostart_edges)
+    quotient = topology.component_dag()
+    components = sorted(quotient.nodes)
 
     # Longest-path generations make fan-out and fan-in visually explicit while
     # keeping each component in one stable left-to-right layer.

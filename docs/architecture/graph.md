@@ -96,6 +96,12 @@ For `A -> B -> D` and `A -> C -> D`, the interval from A to D contains A, B,
 and C. A separate branch from A that never reaches D is excluded. This graph
 calculation is the basis for the MWF 0.6.2 between-command work.
 
+The runtime and graph-only engine share the pure calculations in
+[`topology.py`](../../micro_workflow_manager/topology.py). They supply the raw
+graph and autostart relationships. The calculations read no storage and change
+neither input. Runtime lifecycle updates remain separate, and existing workflow
+methods delegate to this shared module.
+
 ## Circulation and termination
 
 A cycle is topology. Decide whether its circulation makes a meaningful

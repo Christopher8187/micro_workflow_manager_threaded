@@ -75,16 +75,7 @@ class ComponentSchedulerMixin:
     component_queue_poll_seconds = 5.0
 
     def execution_components(self, nodes: list[str] | None = None) -> list[tuple[str, ...]]:
-        """Return Hoeflein execution units in quotient-DAG topological order."""
-        selected = set(self.graph_obj.nodes if nodes is None else nodes)
-        if not selected:
-            return []
-        dag = self.component_dag()
-        return [
-            component
-            for component in nx.topological_sort(dag)
-            if set(component).intersection(selected)
-        ]
+        return self.topology.execution_components(nodes)
 
     def component_has_queued_jobs(self, component: set[str]) -> bool:
         return any(self.storage.has_queued_jobs(node_name) for node_name in component)
