@@ -7,6 +7,11 @@ from pathlib import Path
 
 DATABASE_SCHEMA_VERSION = 5
 AUTOMATIC_SCHEMA_VERSION = 4
+SESSION_TABLES = frozenset({
+    "execution_sessions", "session_components", "session_jobs",
+    "graph_shapes", "component_definitions", "component_reservations", "component_holds",
+    "job_execution_owners",
+})
 
 
 class SQLiteSchemaMixin:
@@ -63,7 +68,7 @@ class SQLiteSchemaMixin:
                             "Install a compatible newer package instead of downgrading."
                         )
 
-            session_tables = {"execution_sessions", "session_components", "session_jobs"}
+            session_tables = SESSION_TABLES
             if existing_tables.intersection(session_tables) and existing_version != 5:
                 raise RuntimeError("Incomplete SQLite execution-session schema: missing version 5 marker")
             target_version = max(existing_version or 0, initial_schema_version)
@@ -238,11 +243,12 @@ class SQLiteSchemaMixin:
             raise RuntimeError("Incomplete SQLite execution-session schema: missing fresh-state marker")
 
         def objects(database):
+            placeholders = ",".join("?" for _ in SESSION_TABLES)
             return {
                 (row[0], row[1]): " ".join(row[2].split()) if row[2] is not None else None
                 for row in database.execute(
                     "SELECT type, name, sql FROM sqlite_master "
-                    "WHERE tbl_name IN ('execution_sessions', 'session_components', 'session_jobs')"
+                    f"WHERE tbl_name IN ({placeholders})", tuple(sorted(SESSION_TABLES)),
                 )
             }
 
@@ -303,6 +309,42 @@ class SQLiteSchemaMixin:
                 job_id INTEGER NOT NULL,
                 PRIMARY KEY(session_id, node_name, job_id),
                 UNIQUE(session_id, position)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE graph_shapes (
+                shape_id INTEGER PRIMARY KEY,
+                shape_json TEXT NOT NULL UNIQUE
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE component_definitions (
+                component_key TEXT PRIMARY KEY,
+                shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE component_reservations (
+                component_key TEXT PRIMARY KEY REFERENCES component_definitions(component_key),
+                session_id TEXT NOT NULL REFERENCES execution_sessions(session_id)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE component_holds (
+                session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
+                component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
+                hold_count INTEGER NOT NULL CHECK(typeof(hold_count)='integer' AND hold_count>0),
+                PRIMARY KEY(session_id, component_key)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE job_execution_owners (
+                execution_id TEXT PRIMARY KEY,
+                node_name TEXT NOT NULL,
+                job_id INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
+                component_key TEXT NOT NULL REFERENCES component_definitions(component_key)
             )
         """)
 

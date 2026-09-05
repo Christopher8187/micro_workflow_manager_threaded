@@ -46,7 +46,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "resetfrom": "Perform the same producer-aware fresh descendant preparation as mwf runfrom, but do not execute task code.",
     "run": "Reset and run the ready Hoeflein component selected by one node, or selected jobs in a singleton node; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control that restarts running and failed/cancelled jobs in the selected active Hoeflein component; it never starts another scheduler.",
-    "threads": "View or change run-scoped per-node max_threads overrides and the optional aggregate API admission budget; active threaded and API nodes scale live.",
+    "threads": "View or change run-scoped per-node max_threads overrides and the deprecated aggregate API admission budget; active threaded and API nodes scale live.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Register output-backed finished jobs, then continue unsuccessful or queued work for the Hoeflein component selected by one node without resetting done or skipped jobs.",
     "runfrom": "Reset and run the Hoeflein component selected by one node and its quotient-DAG descendants; optional refuse stops before a boundary and refuseafter stops after it.",
@@ -310,6 +310,8 @@ stops launching replacements until active concurrency falls to the new limit.
 For example, a node declared with `max_threads=2` can be raised to 5 during a test.
 API node values are cooperative fiber counts. They may be set into the thousands
 without one OS thread per job. `mwf threads --api-total 500` sets a run-scoped aggregate API admission budget across API nodes; `reset` restores the default.
+The --api-total option is deprecated and remains functional. No removal date or
+session-specific form is introduced in 0.6.2.
 Per-node overrides are scoped to the active or next run and are cleared when that
 run finishes. Process pools read overrides when created, while a direct runner
 always executes one job at a time.

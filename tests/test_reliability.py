@@ -151,41 +151,68 @@ def test_threaded_runner_runs_multiple_jobs_inside_one_node_at_once():
         assert node_complete
 
 
-def test_threaded_workflow_runs_ready_nodes_at_the_same_time():
-    import time
+@pytest.mark.parametrize("runner, expected_overlap", [("threaded", True), ("direct", False)])
+def test_workflow_runner_controls_overlap_of_independent_ready_nodes(
+    tmp_path, runner, expected_overlap,
+):
+    import threading
 
-    with tempfile.TemporaryDirectory() as project_dir:
-        workflow = MicroWorkflow(project_dir=project_dir, runner="threaded")
-        workflow.graph([("A", "C"), ("B", "C")])
+    workflow = MicroWorkflow(project_dir=tmp_path, runner=runner)
+    workflow.graph([("A", "C"), ("B", "C")])
+    entered = set()
+    lock = threading.Lock()
+    first_entered = threading.Event()
+    both_entered = threading.Event()
+    release = threading.Event()
+    overlap_observed = []
 
-        @workflow.task("A", max_threads=1)
-        def a(ctx):
-            time.sleep(1.00)
-            return "A"
+    def enter_handler(name):
+        with lock:
+            entered.add(name)
+            first_entered.set()
+            if entered == {"A", "B"}:
+                both_entered.set()
+        assert release.wait(30), "Ready-node handlers were not released"
+        return name
 
-        @workflow.task("B", max_threads=1)
-        def b(ctx):
-            time.sleep(1.00)
-            return "B"
+    @workflow.task("A", max_threads=1)
+    def a(ctx):
+        return enter_handler("A")
 
-        @workflow.task("C")
-        def c(ctx):
-            return "C"
+    @workflow.task("B", max_threads=1)
+    def b(ctx):
+        return enter_handler("B")
 
-        workflow.start("A")
-        workflow.start("B")
+    @workflow.task("C")
+    def c(ctx):
+        return "C"
 
-        started = time.perf_counter()
+    workflow.start("A")
+    workflow.start("B")
+
+    def observe_then_release():
+        try:
+            if first_entered.wait(10):
+                overlap_observed.append(both_entered.wait(10))
+        finally:
+            release.set()
+
+    observer = threading.Thread(target=observe_then_release, daemon=True)
+    observer.start()
+    try:
         ran = workflow.run()
-        elapsed = time.perf_counter() - started
-
         a_complete = workflow.node_complete("A")
         b_complete = workflow.node_complete("B")
+    finally:
+        release.set()
+        observer.join(timeout=10)
         workflow.storage.close_database_connections()
-        assert elapsed < 1.70
-        assert set(ran) == {"A", "B"}
-        assert a_complete
-        assert b_complete
+    assert not observer.is_alive()
+    assert overlap_observed == [expected_overlap]
+    assert entered == {"A", "B"}
+    assert set(ran) == {"A", "B"}
+    assert a_complete
+    assert b_complete
 
 
 def test_threaded_workflow_starts_newly_ready_nodes_while_other_nodes_are_still_running():

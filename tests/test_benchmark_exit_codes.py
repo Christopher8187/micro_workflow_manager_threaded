@@ -1,8 +1,196 @@
+import hashlib
 import json
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
+
+import pytest
 
 from benchmarks import benchmark_explode_pump_function, benchmark_hoeflein_sync, benchmark_hoeflein_wait
 from micro_workflow_manager import MicroWorkflow
+
+
+def test_repeated_api_growth_rejects_a_clear_progressive_slowdown():
+    from benchmarks.benchmark_repeated_api_rounds import evaluate_growth
+
+    result = evaluate_growth([[1, 2, 8, 10]] * 3)
+
+    assert result["early_median"] == 1.5
+    assert result["late_median"] == 9
+    assert result["allowance"] == 5.5
+    assert result["passed"] is False
+
+
+@pytest.mark.parametrize("late, expected", [(1, True), (4, True), (4.01, False)])
+def test_repeated_api_growth_preserves_the_fixed_allowance(late, expected):
+    from benchmarks.benchmark_repeated_api_rounds import evaluate_growth
+
+    result = evaluate_growth([[1, 1, late, late]] * 3)
+
+    assert result["allowance"] == 4
+    assert result["passed"] is expected
+
+
+def _controlled_api_rounds(rounds):
+    def run(source, directory, plan):
+        (directory / "samples.json").write_text(
+            json.dumps({"samples": [{"controlled_rounds": row} for row in rounds]}),
+            encoding="utf-8",
+        )
+        return rounds
+    return run
+
+
+def test_repeated_api_benchmark_returns_nonzero_for_excessive_growth(tmp_path, monkeypatch):
+    from benchmarks.benchmark_repeated_api_rounds import main
+    from benchmarks import benchmark_repeated_api_rounds as benchmark
+
+    monkeypatch.setattr(benchmark, "run_repetitions", _controlled_api_rounds([[1, 2, 8, 10]] * 3))
+    output = tmp_path / "measurement"
+
+    assert main(["--output", str(output), "--source-commit", "test-source", "--source-state", "controlled timing rows"]) == 1
+    result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+    assert result["growth"]["passed"] is False
+    assert result["exit_code"] == 1
+
+
+def test_repeated_api_benchmark_accepts_the_exact_allowance(tmp_path, monkeypatch):
+    from benchmarks import benchmark_repeated_api_rounds as benchmark
+
+    monkeypatch.setattr(benchmark, "run_repetitions", _controlled_api_rounds([[1, 1, 4, 4]] * 3))
+    output = tmp_path / "measurement"
+
+    assert benchmark.main(["--output", str(output), "--source-commit", "test-source", "--source-state", "controlled timing rows"]) == 0
+    result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+    assert result["growth"]["passed"] is True
+    assert result["growth"]["late_median"] == result["growth"]["allowance"] == 4
+
+
+def test_repeated_api_benchmark_preserves_child_failure(tmp_path, monkeypatch):
+    from benchmarks import benchmark_repeated_api_rounds as benchmark
+
+    def child_failure(*args):
+        raise RuntimeError("controlled child failure")
+
+    monkeypatch.setattr(benchmark, "run_repetitions", child_failure)
+    output = tmp_path / "measurement"
+
+    assert benchmark.main(["--output", str(output), "--source-commit", "test-source", "--source-state", "controlled failure"]) == 1
+    result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+    assert result["growth"] is None
+    assert "controlled child failure" in result["error"]
+
+
+def test_repeated_api_worker_rejects_unfinished_jobs(tmp_path, monkeypatch):
+    from pathlib import Path
+    import micro_workflow_manager
+    from benchmarks import benchmark_repeated_api_rounds as benchmark
+
+    # Simulate early scheduler return, retaining real creation and SQLite state.
+    monkeypatch.setattr(MicroWorkflow, "run_node", lambda *args, **kwargs: None)
+    source = Path(micro_workflow_manager.__file__).resolve().parent.parent
+    output = tmp_path / "unfinished"
+
+    assert benchmark.measure_project(source, output) == 1
+    result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+    assert result["correctness"] == "failed"
+    assert result["cleanup"] == "passed"
+    assert result["rounds"] == []
+    storage = micro_workflow_manager.storage.FileStorage(output / "project")
+    try:
+        assert storage.job_status_counts("merge")["queued"] == 96
+    finally:
+        storage.close_thread_connection()
+
+
+@pytest.mark.parametrize("damage", [None, "source_path", "source_hash"])
+def test_repeated_api_parent_binds_results_to_the_measured_source(tmp_path, monkeypatch, damage):
+    from benchmarks import benchmark_repeated_api_rounds as benchmark
+
+    def completed_child(command, *, cwd, env, **kwargs):
+        directory = Path(command[command.index("--child") + 1])
+        directory.mkdir()
+        plan = json.loads((directory.parent / "plan.json").read_text(encoding="utf-8"))
+        rows = []
+        for position in range(5):
+            total = (position + 1) * 96
+            rows.append(dict(
+                round=position, warmup=position == 0, jobs=96, run_seconds=1, drain_seconds=0,
+                counts=dict(cancelled=0, done=total, failed=0, queued=0, running=0, skipped=0),
+                writer=dict(pending_mutations=0, queued=0, durability_backlog=0), pruned=0,
+                asynchronous_errors=[], runtime_future_observations=384, outputs_checked=96,
+                runtimes_checked=96, cumulative_outputs_checked=total, integrity="ok",
+                event_counts={name: 96 for name in ("created", "started", "task_started", "output_written", "done")},
+                cumulative_events={name: total for name in ("created", "started", "task_started", "output_written", "done")},
+            ))
+        data = dict(exit_code=0, correctness="passed", cleanup="passed", cleanup_seconds=0,
+                    source=plan["source"], source_sha256=plan["source_sha256"],
+                    worker_sha256=plan["worker_sha256"], command=command[1:], rounds=rows,
+                    environment={name: env.get(name) for name in ("PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "TEMP", "TMP")},
+                    **plan["environment"])
+        if damage == "source_path":
+            data["source"] = "a different source copy"
+        elif damage == "source_hash":
+            data["source_sha256"] = {}
+        (directory / "result.json").write_text(json.dumps(data), encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(benchmark, "subprocess", SimpleNamespace(run=completed_child, STDOUT=subprocess.STDOUT))
+    output = tmp_path / "measurement"
+    assert benchmark.main(["--output", str(output), "--source-commit", "test-source",
+                           "--source-state", "controlled child observations"]) == (0 if damage is None else 1)
+    result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+    assert result["samples_sha256"] == hashlib.sha256((output / "samples.json").read_bytes()).hexdigest()
+    if damage is None:
+        assert result["growth"]["passed"] is True
+    else:
+        assert result["growth"] is None
+
+
+def test_repeated_api_benchmark_requires_source_state(tmp_path, monkeypatch):
+    from benchmarks import benchmark_repeated_api_rounds as benchmark
+
+    monkeypatch.setattr(benchmark, "run_repetitions", _controlled_api_rounds([[1, 1, 1, 1]] * 3))
+    output = tmp_path / "measurement"
+    with pytest.raises(SystemExit) as error:
+        benchmark.main(["--output", str(output), "--source-commit", "test-source"])
+    assert error.value.code == 2
+    assert not output.exists()
+
+
+def test_repeated_api_benchmark_refuses_optimized_python():
+    from benchmarks import benchmark_repeated_api_rounds as benchmark
+
+    result = subprocess.run([sys.executable, "-O", benchmark.__file__, "--help"],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert "requires unoptimized Python" in result.stderr
+
+
+def test_repeated_api_benchmark_reads_source_version_without_tomllib():
+    import micro_workflow_manager
+    from benchmarks import benchmark_repeated_api_rounds as benchmark
+
+    script = """
+import builtins
+import json
+from pathlib import Path
+import runpy
+import sys
+original_import = builtins.__import__
+def without_tomllib(name, *args, **kwargs):
+    if name == 'tomllib':
+        raise ModuleNotFoundError('tomllib is unavailable on Python 3.10')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = without_tomllib
+module = runpy.run_path(sys.argv[1], run_name='benchmark_compatibility_check')
+print(json.dumps(module['environment_metadata'](Path(sys.argv[1]).resolve().parents[1])))
+"""
+    result = subprocess.run([sys.executable, "-c", script, benchmark.__file__],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["mwf_version"] == micro_workflow_manager.__version__
 
 
 def test_hoeflein_wait_returns_nonzero_with_unfinished_jobs(tmp_path, monkeypatch, capsys):

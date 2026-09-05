@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+from dataclasses import replace
 from datetime import datetime
 from threading import Condition, Thread
 from time import monotonic
@@ -189,6 +190,37 @@ class SchedulerSupervisor(
                     )
                     if current is None or abs(current - deadline) > 1e-9:
                         continue
+                    renewal_entry = watch.external_renewal_entry
+                    if (
+                        kind == "external"
+                        and renewal_entry is not None
+                        and renewal_entry[0] == deadline
+                        and renewal_entry[1] < deadline
+                    ):
+                        # A new physical attempt entered before the old lease
+                        # expired. Only that old lease is exempted; renewal
+                        # clears the marker before installing its new lease.
+                        continue
+                    external_wait_entry = watch.external_wait_entry
+                    if (
+                        kind == "checkpoint"
+                        and external_wait_entry is not None
+                        and external_wait_entry[0] == revision
+                        and external_wait_entry[1] < deadline
+                    ):
+                        # The framework owns this wait even if admission is
+                        # still acquiring the condition. Total time continues.
+                        continue
+                    handler_exit = watch.handler_exit
+                    if (
+                        kind == "checkpoint"
+                        and handler_exit is not None
+                        and handler_exit[0] == revision
+                        and handler_exit[1] < deadline
+                    ):
+                        # User work finished within this section's interval.
+                        # Framework completion may still hit the total limit.
+                        continue
                     watch.state = "timed_out"
                     self._restartable_keys.discard(watch.key)
                     self._stop_restart_event_subscription_locked()
@@ -216,6 +248,9 @@ class SchedulerSupervisor(
                             f"{watch.node_name}.{watch.task_name} exceeded "
                             f"timeout={seconds:g}s"
                         )
+                    # Cancellation can finish network cleanup before SQLite
+                    # publication. Retain the values observed at expiry.
+                    watch.timeout_observation = replace(watch)
                     watch.cancellation_event.set()
                     watch.revision += 1
                     expired.append((watch, kind))
@@ -261,9 +296,9 @@ class SchedulerSupervisor(
 
                     if deadline is None:
                         if self._watches:
-                            # A direct/thread/process checkpoint briefly disarms
-                            # its deadline while the synchronous framework write
-                            # is in progress. All active watches can therefore
+                            # A checkpoint briefly disarms its deadline while
+                            # framework runtime submission is in progress.
+                            # All active watches can therefore
                             # have no heap deadline for a small window. Keep the
                             # one central watchdog alive until those writes rearm
                             # the watches instead of mistaking that window for an

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import textwrap
 import time
@@ -187,7 +188,8 @@ def test_execution_fence_uses_filesystem_lock_not_sqlite_advisory_rows(tmp_path,
     ).fetchone()[0] == 0
 
 
-def test_repeated_api_rounds_release_worker_connections_and_do_not_slow_progressively(tmp_path):
+def test_repeated_api_rounds_release_worker_connections_and_preserve_outputs(tmp_path, monkeypatch):
+    monkeypatch.delenv("MWF_API_STARTUP_STRATEGY", raising=False)
     workflow = MicroWorkflow(project_dir=tmp_path, runner="api")
     workflow.graph([("merge", "sink")])
 
@@ -210,24 +212,46 @@ def test_repeated_api_rounds_release_worker_connections_and_do_not_slow_progress
         return None
 
     workflow.active_job_restart_enabled = True
-    durations = []
-    for round_number in (1, 2, 3):
-        first = (round_number - 1) * 96 + 1
-        for job_id in range(first, first + 96):
-            workflow.start(
-                "merge",
-                job_id=job_id,
-                autostart=False,
-                round_number=round_number,
-            )
-        started = time.perf_counter()
-        workflow.run_node("merge", ignore_readiness=True)
-        durations.append(time.perf_counter() - started)
+    # Repeated-use timing belongs to benchmarks/benchmark_repeated_api_rounds.py.
+    try:
+        for round_number in (1, 2, 3):
+            first = (round_number - 1) * 96 + 1
+            for job_id in range(first, first + 96):
+                workflow.start(
+                    "merge",
+                    job_id=job_id,
+                    autostart=False,
+                    round_number=round_number,
+                )
+            workflow.run_node("merge", ignore_readiness=True)
+            workflow.storage.db_mutation_barrier()
+            writer = workflow.storage.mutation_writer_diagnostics()
+            assert writer["queued"] == writer["pending_mutations"] == writer["durability_backlog"] == 0
+            assert workflow.storage.prune_dead_thread_connections() == 0
+            assert workflow.storage.job_status_counts("merge") == {
+                "cancelled": 0, "done": round_number * 96, "failed": 0,
+                "queued": 0, "running": 0, "skipped": 0,
+            }
+            for job_id in range(first, first + 96):
+                command = workflow.storage.output_path("merge", "jobs", str(job_id), "command.txt")
+                assert command.read_text(encoding="utf-8") == f"{round_number}:{job_id}"
+                output = json.loads(workflow.storage.output_file("merge", job_id).read_text(encoding="utf-8"))
+                assert output == {"status": "done", "result_type": "int", "result_repr": str(job_id), "generation": 0}
+            assert workflow.storage.db_connection().execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        for job_id in range(1, 289):
+            round_number = (job_id - 1) // 96 + 1
+            command = workflow.storage.output_path("merge", "jobs", str(job_id), "command.txt")
+            assert command.read_text(encoding="utf-8") == f"{round_number}:{job_id}"
+            output = json.loads(workflow.storage.output_file("merge", job_id).read_text(encoding="utf-8"))
+            assert output == {"status": "done", "result_type": "int", "result_repr": str(job_id), "generation": 0}
+    finally:
+        workflow.storage.db_mutation_barrier()
+        cleanup_deadline = time.perf_counter() + 10
+        while workflow.storage.mutation_writer_diagnostics()["writer_alive"]:
+            assert time.perf_counter() < cleanup_deadline, "Mutation writer did not retire"
+            time.sleep(0.01)
         workflow.storage.prune_dead_thread_connections()
-        assert _connection_count(workflow.storage) <= 1
-        assert workflow.storage.db_connection().execute("PRAGMA quick_check").fetchone()[0] == "ok"
-
-    assert max(durations[1:]) <= durations[0] * 3 + 1.0
+        workflow.storage.close_thread_connection()
 
 
 def test_cli_repeated_merge_runs_with_threads_override_and_monitor(tmp_path, monkeypatch, capsys):

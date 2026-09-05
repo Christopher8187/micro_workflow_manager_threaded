@@ -1,6 +1,6 @@
 # Benchmarks and diagnostic programs
 
-This directory contains 12 executable programs and three saved result files.
+This directory contains 13 executable programs and three saved result files.
 Run a program only when a change can affect its measured path or Christopher
 requests it. Read [the testing model](../docs/testing.md) and use the `mwf-test`
 skill for isolation and reporting.
@@ -86,6 +86,31 @@ send and receive delay, persisted node count, and ingress wakeups per request.
 Every one of the 6,000 configured jobs and all 22 node observations must be
 present. The related historical observation is
 `results/network_manager_skew_056_observed.json`.
+
+### `benchmark_repeated_api_rounds.py`
+
+Measures repeated API execution in three fresh processes. Each process uses one
+project for an excluded warmup and four measured rounds of 96 new jobs. The
+clock covers `run_node`; creation, mutation draining, validation, and final
+cleanup are recorded or performed outside that interval.
+
+Run the copied program against its isolated source tree with `--output` naming
+a new Test Area directory, `--source-commit` recording the copied base commit,
+and the required `--source-state` describing the copied changes. Use Python
+with optimization disabled so every validation remains active. The program records source
+hashes, environment, commands, raw rounds, drain times, and cleanup durations.
+The summary binds the plan and completed sample records by SHA-256, and the
+sample records bind each raw child result. It preserves all three projects
+and refuses to reuse an existing output path.
+
+Every round checks exact durable completion, output contents, runtime identity,
+events, completed runtime writes, zero mutation backlog, normal worker-connection
+cleanup, and SQLite integrity. Any failure returns a nonzero process status.
+The timing gate compares the median of the final two measured rounds across
+all processes with the median of the first two. It requires
+`late <= early * 3 + 1 second`. Inspect the recorded per-project comparisons
+as well as the aggregate result. This fixed allowance does not promise that
+every individual later round is faster or reject every increasing sequence.
 
 ### `compare_job_loading_models.py`
 

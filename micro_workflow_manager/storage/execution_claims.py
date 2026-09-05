@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from micro_workflow_manager.models import QUEUED, RUNNING
+from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
 
 
 from .priorities import ADMISSION_PRIORITY
@@ -27,6 +28,8 @@ class ExecutionClaimBatch:
     event_time: str
     task_started_data: dict[str, Any] | None = None
     task_started_mask: tuple[bool, ...] | None = None
+    session_id: str | None = None
+    component: tuple[str, ...] | None = None
 
     @property
     def mutation_weight(self) -> int:
@@ -39,7 +42,7 @@ class JobExecutionClaimStorageMixin:
     def _init_job_execution_claim_state(self) -> None:
         self._claim_batch_lock = Lock()
         self._claim_batches: dict[
-            tuple[str, int],
+            tuple[str, int, str | None, tuple[str, ...] | None],
             list[tuple[int, str, Future[tuple[int, str]]]],
         ] = {}
 
@@ -70,6 +73,32 @@ class JobExecutionClaimStorageMixin:
 
     def current_job_generation(self, node_name: str, job_id: int) -> int:
         return int(self.read_job_control(node_name, job_id)["generation"])
+
+    @staticmethod
+    def _execution_claim_owner_error(connection, batch: ExecutionClaimBatch, checked: dict):
+        if batch.session_id is None:
+            return None
+        if batch.node_name not in batch.component:
+            return RuntimeError(f'Claimed node {batch.node_name} is not a member of component {batch.component!r}')
+        key = (batch.session_id, encode_component_key(batch.component))
+        if key not in checked:
+            checked[key] = connection.execute(
+                'SELECT session.status, reservation.session_id AS owner, selected.component_key AS selected_key '
+                'FROM execution_sessions AS session '
+                'LEFT JOIN component_reservations AS reservation ON reservation.component_key=? '
+                'LEFT JOIN session_components AS selected '
+                'ON selected.session_id=session.session_id AND selected.component_key=reservation.component_key '
+                'WHERE session.session_id=?', (key[1], key[0]),
+            ).fetchone()
+        row = checked[key]
+        if row is None or row['status'] != 'running':
+            return RuntimeError('Job claims require an existing running session: ' + batch.session_id)
+        if row['owner'] != batch.session_id:
+            return RuntimeError(f'Component {batch.component!r} reservation belongs to {row["owner"]!r}, '
+                                f'not claiming session {batch.session_id}')
+        if row['selected_key'] is None:
+            return RuntimeError(f'Component {batch.component!r} is outside session {batch.session_id} selected scope')
+        return None
 
     @staticmethod
     def _apply_execution_claim_batches(connection, batches: list[ExecutionClaimBatch]):
@@ -106,9 +135,15 @@ class JobExecutionClaimStorageMixin:
             rows_by_node[node_name] = {int(row["job_id"]): row for row in rows}
 
         updates = []
+        owners = []
         events = []
         outcomes = []
+        checked_owners = {}
         for batch in batches:
+            owner_error = JobExecutionClaimStorageMixin._execution_claim_owner_error(connection, batch, checked_owners)
+            if owner_error is not None:
+                outcomes.append((False, owner_error))
+                continue
             node_rows = rows_by_node[batch.node_name]
             missing = [job_id for job_id in batch.job_ids if job_id not in node_rows]
             if missing:
@@ -132,6 +167,11 @@ class JobExecutionClaimStorageMixin:
                     "execution_id": execution_id,
                     "pid": batch.pid,
                 }
+                owner_data = {}
+                if batch.session_id is not None:
+                    owner_data = {'session_id': batch.session_id, 'component': batch.component}
+                    owners.append((execution_id, batch.node_name, job_id, generation,
+                                   batch.session_id, encode_component_key(batch.component)))
                 updates.append(
                     (
                         execution_id,
@@ -156,6 +196,7 @@ class JobExecutionClaimStorageMixin:
                                 "previous_status": previous_status,
                                 "status": RUNNING,
                                 **status_extra,
+                                **owner_data,
                             },
                             ensure_ascii=False,
                             separators=(",", ":"),
@@ -192,6 +233,11 @@ class JobExecutionClaimStorageMixin:
                 "WHERE node_name=? AND job_id=? AND generation=?",
                 updates,
             )
+            if owners:
+                connection.executemany(
+                    "INSERT INTO job_execution_owners(execution_id, node_name, job_id, generation, session_id, component_key) "
+                    "VALUES(?, ?, ?, ?, ?, ?)", owners,
+                )
             connection.executemany(
                 "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
                 "VALUES(?, ?, ?, ?, ?)",
@@ -206,11 +252,16 @@ class JobExecutionClaimStorageMixin:
         *,
         started_at: str,
         priority: int = ADMISSION_PRIORITY,
+        session_id: str | None = None,
+        component=None,
     ) -> tuple[int, str]:
         node_name = self.validate_node_name(node_name)
         job_id = self.validate_job_id(job_id)
         future: Future[tuple[int, str]] = Future()
-        key = (node_name, priority)
+        if session_id is not None:
+            self._session_text(session_id, 'session_id')
+        component = self._session_component(component) if component is not None else None
+        key = (node_name, priority, session_id, component)
         with self._claim_batch_lock:
             batch = self._claim_batches.get(key)
             leader = batch is None
@@ -232,6 +283,8 @@ class JobExecutionClaimStorageMixin:
                     [request[0] for request in requests],
                     started_at=requests[0][1],
                     priority=priority,
+                    session_id=session_id,
+                    component=component,
                 )
             except BaseException as error:
                 for _job_id, _started_at, request_future in requests:
@@ -253,10 +306,19 @@ class JobExecutionClaimStorageMixin:
         priority: int = ADMISSION_PRIORITY,
         task_started_data: dict[str, Any] | None = None,
         task_started_mask: list[bool] | tuple[bool, ...] | None = None,
+        session_id: str | None = None,
+        component=None,
     ) -> list[tuple[int, str]]:
         """Claim one preloaded API admission burst in one state mutation."""
         node_name = self.validate_node_name(node_name)
         normalized = [self.validate_job_id(job_id) for job_id in job_ids]
+        if session_id is not None:
+            self._session_text(session_id, 'session_id')
+        session_capable = self._metadata_value('database_schema_version') == '5'
+        if not session_capable and (session_id is not None or component is not None):
+            raise RuntimeError('Explicit claim ownership requires a session-capable database')
+        if session_capable and (session_id is None or component is None):
+            raise RuntimeError('Job claims require explicit session_id and component in session-capable storage')
         if not normalized:
             return []
         if len(normalized) != len(set(normalized)):
@@ -275,6 +337,8 @@ class JobExecutionClaimStorageMixin:
                 if task_started_mask is not None
                 else None
             ),
+            session_id=session_id,
+            component=self._session_component(component) if component is not None else None,
         )
         return self.submit_grouped_db_mutation(
             ("execution-claims", priority),
@@ -284,6 +348,17 @@ class JobExecutionClaimStorageMixin:
             priority=priority,
             collect_seconds=0.003,
         )
+
+    def get_job_execution_owner(self, execution_id: str) -> dict | None:
+        self._require_execution_session_storage()
+        row = self.db_connection().execute(
+            'SELECT * FROM job_execution_owners WHERE execution_id=?', (execution_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result['component'] = decode_component_key(result.pop('component_key'))
+        return result
 
     def release_unstarted_job_execution(
         self,

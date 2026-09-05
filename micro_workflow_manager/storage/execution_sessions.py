@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from micro_workflow_manager.session_liveness import execution_session_liveness
+from micro_workflow_manager.component_identity import component_key, decode_component_key, encode_component_key
 
 
 class ExecutionSessionStorageMixin:
@@ -32,7 +33,7 @@ class ExecutionSessionStorageMixin:
     def _session_component(self, component) -> tuple[str, ...]:
         if not isinstance(component, (tuple, list, set, frozenset)) or not component:
             raise ValueError("A selected component needs member node names")
-        return tuple(sorted({self.validate_node_name(node) for node in component}))
+        return component_key(self.validate_node_name(node) for node in component)
 
     def create_execution_session(
         self,
@@ -87,7 +88,7 @@ class ExecutionSessionStorageMixin:
             if node not in nodes:
                 raise ValueError("Selected jobs must belong to selected components")
             jobs.append((node, job_id))
-        components = [json.dumps(list(component)) for component in component_keys]
+        components = [encode_component_key(component) for component in component_keys]
 
         def create(connection):
             connection.execute(
@@ -96,7 +97,7 @@ class ExecutionSessionStorageMixin:
                 "status, started_at, heartbeat_at, hostname, pid, process_identity, details_json) "
                 "VALUES(?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
                 (session_id, session_kind, parent_session_id, command,
-                 json.dumps(list(start_component)), started_at, started_at,
+                 encode_component_key(start_component), started_at, started_at,
                  hostname, pid, process_identity, json.dumps(details or {})),
             )
             connection.executemany(
@@ -186,11 +187,11 @@ class ExecutionSessionStorageMixin:
         # session field together, then attach its immutable scope rows.
         session_id = row["session_id"]
         result = dict(row)
-        result["start_component"] = tuple(json.loads(result["start_component"]))
+        result["start_component"] = decode_component_key(result["start_component"])
         result["failures"] = json.loads(result.pop("failures_json"))
         result["details"] = json.loads(result.pop("details_json"))
         result["selected_components"] = [
-            tuple(json.loads(row[0])) for row in connection.execute(
+            decode_component_key(row[0]) for row in connection.execute(
                 "SELECT component_key FROM session_components WHERE session_id=? ORDER BY position",
                 (session_id,),
             )

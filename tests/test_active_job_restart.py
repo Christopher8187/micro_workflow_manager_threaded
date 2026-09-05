@@ -300,7 +300,7 @@ def test_restart_command_replaces_running_generation_in_process_runner(
             active.communicate(timeout=5)
 
 
-def test_restart_cancels_old_checkpoint_watch_without_overwriting_replacement_runtime(
+def test_restart_preserves_replacement_runtime_after_old_checkpoint_deadline(
     tmp_path,
     monkeypatch,
 ):
@@ -318,12 +318,19 @@ router.create_job(number=1)
 def run(ctx):
     if ctx.execution_generation == 0:
         ctx.input_path("old_started.flag").write_text("started", encoding="utf-8")
+        old_attempt_finished = ctx.input_path("old_attempt_finished.flag")
         ctx.checkpoint("old generation waiting", progress=0.2)
         time.sleep(0.8)
-        ctx.write_output("stale.txt", "stale")
-        return "stale"
+        try:
+            ctx.write_output("stale.txt", "stale")
+            return "stale"
+        finally:
+            old_attempt_finished.write_text("finished", encoding="utf-8")
 
-    ctx.checkpoint("replacement generation", progress=1.0)
+    # Keep the replacement alive beyond the old watch's deadline without
+    # expiring its own checkpoint while it performs the replacement work.
+    ctx.checkpoint("replacement generation", progress=1.0, timeout=5.0)
+    time.sleep(0.6)
     ctx.write_output("fresh.txt", "fresh")
     ctx.node("B").add(value="fresh")
     return "fresh"
@@ -357,10 +364,10 @@ def run(ctx):
     assert not active_thread.is_alive()
     assert run_result == {"code": 0}
 
-    # Wait beyond the abandoned generation's checkpoint deadline. Its old
-    # watch must have been removed rather than emitting a late timeout or
-    # replacing the new generation's runtime state.
-    time.sleep(0.55)
+    # Observe after the old handler has crossed its checkpoint deadline and
+    # attempted its stale write, even if thread scheduling delays that attempt.
+    old_finished = tmp_path / "node" / "A" / "input" / "old_attempt_finished.flag"
+    wait_until(old_finished.exists)
     runtime = state.read_job_runtime("A", 1)
     assert runtime["generation"] == 1
     assert runtime["state"] == "completed"
@@ -370,3 +377,5 @@ def run(ctx):
     events = state.read_job_events("A", 1)
     assert not any(event.get("event") == "timeout" for event in events)
     assert not (tmp_path / "node" / "A" / "output" / "stale.txt").exists()
+    assert (tmp_path / "node" / "A" / "output" / "fresh.txt").read_text(encoding="utf-8") == "fresh"
+    assert (tmp_path / "node" / "B" / "output" / "received.txt").read_text(encoding="utf-8") == "fresh"

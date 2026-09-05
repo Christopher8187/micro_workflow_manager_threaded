@@ -10,6 +10,11 @@ Older entries below describe the releases in which those commands existed.
 Use `reset` or `resetfrom` to prepare retained work for execution; these commands
 preserve input and retained job definitions.
 
+The 0.6.2 development branch also deprecates `mwf threads --api-total VALUE`.
+Help labels the option deprecated, and use prints a warning. The existing
+set/reset behavior remains functional with no removal date or session-specific
+form.
+
 ## What changed in 0.6.1
 
 - Reorganized current documentation around the root README, authoritative

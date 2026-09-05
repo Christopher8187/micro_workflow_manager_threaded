@@ -370,7 +370,10 @@ mwf threads --update
 
 For API nodes, `--api-total` is an aggregate admission budget allocated
 proportionally across running API nodes. Per-node values remain weights and
-upper bounds. Raising a live threaded or API limit is observed within roughly
+upper bounds. The option is deprecated in the 0.6.2 development branch and
+prints a warning when used. Setting and resetting the budget remain functional;
+no removal date or session-specific form is introduced. Raising a live threaded
+or API limit is observed within roughly
 0.2 seconds; lowering it does not cancel jobs already running. A process pool
 reads the value when created, and the direct runner remains single-job.
 

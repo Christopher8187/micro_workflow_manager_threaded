@@ -8,6 +8,9 @@ from pathlib import Path
 from micro_workflow_manager.legacy_runs import preflight_legacy_storage_creation
 
 from .base import FileStorageBase
+from .component_definitions import ComponentDefinitionStorageMixin
+from .component_holds import ComponentHoldStorageMixin
+from .component_reservations import ComponentReservationStorageMixin
 from .execution import JobExecutionStorageMixin
 from .execution_sessions import ExecutionSessionStorageMixin
 from .events import JobEventStorageMixin
@@ -32,6 +35,9 @@ def _is_link_or_reparse_point(path: Path) -> bool:
 
 
 class FileStorage(
+    ComponentDefinitionStorageMixin,
+    ComponentHoldStorageMixin,
+    ComponentReservationStorageMixin,
     ExecutionSessionStorageMixin,
     NetworkStateStorageMixin,
     StateEventStorageMixin,

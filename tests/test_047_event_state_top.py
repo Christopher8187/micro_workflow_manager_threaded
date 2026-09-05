@@ -328,3 +328,84 @@ def test_api_job_event_append_rejects_superseded_execution(tmp_path):
     assert not any(
         event.get("stale") for event in storage.read_job_events("A", 1)
     )
+
+
+@pytest.mark.parametrize("status", ["done", "failed", "skipped", "cancelled"])
+def test_timeout_event_accepts_only_its_recorded_terminal_owner(tmp_path, status):
+    from micro_workflow_manager.errors import JobRestartedError
+
+    storage = FileStorage(tmp_path)
+    storage.create_job(Job(node_name="A", job_id=1, params={}))
+    generation, execution_id = storage.claim_job_execution(
+        "A", 1, started_at="2026-01-01T00:00:00"
+    )
+    storage.finalize_job_execution(
+        "A", 1, generation, execution_id, status,
+        generation=generation, execution_id=execution_id,
+    )
+    owner = dict(_execution_generation=generation, _execution_id=execution_id)
+    try:
+        with pytest.raises(JobRestartedError):
+            storage.append_job_event("A", 1, "trace", _allow_terminal_owner=True, **owner)
+        with pytest.raises(JobRestartedError):
+            storage.append_job_event("A", 1, "timeout", **owner)
+        with pytest.raises(JobRestartedError):
+            storage.append_job_event("A", 1, "timeout", _allow_terminal_owner=True,
+                                     _execution_generation=generation,
+                                     _execution_id="different-execution")
+        storage.append_job_event("A", 1, "timeout", _allow_terminal_owner=True,
+                                 **owner, checkpoint="retained timeout")
+        timeouts = [event for event in storage.read_job_events("A", 1)
+                    if event["event"] == "timeout"]
+        assert len(timeouts) == 1 and timeouts[0]["checkpoint"] == "retained timeout"
+        assert "_allow_terminal_owner" not in timeouts[0]
+        storage.request_job_restart("A", 1, reason="replace terminal execution")
+        with pytest.raises(JobRestartedError):
+            storage.append_job_event("A", 1, "timeout", _allow_terminal_owner=True,
+                                     **owner, checkpoint="stale timeout")
+        assert [event for event in storage.read_job_events("A", 1)
+                if event["event"] == "timeout"] == timeouts
+    finally:
+        storage.db_mutation_barrier()
+        cleanup_deadline = time.perf_counter() + 10
+        while storage.mutation_writer_diagnostics()["writer_alive"]:
+            assert time.perf_counter() < cleanup_deadline, "Mutation writer did not retire"
+            time.sleep(0.01)
+        storage.close_thread_connection()
+
+
+@pytest.mark.parametrize("damaged_status", ["{}", "[]", "{invalid JSON"])
+def test_timeout_event_refuses_damaged_terminal_owner_without_changes(tmp_path, damaged_status):
+    from micro_workflow_manager.errors import JobRestartedError
+
+    storage = FileStorage(tmp_path)
+    storage.create_job(Job(node_name="A", job_id=1, params={}))
+    generation, execution_id = storage.claim_job_execution("A", 1, started_at="2026-01-01")
+    storage.finalize_job_execution(
+        "A", 1, generation, execution_id, "done",
+        generation=generation, execution_id=execution_id,
+    )
+    try:
+        storage.submit_db_mutation(lambda connection: connection.execute(
+            "UPDATE jobs SET status_json=? WHERE node_name='A' AND job_id=1", (damaged_status,),
+        ))
+        before = dict(storage.db_connection().execute(
+            "SELECT * FROM jobs WHERE node_name='A' AND job_id=1"
+        ).fetchone())
+        events = storage.read_job_events("A", 1)
+        with pytest.raises(JobRestartedError):
+            storage.append_job_event(
+                "A", 1, "timeout", _execution_generation=generation,
+                _execution_id=execution_id, _allow_terminal_owner=True,
+            )
+        assert storage.read_job_events("A", 1) == events
+        assert dict(storage.db_connection().execute(
+            "SELECT * FROM jobs WHERE node_name='A' AND job_id=1"
+        ).fetchone()) == before
+    finally:
+        storage.db_mutation_barrier()
+        cleanup_deadline = time.perf_counter() + 10
+        while storage.mutation_writer_diagnostics()["writer_alive"]:
+            assert time.perf_counter() < cleanup_deadline, "Mutation writer did not retire"
+            time.sleep(0.01)
+        storage.close_thread_connection()

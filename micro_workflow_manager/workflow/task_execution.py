@@ -16,6 +16,7 @@ from ..errors import (
 from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
 from ..fibers import cancellation_scope, in_fiber_runtime
 from ..networking import network_attempt_context
+from ..storage.runtime_observations import RuntimeObservationSequence
 
 
 T = TypeVar("T")
@@ -24,7 +25,7 @@ T = TypeVar("T")
 class MountedTaskExecutionMixin:
     """Mounted handler invocation, timeout supervision, retries, and fallbacks."""
 
-    def _call_mounted_handler(self, mounted, ctx: JobContext, params: dict):
+    def _call_mounted_handler(self, mounted, ctx: JobContext, params: dict, watch):
         previous_node_name = getattr(self._job_context, "node_name", None)
         previous_job_id = getattr(self._job_context, "job_id", None)
         previous_generation = getattr(self._job_context, "generation", None)
@@ -37,6 +38,7 @@ class MountedTaskExecutionMixin:
             try:
                 result = mounted.handler(ctx, **params)
             except BaseException:
+                self.scheduler_supervisor.record_handler_exit(watch)
                 # Preserve the handler's original failure. Its already-queued
                 # observability rows are still drained before fallback logic.
                 try:
@@ -44,6 +46,7 @@ class MountedTaskExecutionMixin:
                 except BaseException:
                     pass
                 raise
+            self.scheduler_supervisor.record_handler_exit(watch)
             ctx.flush_pending_events()
             return result
         finally:
@@ -74,7 +77,7 @@ class MountedTaskExecutionMixin:
             try:
                 with cancellation_scope(check_cancelled), network_attempt_context(self, ctx, watch):
                     supervisor.begin_handler_execution(watch)
-                    result = self._call_mounted_handler(mounted, ctx, params)
+                    result = self._call_mounted_handler(mounted, ctx, params, watch)
                 check_cancelled()
             except BaseException as error:
                 restart_error = supervisor.execution_cancel_error(watch)
@@ -95,7 +98,7 @@ class MountedTaskExecutionMixin:
         if not watch.abandonable:
             try:
                 supervisor.begin_handler_execution(watch)
-                result = self._call_mounted_handler(mounted, ctx, params)
+                result = self._call_mounted_handler(mounted, ctx, params, watch)
             except BaseException as error:
                 supervisor.finish_attempt(watch, state="failed", error=error)
                 raise
@@ -108,7 +111,7 @@ class MountedTaskExecutionMixin:
         def target():
             try:
                 supervisor.begin_handler_execution(watch)
-                outcomes.put(("result", self._call_mounted_handler(mounted, ctx, params)))
+                outcomes.put(("result", self._call_mounted_handler(mounted, ctx, params, watch)))
             except BaseException as error:
                 outcomes.put(("error", error))
             finally:
@@ -155,6 +158,7 @@ class MountedTaskExecutionMixin:
         node = self.nodes[job.node_name]
         assert node.main_task is not None
         failure_history: list[Exception] = []
+        runtime_sequence = RuntimeObservationSequence()
 
         try:
             return self.execute_mounted_task(
@@ -165,6 +169,7 @@ class MountedTaskExecutionMixin:
                 task_role="main",
                 first_task_started_pre_recorded=first_task_started_pre_recorded,
                 failure_history=failure_history,
+                runtime_sequence=runtime_sequence,
             )
 
         except JobRestartedError:
@@ -207,6 +212,7 @@ class MountedTaskExecutionMixin:
                         execution_generation=execution_generation,
                         execution_id=execution_id,
                         task_role="fallback",
+                        runtime_sequence=runtime_sequence,
                     )
 
                 except JobRestartedError:
@@ -239,8 +245,11 @@ class MountedTaskExecutionMixin:
         execution_id: str | None,
         task_role: str = "main",
         first_task_started_pre_recorded: bool = False,
+        runtime_sequence: RuntimeObservationSequence | None = None,
     ):
         attempts = mounted.retries + 1
+        if runtime_sequence is None:
+            runtime_sequence = RuntimeObservationSequence()
         all_results = []
         if failure_history is None:
             failure_history = []
@@ -308,6 +317,7 @@ class MountedTaskExecutionMixin:
                         cancellation_event=cancellation_event,
                         total_timeout=mounted.timeout,
                         checkpoint_timeout=mounted.checkpoint_timeout,
+                        runtime_sequence=runtime_sequence,
                         force_abandonable=(
                             self.active_job_restart_enabled and execution_id is not None
                         ),

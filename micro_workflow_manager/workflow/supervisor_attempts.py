@@ -9,6 +9,7 @@ from typing import Any
 from ..errors import JobTimeoutError, safe_exception_repr
 from ..fibers import in_fiber_runtime
 from ..monitor import now_iso
+from ..storage.runtime_observations import RuntimeObservationSequence
 from .supervisor_watch import AttemptWatch, _deadline_iso, _validate_progress, _validate_timeout
 
 
@@ -29,6 +30,7 @@ class SupervisorAttemptMixin:
         total_timeout: float | None,
         checkpoint_timeout: float | None,
         force_abandonable: bool = False,
+        runtime_sequence: RuntimeObservationSequence | None = None,
     ) -> AttemptWatch:
         total_timeout = _validate_timeout(total_timeout, name="timeout")
         checkpoint_timeout = _validate_timeout(
@@ -48,6 +50,8 @@ class SupervisorAttemptMixin:
             default_checkpoint_timeout=checkpoint_timeout,
             force_abandonable=bool(force_abandonable),
         )
+        if runtime_sequence is not None:
+            watch.runtime_order = runtime_sequence.register(watch.watch_id)
         if checkpoint_timeout is not None:
             watch.checkpoint_timeout = checkpoint_timeout
             watch.checkpoint_name = "task start"
@@ -79,29 +83,33 @@ class SupervisorAttemptMixin:
         # to the supervisor. The grouped API write is asynchronous in a fiber;
         # direct/thread/process callers retain synchronous inspect visibility.
         if watch.supervised:
-            provisional = monotonic()
-            watch.started_monotonic = provisional
-            if watch.total_timeout is not None:
-                watch.total_deadline = provisional + watch.total_timeout
             if watch.checkpoint_timeout is not None:
                 watch.checkpoint_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
                 watch.checkpoint_name = "task start"
-                watch.checkpoint_deadline = provisional + watch.checkpoint_timeout
+            # Keep registered deadlines unset until initial submission finishes.
+            # Another attempt can rebuild the heap while this write is blocked.
             self._persist_runtime(
                 watch,
                 state="running",
                 wait=not in_fiber_runtime(),
                 priority=20 if in_fiber_runtime() else 10,
+                total_remaining_override=watch.total_timeout,
+                checkpoint_remaining_override=watch.checkpoint_timeout,
             )
 
-        now_value = monotonic()
-        now_text = datetime.now().astimezone().isoformat(timespec="milliseconds")
         with self._condition:
             if watch.state != "active":
                 error = self.timeout_error(watch) or self.execution_cancel_error(watch)
                 if error is not None:
                     raise error
                 return
+            if watch.supervised:
+                # Heap rebuilding and possible thread startup belong to
+                # framework preparation, before the user's interval starts.
+                self._compact_deadlines_locked()
+                self._ensure_thread_locked()
+            now_text = datetime.now().astimezone().isoformat(timespec="milliseconds")
+            now_value = monotonic()
             watch.started_monotonic = now_value
             watch.started_at = now_text
             if watch.total_timeout is not None:
@@ -113,8 +121,6 @@ class SupervisorAttemptMixin:
             watch.revision += 1
             if watch.supervised:
                 self._schedule_watch_locked(watch)
-                self._compact_deadlines_locked()
-                self._ensure_thread_locked()
                 self._condition.notify_all()
 
     def report_checkpoint(
@@ -144,8 +150,6 @@ class SupervisorAttemptMixin:
         if effective is None:
             effective = watch.default_checkpoint_timeout
         fiber_runtime = in_fiber_runtime()
-        now_text = datetime.now().astimezone().isoformat(timespec="milliseconds")
-        now_value = monotonic()
         with self._condition:
             if watch.state == "timed_out":
                 raise JobTimeoutError(watch.timeout_message or "The task attempt timed out")
@@ -155,7 +159,7 @@ class SupervisorAttemptMixin:
             if watch.state != "active":
                 return
 
-            watch.checkpoint_at = now_text
+            watch.checkpoint_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
             if name is not None:
                 watch.checkpoint_name = name.strip()
             if progress_value is not None:
@@ -167,42 +171,35 @@ class SupervisorAttemptMixin:
                 if not watch.supervised:
                     raise RuntimeError("Checkpoint timeout supervision is not enabled")
                 watch.checkpoint_timeout = effective
-                # A direct/thread/process checkpoint persists synchronously for
-                # immediate inspect/recovery visibility. Temporarily disarm its
-                # checkpoint deadline so framework-owned SQLite time is not
-                # charged to the user's interval. API fibers persist without
-                # waiting and retain the ordinary deadline path.
-                watch.checkpoint_deadline = (
-                    now_value + effective if fiber_runtime else None
-                )
+                # Runtime submission can wait on framework locks even when an
+                # API fiber does not wait for commit. Start the new checkpoint
+                # interval after submission; the total deadline stays active.
+                watch.checkpoint_deadline = None
                 watch.revision += 1
                 self._schedule_watch_locked(watch)
                 self._compact_deadlines_locked()
                 self._ensure_thread_locked()
                 self._condition.notify_all()
 
-        # A cooperative API fiber must not charge group-commit latency against
-        # a very short checkpoint deadline. Direct/thread/process callers keep
-        # synchronous checkpoint visibility for inspect and recovery.
+        # API fibers still submit without waiting for commit. Other callers
+        # keep synchronous checkpoint visibility for inspect and recovery.
         try:
             self._persist_runtime(
                 watch,
                 state="running",
                 wait=not fiber_runtime,
                 priority=20 if fiber_runtime else 10,
-                checkpoint_remaining_override=(
-                    effective if not fiber_runtime else None
-                ),
+                checkpoint_remaining_override=effective,
             )
         finally:
-            if effective is not None and not fiber_runtime:
+            if effective is not None:
                 with self._condition:
                     if watch.state == "active":
+                        self._compact_deadlines_locked()
+                        self._ensure_thread_locked()
                         watch.checkpoint_deadline = monotonic() + effective
                         watch.revision += 1
                         self._schedule_watch_locked(watch)
-                        self._compact_deadlines_locked()
-                        self._ensure_thread_locked()
                         self._condition.notify_all()
 
     def begin_external_wait(
@@ -224,7 +221,11 @@ class SupervisorAttemptMixin:
         assert timeout_value is not None
         grace = _validate_timeout(cleanup_grace, name="external wait cleanup grace")
         assert grace is not None
-        now_value = monotonic()
+        # Publish entry before acquiring a framework lock. Read the revision
+        # first so a concurrent checkpoint cannot inherit an earlier time.
+        entry = (watch.revision, monotonic())
+        watch.external_wait_entry = entry
+        now_value = entry[1]
         with self._condition:
             if watch.state != "active":
                 error = self.timeout_error(watch) or self.execution_cancel_error(watch)
@@ -267,7 +268,11 @@ class SupervisorAttemptMixin:
         transport replay may renew its deadline; user-space heartbeats cannot.
         The task's total timeout remains active across every renewal.
         """
-        now_value = monotonic()
+        # A physical replay has entered framework preparation. Its prior
+        # lease must not expire solely while this condition is unavailable.
+        # Checkpoint heartbeats can change the general revision while this
+        # same external lease remains active. Capture the lease before time.
+        watch.external_renewal_entry = (watch.external_wait_deadline, monotonic())
         with self._condition:
             if watch.state != "active":
                 error = self.timeout_error(watch) or self.execution_cancel_error(watch)
@@ -281,17 +286,23 @@ class SupervisorAttemptMixin:
             if not first_physical_attempt:
                 watch.external_wait_renewals += 1
                 watch.external_wait_last_renewal_reason = str(reason)
+            self._compact_deadlines_locked()
+            self._ensure_thread_locked()
+            watch.external_renewal_entry = None
+            now_value = monotonic()
             watch.external_wait_deadline = now_value + watch.external_wait_timeout
             watch.revision += 1
             self._schedule_watch_locked(watch)
-            self._compact_deadlines_locked()
-            self._ensure_thread_locked()
             self._condition.notify_all()
 
     def end_external_wait(self, watch: AttemptWatch) -> None:
         with self._condition:
             if watch.external_wait_depth <= 0:
                 return
+            if watch.state == "active":
+                # Finish framework maintenance before granting caller time.
+                # The old external entries become stale at publication below.
+                self._compact_deadlines_locked()
             watch.external_wait_depth -= 1
             if watch.external_wait_depth == 0:
                 completed_name = watch.external_wait_name or "network request"
@@ -307,8 +318,12 @@ class SupervisorAttemptMixin:
             watch.revision += 1
             if watch.state == "active":
                 self._schedule_watch_locked(watch)
-                self._compact_deadlines_locked()
                 self._condition.notify_all()
+
+    def record_handler_exit(self, watch: AttemptWatch):
+        # Publish before waiting for any framework lock. Reading revision first
+        # keeps a concurrent later checkpoint separate from this handler exit.
+        watch.handler_exit = (watch.revision, monotonic())
 
     def signal_handler_complete(self, watch: AttemptWatch):
         if not watch.supervised:

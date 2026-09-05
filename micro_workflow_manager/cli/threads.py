@@ -315,7 +315,7 @@ def threads_cli(argv: list[str]) -> int:
         prog="mwf threads",
         description=(
             "View or change run-scoped concurrency controls. Per-node API values are "
-            "cooperative fiber counts; --api-total sets an aggregate API admission budget "
+            "cooperative fiber counts; deprecated --api-total sets an aggregate API admission budget "
             "allocated proportionally across running API nodes."
         ),
     )
@@ -332,7 +332,7 @@ def threads_cli(argv: list[str]) -> int:
     parser.add_argument(
         "--api-total",
         metavar="VALUE",
-        help="Set the aggregate API admission budget allocated across running API nodes, or use reset/default/clear.",
+        help="Deprecated: Set the aggregate API admission budget allocated across running API nodes, or use reset/default/clear.",
     )
     parser.add_argument(
         "--update",
@@ -340,6 +340,11 @@ def threads_cli(argv: list[str]) -> int:
         help="Reload node behavior files and refresh declared max_threads/runner values.",
     )
     args = parser.parse_args(argv)
+    if args.api_total is not None:
+        print(
+            "Deprecation warning: mwf threads --api-total is deprecated and remains functional.",
+            file=sys.stderr,
+        )
 
     try:
         root = find_root()

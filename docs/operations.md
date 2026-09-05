@@ -188,6 +188,11 @@ allocates it proportionally across running API nodes using per-node requested
 limits as weights and upper bounds. Both node overrides and the aggregate budget
 can be reset and clear after their run scope.
 
+The `--api-total` option is deprecated in the 0.6.2 development branch. Help
+marks the option deprecated, and using it prints a warning to standard error,
+including when a supplied value is rejected. Setting and resetting the budget
+remain functional. No removal date or session-specific form is introduced.
+
 `mwf threads --update` reloads node behavior declarations and refreshes mounted
 runner and `max_threads` values. It does not synchronize graph edges or clear
 runtime overrides.

@@ -17,6 +17,7 @@ class JobEventAppend:
     data_json: str
     generation: int | None = None
     execution_id: str | None = None
+    allow_terminal_owner: bool = False
 
 
 class JobEventStorageMixin:
@@ -272,7 +273,20 @@ class JobEventStorageMixin:
         for append in appends:
             expected = (append.generation, append.execution_id)
             observed = current.get((append.node_name, append.job_id))
-            if append.execution_id is not None and observed != expected:
+            owner_matches = observed == expected
+            if (not owner_matches and append.execution_id is not None
+                    and append.allow_terminal_owner and append.event == "timeout"):
+                # API cancellation can finish this execution before its timeout
+                # event arrives. Use the same terminal owner as runtime writes,
+                # while a changed generation still rejects the old event.
+                owner_matches = connection.execute(
+                    "SELECT 1 FROM jobs WHERE node_name=? AND job_id=? "
+                    "AND generation=? AND status IN ('done','failed','skipped','cancelled') "
+                    "AND json_valid(status_json)=1 "
+                    "AND json_extract(status_json, '$.execution_id')=?",
+                    (append.node_name, append.job_id, append.generation, append.execution_id),
+                ).fetchone() is not None
+            if append.execution_id is not None and not owner_matches:
                 errors.append(JobRestartedError(
                     f"Job {append.node_name}/{append.job_id} generation "
                     f"{append.generation} was restarted"
@@ -312,6 +326,7 @@ class JobEventStorageMixin:
         _wait: bool = True,
         _execution_generation: int | None = None,
         _execution_id: str | None = None,
+        _allow_terminal_owner: bool = False,
         **data: Any,
     ):
         append = JobEventAppend(
@@ -325,6 +340,7 @@ class JobEventStorageMixin:
                 if _execution_generation is not None else None
             ),
             execution_id=(str(_execution_id) if _execution_id is not None else None),
+            allow_terminal_owner=bool(_allow_terminal_owner),
         )
         options = {} if _wait else {"wait": False}
         return self.submit_grouped_db_mutation(

@@ -13,17 +13,17 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_036_hoeflein_scheduling.py` | External predecessor readiness, producer-aware merge preservation, and component-wide failure state. |
 | `test_037_advisory_lock_recovery.py` | Advisory-lock ownership, dead-process reclamation, and run-state cleanup when override binding or cleanup fails. |
 | `test_038_fresh_resume_restart_semantics.py` | Fresh run preparation, merge-branch preservation, descendant resume, active restart, and inline monitoring. |
-| `test_039_sqlite_contention_recovery.py` | Checkpoint writes, execution fences, asynchronous runtime observations, connection cleanup, and repeated merge runs. |
+| `test_039_sqlite_contention_recovery.py` | Checkpoint writes, execution fences, asynchronous runtime observations, unassisted worker-connection cleanup, exact retained outputs after repeated API rounds, and repeated CLI merge runs. |
 | `test_040_high_fanout_batching.py` | Prepared payload batches, idempotent fan-out, job-ID reservation, schema upgrade, grouped publication, monitoring, and bulk fresh cleanup. |
 | `test_041_live_component_pumping.py` | Live member refills, component status, lazy-source failure, late job IDs, Windows descendant paths, and monitoring during routing. |
 | `test_042_cooperative_api_scaling.py` | Cooperative API jobs, high logical concurrency, and pending aggregate API budgets. |
 | `test_043_waiting_nodes.py` | Intra-component waiting gates, monitor display, valid and invalid wait targets, and singleton behavior. |
-| `test_043_watchdog_networking.py` | Checkpoint and total deadlines during framework network waits, physical dispatch timing, replay leases, renewal after supervisor-lock contention, and cancellation isolation. |
+| `test_043_watchdog_networking.py` | Checkpoint and total deadlines; initial persistence and heap-maintenance delays; checkpoint/network rearming; physical retry entry and heartbeat progress; caller time, exact expiry and renewed leases; 100-request isolation; immutable timeout observations, event ownership across terminalization/restart, and runtime ordering across retries, fallbacks, queued writes, and write failures. |
 | `test_044_queue_transport_scaling.py` | Batch queue loading, event-driven fiber completion, queue wakeups, HTTP sharding, admission fairness, commit priority, and terminal flushing. |
 | `test_045_terminal_recovery.py` | Idempotent output-backed terminal reconciliation and joining started work before component failure. |
 | `test_046_module_boundaries.py` | The repository's source-module size boundary and approved cohesive exceptions. |
 | `test_046_resume_restart_wait.py` | Resume reconciliation, component restart selections, and the queued/running/failed conditions for waiting gates. |
-| `test_047_event_state_top.py` | Event cursors, local and cross-process wakeups, `mwf top`, writer lifecycle, network-state coalescing, and ordered asynchronous journal appends. |
+| `test_047_event_state_top.py` | Event cursors, local and cross-process wakeups, `mwf top`, writer lifecycle, network-state coalescing, ordered asynchronous journal appends, and timeout-only terminal ownership with stale-execution and damaged-owner rejection. |
 | `test_048_ghost_free_admission.py` | Monitor visibility under balanced high-concurrency admission and small-tail draining. |
 | `test_049_job_trace.py` | Chronological job trace rendering and trace command parsing. |
 | `test_050_windows_process_signal_safety.py` | Platform-safe process liveness checks, subscriber and `top` behavior, and recycled Windows PID rejection. |
@@ -45,9 +45,13 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_068_component_snapshot.py` | Coherent completion observations, waiting-pump progress between claims, and a real waiting deadlock with an idle resident member. |
 | `test_069_execution_sessions.py` | Internal fresh SQLite session storage, exact session history and live readers, process-safe main cardinality, conditional updates, validation, rollback, and preservation of existing project initialization. |
 | `test_070_legacy_run_preflight.py` | Both legacy run-file locations, structural diagnostics and link refusal, preservation during layout conversion, direct creation, graph and process-worker loading, archive initialization, clipboard ordering, and retained established live-project opens. |
-| `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and checkpoint replacement. |
+| `test_071_component_session_ownership.py` | Exact component identity and producing shape, canonical persistence, registration races, full-scope reservations including historical membership overlap, counted holds, rollback, validation, and reopening. |
+| `test_072_job_claim_ownership.py` | Retained version-4 claim bytes, exact session/component ownership in single and batch claims, refusal before mutation, lease/owner/event rollback, historical ownership, bounded owner lookups, concurrent caller separation, and transaction-time validation. |
+| `test_073_sample_calculations.py` | Private sampling selectors, exact component membership, explicit zero, status filtering, exact percentage/count calculations, seeded selection from caller identity bytes, and starting-population coverage. Public command integration remains pending. |
+| `test_074_component_readiness.py` | Private readiness and compatible lineage from supplied direct-parent results, incomplete and conflicting parents, authorized starting overrides, exact origins, and invalid observations. Runtime integration remains pending. |
+| `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and replacement-runtime isolation after the old checkpoint deadline and stale-write attempt. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
-| `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished waiting work, and missing expected rounds; successful completed waiting execution. |
+| `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished work, missing expected rounds, and repeated-API slowdown beyond the fixed allowance; successful completion and exact allowance equality. |
 | `test_checkpoint_keyword_api.py` | Keyword checkpoint fields, persistence, validation, dynamic deadlines, fallbacks, and router schema. |
 | `test_cli_help_and_reset.py` | Help and describe output, reset semantics, selected-job runs, initialization sidecars, and component-expanded preparation. |
 | `test_cli_monitor.py` | Bulk summaries, inline and standalone monitoring, timing metadata, reuse, combined statistics, and diagnostic monitor failure. |
@@ -59,9 +63,9 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_init_clipboard_debug_028.py` | Deployment archive initialization, node clipboard copy/paste, and debug output. |
 | `test_markov_chain_stress.py` | Marked long-running deterministic cyclic filesystem stress. |
 | `test_output_and_runner_edges.py` | Mixed direct and threaded node execution under global runner choices. |
-| `test_reliability.py` | Router validation, job parent identity, component readiness, cancellation, runner concurrency, process execution, dynamic spawn, and high fan-in. |
+| `test_reliability.py` | Router validation, job parent identity, component readiness, cancellation, observed overlap of independent ready-node handlers with a direct-runner serial control, process execution, dynamic spawn, and high fan-in. |
 | `test_release_packaging.py` | Builds a source archive and verifies inclusion of project guidance, all five skills, documentation, examples, benchmarks, and tests while excluding injected HTML and cache sentinels. |
-| `test_runtime_thread_overrides.py` | Runtime thread changes, adaptive worker scaling, aggregate API allocation and redistribution, invalid nodes, high limits, warnings, and concurrent run claiming. |
+| `test_runtime_thread_overrides.py` | Runtime thread changes, adaptive worker scaling, aggregate API allocation and redistribution, set/reset deprecation warnings, rejected API-budget values without stored changes, invalid nodes, high limits, warnings, and concurrent run claiming. |
 
 ## Shared helper
 

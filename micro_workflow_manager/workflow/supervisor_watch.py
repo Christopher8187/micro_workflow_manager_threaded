@@ -7,6 +7,8 @@ from threading import Event
 from time import monotonic
 from uuid import uuid4
 
+from ..storage.runtime_observations import RuntimeObservationOrder
+
 
 def _deadline_iso(seconds: float | None) -> str | None:
     if seconds is None:
@@ -68,11 +70,16 @@ class AttemptWatch:
     progress: float | None = None
     progress_detail: str | None = None
     revision: int = 0
+    handler_exit: tuple[int, float] | None = None
+    external_wait_entry: tuple[int, float] | None = None
+    external_renewal_entry: tuple[float | None, float] | None = None
     state: str = "active"
     timeout_kind: str | None = None
     timeout_message: str | None = None
+    timeout_observation: AttemptWatch | None = field(default=None, repr=False)
     cancel_message: str | None = None
     runtime_written: bool = False
+    runtime_order: RuntimeObservationOrder | None = field(default=None, repr=False)
     external_wait_depth: int = 0
     external_wait_name: str | None = None
     external_wait_timeout: float | None = None

@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+
 import networkx as nx
 
 from .errors import InvalidGraphError
+from .component_identity import component_key
+
+
+@dataclass(frozen=True)
+class ComponentTopologySnapshot:
+    shape_json: str
+    components: tuple[tuple[str, ...], ...]
 
 
 class ComponentTopology:
@@ -29,7 +39,26 @@ class ComponentTopology:
     def component_key(self, component: set[str] | tuple[str, ...] | list[str]) -> tuple[str, ...]:
         # Component identity must remain stable when graph edge declaration order
         # changes. Lexicographic node order gives provenance a portable key.
-        return tuple(sorted(set(component)))
+        return component_key(component)
+
+    def graph_shape(self) -> str:
+        """Record the caller's exact topology in declaration-independent order."""
+        return json.dumps({
+            "nodes": sorted(self.graph_obj.nodes),
+            "edges": sorted(self.graph_obj.edges),
+            "autostart_edges": sorted({
+                (start, end) for start, end in self.autostart_edges
+                if self.graph_obj.has_edge(start, end)
+            }),
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    def snapshot(self) -> ComponentTopologySnapshot:
+        """Capture shape and components; callers keep inputs unchanged during capture."""
+        captured = ComponentTopology(self.graph_obj.copy(), tuple(self.autostart_edges))
+        return ComponentTopologySnapshot(
+            shape_json=captured.graph_shape(),
+            components=tuple(sorted(captured.component_key(c) for c in captured.hoeflein_components())),
+        )
 
     def component_for(self, node_name: str) -> set[str]:
         for component in self.hoeflein_components():

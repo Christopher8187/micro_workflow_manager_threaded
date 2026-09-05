@@ -7,6 +7,33 @@ from threading import Lock
 from typing import Any
 
 
+@dataclass(slots=True)
+class RuntimeObservationSequence:
+    """Watch order for one invocation, including retries and fallbacks."""
+
+    positions: dict[str, int] = field(default_factory=dict)
+    lock: Lock = field(default_factory=Lock)
+
+    def register(self, watch_id: str) -> RuntimeObservationOrder:
+        with self.lock:
+            position = len(self.positions)
+            self.positions[watch_id] = position
+        return RuntimeObservationOrder(self, position)
+
+
+@dataclass(slots=True, frozen=True)
+class RuntimeObservationOrder:
+    sequence: RuntimeObservationSequence
+    position: int
+
+    def precedes(self, watch_id: str | None) -> bool:
+        if not isinstance(watch_id, str):
+            return False
+        with self.sequence.lock:
+            position = self.sequence.positions.get(watch_id)
+        return position is not None and self.position < position
+
+
 @dataclass(slots=True, frozen=True)
 class RuntimeUpdate:
     node_name: str
@@ -16,6 +43,18 @@ class RuntimeUpdate:
     state: str
     watch_id: str | None
     serialized: str
+    order: RuntimeObservationOrder | None = None
+
+
+def _latest_runtime_update(previous: RuntimeUpdate, incoming: RuntimeUpdate) -> RuntimeUpdate:
+    if (
+        previous.order is not None
+        and incoming.order is not None
+        and previous.order.sequence is incoming.order.sequence
+        and previous.order.position > incoming.order.position
+    ):
+        return previous
+    return incoming
 
 
 @dataclass(slots=True)
@@ -65,12 +104,34 @@ class JobRuntimeObservationStorageMixin:
             tuple[str, int, int, str | None], RuntimeUpdate
         ] = {}
         for update in updates:
-            latest_by_attempt[(
+            key = (
                 update.node_name,
                 update.job_id,
                 update.generation,
                 update.execution_id,
-            )] = update
+            )
+            previous = latest_by_attempt.get(key)
+            latest_by_attempt[key] = (
+                update if previous is None else _latest_runtime_update(previous, update)
+            )
+
+        accepted = []
+        for update in latest_by_attempt.values():
+            if update.order is not None:
+                # This read shares the mutation transaction with the UPDATE.
+                # A newer queued or failed write alone does not retire the
+                # older observation; only a stored later watch can do that.
+                row = connection.execute(
+                    "SELECT runtime_json FROM jobs WHERE node_name=? AND job_id=?",
+                    (update.node_name, update.job_id),
+                ).fetchone()
+                try:
+                    current = json.loads(row["runtime_json"] or "{}") if row else {}
+                except json.JSONDecodeError:
+                    current = {}
+                if isinstance(current, dict) and update.order.precedes(current.get("watch_id")):
+                    continue
+            accepted.append(update)
 
         connection.executemany(
             "UPDATE jobs SET runtime_json=? WHERE node_name=? AND job_id=? "
@@ -105,7 +166,7 @@ class JobRuntimeObservationStorageMixin:
                     update.state,
                     update.watch_id,
                 )
-                for update in latest_by_attempt.values()
+                for update in accepted
             ],
         )
         return [(True, None) for _slot in slots]
@@ -118,6 +179,7 @@ class JobRuntimeObservationStorageMixin:
         *,
         wait: bool = True,
         priority: int = 10,
+        _observation_order: RuntimeObservationOrder | None = None,
     ):
         node_name = self.validate_node_name(node_name)
         job_id = self.validate_job_id(job_id)
@@ -140,6 +202,7 @@ class JobRuntimeObservationStorageMixin:
             state=state,
             watch_id=watch_id,
             serialized=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            order=_observation_order,
         )
         slot = RuntimeUpdateSlot(update)
         if wait:
@@ -158,7 +221,7 @@ class JobRuntimeObservationStorageMixin:
             if existing is not None:
                 with existing.lock:
                     if existing.accepting:
-                        existing.latest = update
+                        existing.latest = _latest_runtime_update(existing.latest, update)
                         assert existing.future is not None
                         return existing.future
             self._runtime_slots[key] = slot

@@ -973,14 +973,19 @@ def test_threads_help_describes_api_total_as_an_aggregate_budget(capsys):
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["threads", "--help"])
     assert exit_info.value.code == 0
-    output = capsys.readouterr().out
+    captured = capsys.readouterr()
+    output = captured.out
     assert "aggregate API admission budget" in output
     assert "no aggregate framework cap" not in output
+    assert "Deprecated: Set the aggregate API admission budget" in " ".join(output.split())
+    assert captured.err == ""
 
     assert cli.main(["--describe", "threads"]) == 0
     description = capsys.readouterr().out
     assert "aggregate API admission budget" in description
     assert "no workflow-wide aggregate API cap" not in description
+    assert "deprecated" in description.lower()
+    assert "remains functional" in description
 
 
 def test_preview_and_observer_help_scopes_bootstrap_effects(capsys):
@@ -1112,8 +1117,17 @@ def test_inspect_reports_live_checkpoint_progress(tmp_path, capsys):
     assert result == ["ok"]
 
 
-def test_scheduler_uses_one_central_watchdog_for_multiple_attempts(tmp_path):
+@pytest.mark.parametrize("startup_delay", [0.0, 0.6])
+def test_scheduler_uses_one_central_watchdog_for_multiple_attempts(tmp_path, monkeypatch, startup_delay):
     from threading import Event, Thread, enumerate as enumerate_threads
+    import micro_workflow_manager.workflow.supervisor_attempts as attempts_module
+    import micro_workflow_manager.workflow.supervisor_core as core_module
+    import micro_workflow_manager.workflow.supervisor_persistence as persistence_module
+
+    # This checks shared supervision, so host scheduling must not consume deadlines.
+    frozen_time = time.monotonic()
+    for module in (attempts_module, core_module, persistence_module):
+        monkeypatch.setattr(module, "monotonic", lambda: frozen_time)
 
     workflow = MicroWorkflow(project_dir=tmp_path, runner="threaded")
     workflow.graph([("A", "B")])
@@ -1121,17 +1135,19 @@ def test_scheduler_uses_one_central_watchdog_for_multiple_attempts(tmp_path):
     all_started = Event()
     release = Event()
     started_count = {"value": 0}
+    results = []
+    errors = []
     from threading import Lock
     count_lock = Lock()
 
     @workflow.task("A", max_threads=4, checkpoint_timeout=1.0)
     def a(ctx):
+        ctx.checkpoint("waiting", progress=0.5)
         with count_lock:
             started_count["value"] += 1
             if started_count["value"] == 4:
                 all_started.set()
-        ctx.checkpoint("waiting", progress=0.5)
-        assert release.wait(0.5)
+        assert release.wait(10)
         return ctx.job_id
 
     @workflow.task("B")
@@ -1139,19 +1155,41 @@ def test_scheduler_uses_one_central_watchdog_for_multiple_attempts(tmp_path):
         return None
 
     jobs = [workflow.start("A") for _ in range(4)]
-    runner = Thread(
-        target=lambda: workflow.run_node_jobs("A", jobs, ignore_readiness=True),
-        daemon=True,
-    )
+    def run():
+        try:
+            time.sleep(startup_delay)
+            results.extend(workflow.run_node_jobs("A", jobs, ignore_readiness=True))
+        except BaseException as error:
+            errors.append(error)
+
+    runner = Thread(target=run, daemon=True)
     runner.start()
-    assert all_started.wait(0.5)
-    assert len(workflow.scheduler_supervisor._watches) == 4
-    assert workflow.scheduler_supervisor._thread is not None
-    assert workflow.scheduler_supervisor._thread.name == "mwf-scheduler-supervisor"
-    assert not any(thread.name.startswith("mwf-timeout-") for thread in enumerate_threads())
-    release.set()
-    runner.join(timeout=3)
-    assert not runner.is_alive()
+    try:
+        assert all_started.wait(10)
+        assert len(workflow.scheduler_supervisor._watches) == 4
+        assert workflow.scheduler_supervisor._thread is not None
+        assert workflow.scheduler_supervisor._thread.name == "mwf-scheduler-supervisor"
+        assert not any(thread.name.startswith("mwf-timeout-") for thread in enumerate_threads())
+        release.set()
+        runner.join(timeout=10)
+        assert not runner.is_alive()
+        assert not errors, errors
+        assert sorted(results) == sorted(job.job_id for job in jobs)
+        workflow.storage.db_mutation_barrier()
+        counts = workflow.storage.job_status_counts("A")
+        assert counts.get("done") == 4 and sum(counts.values()) == 4
+        for job in jobs:
+            output = json.loads(workflow.storage.output_file("A", job.job_id).read_text(encoding="utf-8"))
+            assert output == {"status": "done", "result_type": "int", "result_repr": str(job.job_id)}
+    finally:
+        release.set()
+        runner.join(timeout=10)
+        workflow.storage.db_mutation_barrier()
+        cleanup_deadline = time.perf_counter() + 10
+        while workflow.storage.mutation_writer_diagnostics()["writer_alive"]:
+            assert time.perf_counter() < cleanup_deadline, "Mutation writer did not retire"
+            time.sleep(0.01)
+        workflow.storage.close_thread_connection()
 
 
 def test_untimed_task_without_checkpoints_keeps_original_direct_fast_path(tmp_path):

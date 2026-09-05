@@ -268,13 +268,39 @@ def test_threads_cli_sets_and_clears_pending_api_total_budget(
     capsys.readouterr()
 
     assert cli.main(["threads", "--api-total", "64"]) == 0
-    assert "aggregate API admission budget: 64" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "aggregate API admission budget: 64" in captured.out
     data = json.loads((tmp_path / ".mwf" / "threads.json").read_text(encoding="utf-8"))
     assert data["api_total_limit"] == 64
+    assert data["run_id"] is None
+    warning = "Deprecation warning: mwf threads --api-total is deprecated and remains functional.\n"
+    assert captured.err == warning
 
     assert cli.main(["threads", "--api-total", "reset"]) == 0
-    assert "Cleared aggregate API admission budget" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "Cleared aggregate API admission budget" in captured.out
     assert not (tmp_path / ".mwf" / "threads.json").exists()
+    assert captured.err == warning
+
+
+def test_api_total_warning_precedes_invalid_value_without_changing_overrides(
+    tmp_path, monkeypatch, capsys,
+):
+    _make_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    assert cli.main(["threads", "A", "4"]) == 0
+    assert capsys.readouterr().err == ""
+    override_path = tmp_path / ".mwf" / "threads.json"
+    before = override_path.read_bytes()
+
+    assert cli.main(["threads", "--api-total", "nope"]) == 1
+
+    captured = capsys.readouterr()
+    warning = "Deprecation warning: mwf threads --api-total is deprecated and remains functional.\n"
+    assert override_path.read_bytes() == before
+    assert captured.out == ""
+    assert captured.err.startswith(warning + "Error: ")
+    assert captured.err.count("Deprecation warning:") == 1
 
 
 def test_threads_unknown_node_does_not_recreate_folder(tmp_path, monkeypatch, capsys):
