@@ -5,6 +5,8 @@ import sqlite3
 import stat
 from pathlib import Path
 
+from micro_workflow_manager.legacy_runs import preflight_legacy_storage_creation
+
 from .base import FileStorageBase
 from .execution import JobExecutionStorageMixin
 from .execution_sessions import ExecutionSessionStorageMixin
@@ -48,6 +50,7 @@ class FileStorage(
         self._initialize_storage(project_dir)
 
     def _initialize_storage(self, project_dir, *, initial_schema_version=4):
+        preflight_legacy_storage_creation(Path(project_dir))
         super().__init__(project_dir)
         self._init_network_state_publisher()
         self._init_state_event_broker()

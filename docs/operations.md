@@ -226,11 +226,23 @@ node-summary records.
 
 Applied migration checks both `.mwf_run.json` and `.mwf/run.json` before changing
 layout, locks, JSON, or SQLite state. It refuses while either legacy run is
-observed alive. Automatic conversion of an older runtime layout uses the same check.
-Initialization checks before extracting a deployment archive. An unreadable or
-non-object run file also prevents migration.
+observed alive, or when both records exist, preserving both even if their bytes
+match. Automatic conversion of an older runtime layout uses the same check.
+Initialization checks before extracting a deployment archive and again after
+extraction, before further initialization writes. Each present run entry must
+contain a readable UTF-8 JSON object in a regular file and cannot itself be a
+link. Structural errors report every affected path before any migration changes.
 Wait for the recorded run to finish or become stale before migrating; a fresh
 heartbeat from another host also counts as live.
+
+Direct storage and workflow construction also validate both raw records before
+SQLite access. If the database path does not resolve to a file, an observed live
+owner prevents creation. Graph loading, graph setup, process-worker imports,
+and node copy/paste perform this check before their user-code or filesystem
+effects. Established projects with a database and one valid current live record
+remain usable. The guard does not inspect an existing database's completeness;
+handling an interrupted initialization there awaits the
+[SQLite coordination decision](plans/0.6.2/architectural-questions.md#aq1-sqlite-coordination-during-read-only-previews).
 This preflight does not prevent an older process from starting after the check.
 Concurrent-start exclusion and safe session import remain unfinished.
 

@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import Callable, Iterable
 
 from micro_workflow_manager.graph import normalize_edges
+from micro_workflow_manager.legacy_runs import preflight_legacy_storage_creation
 
 from .base import BaseRunner
 
@@ -59,6 +60,7 @@ def _init_process_worker(
 
     project = Path(project_dir).resolve()
     graph_file = Path(graph_path).resolve()
+    preflight_legacy_storage_creation(project)
     module = _import_graph_file(graph_file)
     workflow = MicroWorkflow(
         project_dir=project,

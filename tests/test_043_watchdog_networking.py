@@ -180,6 +180,60 @@ def test_deferred_external_wait_arms_only_at_first_physical_dispatch(tmp_path):
     supervisor.finish_attempt(watch, state="succeeded")
 
 
+def test_external_wait_completion_renews_checkpoint_after_lock_contention(tmp_path, monkeypatch):
+    workflow = MicroWorkflow(tmp_path, runner="api")
+    supervisor = workflow.scheduler_supervisor
+    watch = supervisor.create_attempt(
+        node_name="A", job_id=1, task_name="run", attempt=1, repeat_index=1,
+        generation=0, execution_id=None, cancellation_event=Event(),
+        total_timeout=10.0, checkpoint_timeout=0.02,
+    )
+    supervisor.begin_external_wait(watch, name="model request", timeout=0.5)
+    condition = supervisor._condition
+    waiting_for_lock = Event()
+    clock = [time.monotonic() + 60.0]
+    errors = []
+
+    def finish_wait():
+        try:
+            supervisor.end_external_wait(watch)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=finish_wait)
+
+    class ObservedCondition:
+        def __enter__(self):
+            if threading.current_thread() is worker:
+                waiting_for_lock.set()
+            return condition.__enter__()
+
+        def __exit__(self, *args):
+            return condition.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(condition, name)
+
+    monkeypatch.setattr(supervisor_attempts_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(supervisor, "_condition", ObservedCondition())
+    try:
+        with condition:
+            worker.start()
+            assert waiting_for_lock.wait(3)
+            # Advance the clock while the real supervisor lock is unavailable.
+            # The resumed handler must receive a fresh checkpoint interval.
+            clock[0] += 1.0
+        worker.join(timeout=3)
+        assert not worker.is_alive()
+        assert not errors
+        assert watch.external_wait_depth == 0
+        assert watch.checkpoint_name == "model request completed"
+        assert watch.checkpoint_deadline == pytest.approx(clock[0] + 0.02, abs=0.001, rel=0)
+    finally:
+        worker.join(timeout=3)
+        supervisor.finish_attempt(watch, state="completed")
+
+
 def test_external_wait_starts_when_physical_dispatch_starts(monkeypatch):
     calls = []
 

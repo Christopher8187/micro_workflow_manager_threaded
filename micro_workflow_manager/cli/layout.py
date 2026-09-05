@@ -4,6 +4,8 @@ import json
 import shutil
 from pathlib import Path
 
+from micro_workflow_manager.legacy_runs import read_legacy_run_records
+
 from micro_workflow_manager.paths import (
     LEGACY_CONFIG_NAME,
     LEGACY_LOCKS_NAME,
@@ -33,6 +35,7 @@ def ensure_runtime_layout(root: Path) -> bool:
     """
 
     legacy_config = root / LEGACY_CONFIG_NAME
+    read_legacy_run_records(root)
     target_dir = mwf_dir(root)
     target_config = config_file(root)
     migrated = False

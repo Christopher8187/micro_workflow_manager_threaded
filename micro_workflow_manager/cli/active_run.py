@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 from micro_workflow_manager.processes import process_identity, process_is_alive
-from micro_workflow_manager.paths import LEGACY_RUN_NAME, run_file
+from micro_workflow_manager.legacy_runs import read_legacy_run_records
 
 
 from micro_workflow_manager.session_liveness import (
@@ -36,15 +35,14 @@ def live_active_run(storage_or_workflow) -> dict[str, Any] | None:
 
 def refuse_live_legacy_migration(root: Path) -> None:
     """Check both legacy run locations before layout or database writes."""
-    for path in (root / LEGACY_RUN_NAME, run_file(root)):
-        if not path.is_file():
-            continue
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"Cannot inspect legacy run before migration: {path}") from error
-        if not isinstance(state, dict):
-            raise RuntimeError(f"Cannot inspect legacy run before migration: expected a JSON object in {path}")
+    records = read_legacy_run_records(root)
+    if len(records) > 1:
+        names = ", ".join(
+            f"{path.relative_to(root).as_posix()} (run {state.get('run_id', '?')})"
+            for path, state in records
+        )
+        raise RuntimeError(f"Cannot migrate two legacy run records: {names}. Both records were preserved.")
+    for path, state in records:
         if run_state_liveness(state)["live"]:
             raise RuntimeError(
                 f"Cannot perform migration while legacy run {state.get('run_id', '?')} "

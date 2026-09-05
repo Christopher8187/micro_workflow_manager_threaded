@@ -56,6 +56,24 @@ The local investigation is `testing_ground/issue-45/preview-storage-review.md`
 in the Parent Repo. The unfinished loader and its failing WAL regression remain
 outside accepted commits.
 
+The same coordination choice now blocks a complete preflight for direct
+initialization of an existing but incomplete SQLite store. A live project may
+legitimately reopen a complete database. An incomplete database must refuse
+migration under an observed live legacy owner before any mutation. Determining
+which case exists through `mode=ro` can itself create sidecars or change SHM
+before refusing. The private-copy and immutable alternatives retain the limits
+above. No completion marker outside SQLite or availability rule is assumed.
+
+The implementer checked the current constructor, schema/import ordering,
+workflow-loading callers, and final resolution, then re-read both complete
+preparation transcripts as the final check. Q1/Q2 and the later correction
+authorize deferring dependent work; they supply no exception for SQLite
+coordination writes. A Sol xhigh preparation review reached the same conclusion.
+This blocks complete direct-loading preflight and its before-mutation checks
+under 44-SES-034 when SQLite already exists. Filesystem-only validation of both
+run records, preserving both during layout refusal, and a live-owner guard when
+the database is absent remain independent.
+
 ## AQ2: Converting legacy component results
 
 How should migration convert ambiguous legacy raw-node state into one component
@@ -141,6 +159,7 @@ quiescence or older-writer admission rule.
 
 Complete legacy session import and exclusion under 44-SES-033/034 are blocked
 on this answer. New-project SQLite session records, reservations, ownership,
-and session readers remain independent. Direct storage loading and validation
-of both legacy run records are known implementation work; the concurrency
-choice does not excuse those remaining changes.
+and session readers remain independent. Missing-database direct loading and
+validation of both legacy run records are now
+[accepted within their boundary](stage-legacy-loading.md). The existing-database
+completion check also depends on AQ1, as recorded above.

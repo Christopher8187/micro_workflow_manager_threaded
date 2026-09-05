@@ -7,6 +7,7 @@ from pathlib import Path
 from types import ModuleType
 
 from micro_workflow_manager.graph import normalize_edges
+from micro_workflow_manager.legacy_runs import preflight_legacy_storage_creation
 from micro_workflow_manager.models import QUEUED
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.storage import FileStorage
@@ -29,6 +30,7 @@ def init_project(archive_path: str | None = None) -> int:
     if archive is not None:
         print(f"  deployment archive: {archive}")
         _extract_deployment_archive(archive, root)
+        refuse_live_legacy_migration(root)
     else:
         print("  deployment archive: none detected")
 
@@ -138,6 +140,7 @@ def setup_graph(
     This command is the single explicit synchronization point.
     """
 
+    preflight_legacy_storage_creation(root)
     config = read_config(root)
     previous_nodes = _nodes_from_edges(_stored_edges(config))
     path = _resolve_graph_path(root, config, graph_path, update=update)
@@ -208,6 +211,7 @@ def load_workflow(
     *,
     require_synced: bool = True,
 ) -> MicroWorkflow:
+    preflight_legacy_storage_creation(root)
     config = read_config(root)
     config_schema = config.get("schema_version")
     if type(config_schema) is int and config_schema > CURRENT_STATE_SCHEMA_VERSION:

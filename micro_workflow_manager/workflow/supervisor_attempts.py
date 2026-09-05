@@ -289,7 +289,6 @@ class SupervisorAttemptMixin:
             self._condition.notify_all()
 
     def end_external_wait(self, watch: AttemptWatch) -> None:
-        now_value = monotonic()
         with self._condition:
             if watch.external_wait_depth <= 0:
                 return
@@ -302,7 +301,9 @@ class SupervisorAttemptMixin:
                 watch.checkpoint_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
                 watch.checkpoint_name = f"{completed_name} completed"
                 effective = watch.checkpoint_timeout or watch.default_checkpoint_timeout
-                watch.checkpoint_deadline = now_value + effective if effective is not None else None
+                # Lock contention belongs to the framework wait, not the
+                # handler's renewed checkpoint interval.
+                watch.checkpoint_deadline = monotonic() + effective if effective is not None else None
             watch.revision += 1
             if watch.state == "active":
                 self._schedule_watch_locked(watch)

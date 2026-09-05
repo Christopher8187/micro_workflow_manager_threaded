@@ -269,36 +269,35 @@ def test_router_can_force_one_node_to_run_jobs_sequentially_with_threaded_workfl
         workflow.storage.close_database_connections()
 
 
-def test_run_node_marks_node_running_before_streaming_queued_jobs(monkeypatch):
-    with tempfile.TemporaryDirectory() as project_dir:
-        workflow = MicroWorkflow(project_dir=project_dir, runner="direct")
-        workflow.graph([("A", "B")])
+def test_run_node_marks_node_running_before_streaming_queued_jobs(tmp_path, monkeypatch):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
 
-        @workflow.task("A")
-        def a(ctx):
-            return "done"
+    @workflow.task("A")
+    def a(ctx):
+        return "done"
 
-        @workflow.task("B")
-        def b(ctx):
-            return "done"
+    @workflow.task("B")
+    def b(ctx):
+        return "done"
 
-        workflow.start("A")
-        original_iter_queued_job_ids = workflow.storage.iter_queued_job_ids
-        observed_status = {}
+    workflow.start("A")
+    original_iter_queued_job_ids = workflow.storage.iter_queued_job_ids
+    observed_status = {}
 
-        def iter_queued_job_ids_spy(node_name):
-            observed_status[node_name] = workflow.storage.get_node_status(node_name)
-            yield from original_iter_queued_job_ids(node_name)
+    def iter_queued_job_ids_spy(node_name):
+        observed_status[node_name] = workflow.storage.get_node_status(node_name)
+        yield from original_iter_queued_job_ids(node_name)
 
-        def queued_jobs_should_not_be_used(node_name):
-            raise AssertionError("run_node should stream queued job IDs instead")
+    def queued_jobs_should_not_be_used(node_name):
+        raise AssertionError("run_node should stream queued job IDs instead")
 
-        monkeypatch.setattr(workflow.storage, "iter_queued_job_ids", iter_queued_job_ids_spy)
-        monkeypatch.setattr(workflow.storage, "queued_jobs", queued_jobs_should_not_be_used)
-        workflow.run_node("A")
+    monkeypatch.setattr(workflow.storage, "iter_queued_job_ids", iter_queued_job_ids_spy)
+    monkeypatch.setattr(workflow.storage, "queued_jobs", queued_jobs_should_not_be_used)
+    workflow.run_node("A")
 
-        assert observed_status["A"] == "running"
-        workflow.storage.close_database_connections()
+    assert observed_status["A"] == "running"
+    workflow.storage.close_database_connections()
 
 
 def test_threaded_runner_starts_before_lazy_source_is_exhausted():

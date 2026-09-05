@@ -18,7 +18,7 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_041_live_component_pumping.py` | Live member refills, component status, lazy-source failure, late job IDs, Windows descendant paths, and monitoring during routing. |
 | `test_042_cooperative_api_scaling.py` | Cooperative API jobs, high logical concurrency, and pending aggregate API budgets. |
 | `test_043_waiting_nodes.py` | Intra-component waiting gates, monitor display, valid and invalid wait targets, and singleton behavior. |
-| `test_043_watchdog_networking.py` | Checkpoint and total deadlines during framework network waits, physical dispatch timing, replay leases, and cancellation isolation. |
+| `test_043_watchdog_networking.py` | Checkpoint and total deadlines during framework network waits, physical dispatch timing, replay leases, renewal after supervisor-lock contention, and cancellation isolation. |
 | `test_044_queue_transport_scaling.py` | Batch queue loading, event-driven fiber completion, queue wakeups, HTTP sharding, admission fairness, commit priority, and terminal flushing. |
 | `test_045_terminal_recovery.py` | Idempotent output-backed terminal reconciliation and joining started work before component failure. |
 | `test_046_module_boundaries.py` | The repository's source-module size boundary and approved cohesive exceptions. |
@@ -44,6 +44,7 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_067_live_legacy_migration.py` | Applied migration, automatic layout conversion, and initialization before archive extraction refuse observed live legacy owners or non-object run state before filesystem changes; finished or recycled process owners permit migration. |
 | `test_068_component_snapshot.py` | Coherent completion observations, waiting-pump progress between claims, and a real waiting deadlock with an idle resident member. |
 | `test_069_execution_sessions.py` | Internal fresh SQLite session storage, exact session history and live readers, process-safe main cardinality, conditional updates, validation, rollback, and preservation of existing project initialization. |
+| `test_070_legacy_run_preflight.py` | Both legacy run-file locations, structural diagnostics and link refusal, preservation during layout conversion, direct creation, graph and process-worker loading, archive initialization, clipboard ordering, and retained established live-project opens. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and checkpoint replacement. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished waiting work, and missing expected rounds; successful completed waiting execution. |
