@@ -43,6 +43,7 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_066_shared_topology.py` | Runtime and engine agreement on autostart components and quotient edges, plus updated selections after autostart registration or replacement. |
 | `test_067_live_legacy_migration.py` | Applied migration, automatic layout conversion, and initialization before archive extraction refuse observed live legacy owners or non-object run state before filesystem changes; finished or recycled process owners permit migration. |
 | `test_068_component_snapshot.py` | Coherent completion observations, waiting-pump progress between claims, and a real waiting deadlock with an idle resident member. |
+| `test_069_execution_sessions.py` | Internal fresh SQLite session storage, exact session history and live readers, process-safe main cardinality, conditional updates, validation, rollback, and preservation of existing project initialization. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and checkpoint replacement. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished waiting work, and missing expected rounds; successful completed waiting execution. |

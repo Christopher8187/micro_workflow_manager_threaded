@@ -37,7 +37,7 @@ class SQLiteConnectionMixin:
     _advisory_owner_registry: set[str] = set()
     _advisory_owner_registry_guard = threading.Lock()
 
-    def _init_sqlite_state(self) -> None:
+    def _init_sqlite_state(self, *, initial_schema_version: int = 4) -> None:
         self._advisory_local = threading.local()
         raw_path = state_database_file(self.project_dir)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,8 +60,8 @@ class SQLiteConnectionMixin:
             lock = self._db_init_locks.setdefault(path, threading.Lock())
         with lock:
             initialized_key = (path, os.getpid())
-            if initialized_key not in self._initialized_databases or not path.is_file():
-                self.initialize_state_database()
+            if initial_schema_version == 5 or initialized_key not in self._initialized_databases or not path.is_file():
+                self.initialize_state_database(initial_schema_version=initial_schema_version)
                 self._initialized_databases.add(initialized_key)
 
     def submit_db_mutation(

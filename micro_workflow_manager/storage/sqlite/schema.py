@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 from pathlib import Path
 
 
-DATABASE_SCHEMA_VERSION = 4
+DATABASE_SCHEMA_VERSION = 5
+AUTOMATIC_SCHEMA_VERSION = 4
 
 
 class SQLiteSchemaMixin:
     """Schema creation, migration metadata, and integrity checks."""
 
-    def initialize_state_database(self) -> Path:
+    def initialize_state_database(self, *, initial_schema_version: int = AUTOMATIC_SCHEMA_VERSION) -> Path:
         connection = self._new_db_connection()
         required_tables = {
             "metadata",
@@ -28,6 +30,9 @@ class SQLiteSchemaMixin:
             # short metadata writes. The WAL and SHM files are SQLite internals,
             # not per-job filesystem state.
             connection.execute("PRAGMA journal_mode = WAL")
+            # All processes must decide the schema under the same SQLite write
+            # transaction. A process must not publish a stale pre-lock version.
+            connection.execute("BEGIN IMMEDIATE")
 
             existing_tables = {
                 str(row[0])
@@ -35,6 +40,10 @@ class SQLiteSchemaMixin:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
+            if initial_schema_version == 5:
+                if existing_tables:
+                    raise RuntimeError("Fresh session storage found an already initialized database")
+                self._fresh_database_owned = True
             existing_version: int | None = None
             if "metadata" in existing_tables:
                 row = connection.execute(
@@ -54,12 +63,22 @@ class SQLiteSchemaMixin:
                             "Install a compatible newer package instead of downgrading."
                         )
 
+            session_tables = {"execution_sessions", "session_components", "session_jobs"}
+            if existing_tables.intersection(session_tables) and existing_version != 5:
+                raise RuntimeError("Incomplete SQLite execution-session schema: missing version 5 marker")
+            target_version = max(existing_version or 0, initial_schema_version)
+            if target_version == 5:
+                required_tables.update(session_tables)
+                if existing_version == 5 and not required_tables.issubset(existing_tables):
+                    raise RuntimeError("Incomplete SQLite execution-session schema")
+                if existing_version == 5:
+                    self._validate_execution_session_schema(connection)
             schema_is_current = (
-                existing_version == DATABASE_SCHEMA_VERSION
+                existing_version == target_version
                 and required_tables.issubset(existing_tables)
             )
             if not schema_is_current:
-                connection.executescript(
+                self._execute_schema_statements(connection,
                     """
                     CREATE TABLE IF NOT EXISTS metadata (
                         key TEXT PRIMARY KEY,
@@ -157,6 +176,11 @@ class SQLiteSchemaMixin:
                     );
                     """
                 )
+                if target_version == 5:
+                    self._create_execution_session_tables(connection)
+                    connection.execute(
+                        "INSERT INTO metadata(key, value) VALUES('legacy_file_metadata_imported', '1')"
+                    )
                 connection.execute(
                     "INSERT INTO job_sequences(node_name, next_job_id) "
                     "SELECT node_name, COALESCE(MAX(job_id), 0) + 1 FROM jobs GROUP BY node_name "
@@ -166,9 +190,12 @@ class SQLiteSchemaMixin:
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('database_schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (str(DATABASE_SCHEMA_VERSION),),
+                    (str(target_version),),
                 )
-                connection.commit()
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -188,6 +215,96 @@ class SQLiteSchemaMixin:
             else:
                 legacy_locks.unlink()
         return self.state_database_path()
+
+    @staticmethod
+    def _execute_schema_statements(connection, script: str) -> None:
+        # executescript commits an existing transaction before executing its
+        # input. Execute these fixed declarations without releasing our lock.
+        statement = ""
+        for line in script.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                connection.execute(statement)
+                statement = ""
+        if statement.strip():
+            raise RuntimeError("Incomplete internal SQLite schema declaration")
+
+    @staticmethod
+    def _validate_execution_session_schema(connection) -> None:
+        marker = connection.execute(
+            "SELECT value FROM metadata WHERE key='legacy_file_metadata_imported'"
+        ).fetchone()
+        if marker is None or marker[0] != "1":
+            raise RuntimeError("Incomplete SQLite execution-session schema: missing fresh-state marker")
+
+        def objects(database):
+            return {
+                (row[0], row[1]): " ".join(row[2].split()) if row[2] is not None else None
+                for row in database.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE tbl_name IN ('execution_sessions', 'session_components', 'session_jobs')"
+                )
+            }
+
+        # Version 5 has one complete shape. Compare its declarations, including
+        # column checks, foreign keys and the partial main-slot uniqueness rule.
+        reference = sqlite3.connect(":memory:")
+        try:
+            SQLiteSchemaMixin._create_execution_session_tables(reference)
+            expected = objects(reference)
+        finally:
+            reference.close()
+        actual = objects(connection)
+        if actual != expected:
+            raise RuntimeError("Incomplete SQLite execution-session schema: declarations differ")
+
+    @staticmethod
+    def _create_execution_session_tables(connection) -> None:
+        connection.execute("""
+            CREATE TABLE execution_sessions (
+                session_id TEXT PRIMARY KEY,
+                session_kind TEXT NOT NULL CHECK(session_kind IN ('main', 'interrupt')),
+                parent_session_id TEXT REFERENCES execution_sessions(session_id)
+                    CHECK(parent_session_id IS NULL OR
+                          (session_kind='interrupt' AND parent_session_id<>session_id)),
+                command TEXT NOT NULL,
+                start_component TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('running', 'terminal')),
+                started_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                finished_at TEXT,
+                hostname TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                process_identity TEXT,
+                outcome TEXT,
+                failures_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        connection.execute("""
+            CREATE UNIQUE INDEX one_running_main_session
+                ON execution_sessions(session_kind)
+                WHERE session_kind='main' AND status='running'
+        """)
+        connection.execute("""
+            CREATE TABLE session_components (
+                session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
+                position INTEGER NOT NULL,
+                component_key TEXT NOT NULL,
+                PRIMARY KEY(session_id, component_key),
+                UNIQUE(session_id, position)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE session_jobs (
+                session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
+                position INTEGER NOT NULL,
+                node_name TEXT NOT NULL,
+                job_id INTEGER NOT NULL,
+                PRIMARY KEY(session_id, node_name, job_id),
+                UNIQUE(session_id, position)
+            )
+        """)
 
     def database_integrity_check(self) -> str:
         row = self.db_connection().execute("PRAGMA quick_check").fetchone()
