@@ -21,7 +21,6 @@ def main():
 
     w = MicroWorkflow(Path(tempfile.mkdtemp(prefix="mwf-wait-bench-")), runner="threaded")
     w.graph([("A", "B"), ("B", "A")])
-    done = {"A": 0, "B": 0}
 
     A = NodeRouter("A", runner="threaded", max_threads=a.threads, wait_for=["B"])
     B = NodeRouter("B", runner="threaded", max_threads=a.threads, wait_for=["A"])
@@ -29,7 +28,6 @@ def main():
     @A.task
     def run_a(ctx, seed, round):
         time.sleep(a.delay)
-        done["A"] += 1
         if round < a.rounds:
             ctx.node("B").add(seed=seed, round=round)
         return round
@@ -37,7 +35,6 @@ def main():
     @B.task
     def run_b(ctx, seed, round):
         time.sleep(a.delay)
-        done["B"] += 1
         if round < a.rounds:
             ctx.node("A").add(seed=seed, round=round + 1)
         return round
@@ -51,11 +48,25 @@ def main():
     except BaseException as exc:
         error = repr(exc)
     elapsed = time.perf_counter() - started
+    job_counts = {node: w.storage.job_status_counts(node) for node in ("A", "B")}
+    done = {node: counts.get("done", 0) for node, counts in job_counts.items()}
+    expected_done = {
+        "A": max(a.seeds, 0) * max(a.rounds, 1),
+        "B": max(a.seeds, 0) * max(a.rounds - 1, 0),
+    }
+    unfinished = any(
+        count for counts in job_counts.values()
+        for status, count in counts.items() if status != "done"
+    )
+    if error is None and (done != expected_done or unfinished):
+        error = "Incomplete benchmark execution: expected completion counts or empty pending state were not reached"
     total = done["A"] + done["B"]
     print(json.dumps({
         "elapsed_seconds": elapsed,
         "jobs_per_second": total / elapsed if elapsed else 0.0,
         "done": done,
+        "expected_done": expected_done,
+        "job_counts": job_counts,
         "error": error,
     }, sort_keys=True))
     return 0 if error is None else 1

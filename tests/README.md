@@ -42,9 +42,10 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_065_removed_commands.py` | Rejection of retired commands before project bootstrap, with no description, help example, or filesystem mutation. |
 | `test_066_shared_topology.py` | Runtime and engine agreement on autostart components and quotient edges, plus updated selections after autostart registration or replacement. |
 | `test_067_live_legacy_migration.py` | Applied migration, automatic layout conversion, and initialization before archive extraction refuse observed live legacy owners or non-object run state before filesystem changes; finished or recycled process owners permit migration. |
+| `test_068_component_snapshot.py` | Coherent completion observations, waiting-pump progress between claims, and a real waiting deadlock with an idle resident member. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and checkpoint replacement. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
-| `test_benchmark_exit_codes.py` | Nonzero benchmark status when Hoeflein synchronization raises or an explode-pump sample reports failed jobs. |
+| `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished waiting work, and missing expected rounds; successful completed waiting execution. |
 | `test_checkpoint_keyword_api.py` | Keyword checkpoint fields, persistence, validation, dynamic deadlines, fallbacks, and router schema. |
 | `test_cli_help_and_reset.py` | Help and describe output, reset semantics, selected-job runs, initialization sidecars, and component-expanded preparation. |
 | `test_cli_monitor.py` | Bulk summaries, inline and standalone monitoring, timing metadata, reuse, combined statistics, and diagnostic monitor failure. |

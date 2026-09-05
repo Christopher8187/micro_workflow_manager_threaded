@@ -168,16 +168,16 @@ def test_component_scheduler_error_joins_live_member_jobs_before_failure(tmp_pat
     workflow.include_router(a)
     workflow.include_router(b)
 
-    original = workflow.storage.queued_nodes
+    original = workflow.storage.nodes_by_job_status
     injected = {"raised": False}
 
-    def unstable_queued_nodes(node_names):
+    def unstable_job_observation(node_names, statuses):
         if b_started.is_set() and not injected["raised"]:
             injected["raised"] = True
             raise OSError("synthetic VPS scheduler I/O failure")
-        return original(node_names)
+        return original(node_names, statuses)
 
-    workflow.storage.queued_nodes = unstable_queued_nodes  # type: ignore[method-assign]
+    workflow.storage.nodes_by_job_status = unstable_job_observation  # type: ignore[method-assign]
 
     with pytest.raises(OSError, match="synthetic VPS"):
         workflow.run_component({"A", "B"}, ignore_readiness=True)

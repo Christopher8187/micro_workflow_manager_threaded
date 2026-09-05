@@ -357,12 +357,16 @@ class ComponentSchedulerMixin:
                     if first_error is not None:
                         break
 
-                    queued_set = self.storage.queued_nodes(component_nodes)
-                    work_nodes.update(queued_set)
-                    running_job_nodes = self.storage.nodes_with_job_statuses(
-                        component_nodes, {RUNNING}
+                    # Publication and producer completion can occur between
+                    # separate reads. One snapshot prevents false quiescence
+                    # or deadlock from combining incompatible observations.
+                    observed = self.storage.nodes_by_job_status(
+                        component_nodes, WAIT_BLOCKING_JOB_STATUSES
                     )
-                    blocking_nodes = self._component_wait_blockers(component_nodes)
+                    queued_set = observed[QUEUED]
+                    work_nodes.update(queued_set)
+                    running_job_nodes = observed[RUNNING]
+                    blocking_nodes = set().union(*observed.values())
 
                     # Explicit waiting nodes remain phase-gated. Non-live runner
                     # types also use the legacy finite pump semantics. Ordinary
@@ -387,8 +391,11 @@ class ComponentSchedulerMixin:
 
                     # The only legal internal queue is a real waiting deadlock:
                     # every queued node is explicitly waiting on a blocking peer
-                    # and no job is currently running that could clear it.
-                    if queued_set and not running_job_nodes:
+                    # and no admitted finite pump can still make progress.
+                    # A pump between claims may have only QUEUED rows. Wait
+                    # for its Future before declaring deadlock. Resident pumps
+                    # remain alive while idle and do not prevent this decision.
+                    if queued_set and not running_job_nodes and not (active_nodes - live_nodes):
                         blocked_queued = {
                             node_name
                             for node_name in queued_set

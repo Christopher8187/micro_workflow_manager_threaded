@@ -58,7 +58,10 @@ Measures an alternating two-node component that uses explicit `wait_for` gates.
 It needs only MWF and local temporary storage. Important values are completed A
 and B jobs, total elapsed time, throughput, and error. Use it for changes to
 waiting admission or component cleanup. All expected rounds must finish without
-queued or running residue.
+non-done residue.
+The JSON includes expected completion counts and durable job-status counts.
+Missing expected rounds or any non-done jobs produce a nonzero process status,
+even when the workflow returned without an exception.
 
 ### `benchmark_http_fanout_matrix.py`
 

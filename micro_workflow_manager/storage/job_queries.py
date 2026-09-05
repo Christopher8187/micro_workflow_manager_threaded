@@ -371,5 +371,24 @@ class JobQueryStorageMixin:
         """Return queued members of a component with one indexed query."""
         return self.nodes_with_job_statuses(node_names, {QUEUED})
 
+    def nodes_by_job_status(self, node_names, statuses) -> dict[str, set[str]]:
+        """Observe all requested job states in one SQLite snapshot."""
+        names = list(dict.fromkeys(self.validate_node_name(name) for name in node_names))
+        states = list(dict.fromkeys(self.validate_status(status) for status in statuses))
+        observed = {status: set() for status in states}
+        if not names or not states:
+            return observed
+        node_placeholders = ",".join("?" for _ in names)
+        status_placeholders = ",".join("?" for _ in states)
+        rows = self.db_connection().execute(
+            "SELECT DISTINCT node_name, status FROM jobs "
+            f"WHERE status IN ({status_placeholders}) "
+            f"AND node_name IN ({node_placeholders})",
+            [*states, *names],
+        ).fetchall()
+        for row in rows:
+            observed[str(row["status"])].add(str(row["node_name"]))
+        return observed
+
     def queued_jobs(self, node_name: str) -> list[Job]:
         return [self.load_job(node_name, job_id) for job_id in self.iter_queued_job_ids(node_name)]
