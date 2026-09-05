@@ -182,6 +182,11 @@ def test_many_component_definitions_keep_bounded_storage_and_exact_shapes(tmp_pa
         assert reopened.get_component_definition(members) == {
             'members': members, 'shape_json': snapshot.shape_json,
         }
+        assert reopened.get_component_state(members) == {
+            'members': members, 'shape_json': snapshot.shape_json,
+            'lifecycle': 'queued', 'stability': None, 'instability_origin': None,
+            'misaligned': False, 'alignment_generation': 0,
+        }
     assert reopened.register_component_topology(snapshot) is False
     assert reopened.database_integrity_check() == 'ok'
     reopened.close_database_connections()

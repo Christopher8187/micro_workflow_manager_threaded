@@ -11,6 +11,7 @@ from .base import FileStorageBase
 from .component_definitions import ComponentDefinitionStorageMixin
 from .component_holds import ComponentHoldStorageMixin
 from .component_reservations import ComponentReservationStorageMixin
+from .component_states import ComponentStateStorageMixin
 from .execution import JobExecutionStorageMixin
 from .execution_sessions import ExecutionSessionStorageMixin
 from .events import JobEventStorageMixin
@@ -38,6 +39,7 @@ class FileStorage(
     ComponentDefinitionStorageMixin,
     ComponentHoldStorageMixin,
     ComponentReservationStorageMixin,
+    ComponentStateStorageMixin,
     ExecutionSessionStorageMixin,
     NetworkStateStorageMixin,
     StateEventStorageMixin,

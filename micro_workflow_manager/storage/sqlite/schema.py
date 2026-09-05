@@ -10,7 +10,7 @@ AUTOMATIC_SCHEMA_VERSION = 4
 SESSION_TABLES = frozenset({
     "execution_sessions", "session_components", "session_jobs",
     "graph_shapes", "component_definitions", "component_reservations", "component_holds",
-    "job_execution_owners",
+    "job_execution_owners", "component_states",
 })
 
 
@@ -321,6 +321,31 @@ class SQLiteSchemaMixin:
             CREATE TABLE component_definitions (
                 component_key TEXT PRIMARY KEY,
                 shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE component_states (
+                component_key TEXT PRIMARY KEY REFERENCES component_definitions(component_key),
+                lifecycle TEXT NOT NULL DEFAULT 'queued'
+                    CHECK(lifecycle IN ('queued','running','sampled','done','failed')),
+                stability TEXT CHECK(stability IN ('stable','unstable')),
+                instability_origin TEXT REFERENCES execution_sessions(session_id),
+                misaligned INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(misaligned)='integer' AND misaligned IN (0,1)),
+                alignment_generation INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
+                CHECK((
+                    (
+                        (lifecycle IN ('queued','running','failed')
+                            AND stability IS NULL AND instability_origin IS NULL)
+                        OR (lifecycle IN ('running','sampled','done') AND (
+                            (stability='stable' AND instability_origin IS NULL)
+                            OR (stability='unstable' AND instability_origin IS NOT NULL
+                                AND length(instability_origin)>0)
+                        ))
+                    )
+                    AND (lifecycle NOT IN ('queued','running') OR misaligned=0)
+                ) IS 1)
             )
         """)
         connection.execute("""

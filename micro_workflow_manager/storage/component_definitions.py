@@ -23,16 +23,33 @@ class ComponentDefinitionStorageMixin:
             ).fetchone()
             shape_id = shape['shape_id'] if shape is not None else None
             conflicts = []
+            existing_components = set()
             for offset in range(0, len(components), 500):
                 selected = components[offset:offset + 500]
                 placeholders = ','.join('?' for _ in selected)
                 rows = connection.execute(
-                    'SELECT component_key, shape_id FROM component_definitions '
-                    f'WHERE component_key IN ({placeholders})', selected,
+                    'SELECT d.component_key, d.shape_id, s.component_key AS state_key '
+                    'FROM component_definitions d LEFT JOIN component_states s USING(component_key) '
+                    f'WHERE d.component_key IN ({placeholders})', selected,
                 )
-                conflicts.extend(row['component_key'] for row in rows if row['shape_id'] != shape_id)
+                for row in rows:
+                    if row['state_key'] is None:
+                        raise RuntimeError('Incomplete component state for ' + row['component_key'])
+                    existing_components.add(row['component_key'])
+                    if row['shape_id'] != shape_id:
+                        conflicts.append(row['component_key'])
             if conflicts:
                 raise RuntimeError('Components belong to a different graph shape: ' + ', '.join(sorted(conflicts)))
+            if shape_id is not None:
+                registered_components = {
+                    row['component_key']
+                    for row in connection.execute(
+                        'SELECT component_key FROM component_definitions WHERE shape_id=?',
+                        (shape_id,),
+                    )
+                }
+                if registered_components != set(components):
+                    raise RuntimeError('Incomplete registered component topology')
             changed = connection.execute(
                 "INSERT INTO graph_shapes(shape_json) VALUES(?) ON CONFLICT DO NOTHING",
                 (snapshot.shape_json,),
@@ -46,6 +63,10 @@ class ComponentDefinitionStorageMixin:
                 "ON CONFLICT(component_key) DO NOTHING",
                 [(component, shape_id) for component in components],
             ).rowcount
+            connection.executemany(
+                "INSERT INTO component_states(component_key) VALUES(?)",
+                [(component,) for component in components if component not in existing_components],
+            )
             return changed > 0
 
         return self.submit_db_mutation(register, wait=True, priority=0)
