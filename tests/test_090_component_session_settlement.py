@@ -4,6 +4,7 @@ import os
 import json
 import socket
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Event
@@ -105,6 +106,69 @@ def test_component_result_and_session_exit_commit_together(running_component):
         assert reopened.get_component_reservation(('A', 'B')) is None
     finally:
         _close(reopened)
+
+
+@pytest.mark.parametrize('running_component', [[('A', 'B'), ('C',)]], indirect=True)
+def test_successful_component_can_finish_while_its_session_remains_live(running_component):
+    storage, topology, generation, execution_id = running_component
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
+    before = _rows(storage)
+
+    assert storage.finish_successful_component_execution('ordinary-result', _outcome(topology)) is True
+
+    expected = deepcopy(before)
+    component_row = next(row for row in expected['component_states'] if row['component_key'] == json.dumps(['A', 'B']))
+    component_row.update(lifecycle='done', stability='stable')
+    assert _rows(storage) == expected
+    observed = storage.read_component_states([('A', 'B'), ('C',)], expected_shape=topology.shape_json)
+    assert observed[('A', 'B')]['lifecycle'] == 'done'
+    assert observed[('C',)]['lifecycle'] == 'queued'
+    assert storage.get_execution_session('ordinary-result')['status'] == 'running'
+    assert storage.get_component_reservation(('A', 'B'))['session_id'] == 'ordinary-result'
+    assert storage.get_component_reservation(('C',))['session_id'] == 'ordinary-result'
+
+
+@pytest.mark.parametrize('obstruction', [
+    'failed-result', 'queued-restart', 'active-job', 'reservation', 'generation', 'ignored-write',
+])
+def test_intermediate_component_success_preserves_state_when_refused(running_component, obstruction):
+    storage, topology, generation, execution_id = running_component
+    outcome = _outcome(topology)
+    if obstruction == 'failed-result':
+        outcome = _outcome(topology, lifecycle='failed', stability=None)
+    if obstruction != 'active-job':
+        storage.finalize_job_execution(
+            'A', 1, generation, execution_id, 'failed' if obstruction == 'queued-restart' else 'done',
+        )
+    if obstruction == 'queued-restart':
+        storage.request_owned_job_restarts(storage.plan_owned_job_restarts([('A', 1)]))
+    elif obstruction == 'reservation':
+        storage.release_execution_components('ordinary-result')
+    elif obstruction == 'generation':
+        storage.submit_db_mutation(lambda connection: connection.execute(
+            'UPDATE component_states SET alignment_generation=1 WHERE component_key=?',
+            (json.dumps(['A', 'B']),),
+        ))
+    elif obstruction == 'ignored-write':
+        storage.submit_db_mutation(lambda connection: connection.execute(
+            'CREATE TRIGGER suppress_component_success BEFORE UPDATE OF lifecycle ON component_states '
+            "WHEN NEW.lifecycle='done' BEGIN "
+            "UPDATE component_states SET alignment_generation=3 WHERE component_key='[\"C\"]'; "
+            'SELECT RAISE(IGNORE); END',
+        ))
+    before = _rows(storage)
+    with pytest.raises(ValueError if obstruction == 'failed-result' else RuntimeError):
+        storage.finish_successful_component_execution('ordinary-result', outcome)
+    assert _rows(storage) == before
+    if obstruction == 'queued-restart':
+        decision = storage.decide_execution_session_exit(
+            'ordinary-result', outcome='failed', finished_at=now(),
+            restart_attempts=[('A', 1, generation, execution_id)],
+            component_outcomes=[_outcome(topology, lifecycle='failed', stability=None)],
+        )
+        assert list(decision['restarts']) == [('A', 1)]
+        assert decision['released'] == 0
+        assert _rows(storage) == before
 
 
 @pytest.mark.parametrize('suppressed', ['session-finish', 'reservation-release'])

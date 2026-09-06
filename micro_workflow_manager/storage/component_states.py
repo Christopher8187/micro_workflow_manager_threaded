@@ -20,6 +20,21 @@ class ComponentTerminalOutcome:
 class ComponentStateStorageMixin:
     """Persist private component lifecycle records at their producing shape."""
 
+    def finish_successful_component_execution(self, session_id: str, outcome: ComponentTerminalOutcome) -> bool:
+        """Publish one successful component while retaining its session scope."""
+        self._require_execution_session_storage()
+        self._session_text(session_id, 'session_id')
+        outcomes = self._normalize_component_terminal_outcomes([outcome])
+        if outcomes[0].lifecycle != 'done':
+            raise ValueError('Intermediate component completion requires a successful result')
+
+        def finish(connection):
+            self._validate_component_terminal_outcomes(connection, session_id, outcomes)
+            self._publish_component_terminal_outcomes(connection, outcomes)
+            return True
+
+        return self.submit_db_mutation(finish, wait=True, priority=0)
+
     def _normalize_component_terminal_outcomes(self, outcomes):
         normalized = []
         seen = set()

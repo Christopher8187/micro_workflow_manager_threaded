@@ -27,6 +27,10 @@ accepted as a private prerequisite for parent readiness. It reads one snapshot
 and preserves caller transactions. Parent discovery, complete parent selection,
 and runtime admission remain unfinished.
 
+The [success publication within a live session](component-success-publication.md)
+is accepted privately. It preserves session scope while publishing one completed
+component. Shared caller activation and parent scheduling remain unfinished.
+
 The [interval calculation](stage-s1a.md),
 [command retirement](stage-retirement.md), [shared topology](stage-topology.md),
 [retained scheduler repair](stage-scheduler-completion.md),
