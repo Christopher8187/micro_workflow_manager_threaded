@@ -22,6 +22,11 @@ is accepted for private terminal arbitration and guarded batch publication.
 Its focused checks and two independent Sol reviews passed. The mixed adjacent
 result retains its documented failures. It completes no whole requirement.
 
+The [consistent component-state reader](component-state-observations.md) is
+accepted as a private prerequisite for parent readiness. It reads one snapshot
+and preserves caller transactions. Parent discovery, complete parent selection,
+and runtime admission remain unfinished.
+
 The [interval calculation](stage-s1a.md),
 [command retirement](stage-retirement.md), [shared topology](stage-topology.md),
 [retained scheduler repair](stage-scheduler-completion.md),

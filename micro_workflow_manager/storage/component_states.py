@@ -350,6 +350,21 @@ class ComponentStateStorageMixin:
 
         return self.submit_db_mutation(fail, wait=True, priority=0)
 
+    def read_component_states(self, components, *, expected_shape: str) -> dict:
+        """Read exact component records from one snapshot in requested order."""
+        self._require_execution_session_storage()
+        self._session_text(expected_shape, 'expected_shape')
+        members = tuple(self._session_component(component) for component in components)
+        connection = self.db_connection()
+        connection.execute('SAVEPOINT mwf_component_observation')
+        try:
+            observed = {component: self.get_component_state(component) for component in members}
+            if any(state is None or state['shape_json'] != expected_shape for state in observed.values()):
+                raise RuntimeError('Component observations require the expected producing shape')
+            return observed
+        finally:
+            connection.execute('RELEASE SAVEPOINT mwf_component_observation')
+
     def get_component_state(self, component) -> dict | None:
         self._require_execution_session_storage()
         members = self._session_component(component)
