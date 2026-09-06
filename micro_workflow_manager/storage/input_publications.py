@@ -100,6 +100,7 @@ class InputPublicationStorageMixin:
         ):
             raise RuntimeError('Managed input producing component changed before publication')
         self._validate_input_edge(connection, owner, receiver)
+        return owner
 
     def publish_managed_inputs(self, node, job_id, generation, execution_id, receiver, changes, *, event_data=None):
         node = self.validate_node_name(node)
@@ -130,10 +131,17 @@ class InputPublicationStorageMixin:
                 )
 
     def _publish_input_files(self, node, job_id, generation, execution_id, receiver, operation_id, files, event_data):
+        arrival_identity = None
+
         def validate(connection):
-            self._validate_input_producer(connection, node, job_id, generation, execution_id, receiver)
+            owner = self._validate_input_producer(connection, node, job_id, generation, execution_id, receiver)
+            first_changed_path = None
             for entry in files.entries:
-                self._read_input_ownership(connection, receiver, entry['relative'])
+                ownership = self._read_input_ownership(connection, receiver, entry['relative'])
+                if (first_changed_path is None
+                        and (entry['change'].kind != 'delete' or entry['existed'] or ownership is not None)):
+                    first_changed_path = entry['relative']
+            return owner, first_changed_path
 
         def prepare(connection):
             validate(connection)
@@ -144,7 +152,8 @@ class InputPublicationStorageMixin:
             )
 
         def commit(connection):
-            validate(connection)
+            nonlocal arrival_identity
+            owner, first_changed_path = validate(connection)
             for entry in files.entries:
                 relative = entry['relative']
                 if entry['change'].kind == 'delete':
@@ -158,6 +167,10 @@ class InputPublicationStorageMixin:
                 connection.execute(
                     'INSERT INTO managed_input_producers VALUES(?,?,?) ON CONFLICT DO NOTHING',
                     (receiver, relative, execution_id),
+                )
+            if first_changed_path is not None:
+                arrival_identity = self._mark_component_input_arrival(
+                    connection, receiver, owner, first_changed_path,
                 )
             for succeeded, error in self._apply_job_event_appends(connection, appends):
                 if not succeeded:
@@ -193,6 +206,8 @@ class InputPublicationStorageMixin:
             self._submit_input_decision(operation_id, 'prepared', prepare)
             files.publish()
             self._submit_input_decision(operation_id, 'committed', commit)
+            if arrival_identity is not None:
+                self._component_arrival_latches[receiver] = arrival_identity
         except BaseException as error:
             # A durable receipt distinguishes a failed transaction from a
             # notification error after COMMIT. If receipt reads fail, retain

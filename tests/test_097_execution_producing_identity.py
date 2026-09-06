@@ -72,7 +72,7 @@ def test_public_execution_records_producing_identity_before_task_and_keeps_it_af
             'SELECT shape_id FROM graph_shapes WHERE shape_json=?', (workflow.topology.snapshot().shape_json,),
         ).fetchone()['shape_id']
         assert owner.get('shape_id') == shape_id
-        assert owner.get('alignment_generation') == 0
+        assert owner.get('alignment_generation') == (0 if selected else 1)
         assert owner['component'] == ('A', 'B')
         assert owner['node_name'] == 'A'
         assert owner['job_id'] == 1

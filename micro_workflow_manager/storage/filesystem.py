@@ -13,6 +13,7 @@ from micro_workflow_manager.project_format import (
 from .base import FileStorageBase
 from .component_definitions import ComponentDefinitionStorageMixin
 from .component_holds import ComponentHoldStorageMixin
+from .component_misalignment import ComponentMisalignmentStorageMixin
 from .component_reservations import ComponentReservationStorageMixin
 from .component_states import ComponentStateStorageMixin
 from .execution import JobExecutionStorageMixin
@@ -30,6 +31,7 @@ from .state_events import StateEventStorageMixin
 
 class FileStorage(
     InputPublicationStorageMixin,
+    ComponentMisalignmentStorageMixin,
     ComponentDefinitionStorageMixin,
     ComponentHoldStorageMixin,
     ComponentReservationStorageMixin,
@@ -66,6 +68,7 @@ class FileStorage(
         self._init_state_event_broker()
         self._init_sqlite_state(create=create)
         self._init_job_execution_state()
+        self._component_arrival_latches = {}
 
     @classmethod
     def _create_new_project_state(cls, project_dir):

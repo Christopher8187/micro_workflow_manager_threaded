@@ -78,6 +78,15 @@ cannot complete, MWF retains recovery material and refuses further managed
 publication and ownership reads for that receiver. Full crash recovery remains
 under implementation for 0.6.2.
 
+Managed input changes mark done, sampled, or failed receivers misaligned while
+preserving their jobs and output. The same publication decision records one first
+cause per receiving raw node and alignment generation, using the actual changed
+path. Queued and running receivers stay aligned. Repeated arrivals retain the
+first cause; manual filesystem edits trigger no detection. Full fresh preparation
+advances the generation and removes old causes from the current view. Job-arrival
+causes, preparation-driven causes, and public trace integration remain under
+implementation. See [receiver input progress](../plans/0.6.2/receiver-input-misalignment-progress.md).
+
 An overwritten or appended path can retain several producing executions.
 Overwriting an existing unowned file also preserves that predecessor in the
 ownership record. Ambiguous ownership refuses automatic owner selection;
