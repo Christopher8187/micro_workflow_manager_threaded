@@ -46,6 +46,155 @@ def _outcome(topology, *, lifecycle='done', stability='stable', instability_orig
     )
 
 
+@pytest.mark.parametrize('publication', ['component', 'session'])
+def test_component_publication_rolls_back_when_pending_record_cannot_be_removed(running_component, publication):
+    storage, topology, generation, execution_id = running_component
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
+    storage.submit_db_mutation(lambda connection: connection.execute(
+        'CREATE TRIGGER suppress_pending_removal BEFORE DELETE ON pending_component_executions BEGIN '
+        "UPDATE nodes SET status='failed' WHERE node_name='A'; SELECT RAISE(IGNORE); END",
+    ))
+    before = _rows(storage)
+    with pytest.raises(RuntimeError, match='pending'):
+        if publication == 'component':
+            storage.finish_successful_component_execution('ordinary-result', _outcome(topology))
+        else:
+            storage.decide_execution_session_exit(
+                'ordinary-result', outcome='done', finished_at=now(), component_outcomes=[_outcome(topology)],
+            )
+    assert _rows(storage) == before
+
+
+def test_failed_exit_refuses_a_running_component_without_its_pending_record(running_component):
+    storage, topology, generation, execution_id = running_component
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'failed')
+    storage.submit_db_mutation(lambda connection: connection.execute(
+        'DELETE FROM pending_component_executions WHERE session_id=?', ('ordinary-result',),
+    ))
+    before = _rows(storage)
+    with pytest.raises(RuntimeError, match='running component'):
+        storage.decide_execution_session_exit('ordinary-result', outcome='failed', finished_at=now())
+    assert _rows(storage) == before
+
+
+@pytest.mark.parametrize('damage', ['main-origin', 'invalid-ready'])
+def test_failed_exit_refuses_malformed_pending_completion_without_erasing_it(running_component, damage):
+    storage, topology, generation, execution_id = running_component
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'failed')
+
+    def change(connection):
+        if damage == 'main-origin':
+            connection.execute(
+                "UPDATE pending_component_executions SET completion_ready=1, stability='unstable', "
+                "instability_origin='ordinary-result'",
+            )
+        else:
+            connection.execute('PRAGMA ignore_check_constraints=ON')
+            try:
+                connection.execute('UPDATE pending_component_executions SET completion_ready=2')
+            finally:
+                connection.execute('PRAGMA ignore_check_constraints=OFF')
+
+    storage.submit_db_mutation(change)
+    before = _rows(storage)
+    with pytest.raises(RuntimeError, match='pending'):
+        storage.decide_execution_session_exit('ordinary-result', outcome='failed', finished_at=now())
+    assert _rows(storage) == before
+
+
+@pytest.mark.parametrize('publication', ['component', 'session'])
+@pytest.mark.parametrize('changed', [False, True])
+def test_ready_component_keeps_its_recorded_successful_lineage(running_component, publication, changed):
+    storage, topology, generation, execution_id = running_component
+    storage.create_execution_session(
+        'interrupt-origin', session_kind='interrupt', command='run',
+        start_component=('C',), selected_components=[('C',)],
+        started_at=now(), hostname=socket.gethostname(), pid=os.getpid(),
+        process_identity=process_identity(os.getpid()),
+    )
+    storage.submit_db_mutation(lambda connection: connection.execute(
+        "UPDATE pending_component_executions SET completion_ready=1, stability='stable'",
+    ))
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
+    result = _outcome(
+        topology, stability='unstable' if changed else 'stable',
+        instability_origin='interrupt-origin' if changed else None,
+    )
+    before = _rows(storage)
+
+    def publish():
+        if publication == 'component':
+            return storage.finish_successful_component_execution('ordinary-result', result)
+        return storage.decide_execution_session_exit(
+            'ordinary-result', outcome='done', finished_at=now(), component_outcomes=[result],
+        )
+
+    if changed:
+        with pytest.raises(RuntimeError, match='recorded.*lineage'):
+            publish()
+        assert _rows(storage) == before
+    else:
+        publish()
+        state = storage.get_component_state(('A', 'B'))
+        assert (state['lifecycle'], state['stability'], state['instability_origin']) == ('done', 'stable', None)
+
+
+@pytest.mark.parametrize('publication', ['component', 'session'])
+@pytest.mark.parametrize('damage', ['shape', 'generation', 'missing'])
+def test_component_publication_rechecks_its_pending_start_record(running_component, publication, damage):
+    storage, topology, generation, execution_id = running_component
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
+
+    def change(connection):
+        if damage == 'shape':
+            shape_id = connection.execute(
+                'INSERT INTO graph_shapes(shape_json) VALUES(?)',
+                (topology.shape_json.replace('"C"', '"D"'),),
+            ).lastrowid
+            connection.execute('UPDATE pending_component_executions SET shape_id=?', (shape_id,))
+        elif damage == 'generation':
+            connection.execute('UPDATE pending_component_executions SET alignment_generation=1')
+        else:
+            connection.execute('DELETE FROM pending_component_executions')
+
+    storage.submit_db_mutation(change)
+    before = _rows(storage)
+    with pytest.raises(RuntimeError):
+        if publication == 'component':
+            storage.finish_successful_component_execution('ordinary-result', _outcome(topology))
+        else:
+            storage.decide_execution_session_exit(
+                'ordinary-result', outcome='done', finished_at=now(), component_outcomes=[_outcome(topology)],
+            )
+    assert _rows(storage) == before
+
+
+def test_component_publication_preserves_another_sessions_pending_record(running_component):
+    storage, topology, generation, execution_id = running_component
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
+    storage.create_execution_session(
+        'retained-owner', session_kind='interrupt', command='run',
+        start_component=('A', 'B'), selected_components=[('A', 'B')],
+        started_at=now(), hostname=socket.gethostname(), pid=os.getpid(),
+        process_identity=process_identity(os.getpid()),
+    )
+    storage.submit_db_mutation(lambda connection: connection.execute(
+        'INSERT INTO pending_component_executions(session_id, component_key, shape_id, alignment_generation, stability, instability_origin) '
+        'SELECT ?, component_key, shape_id, alignment_generation, stability, instability_origin FROM pending_component_executions WHERE session_id=?',
+        ('retained-owner', 'ordinary-result'),
+    ))
+    before = _rows(storage)
+    assert storage.finish_successful_component_execution('ordinary-result', _outcome(topology)) is True
+    expected = deepcopy(before)
+    for row in expected['component_states']:
+        if row['component_key'] == json.dumps(['A', 'B']):
+            row.update(lifecycle='done', stability='stable')
+    expected['pending_component_executions'] = [
+        row for row in expected['pending_component_executions'] if row['session_id'] == 'retained-owner'
+    ]
+    assert _rows(storage) == expected
+
+
 @pytest.fixture
 def running_component(tmp_path, request):
     storage = FileStorage._create_new_project_state(tmp_path)
@@ -61,7 +210,7 @@ def running_component(tmp_path, request):
     storage.reserve_execution_components('ordinary-result', expected_shape=topology.shape_json)
     storage.begin_queued_component_execution(
         'ordinary-result', ('A', 'B'), expected_shape=topology.shape_json,
-        expected_alignment_generation=0,
+        expected_alignment_generation=0, successful_lineage=('stable', None),
     )
     storage.create_job(Job(node_name='A', job_id=1, params={'value': 'preserved'}))
     generation, execution_id = storage.claim_job_execution(
@@ -119,6 +268,7 @@ def test_successful_component_can_finish_while_its_session_remains_live(running_
     expected = deepcopy(before)
     component_row = next(row for row in expected['component_states'] if row['component_key'] == json.dumps(['A', 'B']))
     component_row.update(lifecycle='done', stability='stable')
+    expected['pending_component_executions'] = []
     assert _rows(storage) == expected
     observed = storage.read_component_states([('A', 'B'), ('C',)], expected_shape=topology.shape_json)
     assert observed[('A', 'B')]['lifecycle'] == 'done'
@@ -288,9 +438,14 @@ def test_component_settlement_rechecks_state_at_its_write_boundary(running_compo
                 elif change == 'reservation':
                     other.release_execution_components('ordinary-result')
                 elif change == 'selection':
-                    other.submit_db_mutation(lambda connection: connection.execute(
-                        'DELETE FROM session_components WHERE session_id=?', ('ordinary-result',),
-                    ))
+                    def remove_selection(connection):
+                        connection.execute(
+                            'DELETE FROM pending_component_executions WHERE session_id=?', ('ordinary-result',),
+                        )
+                        connection.execute(
+                            'DELETE FROM session_components WHERE session_id=?', ('ordinary-result',),
+                        )
+                    other.submit_db_mutation(remove_selection)
                 elif change == 'shape':
                     other.submit_db_mutation(lambda connection: connection.execute(
                         'UPDATE graph_shapes SET shape_json=?', (topology.shape_json.replace('"C"', '"D"'),),
@@ -318,7 +473,7 @@ def test_component_settlement_rolls_back_the_whole_result_batch(running_componen
     storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
     storage.begin_queued_component_execution(
         'ordinary-result', ('C',), expected_shape=topology.shape_json,
-        expected_alignment_generation=0,
+        expected_alignment_generation=0, successful_lineage=('stable', None),
     )
     if obstruction == 'unfinished-job':
         storage.create_job(Job(node_name='C', job_id=1, params={}))
@@ -346,7 +501,7 @@ def test_component_result_batch_cannot_leave_an_owned_component_running(running_
     if other_started:
         storage.begin_queued_component_execution(
             'ordinary-result', ('C',), expected_shape=topology.shape_json,
-            expected_alignment_generation=0,
+            expected_alignment_generation=0, successful_lineage=('stable', None),
         )
     before = _rows(storage)
     arguments = dict(outcome='done', finished_at=now(), component_outcomes=[_outcome(topology)])
@@ -365,7 +520,7 @@ def test_component_result_batch_preserves_work_transferred_to_another_session(ru
     storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
     storage.begin_queued_component_execution(
         'ordinary-result', ('C',), expected_shape=topology.shape_json,
-        expected_alignment_generation=0,
+        expected_alignment_generation=0, successful_lineage=('stable', None),
     )
     storage.create_execution_session(
         'next-owner', session_kind='interrupt', command='run',
@@ -409,6 +564,10 @@ def test_component_settlement_preserves_or_clears_successful_lineage(running_com
         process_identity=process_identity(os.getpid()),
     )
     lifecycle = 'failed' if mode == 'failed' else 'done'
+    if mode in ('new-unstable', 'retained-unstable'):
+        storage.submit_db_mutation(lambda connection: connection.execute(
+            "UPDATE pending_component_executions SET stability='unstable', instability_origin='interrupt-origin'",
+        ))
     storage.finalize_job_execution('A', 1, generation, execution_id, lifecycle)
     if mode != 'new-unstable':
         storage.submit_db_mutation(lambda connection: connection.execute(
@@ -438,7 +597,7 @@ def test_component_settlement_requires_a_real_interrupt_origin(running_component
     storage, topology, generation, execution_id = running_component
     storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
     before = _rows(storage)
-    with pytest.raises(RuntimeError, match='interrupt origin'):
+    with pytest.raises(RuntimeError, match='interrupt origin|recorded successful lineage'):
         storage.decide_execution_session_exit(
             'ordinary-result', outcome='done', finished_at=now(),
             component_outcomes=[_outcome(topology, stability='unstable', instability_origin=origin)],
@@ -465,3 +624,30 @@ def test_component_settlement_rejects_invalid_calculated_results(running_compone
             'ordinary-result', outcome='done', finished_at=now(), component_outcomes=outcomes,
         )
     assert _rows(storage) == before
+
+
+@pytest.mark.parametrize('stage', ['ordinary-active', 'failed', 'accepted-queued', 'accepted-active', 'accepted-done'])
+def test_ordinary_claim_waits_until_an_accepted_component_repair_finishes(running_component, stage):
+    storage, topology, generation, execution_id = running_component
+    storage.create_job(Job(node_name='A', job_id=2, params={}))
+    claim = dict(started_at=now(), session_id='ordinary-result', component=('A', 'B'))
+    if stage != 'ordinary-active':
+        storage.finalize_job_execution('A', 1, generation, execution_id, 'failed')
+    if stage.startswith('accepted-'):
+        storage.request_owned_job_restarts(storage.plan_owned_job_restarts([('A', 1)]))
+        before = _rows(storage)
+        with pytest.raises(RuntimeError, match='Ordinary admission'):
+            storage.claim_job_executions_batch('A', [1, 2], **claim)
+        assert _rows(storage) == before
+        if stage != 'accepted-queued':
+            generation, execution_id = storage.claim_job_execution('A', 1, **claim)
+            if stage == 'accepted-done':
+                storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
+    if stage in {'failed', 'accepted-queued', 'accepted-active'}:
+        before = _rows(storage)
+        with pytest.raises(RuntimeError, match='Ordinary admission'):
+            storage.claim_job_execution('A', 2, **claim)
+        assert _rows(storage) == before
+    else:
+        storage.claim_job_execution('A', 2, **claim)
+        assert storage.get_job_status('A', 2) == 'running'

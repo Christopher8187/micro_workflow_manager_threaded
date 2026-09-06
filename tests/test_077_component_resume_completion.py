@@ -504,7 +504,7 @@ def test_concurrent_resumed_sample_completions_publish_once_and_refuse_other_att
         _close(storage)
 
 
-def test_resumed_sample_completion_refuses_version4_and_preserves_existing_work(tmp_path):
+def test_resumed_sample_completion_refuses_missing_native_session_and_preserves_existing_work(tmp_path):
     storage = FileStorage(tmp_path)
     try:
         storage.create_job(Job(node_name='A', job_id=1, params={'source': 'retained-input'}))
@@ -513,9 +513,9 @@ def test_resumed_sample_completion_refuses_version4_and_preserves_existing_work(
         output.write_bytes(b'established output')
         before = tuple(storage.db_connection().iterdump())
 
-        with pytest.raises(RuntimeError, match='session-capable database'):
+        with pytest.raises(RuntimeError, match='existing running session'):
             storage.finish_sampled_component_resume(
-                'main-resume', ('A',), expected_shape='unused-version4-shape',
+                'main-resume', ('A',), expected_shape='unused-shape',
                 expected_alignment_generation=7,
             )
 
@@ -523,6 +523,6 @@ def test_resumed_sample_completion_refuses_version4_and_preserves_existing_work(
         assert output.read_bytes() == b'established output'
         assert storage.db_connection().execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone()[0] == '4'
+        ).fetchone()[0] == '5'
     finally:
         _close(storage)

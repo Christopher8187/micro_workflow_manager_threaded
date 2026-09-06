@@ -472,7 +472,7 @@ def test_concurrent_sampled_resumes_change_exactly_one_component_once(tmp_path):
         _close(storage)
 
 
-def test_sampled_resume_refuses_version4_without_upgrading_or_changing_existing_work(tmp_path):
+def test_sampled_resume_refuses_missing_native_session_without_changing_existing_work(tmp_path):
     storage = FileStorage(tmp_path)
     try:
         storage.create_job(Job(node_name='A', job_id=1, params={'source': 'prior-input'}))
@@ -481,13 +481,13 @@ def test_sampled_resume_refuses_version4_without_upgrading_or_changing_existing_
         output.write_bytes(b'established output')
         before = tuple(storage.db_connection().iterdump())
 
-        with pytest.raises(RuntimeError, match='session-capable database'):
+        with pytest.raises(RuntimeError, match='existing running session'):
             storage.begin_sampled_component_resume('main-resume', ('A',), expected_alignment_generation=7)
 
         assert tuple(storage.db_connection().iterdump()) == before
         assert output.read_bytes() == b'established output'
         assert storage.db_connection().execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone()[0] == '4'
+        ).fetchone()[0] == '5'
     finally:
         _close(storage)

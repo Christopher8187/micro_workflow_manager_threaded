@@ -6,9 +6,9 @@ import networkx as nx
 
 from ..errors import InvalidGraphError
 from ..models import FAILED, QUEUED, RUNNING, WAITING
-from ..storage.execution_terminal import TerminalOwnerExpectation
 from .execution_scope import programmatic_execution
 from .component_execution_operation import ComponentExecutionOperation
+from .component_failure_cleanup import ComponentFailureCleanupMixin
 
 
 WAIT_BLOCKING_JOB_STATUSES = {QUEUED, RUNNING, FAILED}
@@ -71,7 +71,7 @@ def allocate_api_pumps(
     return allocations
 
 
-class ComponentSchedulerMixin:
+class ComponentSchedulerMixin(ComponentFailureCleanupMixin):
     # Durable lifecycle commits wake the scheduler immediately. The timeout is
     # only a defensive cross-process fallback if an external writer cannot use
     # the project event broker.
@@ -92,99 +92,6 @@ class ComponentSchedulerMixin:
             component_nodes,
             WAIT_BLOCKING_JOB_STATUSES,
         )
-
-    def _finalize_failed_component(
-        self, component: set[str], error: BaseException, *, execution_context,
-        publish_failure=True, operation=None,
-    ) -> None:
-        """Publish one failed SCC only after no local runner can still mutate it.
-
-        A hard resource failure can occur after a handler wrote its output but
-        before SQLite accepted the terminal update. Recover those output-backed
-        completions first. Any remaining RUNNING rows are abandoned executions:
-        every node runner has already been joined at this point, so mark them
-        failed with an explicit recovery reason rather than leaving a terminal
-        component that still appears to own live work.
-        """
-        component = set(component)
-        recovery_error = repr(error)
-        candidates = {} if operation is None else operation.abandoned_attempts()
-        attempts, owners = {}, {}
-
-        # Normal handler failures already publish their terminal state before a
-        # runner unwinds. Preserve the no-scan hot failure path in that common
-        # case; recovery I/O is needed only when a joined component still has
-        # stale RUNNING rows (for example after EMFILE interrupted publication).
-        running_by_node = {}
-        for node_name in sorted(component):
-            try:
-                running = self.storage.list_jobs(node_name, status=RUNNING)
-            except BaseException:
-                running = []
-            if running:
-                running_by_node[node_name] = running
-            for job in running:
-                try:
-                    job_id = int(job['job_id'])
-                    observed = self.storage.read_job_owner_observation(node_name, job_id)
-                    owner = None if observed is None else observed['owner']
-                    if (owner is None or owner['session_id'] != execution_context[0]
-                            or owner['component'] != execution_context[1].get(node_name)
-                            or set(owner['component']) != component
-                            or observed['status'] != RUNNING
-                            or observed['active_execution_id'] != owner['execution_id']
-                            or observed['session']['status'] != 'running'):
-                        continue
-                    attempt = (node_name, job_id, owner['generation'], owner['execution_id'])
-                    candidate = candidates.get((node_name, job_id))
-                    if candidate is not None and candidate != attempt:
-                        continue
-                    reservation = self.storage.get_component_reservation(owner['component'])
-                    if reservation is None or reservation['session_id'] != owner['session_id']:
-                        continue
-                    attempts[(node_name, job_id)] = attempt
-                    owners[(node_name, job_id)] = TerminalOwnerExpectation(
-                        owner['session_id'], owner['component'], owner['job_instance_id'],
-                    )
-                    if operation is not None:
-                        operation.record_cleanup_attempt(*attempt)
-                except BaseException:
-                    # Leave damaged or unreadable ownership for the session's
-                    # active-claim exit check instead of guessing an execution.
-                    pass
-
-        if running_by_node:
-            try:
-                self.storage.reconcile_terminal_outputs(
-                    component, execution_attempts=attempts, execution_owners=owners,
-                )
-            except BaseException:
-                # Preserve the original component error. Remaining RUNNING rows
-                # are handled below once descriptor/database pressure subsides.
-                pass
-
-        for node_name in sorted(component):
-            try:
-                running = self.storage.list_jobs(node_name, status=RUNNING)
-            except BaseException:
-                continue
-            for job in running:
-                try:
-                    job_id = int(job['job_id'])
-                    attempt = attempts.get((node_name, job_id))
-                    if attempt is None:
-                        continue
-                    self.storage.finalize_job_execution(
-                        node_name, job_id, attempt[2], attempt[3], FAILED,
-                        expected_owner=owners[(node_name, job_id)],
-                        error=recovery_error, recovered_after_component_abort=True,
-                    )
-                except BaseException:
-                    # Failure cleanup is best effort and must never replace the
-                    # original error being raised to the caller.
-                    pass
-        if publish_failure:
-            self.mark_component_failed(component)
 
     def _waiting_startable_nodes(
         self,
@@ -230,11 +137,11 @@ class ComponentSchedulerMixin:
                 raise ValueError('Execution requires one complete current component')
         with programmatic_execution(
             self, command='run_component', start_node=sorted(members)[0], nodes=sorted(members),
-            include_driver=True,
-        ) as (context, driver):
+            include_driver=True, include_parent=True,
+        ) as (context, driver, parent):
             return self._run_component(
                 members, ignore_readiness, wait_deadlock_resolver, api_pump_allocations,
-                execution_context=context, _session_driver=driver,
+                execution_context=context, _session_driver=driver, _task_parent=parent,
             )
 
     def _run_component(
@@ -247,6 +154,7 @@ class ComponentSchedulerMixin:
         execution_context,
         _session_driver=None,
         _operation=None,
+        _task_parent=None,
     ) -> list[str]:
         """Pump one Hoeflein component until it is quiescent.
 
@@ -264,11 +172,12 @@ class ComponentSchedulerMixin:
         if not ignore_readiness and not self.component_ready(component_set):
             raise InvalidGraphError(f"Hoeflein component {sorted(component_set)} is not ready yet")
 
-        if _session_driver is not None:
+        if _operation is None:
             operation = ComponentExecutionOperation(
                 self, component_set, execution_context, wait_deadlock_resolver, api_pump_allocations,
+                task_parent=_task_parent,
             )
-            return _session_driver.drive(operation)
+            return _session_driver.drive(operation) if _session_driver is not None else operation.run()
 
         ran: list[str] = [] if _operation is None else _operation.ran
         component_nodes = list(self.component_key(component_set))

@@ -31,6 +31,13 @@ The [success publication within a live session](component-success-publication.md
 is accepted privately. It preserves session scope while publishing one completed
 component. Shared caller activation and parent scheduling remain unfinished.
 
+The [native public component progress](native-public-component-progress.md)
+records ordinary activation and nested-repair increments. The same-component
+ordinary-remainder correction and its regression cases remain included. Its
+final source passed all 609 checks across 15 full surrounding modules, plus
+57 focused checks. CLI integration and wider lifecycle requirements remain
+unfinished; this bounded local change completes no whole requirement row.
+
 The [interval calculation](stage-s1a.md),
 [command retirement](stage-retirement.md), [shared topology](stage-topology.md),
 [retained scheduler repair](stage-scheduler-completion.md),

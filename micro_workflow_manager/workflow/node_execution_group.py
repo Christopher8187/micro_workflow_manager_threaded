@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from threading import Lock
 
@@ -9,6 +9,7 @@ from ..errors import JobFailedError
 from ..models import Job, QUEUED
 from ..runners.process import ProcessPoolRunner
 from ..storage.execution_claims import RestartClaimChanged
+from ..storage.component_states import ComponentExecutionIncomplete
 
 
 @dataclass
@@ -29,7 +30,7 @@ class NodeExecutionGroup:
     and continues the original source without losing prefetched items.
     """
 
-    def __init__(self, storage, node_name, execution_context, source):
+    def __init__(self, storage, node_name, execution_context, source, *, component_completion=None):
         self.storage = storage
         self.node_name = node_name
         self.session_id = execution_context[0]
@@ -39,7 +40,10 @@ class NodeExecutionGroup:
         self.slots: dict[int, _Slot] = {}
         self.pending = deque()
         self.source_paused = False
+        self.stop_admission = False
+        self.replacement_epoch = False
         self.lock = Lock()
+        self.component_completion = component_completion
 
     @staticmethod
     def _job_id(item):
@@ -101,16 +105,17 @@ class NodeExecutionGroup:
             return False
         for slot, item, expected in replacements:
             slot.item, slot.error, slot.expected_restart = item, None, expected
-        self.source_paused = any(slot.error is not None for slot in self.slots.values())
-        if self.source_paused:
-            # An unrepaired failure still stops ordinary admission. Explicitly
-            # accepted replacements must nevertheless run before we report it.
-            self.pending.extend(item for _, item, _ in replacements)
-        else:
-            self.pending.extend(slot.item for slot in self.slots.values() if not slot.complete)
+        # Join every accepted successor before admitting ordinary work. Keep
+        # prefetched ordinary items in their slots for the following epoch.
+        self.replacement_epoch = self.source_paused = True
+        self.pending.clear()
+        self.pending.extend(item for _, item, _ in replacements)
         return True
 
     def _record_outcome(self, item, *, value=None, error=None):
+        if (self.component_completion is not None and isinstance(error, ComponentExecutionIncomplete)
+                and getattr(error, 'execution_attempt', None) is None):
+            return
         with self.lock:
             slot = self.slots[self._job_id(item)]
             if error is not None:
@@ -120,6 +125,11 @@ class NodeExecutionGroup:
                     slot.failed_attempt = attempt
             else:
                 slot.value, slot.complete = value, True
+
+    def failed_component_outcomes(self):
+        if self.component_completion is None:
+            return ()
+        return (replace(self.component_completion, lifecycle='failed', stability=None, instability_origin=None),)
 
     def failed_attempts(self):
         failed = [slot for slot in self.slots.values()
@@ -157,11 +167,14 @@ class NodeExecutionGroup:
             resumed.append((slot, item, expected))
         for slot, item, expected in resumed:
             slot.item, slot.error, slot.expected_restart = item, None, expected
-        self.source_paused = stop_admission or any(slot.error is not None for slot in self.slots.values())
+        self.stop_admission = stop_admission
+        self.replacement_epoch = bool(resumed)
+        self.source_paused = (stop_admission or self.replacement_epoch
+                              or any(slot.error is not None for slot in self.slots.values()))
         self.pending.clear()
-        if self.source_paused:
+        if resumed:
             self.pending.extend(item for _, item, _ in resumed)
-        else:
+        elif not self.source_paused:
             self.pending.extend(slot.item for slot in self.slots.values() if not slot.complete)
 
     def run(self, runner, run_one):
@@ -178,6 +191,7 @@ class NodeExecutionGroup:
             return value
 
         while True:
+            paused = False
             try:
                 if isinstance(runner, ProcessPoolRunner):
                     runner.run_job_source(
@@ -186,6 +200,10 @@ class NodeExecutionGroup:
                     )
                 else:
                     runner.run_job_source(self.node_name, self, execute)
+            except ComponentExecutionIncomplete as error:
+                if self.component_completion is None or getattr(error, 'execution_attempt', None) is not None:
+                    raise
+                paused = True
             except JobFailedError:
                 if self._prepare_replacements():
                     continue
@@ -195,4 +213,9 @@ class NodeExecutionGroup:
                 if self._prepare_replacements():
                     continue
                 raise errors[0]
+            if self.replacement_epoch and not paused and not self.stop_admission:
+                self.resume({})
+                continue
+            # A no-attempt pause hands the pending component back to the
+            # full-call boundary after preserving any actual attempt failure.
             return [slot.value for slot in self.slots.values() if slot.complete]

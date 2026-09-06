@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .execution_claims import JobExecutionClaimStorageMixin
+from .execution_ownership import JobExecutionOwnerStorageMixin
 from .execution_restart import JobRestartStorageMixin
 from .execution_terminal import JobTerminalStorageMixin
 from .runtime_observations import JobRuntimeObservationStorageMixin
@@ -11,6 +12,7 @@ class JobExecutionStorageMixin(
     JobTerminalStorageMixin,
     JobRuntimeObservationStorageMixin,
     JobExecutionClaimStorageMixin,
+    JobExecutionOwnerStorageMixin,
 ):
     """Facade for execution leases, terminal publication, and restarts."""
 

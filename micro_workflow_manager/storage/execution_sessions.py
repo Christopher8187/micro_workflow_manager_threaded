@@ -182,7 +182,6 @@ class ExecutionSessionStorageMixin:
             ).fetchone()
             if session is None or session['status'] != 'running':
                 raise RuntimeError(f'Execution session {session_id} is missing or already terminal')
-            self._validate_component_terminal_outcomes(connection, session_id, component_outcomes)
             owned_nodes = {
                 node for row in connection.execute(
                     'SELECT selected.component_key FROM session_components AS selected '
@@ -283,21 +282,98 @@ class ExecutionSessionStorageMixin:
                         'generation': observed['generation'], 'owner': owner,
                         'restart_requested_at': marker,
                     }
+            nested_components = {}
+            known_attempts = {(node, job_id) for node, job_id, _, _ in attempts
+                              if not selected_jobs or (node, job_id) in selected_jobs}
+            from .component_states import ComponentTerminalOutcome
+
+            for pending_row in connection.execute(
+                'SELECT pending.component_key, shape.shape_json, pending.alignment_generation, '
+                'pending.completion_ready, pending.stability, pending.instability_origin '
+                'FROM pending_component_executions AS pending JOIN graph_shapes AS shape USING(shape_id) '
+                'JOIN component_reservations AS reservation USING(component_key) '
+                'WHERE pending.session_id=? AND reservation.session_id=?', (session_id, session_id),
+            ).fetchall():
+                component = decode_component_key(pending_row['component_key'])
+                for node in component:
+                    for job in connection.execute(
+                        "SELECT job_id, restart_requested_at FROM jobs WHERE node_name=? AND status='queued' "
+                        'AND active_execution_id IS NULL AND restart_requested_at IS NOT NULL', (node,),
+                    ).fetchall():
+                        key = node, job['job_id']
+                        if key in known_attempts:
+                            continue
+                        expected = self._read_owned_restart(connection, *key, session_id, component)
+                        if expected is None:
+                            continue
+                        previous = rejected.get(key) or exhausted.get(key)
+                        if previous is not None and (
+                            expected['job_instance_id'] != previous['job_instance_id']
+                            or expected['owner'] != previous['owner'] or expected['generation'] <= previous['generation']
+                        ):
+                            continue
+                        proposal = ComponentTerminalOutcome(
+                            component, pending_row['shape_json'], pending_row['alignment_generation'],
+                            'done', pending_row['stability'], pending_row['instability_origin'],
+                        )
+                        self._validate_component_terminal_outcomes(connection, session_id, (proposal,))
+                        replacements[key] = expected
+                        nested_components[key] = proposal
             if replacements:
-                return {'restarts': replacements, 'released': 0}
-            if component_outcomes:
-                supplied_keys = {encode_component_key(result.component) for result in component_outcomes}
-                running_keys = {row[0] for row in connection.execute(
-                    'SELECT state.component_key FROM component_states AS state '
-                    'JOIN component_reservations AS reservation USING(component_key) '
-                    "WHERE reservation.session_id=? AND state.lifecycle='running'", (session_id,),
-                )}
-                if running_keys - supplied_keys:
-                    raise RuntimeError('Terminal settlement omitted an owned running component')
+                decision = {'restarts': replacements, 'released': 0}
+                if nested_components:
+                    decision['component_restarts'] = nested_components
+                return decision
+
+            pending = connection.execute(
+                'SELECT pending.component_key, shape.shape_json, pending.alignment_generation, '
+                'pending.completion_ready, pending.stability, pending.instability_origin '
+                'FROM pending_component_executions AS pending '
+                'JOIN graph_shapes AS shape USING(shape_id) '
+                'JOIN component_reservations AS reservation USING(component_key) '
+                'WHERE pending.session_id=? AND reservation.session_id=?', (session_id, session_id),
+            ).fetchall()
+            settled = {result.component: result for result in component_outcomes}
+            for row in pending:
+                self._validate_pending_component_row(connection, row)
+                component = decode_component_key(row['component_key'])
+                ready = row['completion_ready'] == 1
+                if component not in settled and outcome != 'failed' and not ready:
+                    raise RuntimeError('Session completion omitted a running component')
+                successful = ready and all(
+                    job['status'] in ('done', 'skipped') and job['active_execution_id'] is None
+                    for node in component for job in connection.execute(
+                        'SELECT status, active_execution_id FROM jobs WHERE node_name=?', (node,),
+                    )
+                )
+                if ready and outcome != 'failed' and not successful:
+                    raise RuntimeError('Deferred component completion has unfinished jobs')
+                recorded = ComponentTerminalOutcome(
+                    component, row['shape_json'], row['alignment_generation'],
+                    'done' if successful else 'failed',
+                    row['stability'] if successful else None,
+                    row['instability_origin'] if successful else None,
+                )
+                if component in settled and (
+                    settled[component].expected_shape != recorded.expected_shape
+                    or settled[component].expected_alignment_generation != recorded.expected_alignment_generation
+                ):
+                    raise RuntimeError('Component outcome differs from its recorded start')
+                settled.setdefault(component, recorded)
+            settled_outcomes = tuple(settled.values())
+            self._validate_component_terminal_outcomes(connection, session_id, settled_outcomes)
+            supplied_keys = {encode_component_key(result.component) for result in settled_outcomes}
+            running_keys = {row[0] for row in connection.execute(
+                'SELECT state.component_key FROM component_states AS state '
+                'JOIN component_reservations AS reservation USING(component_key) '
+                "WHERE reservation.session_id=? AND state.lifecycle='running'", (session_id,),
+            )}
+            if running_keys - supplied_keys:
+                raise RuntimeError('Terminal settlement omitted an owned running component')
             reserved_count = connection.execute(
                 'SELECT COUNT(*) FROM component_reservations WHERE session_id=?', (session_id,),
             ).fetchone()[0]
-            self._publish_component_terminal_outcomes(connection, component_outcomes)
+            self._publish_component_terminal_outcomes(connection, session_id, settled_outcomes)
             if failed_nodes:
                 if not set(failed_nodes) <= owned_nodes:
                     raise RuntimeError('Failed nodes are outside the session reserved scope')

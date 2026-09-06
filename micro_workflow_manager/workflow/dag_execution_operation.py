@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ..errors import JobFailedError
+from ..storage.component_states import ComponentExecutionIncomplete
 from ..storage.execution_claims import RestartClaimChanged
 from .component_execution_operation import ComponentExecutionOperation
 
@@ -8,7 +9,9 @@ from .component_execution_operation import ComponentExecutionOperation
 class DagExecutionOperation:
     """Keep selected units and their results while a failed unit is resumed."""
 
-    def __init__(self, workflow, units, execution_context, ready_check, options):
+    continues_after_nested_restarts = True
+
+    def __init__(self, workflow, units, execution_context, ready_check, options, *, task_parent=None):
         self.workflow = workflow
         self.units = tuple(units)
         self.execution_context = execution_context
@@ -22,12 +25,14 @@ class DagExecutionOperation:
         self.stop_admission = False
         self.admission_stopped = False
         self.futures = {}
+        self.task_parent = task_parent
 
     def component_operation(self, unit, api_pumps):
         if unit not in self.operations:
             self.operations[unit] = ComponentExecutionOperation(
                 self.workflow, unit, self.execution_context,
                 self.options['wait_deadlock_resolver'], api_pumps,
+                task_parent=self.task_parent,
             )
         return self.operations[unit]
 
@@ -50,8 +55,12 @@ class DagExecutionOperation:
         else:
             error = operation.primary_error(error)
             self.errors[unit] = error
-            if not isinstance(error, (JobFailedError, RestartClaimChanged)) and self.unrelated_error is None:
+            if not isinstance(error, (JobFailedError, RestartClaimChanged, ComponentExecutionIncomplete)) and self.unrelated_error is None:
                 self.unrelated_error = error
+
+    def retain_component_restarts(self, completion, replacements):
+        operation = self.operations.get(completion.component)
+        return operation is not None and operation.retain_component_restarts(completion, replacements)
 
     def failed_attempts(self):
         return tuple(attempt for operation in self.operations.values()
@@ -68,11 +77,15 @@ class DagExecutionOperation:
     def failed_nodes(self):
         return tuple(node for unit in self.units if unit in self.errors for node in unit)
 
+    def failed_component_outcomes(self):
+        return tuple(outcome for operation in self.operations.values()
+                     for outcome in operation.failed_component_outcomes())
+
     def primary_error(self, error):
         return self.unrelated_error or next(iter(self.errors.values()), error)
 
     def retain_exit_error(self, exception_type, error, traceback):
-        if (error is not None and not isinstance(error, (JobFailedError, RestartClaimChanged))
+        if (error is not None and not isinstance(error, (JobFailedError, RestartClaimChanged, ComponentExecutionIncomplete))
                 and self.unrelated_error is None):
             self.unrelated_error = error
         return False
@@ -93,6 +106,8 @@ class DagExecutionOperation:
                     self.errors.pop(unit, None)
                 for key in selected:
                     remaining.pop(key)
+            elif not operation.completed:
+                operation.resume({}, stop_admission=self.stop_admission)
         if remaining:
             raise RuntimeError('Session continuation lies outside the selected DAG operations')
 

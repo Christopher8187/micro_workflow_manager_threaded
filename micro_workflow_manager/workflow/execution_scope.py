@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
+from ..storage.component_states import ComponentTaskParent
 from .execution_session import execution_session, validate_selected_jobs
 
 
 @contextmanager
 def programmatic_execution(
-    workflow, *, command, start_node, nodes, selected_jobs=None, include_driver=False,
+    workflow, *, command, start_node, nodes, selected_jobs=None, include_driver=False, include_parent=False,
 ):
     """Admit an independent call, or reuse the exact owner of a current task."""
     execution_id = getattr(workflow._job_context, 'execution_id', None)
@@ -33,11 +34,15 @@ def programmatic_execution(
                 raise RuntimeError('The requested component is no longer reserved by this execution session')
         validate_selected_jobs(workflow, start_node, selected_jobs)
         context = workflow.execution_session_context
-        yield (context, None) if include_driver else context
+        parent = ComponentTaskParent(
+            current_node, workflow._job_context.job_id, workflow._job_context.generation,
+            execution_id, session_id, component,
+        )
+        yield (context, None, parent) if include_parent else (context, None) if include_driver else context
         return
     with execution_session(
         workflow, command=command, start_node=start_node,
         nodes=nodes, selected_jobs=selected_jobs,
     ) as driver:
         context = workflow.execution_session_context
-        yield (context, driver) if include_driver else context
+        yield (context, driver, None) if include_parent else (context, driver) if include_driver else context

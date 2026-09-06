@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import networkx as nx
 
+from ..component_readiness import calculate_component_readiness
 from ..errors import InvalidGraphError
+from ..storage.component_states import ComponentTerminalOutcome
 from ..topology import ComponentTopology
 from ..models import (
     CANCELLED,
@@ -29,6 +31,46 @@ class ComponentStateMixin:
     @property
     def topology(self) -> ComponentTopology:
         return ComponentTopology(self.graph_obj, self.autostart_edges)
+
+    def begin_full_component_execution(self, component, *, execution_context, task_parent=None):
+        component = self.component_key(component)
+        session_id, owned_component = self.execution_claim_context(component[0], context=execution_context)
+        if owned_component != component:
+            raise RuntimeError('Execution requires the complete admitted component')
+        expected_shape = execution_context[2]
+        state = self.storage.get_component_state(component)
+        if state is not None and state['lifecycle'] == 'running' and task_parent is not None:
+            if task_parent.component == component:
+                self.storage.begin_queued_component_execution(
+                    session_id, component, expected_shape=expected_shape,
+                    expected_alignment_generation=state['alignment_generation'], task_parent=task_parent,
+                    successful_lineage=None,
+                )
+                return None
+        with self.lock:
+            if self.topology.graph_shape() != expected_shape:
+                raise RuntimeError('Component execution graph changed after session admission')
+            parents = sorted(self.component_predecessor_components(set(component)))
+        observations = self.storage.read_component_states(parents, expected_shape=expected_shape)
+        if set(observations) != set(parents):
+            raise RuntimeError('Component admission requires every direct parent observation')
+        readiness = calculate_component_readiness(
+            (state['lifecycle'], state['stability'], state['instability_origin'])
+            for state in observations.values()
+        )
+        if readiness is None:
+            raise InvalidGraphError(f'Hoeflein component {list(component)} is not ready yet')
+        self.storage.begin_queued_component_execution(
+            session_id, component, expected_shape=expected_shape,
+            expected_alignment_generation=state['alignment_generation'],
+            expected_parent_states=observations,
+            successful_lineage=(readiness[0], readiness[1]),
+            task_parent=task_parent,
+        )
+        return ComponentTerminalOutcome(
+            component, expected_shape, state['alignment_generation'],
+            'done', readiness[0], readiness[1],
+        )
 
     def set_autostart_edges(self, edges) -> None:
         normalized: set[tuple[str, str]] = set()
@@ -149,7 +191,14 @@ class ComponentStateMixin:
         return self.topology.component_predecessor_components(component)
 
     def component_ready(self, component: set[str]) -> bool:
-        return all(self.node_complete(node) for node in self.component_predecessors(component))
+        with self.lock:
+            expected_shape = self.topology.graph_shape()
+            parents = sorted(self.component_predecessor_components(component))
+        observations = self.storage.read_component_states(parents, expected_shape=expected_shape)
+        return calculate_component_readiness(
+            (state['lifecycle'], state['stability'], state['instability_origin'])
+            for state in observations.values()
+        ) is not None
 
     def component_has_any_jobs(self, component: set[str]) -> bool:
         return any(self.storage.list_jobs(node_name) for node_name in component)

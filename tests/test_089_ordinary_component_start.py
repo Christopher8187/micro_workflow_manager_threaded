@@ -48,7 +48,7 @@ def _rows(storage):
             for table in tables}
 
 
-def test_ordinary_component_start_changes_only_its_queued_lifecycle_and_reopens(owned_component):
+def test_ordinary_component_start_records_its_lifecycle_and_pending_execution_and_reopens(owned_component):
     storage, topology = owned_component
     before = storage.get_component_state(('A', 'B'))
     assert before['lifecycle'] == 'queued'
@@ -57,10 +57,15 @@ def test_ordinary_component_start_changes_only_its_queued_lifecycle_and_reopens(
     component_rows = expected_rows['component_states']
     component = next(row for row in component_rows if json.loads(row['component_key']) == ['A', 'B'])
     component['lifecycle'] = 'running'
+    expected_rows['pending_component_executions'] = [{
+        'session_id': 'ordinary-start', 'component_key': json.dumps(['A', 'B']),
+        'shape_id': 1, 'alignment_generation': 0,
+        'completion_ready': 0, 'stability': 'stable', 'instability_origin': None,
+    }]
 
     assert storage.begin_queued_component_execution(
         'ordinary-start', ('A', 'B'), expected_shape=topology.shape_json,
-        expected_alignment_generation=0,
+        expected_alignment_generation=0, successful_lineage=('stable', None),
     ) is True
 
     assert storage.get_component_state(('A', 'B')) == {**before, 'lifecycle': 'running'}
@@ -72,6 +77,33 @@ def test_ordinary_component_start_changes_only_its_queued_lifecycle_and_reopens(
         assert _rows(reopened) == expected_rows
     finally:
         _close(reopened)
+
+
+def test_component_start_rolls_back_when_its_pending_insert_is_suppressed(owned_component):
+    storage, topology = owned_component
+    storage.submit_db_mutation(lambda connection: connection.execute(
+        'CREATE TRIGGER suppress_pending_start BEFORE INSERT ON pending_component_executions BEGIN '
+        "UPDATE nodes SET status='failed' WHERE node_name='A'; SELECT RAISE(IGNORE); END",
+    ))
+    before = _rows(storage)
+    with pytest.raises(RuntimeError, match='not recorded'):
+        storage.begin_queued_component_execution(
+            'ordinary-start', ('A', 'B'), expected_shape=topology.shape_json,
+            expected_alignment_generation=0, successful_lineage=('stable', None),
+        )
+    assert _rows(storage) == before
+
+
+@pytest.mark.parametrize('origin', ['missing-origin', 'ordinary-start'])
+def test_component_start_requires_a_real_interrupt_for_its_proposed_lineage(owned_component, origin):
+    storage, topology = owned_component
+    before = _rows(storage)
+    with pytest.raises(RuntimeError, match='interrupt origin'):
+        storage.begin_queued_component_execution(
+            'ordinary-start', ('A', 'B'), expected_shape=topology.shape_json,
+            expected_alignment_generation=0, successful_lineage=('unstable', origin),
+        )
+    assert _rows(storage) == before
 
 
 @pytest.mark.parametrize('case', [
@@ -136,7 +168,7 @@ def test_component_start_refuses_ineligible_state_without_partial_changes(owned_
     with pytest.raises(RuntimeError):
         storage.begin_queued_component_execution(
             session_id, ('A', 'B'), expected_shape=expected_shape,
-            expected_alignment_generation=expected_generation,
+            expected_alignment_generation=expected_generation, successful_lineage=('stable', None),
         )
     assert _rows(storage) == before
 
@@ -148,7 +180,7 @@ def test_component_start_requires_an_exact_nonnegative_generation(owned_componen
     with pytest.raises(ValueError, match='generation'):
         storage.begin_queued_component_execution(
             'ordinary-start', ('A', 'B'), expected_shape=topology.shape_json,
-            expected_alignment_generation=generation,
+            expected_alignment_generation=generation, successful_lineage=('stable', None),
         )
     assert _rows(storage) == before
 
@@ -170,7 +202,7 @@ def test_component_start_rolls_back_when_its_write_fails(owned_component, failur
     with pytest.raises(error, match=message):
         storage.begin_queued_component_execution(
             'ordinary-start', ('A', 'B'), expected_shape=topology.shape_json,
-            expected_alignment_generation=0,
+            expected_alignment_generation=0, successful_lineage=('stable', None),
         )
     assert _rows(storage) == before
 
@@ -185,7 +217,7 @@ def test_simultaneous_component_starts_commit_only_one_transition(owned_componen
         try:
             candidate.begin_queued_component_execution(
                 'ordinary-start', ('A', 'B'), expected_shape=topology.shape_json,
-                expected_alignment_generation=0,
+                expected_alignment_generation=0, successful_lineage=('stable', None),
             )
         except RuntimeError as error:
             assert 'aligned queued component' in str(error)
@@ -227,7 +259,7 @@ def test_component_start_rechecks_state_when_its_mutation_is_submitted(owned_com
             patch.setattr(storage, 'submit_db_mutation', paused_submit)
             future = pool.submit(
                 storage.begin_queued_component_execution, 'ordinary-start', ('A', 'B'),
-                expected_shape=topology.shape_json, expected_alignment_generation=0,
+                expected_shape=topology.shape_json, expected_alignment_generation=0, successful_lineage=('stable', None),
             )
             try:
                 assert awaiting_write.wait(5), 'Component start did not reach its write boundary'
