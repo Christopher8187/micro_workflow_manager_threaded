@@ -11,9 +11,10 @@ from typing import Any, Iterable
 from uuid import uuid4
 
 from micro_workflow_manager.models import Job, QUEUED
+from .job_producers import JobProducerStorageMixin
 
 
-class JobIdentityStorageMixin:
+class JobIdentityStorageMixin(JobProducerStorageMixin):
     """Idempotency, job IDs, and default-job declarations."""
 
     def read_job_instance_id(self, node_name: str, job_id: int) -> str | None:

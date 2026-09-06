@@ -53,7 +53,7 @@ class ComponentTransitionStorageMixin:
                 raise RuntimeError('Full preparation requires a running selected component owner: ' + key)
             if reservation is None or reservation['session_id'] != session_id:
                 raise RuntimeError('Full preparation requires the exact component reservation: ' + key)
-            if connection.execute('SELECT 1 FROM session_jobs WHERE session_id=? LIMIT 1', (session_id,)).fetchone():
+            if self._read_session_job_roots(connection, session_id):
                 raise RuntimeError('Selected-job preparation cannot realign a full component')
         if connection.execute(
             'SELECT 1 FROM component_holds WHERE component_key=? LIMIT 1', (key,),

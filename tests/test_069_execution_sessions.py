@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.models import Job
 from micro_workflow_manager.processes import process_identity
 
 
@@ -29,22 +30,23 @@ def _session(storage, session_id="main-1", *, kind="main", **overrides):
     return storage.create_execution_session(session_id, **fields)
 
 
-def test_ordinary_storage_keeps_existing_schema_and_payloads(tmp_path):
-    storage = FileStorage(tmp_path)
-    storage.write_run_state({"run_id": "legacy-main", "status": "done"})
-    run_bytes = (tmp_path / ".mwf" / "run.json").read_bytes()
+def test_ordinary_reopen_keeps_native_schema_and_payloads(tmp_path):
+    storage = FileStorage._create_new_project_state(tmp_path)
+    storage.create_job(Job(node_name='A', job_id=1, params={'original': True}))
+    input_path = storage.input_file('A', 1)
+    input_bytes = input_path.read_bytes()
+    instance = storage.read_job_instance_id('A', 1)
     storage.close_database_connections()
 
     reopened = FileStorage(tmp_path)
-    assert reopened.get_run_state()["run_id"] == "legacy-main"
-    assert (tmp_path / ".mwf" / "run.json").read_bytes() == run_bytes
-    with sqlite3.connect(tmp_path / ".mwf" / "state.sqlite3") as connection:
+    assert reopened.load_job('A', 1).params == {'original': True}
+    assert input_path.read_bytes() == input_bytes
+    assert reopened.read_job_instance_id('A', 1) == instance
+    with sqlite3.connect(tmp_path / '.mwf' / 'state.sqlite3') as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone() == ("4",)
-        assert connection.execute(
-            "SELECT name FROM sqlite_master WHERE name='execution_sessions'"
-        ).fetchone() is None
+        ).fetchone() == ('5',)
+        assert connection.execute('SELECT COUNT(*) FROM execution_sessions').fetchone() == (0,)
     reopened.close_database_connections()
 
 
@@ -83,6 +85,8 @@ def test_terminal_session_keeps_exact_outcome_when_old_heartbeat_or_finish_arriv
 
 def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
+    for node, job_id in [("B", 9), ("A", 3)]:
+        storage.create_job(Job(node_name=node, job_id=job_id, params={}))
     records = {}
     for session_id, kind, parent in (
         ("main-1", "main", None),
@@ -120,6 +124,7 @@ def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_
             "start_component": ("A", "B"),
             "selected_components": [("A", "B"), ("C",)],
             "selected_jobs": [("B", 9), ("A", 3)],
+            "selection_kind": "jobs",
             "status": "running",
             "started_at": "2026-09-05T12:00:00+00:00",
             "heartbeat_at": "2026-09-05T12:00:00+00:00",
@@ -140,6 +145,7 @@ def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_
 
 def test_separate_processes_cannot_create_two_running_main_sessions(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
+    storage.create_job(Job(node_name="A", job_id=1, params={}))
     script = """
 import sqlite3, sys, time
 from pathlib import Path
@@ -295,6 +301,7 @@ def test_session_creation_rejects_invalid_identity_or_scope_without_partial_rows
 
 def test_session_mutations_share_the_writer_and_rollback_partial_children(tmp_path, monkeypatch):
     storage = FileStorage._create_new_project_state(tmp_path)
+    storage.create_job(Job(node_name="A", job_id=1, params={}))
     original = storage.submit_db_mutation
     mutations = []
 
@@ -354,25 +361,27 @@ def test_failed_schema_creation_does_not_publish_a_partial_version(tmp_path, mon
     storage.close_database_connections()
 
 
-def test_session_operations_on_ordinary_storage_do_not_upgrade_it(tmp_path):
+def test_session_operations_refuse_changed_schema_without_mutation(tmp_path):
+    from tests.test_090_component_session_settlement import _rows, _close
+
     storage = FileStorage(tmp_path)
-    for operation in (
-        lambda: _session(storage),
-        lambda: storage.get_execution_session("main-1"),
-        storage.list_execution_sessions,
-        lambda: storage.heartbeat_execution_session("main-1", "2026-09-05T12:01:00+00:00"),
-        lambda: storage.finish_execution_session("main-1", outcome="done", finished_at="2026-09-05T12:02:00+00:00"),
-    ):
-        with pytest.raises(RuntimeError, match="session-capable"):
-            operation()
-    with sqlite3.connect(tmp_path / ".mwf" / "state.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone() == ("4",)
-        assert connection.execute(
-            "SELECT name FROM sqlite_master WHERE name='execution_sessions'"
-        ).fetchone() is None
-    storage.close_database_connections()
+    try:
+        storage.submit_db_mutation(lambda connection: connection.execute(
+            "UPDATE metadata SET value='4' WHERE key='database_schema_version'",
+        ))
+        before = _rows(storage)
+        for operation in (
+            lambda: _session(storage),
+            lambda: storage.get_execution_session('main-1'),
+            storage.list_execution_sessions,
+            lambda: storage.heartbeat_execution_session('main-1', '2026-09-05T12:01:00+00:00'),
+            lambda: storage.finish_execution_session('main-1', outcome='done', finished_at='2026-09-05T12:02:00+00:00'),
+        ):
+            with pytest.raises(RuntimeError, match='session-capable'):
+                operation()
+            assert _rows(storage) == before
+    finally:
+        _close(storage)
 
 
 def test_fresh_session_storage_keeps_user_source_and_output_files(tmp_path):
@@ -386,7 +395,7 @@ def test_fresh_session_storage_keeps_user_source_and_output_files(tmp_path):
     _session(storage)
     assert source.read_bytes() == b"EDGES = []\n"
     assert output.read_bytes() == b"user-owned result"
-    assert not (tmp_path / ".mwf" / "project.json").exists()
+    assert (tmp_path / ".mwf" / "project.json").is_file()
     assert not (tmp_path / ".mwf" / "run.json").exists()
     storage.close_database_connections()
 
@@ -410,8 +419,8 @@ def test_invalid_session_updates_preserve_the_running_record(tmp_path, update):
     storage.close_database_connections()
 
 
-@pytest.mark.parametrize("damage", ["main-uniqueness", "child-shape", "legacy-marker", "schema-marker", "extra-constraint"])
-def test_incomplete_session_schema_refuses_reopen_before_legacy_import(tmp_path, damage):
+@pytest.mark.parametrize("damage", ["main-uniqueness", "child-shape", "shape-immutability", "schema-marker", "extra-constraint"])
+def test_incomplete_session_schema_refuses_reopen_without_importing_unrelated_files(tmp_path, damage):
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.close_database_connections()
     with sqlite3.connect(tmp_path / ".mwf" / "state.sqlite3") as connection:
@@ -420,8 +429,8 @@ def test_incomplete_session_schema_refuses_reopen_before_legacy_import(tmp_path,
         elif damage == "child-shape":
             connection.execute("DROP TABLE session_jobs")
             connection.execute("CREATE TABLE session_jobs(session_id TEXT, job_id INTEGER)")
-        elif damage == "legacy-marker":
-            connection.execute("DELETE FROM metadata WHERE key='legacy_file_metadata_imported'")
+        elif damage == "shape-immutability":
+            connection.execute("DROP TRIGGER prevent_graph_shape_update")
         elif damage == "schema-marker":
             connection.execute("DELETE FROM metadata WHERE key='database_schema_version'")
         else:
@@ -510,119 +519,99 @@ def test_session_parent_must_be_a_distinct_actual_parent_of_an_interrupt(tmp_pat
     storage.close_database_connections()
 
 
-@pytest.mark.parametrize("other_process", [False, True])
-def test_fresh_creator_preserves_an_ordinary_store_that_initialized_first(tmp_path, monkeypatch, other_process):
-    original = FileStorage._initialize_storage
+@pytest.mark.parametrize('other_process', [False, True])
+def test_fresh_creator_preserves_a_native_store_that_initialized_first(tmp_path, monkeypatch, other_process):
+    original = FileStorage._refuse_existing_runtime
+    competed = False
 
-    def initialize(storage, root, **kwargs):
-        if kwargs.get("initial_schema_version") == 5:
-            if other_process:
-                result = subprocess.run([
-                    sys.executable, "-c",
-                    "import sys; from micro_workflow_manager.storage import FileStorage; "
-                    "s=FileStorage(sys.argv[1]); s.write_run_state({'run_id':'competing','status':'done'}); "
-                    "s.close_database_connections()", str(root),
-                ], capture_output=True, text=True, timeout=20)
-                assert result.returncode == 0, result.stderr
-            else:
-                ordinary = FileStorage(root)
-                ordinary.write_run_state({"run_id": "competing", "status": "done"})
-                ordinary.close_database_connections()
-        return original(storage, root, **kwargs)
+    def check(root):
+        nonlocal competed
+        original(root)
+        if competed:
+            return
+        competed = True
+        if other_process:
+            result = subprocess.run([
+                sys.executable, '-c',
+                'import sys; from micro_workflow_manager.storage import FileStorage; '
+                'from micro_workflow_manager.models import Job; '
+                's=FileStorage(sys.argv[1]); s.create_job(Job(node_name="A", job_id=1, params={"competing":True})); '
+                's.close_database_connections()', str(root),
+            ], capture_output=True, text=True, timeout=20)
+            assert result.returncode == 0, result.stderr
+        else:
+            ordinary = FileStorage(root)
+            ordinary.create_job(Job(node_name='A', job_id=1, params={'competing': True}))
+            ordinary.close_database_connections()
 
-    monkeypatch.setattr(FileStorage, "_initialize_storage", initialize)
-    with pytest.raises(RuntimeError, match="Fresh session storage"):
-        FileStorage._create_new_project_state(tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(FileStorage, '_refuse_existing_runtime', staticmethod(check))
+        with pytest.raises(FileExistsError):
+            FileStorage._create_new_project_state(tmp_path)
     storage = FileStorage(tmp_path)
-    assert storage.get_run_state()["run_id"] == "competing"
-    with sqlite3.connect(tmp_path / ".mwf" / "state.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone() == ("4",)
-        assert connection.execute(
-            "SELECT name FROM sqlite_master WHERE name='execution_sessions'"
-        ).fetchone() is None
-    storage.close_database_connections()
+    try:
+        assert storage.load_job('A', 1).params == {'competing': True}
+        assert storage.list_execution_sessions() == []
+        assert storage.database_integrity_check() == 'ok'
+        assert storage.db_connection().execute(
+            "SELECT value FROM metadata WHERE key='database_schema_version'",
+        ).fetchone()[0] == '5'
+    finally:
+        storage.close_database_connections()
 
 
-def test_concurrent_ordinary_open_cannot_publish_a_stale_schema_version(tmp_path):
+def test_concurrent_open_refuses_unpublished_native_configuration_without_changing_state(tmp_path):
     fresh_script = """
 import sys, time
 from pathlib import Path
-from types import SimpleNamespace
 from micro_workflow_manager.storage import FileStorage
 root = Path(sys.argv[1])
-original = FileStorage._new_db_connection
-observed = False
-class Connection:
-    def __init__(self, connection): self.connection = connection
-    def execute(self, sql, *args):
-        global observed
-        cursor = self.connection.execute(sql, *args)
-        if not observed and sql == "SELECT name FROM sqlite_master WHERE type='table'":
-            observed = True
-            rows = cursor.fetchall()
-            print('fresh-read', flush=True)
-            deadline = time.monotonic() + 20
-            while not (root / 'release').exists():
-                if time.monotonic() > deadline: raise RuntimeError('release missing')
-                time.sleep(0.001)
-            return SimpleNamespace(fetchall=lambda: rows)
-        return cursor
-    def __getattr__(self, name): return getattr(self.connection, name)
-FileStorage._new_db_connection = lambda self: Connection(original(self))
+original = FileStorage._init_job_execution_state
+def pause(storage):
+    original(storage)
+    print('fresh-ready', flush=True)
+    deadline = time.monotonic() + 20
+    while not (root / 'release').exists():
+        if time.monotonic() > deadline: raise RuntimeError('release missing')
+        time.sleep(0.001)
+FileStorage._init_job_execution_state = pause
 storage = FileStorage._create_new_project_state(root)
 storage.close_database_connections()
 """
     ordinary_script = """
-import sys, time
-from pathlib import Path
+import sys
 from micro_workflow_manager.storage import FileStorage
-original = FileStorage._new_db_connection
-def before_statement(sql):
-    if sql.strip().upper().startswith('BEGIN IMMEDIATE'):
-        print('ordinary-write', flush=True)
-        deadline = time.monotonic() + 20
-        while not (Path(sys.argv[1]) / 'ordinary-release').exists():
-            if time.monotonic() > deadline: raise RuntimeError('ordinary release missing')
-            time.sleep(0.001)
-def connection(self):
-    result = original(self)
-    result.set_trace_callback(before_statement)
-    return result
-FileStorage._new_db_connection = connection
-storage = FileStorage(sys.argv[1])
-storage.close_database_connections()
+try:
+    FileStorage(sys.argv[1])
+except RuntimeError:
+    print('refused', flush=True)
+else:
+    raise AssertionError('Unpublished native project was accepted')
 """
-    fresh = subprocess.Popen([sys.executable, "-c", fresh_script, str(tmp_path)],
+    fresh = subprocess.Popen([sys.executable, '-c', fresh_script, str(tmp_path)],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    ordinary = None
     try:
-        assert fresh.stdout.readline().strip() == "fresh-read"
-        ordinary = subprocess.Popen([sys.executable, "-c", ordinary_script, str(tmp_path)],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        assert ordinary.stdout.readline().strip() == "ordinary-write"
-        (tmp_path / "release").touch()
+        assert fresh.stdout.readline().strip() == 'fresh-ready'
+        before = {p.name: p.read_bytes() for p in (tmp_path / '.mwf').iterdir() if p.is_file()}
+        ordinary = subprocess.run([sys.executable, '-c', ordinary_script, str(tmp_path)],
+                                  capture_output=True, text=True, timeout=20)
+        assert ordinary.returncode == 0 and ordinary.stdout.strip() == 'refused', ordinary.stderr
+        assert {p.name: p.read_bytes() for p in (tmp_path / '.mwf').iterdir() if p.is_file()} == before
+        (tmp_path / 'release').touch()
         stdout, stderr = fresh.communicate(timeout=25)
         assert fresh.returncode == 0, stderr
-        (tmp_path / "ordinary-release").touch()
-        stdout, stderr = ordinary.communicate(timeout=25)
-        assert ordinary.returncode == 0, stderr
     finally:
-        (tmp_path / "release").touch()
-        (tmp_path / "ordinary-release").touch()
-        for process in (fresh, ordinary):
-            if process is not None and process.poll() is None:
-                process.kill()
-                process.communicate(timeout=5)
+        (tmp_path / 'release').touch()
+        if fresh.poll() is None:
+            fresh.kill()
+        fresh.communicate(timeout=5)
     storage = FileStorage(tmp_path)
-    _session(storage)
-    assert storage.get_execution_session("main-1")["status"] == "running"
-    with sqlite3.connect(tmp_path / ".mwf" / "state.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone() == ("5",)
-    storage.close_database_connections()
+    try:
+        _session(storage)
+        assert storage.get_execution_session('main-1')['status'] == 'running'
+        assert storage.database_integrity_check() == 'ok'
+    finally:
+        storage.close_database_connections()
 
 
 def test_fresh_creation_retries_after_its_schema_commits_but_object_setup_fails(tmp_path, monkeypatch):

@@ -19,6 +19,7 @@ class PreparationJob:
     active_pid: int | None = None
     active_thread_id: int | None = None
     active_started_at: str | None = None
+    created_by_execution_id: str | None = None
 
     @property
     def producer(self):
@@ -42,7 +43,8 @@ class NodeJobPreparation:
 def _read_jobs(connection, node):
     return tuple(PreparationJob(*row) for row in connection.execute(
         'SELECT j.job_id, j.parent_json, j.status, j.generation, j.active_execution_id, '
-        'i.instance_id, i.last_execution_id, j.active_pid, j.active_thread_id, j.active_started_at '
+        'i.instance_id, i.last_execution_id, j.active_pid, j.active_thread_id, j.active_started_at, '
+        'i.created_by_execution_id '
         'FROM jobs AS j LEFT JOIN job_instances AS i USING(node_name, job_id) '
         'WHERE j.node_name=? ORDER BY j.job_id', (node,),
     ))
@@ -73,6 +75,8 @@ def read_job_preparation(storage, nodes, producers, *, reset_retained: bool, pre
                 if (type(job.instance_id) is not str or len(job.instance_id) != 32
                         or any(character not in '0123456789abcdef' for character in job.instance_id)):
                     raise RuntimeError(f'Preparation requires an exact job instance: {node}/{job.job_id}')
+                if job.last_execution_id is not None or job.created_by_execution_id is not None:
+                    storage._read_job_owner_observation(connection, node, job.job_id)
             delete_ids = tuple(job.job_id for job in jobs if job.producer in producers)
             deleted = set(delete_ids)
             retained = [job for job in jobs if job.job_id not in deleted]

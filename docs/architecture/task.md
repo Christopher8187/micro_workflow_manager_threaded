@@ -139,6 +139,19 @@ batch. For cross-node fan-out, precompute child specifications and call `add()`
 with one explicit idempotency key per child. MWF 0.6.1 has no public staging
 helper around several `add()` calls.
 
+MWF 0.6.2 records the executing task as the creator of a new job made through
+`add()`, `add_many()`, `add_job()`, or `add_jobs()`. Logical parent metadata is
+separate. Clearing optional trace preserves this operational ancestry, and
+idempotent reuse keeps the reused job's original creator. A retained handle
+cannot publish after its producer finishes or while another task is active.
+Default job declarations and calls outside a task have no task creator.
+
+The current implementation checks exact selected roots and their newly created
+same-component descendants at claim time. Automatic ordinary child execution
+for selected runs is still under implementation. See the
+[producing identity progress](../plans/0.6.2/execution-producing-identity-progress.md)
+for the verified boundary and remaining work.
+
 For fan-in, sort inputs by stable identity, check the expected set, reject
 duplicates or missing required inputs, and write one assembled result. Thread
 completion order must not decide output order.

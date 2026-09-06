@@ -77,6 +77,7 @@ class JobBatchStorageMixin:
         jobs: list[Job],
         *,
         idempotency_keys: list[str | None] | None = None,
+        producer_execution_id: str | None = None,
     ) -> list[Job]:
         """Commit prepared job payloads with one SQLite transaction."""
         if not jobs:
@@ -113,15 +114,7 @@ class JobBatchStorageMixin:
         event_rows = []
         event_time = datetime.now().isoformat(timespec="milliseconds")
         for job in jobs:
-            stored_parent = dict(job.parent) if job.parent is not None else None
-            if stored_parent is not None and job.producer_component is not None:
-                stored_parent["_mwf_from_component"] = list(job.producer_component)
-                stored_parent["_mwf_job_kind"] = job.job_kind
-            parent_json = (
-                json.dumps(stored_parent, ensure_ascii=False)
-                if stored_parent is not None
-                else None
-            )
+            parent_json = self._job_parent_json(job)
             job_rows.append(
                 (job.node_name, job.job_id, parent_json, job.created_at, QUEUED)
             )
@@ -145,11 +138,15 @@ class JobBatchStorageMixin:
             )
 
         with self.db_transaction() as connection:
+            for job in jobs:
+                self._validate_job_producer(connection, job, producer_execution_id)
             connection.executemany(
                 "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
                 "VALUES(?, ?, ?, ?, ?, '{}')",
                 job_rows,
             )
+            for job in jobs:
+                self._record_job_producer(connection, job.node_name, job.job_id, producer_execution_id)
             self.insert_job_created_events(
                 connection,
                 [
@@ -185,6 +182,7 @@ class JobBatchStorageMixin:
         jobs: list[Job],
         *,
         idempotency_keys: list[str | None] | None = None,
+        producer_execution_id: str | None = None,
     ) -> tuple[list[Job], dict[str, int]]:
         """Atomically resolve idempotency races and commit the remaining jobs."""
         if not jobs:
@@ -208,6 +206,8 @@ class JobBatchStorageMixin:
             requested[key_hash] = key
 
         with self.db_transaction() as connection:
+            for job in jobs:
+                self._validate_job_producer(connection, job, producer_execution_id)
             existing_by_key: dict[str, int] = {}
             if requested:
                 hashes = list(requested)
@@ -253,15 +253,7 @@ class JobBatchStorageMixin:
             event_rows = []
             idempotency_rows = []
             for job, key in zip(commit_jobs, commit_keys):
-                stored_parent = dict(job.parent) if job.parent is not None else None
-                if stored_parent is not None and job.producer_component is not None:
-                    stored_parent["_mwf_from_component"] = list(job.producer_component)
-                    stored_parent["_mwf_job_kind"] = job.job_kind
-                parent_json = (
-                    json.dumps(stored_parent, ensure_ascii=False)
-                    if stored_parent is not None
-                    else None
-                )
+                parent_json = self._job_parent_json(job)
                 job_rows.append((job.node_name, job.job_id, parent_json, job.created_at, QUEUED))
                 event_rows.append((
                     job.node_name,
@@ -290,6 +282,8 @@ class JobBatchStorageMixin:
                     "VALUES(?, ?, ?, ?, ?, '{}')",
                     job_rows,
                 )
+                for job in commit_jobs:
+                    self._record_job_producer(connection, job.node_name, job.job_id, producer_execution_id)
                 self.insert_job_created_events(
                     connection,
                     [

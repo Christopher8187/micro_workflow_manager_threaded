@@ -62,16 +62,21 @@ class ExecutionSessionDriver:
             selected = {}
             for key, expected in decision['restarts'].items():
                 proposal = proposals.get(key)
-                if proposal is None:
-                    raise RuntimeError('Session completion restart has no recorded component start')
-                selected.setdefault(proposal.component, {})[key] = expected
+                component = proposal.component if proposal is not None else expected['owner']['component']
+                selected.setdefault(component, {})[key] = expected
             try:
                 continuations = []
                 for component, replacements in selected.items():
-                    proposal = next(proposals[key] for key in replacements)
-                    continuations.append(ComponentExecutionOperation.from_pending_component(
-                        self.workflow, proposal, self.workflow.execution_session_context, replacements,
-                    ))
+                    proposal = next((proposals[key] for key in replacements if key in proposals), None)
+                    if proposal is None:
+                        continuation = ComponentExecutionOperation.from_selected_restarts(
+                            self.workflow, component, self.workflow.execution_session_context, replacements,
+                        )
+                    else:
+                        continuation = ComponentExecutionOperation.from_pending_component(
+                            self.workflow, proposal, self.workflow.execution_session_context, replacements,
+                        )
+                    continuations.append(continuation)
                 # Retain every accepted repair before any ordinary queue can
                 # reopen. Later decisions update these same operations.
                 self.drive(
@@ -182,18 +187,20 @@ class ExecutionSessionDriver:
                 if proposal is not None and retain is not None and retain(proposal, {key: expected}):
                     local[key] = expected
                     continue
-                component = proposal.component if proposal is not None else adopted_by_job.get(key)
-                if component is None:
-                    local[key] = expected
-                else:
-                    selected_adopted.setdefault(component, {})[key] = expected
-                    adopted_by_job[key] = component
+                component = proposal.component if proposal is not None else expected['owner']['component']
+                selected_adopted.setdefault(component, {})[key] = expected
+                adopted_by_job[key] = component
             for component, selected in selected_adopted.items():
                 if component not in adopted:
-                    proposal = next(proposals[key] for key in selected if key in proposals)
-                    adopted[component] = ComponentExecutionOperation.from_pending_component(
-                        self.workflow, proposal, self.workflow.execution_session_context, selected,
-                    )
+                    proposal = next((proposals[key] for key in selected if key in proposals), None)
+                    if proposal is None:
+                        adopted[component] = ComponentExecutionOperation.from_selected_restarts(
+                            self.workflow, component, self.workflow.execution_session_context, selected,
+                        )
+                    else:
+                        adopted[component] = ComponentExecutionOperation.from_pending_component(
+                            self.workflow, proposal, self.workflow.execution_session_context, selected,
+                        )
                 else:
                     continuation = adopted[component]
                     for key, expected in selected.items():

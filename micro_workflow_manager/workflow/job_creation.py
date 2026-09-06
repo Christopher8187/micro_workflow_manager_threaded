@@ -8,6 +8,20 @@ from .execution_scope import programmatic_execution
 
 
 class JobCreationMixin:
+    def _job_creation_producer(self, execution_id, target):
+        current = getattr(self._job_context, 'execution_id', None)
+        if current is not None and execution_id is not None and current != execution_id:
+            raise RuntimeError('Job producer execution differs from the current task')
+        execution_id = current if current is not None else execution_id
+        if execution_id is None:
+            return None, None, None
+        owner = self.storage.get_job_execution_owner(execution_id)
+        if owner is None:
+            raise RuntimeError('Job creation has no recorded producer execution')
+        self.check_job_execution(owner['node_name'], owner['job_id'], owner['generation'], execution_id)
+        kind = 'component' if target in owner['component'] else 'dag'
+        return execution_id, owner['component'], kind
+
     def validate_edge(self, from_node: str, to_node: str):
         if not self.graph_obj.has_edge(from_node, to_node):
             raise InvalidGraphError(f"{from_node} cannot create jobs on {to_node}")
@@ -153,6 +167,7 @@ class JobCreationMixin:
         job_id: int | None = None,
         autostart: bool = False,
         _parent_job_id: int | None = None,
+        _parent_execution_id: str | None = None,
         _parent_event_data: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         **params,
@@ -195,6 +210,10 @@ class JobCreationMixin:
         target_component = self.component_id(to_node)
         same_component = source_component is not None and source_component == target_component
         effective_autostart = bool(autostart or same_component)
+        _parent_execution_id, producer_component, job_kind = self._job_creation_producer(_parent_execution_id, to_node)
+        if _parent_execution_id is None:
+            producer_component = source_component
+            job_kind = 'component' if same_component else ('dag' if from_node is not None else None)
 
         if effective_autostart and self.allowed_run_nodes is not None and to_node not in self.allowed_run_nodes:
             parent = f"{from_node}/{_parent_job_id}" if _parent_job_id is not None else str(from_node)
@@ -234,10 +253,10 @@ class JobCreationMixin:
                         node_name=to_node,
                         params=params,
                         parent=parent,
-                        producer_component=source_component,
-                        job_kind="component" if same_component else ("dag" if from_node is not None else None),
+                        producer_component=producer_component,
+                        job_kind=job_kind,
                     )
-                    self.storage.create_job(job)
+                    self.storage.create_job(job, producer_execution_id=_parent_execution_id)
                     if idempotency_key is not None:
                         self.storage.record_idempotent_job(to_node, idempotency_key, job_id)
                     self.storage.set_node_status(to_node, QUEUED)
@@ -249,9 +268,10 @@ class JobCreationMixin:
                 node_name=to_node,
                 params=params,
                 parent=parent,
-                producer_component=source_component,
-                job_kind="component" if same_component else ("dag" if from_node is not None else None),
+                producer_component=producer_component,
+                job_kind=job_kind,
                 idempotency_key=idempotency_key,
+                producer_execution_id=_parent_execution_id,
                 parent_event=(
                     (from_node, _parent_job_id, _parent_event_data)
                     if (
@@ -292,6 +312,7 @@ class JobCreationMixin:
         *,
         autostart: bool = False,
         _parent_job_id: int | None = None,
+        _parent_execution_id: str | None = None,
         idempotency_keys: list[str | None] | None = None,
     ):
         """Create a high-fanout batch while keeping one job per params object.
@@ -326,6 +347,10 @@ class JobCreationMixin:
         target_component = self.component_id(to_node)
         same_component = source_component is not None and source_component == target_component
         effective_autostart = bool(autostart or same_component)
+        _parent_execution_id, producer_component, job_kind = self._job_creation_producer(_parent_execution_id, to_node)
+        if _parent_execution_id is None:
+            producer_component = source_component
+            job_kind = 'component' if same_component else ('dag' if from_node is not None else None)
 
         if effective_autostart and self.allowed_run_nodes is not None and to_node not in self.allowed_run_nodes:
             parent = f"{from_node}/{_parent_job_id}" if _parent_job_id is not None else str(from_node)
@@ -375,12 +400,8 @@ class JobCreationMixin:
                 node_name=to_node,
                 params=dict(params),
                 parent=parent,
-                producer_component=source_component,
-                job_kind=(
-                    "component"
-                    if same_component
-                    else ("dag" if from_node is not None else None)
-                ),
+                producer_component=producer_component,
+                job_kind=job_kind,
             )
             new_jobs.append(job)
             new_keys.append(key)
@@ -392,6 +413,7 @@ class JobCreationMixin:
                 self.storage.commit_prepared_jobs_batch_resolving_idempotency(
                     new_jobs,
                     idempotency_keys=new_keys,
+                    producer_execution_id=_parent_execution_id,
                 )
             )
         except BaseException:

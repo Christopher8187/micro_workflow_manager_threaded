@@ -447,9 +447,12 @@ def test_component_settlement_rechecks_state_at_its_write_boundary(running_compo
                         )
                     other.submit_db_mutation(remove_selection)
                 elif change == 'shape':
-                    other.submit_db_mutation(lambda connection: connection.execute(
-                        'UPDATE graph_shapes SET shape_json=?', (topology.shape_json.replace('"C"', '"D"'),),
-                    ))
+                    def corrupt_shape(connection):
+                        connection.execute('DROP TRIGGER prevent_graph_shape_update')
+                        connection.execute(
+                            'UPDATE graph_shapes SET shape_json=?', (topology.shape_json.replace('"C"', '"D"'),),
+                        )
+                    other.submit_db_mutation(corrupt_shape)
                 else:
                     other.submit_db_mutation(lambda connection: connection.execute(
                         'UPDATE component_states SET alignment_generation=1 WHERE component_key=?',

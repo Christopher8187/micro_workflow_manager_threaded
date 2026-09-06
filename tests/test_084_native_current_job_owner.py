@@ -317,6 +317,14 @@ def test_current_owner_refuses_retained_execution_of_a_deleted_job_instance(work
     assert storage.read_job_events('A', 1) == before_events
     assert storage.get_job_execution_owner(execution_id) == old_owner
     _session(workflow, 'replacement-session')
+    before = list(storage.db_connection().iterdump())
+    with pytest.raises(RuntimeError, match='ownership'):
+        _claim(storage, 'replacement-session')
+    assert list(storage.db_connection().iterdump()) == before
+    # Restore the valid unclaimed pointer that this fixture deliberately damaged.
+    storage.submit_db_mutation(lambda connection: connection.execute(
+        "UPDATE job_instances SET last_execution_id=NULL WHERE node_name='A' AND job_id=1",
+    ))
     _, replacement_execution = _claim(storage, 'replacement-session')
     replacement_owner = storage.read_job_current_owner('A', 1)
     assert replacement_owner['execution_id'] == replacement_execution

@@ -165,6 +165,7 @@ class NodeHandle(_ExecutionChecks):
                 job_id=job_id,
                 autostart=autostart,
                 _parent_job_id=self.from_job_id,
+                _parent_execution_id=self.execution_id,
                 _parent_event_data=self._event_fields(),
                 idempotency_key=idempotency_key,
                 **params,
@@ -190,6 +191,7 @@ class NodeHandle(_ExecutionChecks):
                 params_list=params_list,
                 autostart=autostart,
                 _parent_job_id=self.from_job_id,
+                _parent_execution_id=self.execution_id,
                 idempotency_keys=idempotency_keys,
             )
         )

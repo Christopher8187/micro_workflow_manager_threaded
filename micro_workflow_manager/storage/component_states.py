@@ -45,9 +45,14 @@ class ComponentStateStorageMixin(ComponentTransitionStorageMixin):
             ).fetchone()
             if pending is None:
                 return None
-            if all(self._read_owned_restart(
+            restarts = [self._read_owned_restart(
                 connection, batch.node_name, job_id, batch.session_id, batch.component,
-            ) is not None for job_id in batch.job_ids):
+            ) for job_id in batch.job_ids]
+            if all(restart is not None for restart in restarts):
+                identity = self._read_component_producing_identity(connection, batch.component)
+                if any((restart['owner']['shape_id'], restart['owner']['alignment_generation']) != identity
+                       for restart in restarts):
+                    raise RuntimeError('Restart producing component changed before claim')
                 # Accepted repairs precede terminal proposal validation. A
                 # damaged pending result must still refuse publication later.
                 return None

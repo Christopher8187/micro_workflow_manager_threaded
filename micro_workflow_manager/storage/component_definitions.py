@@ -1,12 +1,45 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
+from .base import FileStorageBase
 
 if TYPE_CHECKING:
     from micro_workflow_manager.topology import ComponentTopologySnapshot
+
+
+@lru_cache(maxsize=128)
+def component_snapshot_from_shape(shape_json: str):
+    """Decode a canonical stored shape without consulting current definitions."""
+    import networkx as nx
+    from micro_workflow_manager.topology import ComponentTopology
+
+    try:
+        shape = json.loads(shape_json)
+        if not isinstance(shape, dict) or set(shape) != {'nodes', 'edges', 'autostart_edges'}:
+            raise ValueError('Invalid graph shape collections')
+        if any(not isinstance(shape[name], list) for name in shape):
+            raise ValueError('Graph shape collections must be lists')
+        for node in shape['nodes']:
+            FileStorageBase.validate_node_name(node)
+        nodes = set(shape['nodes'])
+        for name in ('edges', 'autostart_edges'):
+            for edge in shape[name]:
+                if (not isinstance(edge, list) or len(edge) != 2
+                        or any(not isinstance(node, str) or node not in nodes for node in edge)):
+                    raise ValueError('Invalid graph shape edge')
+        graph = nx.DiGraph()
+        graph.add_nodes_from(nodes)
+        graph.add_edges_from(shape['edges'])
+        snapshot = ComponentTopology(graph, shape['autostart_edges']).snapshot()
+        if snapshot.shape_json != shape_json:
+            raise ValueError('Graph shape must be canonical')
+        return snapshot
+    except (TypeError, ValueError) as error:
+        raise ValueError('Invalid producing graph shape') from error
 
 
 class ComponentDefinitionStorageMixin:
@@ -72,32 +105,29 @@ class ComponentDefinitionStorageMixin:
         return self.submit_db_mutation(register, wait=True, priority=0)
 
     def _validate_component_snapshot(self, snapshot: ComponentTopologySnapshot) -> None:
-        import networkx as nx
-        from micro_workflow_manager.topology import ComponentTopology, ComponentTopologySnapshot
+        from micro_workflow_manager.topology import ComponentTopologySnapshot
 
         if not isinstance(snapshot, ComponentTopologySnapshot):
             raise ValueError('Expected a component topology snapshot')
-        try:
-            shape = json.loads(snapshot.shape_json)
-        except (TypeError, ValueError) as error:
-            raise ValueError('Invalid graph shape in component snapshot') from error
-        if not isinstance(shape, dict) or set(shape) != {'nodes', 'edges', 'autostart_edges'}:
-            raise ValueError('Invalid graph shape in component snapshot')
-        if any(not isinstance(shape[name], list) for name in shape):
-            raise ValueError('Component snapshot graph collections must be lists')
-        nodes = {self.validate_node_name(node) for node in shape['nodes']}
-        for name in ('edges', 'autostart_edges'):
-            for edge in shape[name]:
-                if not isinstance(edge, list) or len(edge) != 2:
-                    raise ValueError('Component snapshot edges need two node names')
-                if any(self.validate_node_name(node) not in nodes for node in edge):
-                    raise ValueError('Component snapshot edges must join known nodes')
-        graph = nx.DiGraph()
-        graph.add_nodes_from(nodes)
-        graph.add_edges_from(shape['edges'])
-        expected = ComponentTopology(graph, shape['autostart_edges']).snapshot()
+        expected = component_snapshot_from_shape(snapshot.shape_json)
         if snapshot != expected:
             raise ValueError('Component snapshot must match its canonical graph shape and exact components')
+
+    def _read_component_producing_identity(self, connection, component):
+        state = self._read_component_state(connection, component)
+        if state is None:
+            raise RuntimeError('Missing producing component state')
+        try:
+            snapshot = component_snapshot_from_shape(state['shape_json'])
+        except ValueError as error:
+            raise RuntimeError('Invalid producing component shape') from error
+        if component not in snapshot.components:
+            raise RuntimeError('Producing component does not belong to its recorded shape')
+        shape = connection.execute(
+            'SELECT shape_id FROM component_definitions WHERE component_key=?',
+            (encode_component_key(component),),
+        ).fetchone()
+        return shape['shape_id'], state['alignment_generation']
 
     def get_component_definition(self, component) -> dict | None:
         self._require_execution_session_storage()

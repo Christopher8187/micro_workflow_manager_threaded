@@ -141,10 +141,15 @@ def test_full_preparation_transition_refuses_unowned_or_invalid_state(tmp_path, 
                 f'UPDATE jobs SET {field}=? WHERE node_name=? AND job_id=1', (value, 'A'),
             ))
         elif damage == 'selected-job':
-            storage.submit_db_mutation(lambda connection: connection.execute(
-                'INSERT INTO session_jobs(session_id, position, node_name, job_id) VALUES(?, 0, ?, 1)',
-                (session, 'A'),
-            ))
+            storage.create_job(Job(node_name='A', job_id=1, params={}))
+            def select_job(connection):
+                connection.execute("UPDATE execution_sessions SET selection_kind='jobs' WHERE session_id=?", (session,))
+                connection.execute(
+                    'INSERT INTO session_jobs(session_id, position, node_name, job_id, job_instance_id) '
+                    'SELECT ?, 0, node_name, job_id, instance_id FROM job_instances WHERE node_name=? AND job_id=1',
+                    (session, 'A'),
+                )
+            storage.submit_db_mutation(select_job)
         elif damage == 'changed-result':
             storage.submit_db_mutation(lambda connection: connection.execute(
                 "UPDATE component_states SET lifecycle='done', stability='stable' WHERE component_key=?", ('["A"]',),

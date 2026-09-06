@@ -270,6 +270,7 @@ class SQLiteSchemaMixin:
                           AND length(CAST(instance_id AS BLOB))=32
                           AND instance_id NOT GLOB '*[^0-9a-f]*'),
                 last_execution_id TEXT REFERENCES job_execution_owners(execution_id),
+                created_by_execution_id TEXT REFERENCES job_execution_owners(execution_id),
                 PRIMARY KEY(node_name, job_id),
                 FOREIGN KEY(node_name, job_id) REFERENCES jobs(node_name, job_id)
                     ON DELETE CASCADE
@@ -293,6 +294,7 @@ class SQLiteSchemaMixin:
                     CHECK(parent_session_id IS NULL OR
                           (session_kind='interrupt' AND parent_session_id<>session_id)),
                 command TEXT NOT NULL,
+                selection_kind TEXT NOT NULL CHECK(selection_kind IN ('components', 'jobs')),
                 start_component TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('running', 'terminal')),
                 started_at TEXT NOT NULL,
@@ -326,6 +328,10 @@ class SQLiteSchemaMixin:
                 position INTEGER NOT NULL,
                 node_name TEXT NOT NULL,
                 job_id INTEGER NOT NULL,
+                job_instance_id TEXT NOT NULL
+                    CHECK(typeof(job_instance_id)='text' AND length(job_instance_id)=32
+                          AND length(CAST(job_instance_id AS BLOB))=32
+                          AND job_instance_id NOT GLOB '*[^0-9a-f]*'),
                 PRIMARY KEY(session_id, node_name, job_id),
                 UNIQUE(session_id, position)
             )
@@ -335,6 +341,12 @@ class SQLiteSchemaMixin:
                 shape_id INTEGER PRIMARY KEY,
                 shape_json TEXT NOT NULL UNIQUE
             )
+        """)
+        connection.execute("""
+            CREATE TRIGGER prevent_graph_shape_update BEFORE UPDATE ON graph_shapes
+            BEGIN
+                SELECT RAISE(ABORT, 'Producing graph shapes are immutable');
+            END
         """)
         connection.execute("""
             CREATE TABLE component_definitions (
@@ -411,7 +423,11 @@ class SQLiteSchemaMixin:
                           AND job_instance_id NOT GLOB '*[^0-9a-f]*'),
                 generation INTEGER NOT NULL,
                 session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
-                component_key TEXT NOT NULL REFERENCES component_definitions(component_key)
+                component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
+                shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id),
+                alignment_generation INTEGER NOT NULL
+                    CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
+                created_by_execution_id TEXT REFERENCES job_execution_owners(execution_id)
             )
         """)
 

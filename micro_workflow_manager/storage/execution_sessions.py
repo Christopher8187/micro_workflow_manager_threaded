@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from micro_workflow_manager.session_liveness import execution_session_liveness
+from .session_selection import SessionSelectionStorageMixin
 from micro_workflow_manager.component_identity import component_key, decode_component_key, encode_component_key
 
 
@@ -12,7 +13,7 @@ class ExecutionSessionHasActiveJobs(RuntimeError):
     """Joined work still has unsettled active claims in its owned scope."""
 
 
-class ExecutionSessionStorageMixin:
+class ExecutionSessionStorageMixin(SessionSelectionStorageMixin):
     """Persist exact execution-session records in SQLite."""
 
     def _require_execution_session_storage(self) -> None:
@@ -95,12 +96,19 @@ class ExecutionSessionStorageMixin:
         components = [encode_component_key(component) for component in component_keys]
 
         def create(connection):
+            job_roots = []
+            for position, (node, job_id) in enumerate(jobs):
+                observed = self._read_job_owner_observation(connection, node, job_id)
+                if observed is None:
+                    raise RuntimeError(f'Selected job does not exist at session admission: {node}/{job_id}')
+                job_roots.append((session_id, position, node, job_id, observed['job_instance_id']))
+            selection_kind = 'jobs' if job_roots else 'components'
             connection.execute(
                 "INSERT INTO execution_sessions("
-                "session_id, session_kind, parent_session_id, command, start_component, "
+                "session_id, session_kind, parent_session_id, command, selection_kind, start_component, "
                 "status, started_at, heartbeat_at, hostname, pid, process_identity, details_json) "
-                "VALUES(?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
-                (session_id, session_kind, parent_session_id, command,
+                "VALUES(?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
+                (session_id, session_kind, parent_session_id, command, selection_kind,
                  encode_component_key(start_component), started_at, started_at,
                  hostname, pid, process_identity, json.dumps(details or {})),
             )
@@ -108,10 +116,12 @@ class ExecutionSessionStorageMixin:
                 "INSERT INTO session_components(session_id, position, component_key) VALUES(?, ?, ?)",
                 [(session_id, position, component) for position, component in enumerate(components)],
             )
-            connection.executemany(
-                "INSERT INTO session_jobs(session_id, position, node_name, job_id) VALUES(?, ?, ?, ?)",
-                [(session_id, position, node, job_id) for position, (node, job_id) in enumerate(jobs)],
-            )
+            recorded = connection.executemany(
+                "INSERT INTO session_jobs(session_id, position, node_name, job_id, job_instance_id) "
+                "VALUES(?, ?, ?, ?, ?)", job_roots,
+            ).rowcount
+            if recorded != len(job_roots):
+                raise RuntimeError('Session admission did not record every selected job instance')
             row = connection.execute(
                 'SELECT * FROM execution_sessions WHERE session_id=?', (session_id,),
             ).fetchone()
@@ -182,19 +192,14 @@ class ExecutionSessionStorageMixin:
             ).fetchone()
             if session is None or session['status'] != 'running':
                 raise RuntimeError(f'Execution session {session_id} is missing or already terminal')
-            owned_nodes = {
-                node for row in connection.execute(
-                    'SELECT selected.component_key FROM session_components AS selected '
-                    'JOIN component_reservations AS reservation USING(component_key) '
-                    'WHERE selected.session_id=? AND reservation.session_id=?',
-                    (session_id, session_id),
-                ) for node in decode_component_key(row['component_key'])
-            }
-            selected_nodes = {
-                node for row in connection.execute(
-                    'SELECT component_key FROM session_components WHERE session_id=?', (session_id,),
-                ) for node in decode_component_key(row['component_key'])
-            }
+            components = self._read_session_components(connection, session_id)
+            roots = set(self._read_session_job_roots(connection, session_id, components=components))
+            reserved_keys = {row['component_key'] for row in connection.execute(
+                'SELECT component_key FROM component_reservations WHERE session_id=?', (session_id,),
+            )}
+            owned_nodes = {node for component in components if encode_component_key(component) in reserved_keys
+                           for node in component}
+            selected_nodes = {node for component in components for node in component}
             # Joined execution has no active work left. Include reserved nodes
             # even when their active-owner pointer is damaged or contradictory.
             # Previously selected work can remain active under another owner,
@@ -228,13 +233,23 @@ class ExecutionSessionStorageMixin:
                     f'{active["node_name"]}/{active["job_id"]}, generation {active["generation"]}, '
                     f'execution {active["active_execution_id"]}; recovery is required'
                 )
-            selected_jobs = {tuple(row) for row in connection.execute(
-                'SELECT node_name, job_id FROM session_jobs WHERE session_id=?', (session_id,),
-            )}
+            candidates = list(attempts)
+            if roots:
+                # A root can catch a nested child's failure. Its accepted
+                # successor remains owned work even when no Python failure
+                # escapes the root or reaches the session driver.
+                candidates.extend(tuple(row) for row in connection.execute(
+                    'SELECT job.node_name, job.job_id, owner.generation, owner.execution_id '
+                    'FROM jobs AS job JOIN job_instances AS instance USING(node_name, job_id) '
+                    'JOIN job_execution_owners AS owner ON owner.execution_id=instance.last_execution_id '
+                    "WHERE owner.session_id=? AND job.status='queued' "
+                    'AND job.active_execution_id IS NULL AND job.restart_requested_at IS NOT NULL '
+                    'ORDER BY job.node_name, job.job_id',
+                    (session_id,),
+                ))
             replacements = {}
-            for node, job_id, generation, execution_id in attempts:
-                if selected_jobs and (node, job_id) not in selected_jobs:
-                    continue
+            known_attempts = set()
+            for node, job_id, generation, execution_id in dict.fromkeys(candidates):
                 observed = self._read_job_owner_observation(connection, node, job_id)
                 owner = None if observed is None else observed['owner']
                 if (owner is None or owner['session_id'] != session_id
@@ -244,6 +259,15 @@ class ExecutionSessionStorageMixin:
                         or observed['status'] != 'queued'
                         or observed['active_execution_id'] is not None):
                     continue
+                if roots:
+                    producing_identity = self._read_component_producing_identity(connection, owner['component'])
+                    if not self._job_descends_from_selected_root(
+                        connection, execution_id, roots, session_id, owner['component'], producing_identity,
+                    ):
+                        raise RuntimeError('Owned restart is outside selected job causal scope')
+                    if self._read_owned_restart(connection, node, job_id, session_id, owner['component']) is None:
+                        raise RuntimeError('Selected job restart lost its accepted owner')
+                known_attempts.add((node, job_id))
                 reservation = connection.execute(
                     'SELECT session_id FROM component_reservations WHERE component_key=?',
                     (encode_component_key(owner['component']),),
@@ -283,8 +307,6 @@ class ExecutionSessionStorageMixin:
                         'restart_requested_at': marker,
                     }
             nested_components = {}
-            known_attempts = {(node, job_id) for node, job_id, _, _ in attempts
-                              if not selected_jobs or (node, job_id) in selected_jobs}
             from .component_states import ComponentTerminalOutcome
 
             for pending_row in connection.execute(
@@ -301,10 +323,13 @@ class ExecutionSessionStorageMixin:
                         'AND active_execution_id IS NULL AND restart_requested_at IS NOT NULL', (node,),
                     ).fetchall():
                         key = node, job['job_id']
-                        if key in known_attempts:
+                        accepted = bool(roots) and key in replacements
+                        if key in known_attempts and not accepted:
                             continue
-                        expected = self._read_owned_restart(connection, *key, session_id, component)
-                        if expected is None:
+                        expected = replacements[key] if accepted else self._read_owned_restart(
+                            connection, *key, session_id, component,
+                        )
+                        if expected is None or encode_component_key(expected['owner']['component']) != pending_row['component_key']:
                             continue
                         previous = rejected.get(key) or exhausted.get(key)
                         if previous is not None and (
@@ -316,7 +341,14 @@ class ExecutionSessionStorageMixin:
                             component, pending_row['shape_json'], pending_row['alignment_generation'],
                             'done', pending_row['stability'], pending_row['instability_origin'],
                         )
-                        self._validate_component_terminal_outcomes(connection, session_id, (proposal,))
+                        try:
+                            self._validate_component_terminal_outcomes(connection, session_id, (proposal,))
+                        except RuntimeError:
+                            if not accepted:
+                                raise
+                            # Repair the already accepted job first. The next
+                            # exit still refuses this damaged pending result.
+                            continue
                         replacements[key] = expected
                         nested_components[key] = proposal
             if replacements:
@@ -438,19 +470,14 @@ class ExecutionSessionStorageMixin:
         # session field together, then attach its immutable scope rows.
         session_id = row["session_id"]
         result = dict(row)
-        result["start_component"] = decode_component_key(result["start_component"])
+        result["start_component"] = SessionSelectionStorageMixin._stored_session_component(result["start_component"])
         result["failures"] = json.loads(result.pop("failures_json"))
         result["details"] = json.loads(result.pop("details_json"))
-        result["selected_components"] = [
-            decode_component_key(row[0]) for row in connection.execute(
-                "SELECT component_key FROM session_components WHERE session_id=? ORDER BY position",
-                (session_id,),
-            )
-        ]
+        result["selected_components"] = SessionSelectionStorageMixin._read_session_components(connection, session_id)
         result["selected_jobs"] = [
-            (row[0], row[1]) for row in connection.execute(
-                "SELECT node_name, job_id FROM session_jobs WHERE session_id=? ORDER BY position",
-                (session_id,),
+            (node, job_id) for node, job_id, _ in
+            ExecutionSessionStorageMixin._read_session_job_roots(
+                connection, session_id, components=result["selected_components"],
             )
         ]
         return result

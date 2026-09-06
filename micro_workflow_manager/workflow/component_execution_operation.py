@@ -33,6 +33,7 @@ class ComponentExecutionOperation:
         self.completion = None
         self.completed = False
         self.started = False
+        self.selected_restarts_only = False
         self.task_parent = task_parent
 
     @classmethod
@@ -43,6 +44,18 @@ class ComponentExecutionOperation:
         operation.completion = completion
         operation.started = True
         operation.stop_admission = True
+        operation.expectations = dict(replacements)
+        operation.attempts = {
+            key: (*key, expected['owner']['generation'], expected['owner']['execution_id'])
+            for key, expected in replacements.items()
+        }
+        return operation
+
+    @classmethod
+    def from_selected_restarts(cls, workflow, component, execution_context, replacements):
+        """Continue only accepted jobs without starting or realigning a component."""
+        operation = cls(workflow, component, execution_context, None, None)
+        operation.started = operation.stop_admission = operation.selected_restarts_only = True
         operation.expectations = dict(replacements)
         operation.attempts = {
             key: (*key, expected['owner']['generation'], expected['owner']['execution_id'])
@@ -125,6 +138,8 @@ class ComponentExecutionOperation:
         return [node for node in self.component if self.restart_job_ids(node)]
 
     def failed_nodes(self):
+        if self.selected_restarts_only:
+            return tuple(dict.fromkeys(node for node, _ in self.errors))
         return self.component
 
     def failed_component_outcomes(self):
@@ -161,7 +176,8 @@ class ComponentExecutionOperation:
                 self.retried_expectations.pop(key, None)
             self.expectations[key] = expected
             self.errors.pop(key, None)
-        self.stop_admission = stop_admission or bool(self.errors) or self.unrelated_error is not None
+        self.stop_admission = (self.selected_restarts_only or stop_admission
+                               or bool(self.errors) or self.unrelated_error is not None)
 
     def run(self):
         if not self.started:
@@ -189,6 +205,10 @@ class ComponentExecutionOperation:
                     )
             if self.unrelated_error is not None or self.errors:
                 raise self.primary_error(None)
+            if self.selected_restarts_only:
+                self.workflow.refresh_component_status(set(self.component), allow_complete=True)
+                self.completed = True
+                return self.ran
             if not self.replacement_epoch:
                 break
         self.workflow.refresh_component_status(set(self.component), allow_complete=True)

@@ -79,32 +79,6 @@ class JobExecutionClaimStorageMixin:
     def current_job_generation(self, node_name: str, job_id: int) -> int:
         return int(self.read_job_control(node_name, job_id)["generation"])
 
-    @staticmethod
-    def _execution_claim_owner_error(connection, batch: ExecutionClaimBatch, checked: dict):
-        if batch.session_id is None:
-            return None
-        if batch.node_name not in batch.component:
-            return RuntimeError(f'Claimed node {batch.node_name} is not a member of component {batch.component!r}')
-        key = (batch.session_id, encode_component_key(batch.component))
-        if key not in checked:
-            checked[key] = connection.execute(
-                'SELECT session.status, reservation.session_id AS owner, selected.component_key AS selected_key '
-                'FROM execution_sessions AS session '
-                'LEFT JOIN component_reservations AS reservation ON reservation.component_key=? '
-                'LEFT JOIN session_components AS selected '
-                'ON selected.session_id=session.session_id AND selected.component_key=reservation.component_key '
-                'WHERE session.session_id=?', (key[1], key[0]),
-            ).fetchone()
-        row = checked[key]
-        if row is None or row['status'] != 'running':
-            return RuntimeError('Job claims require an existing running session: ' + batch.session_id)
-        if row['owner'] != batch.session_id:
-            return RuntimeError(f'Component {batch.component!r} reservation belongs to {row["owner"]!r}, '
-                                f'not claiming session {batch.session_id}')
-        if row['selected_key'] is None:
-            return RuntimeError(f'Component {batch.component!r} is outside session {batch.session_id} selected scope')
-        return None
-
     def _apply_execution_claim_batches(self, connection, batches: list[ExecutionClaimBatch]):
         """Claim simultaneous node bursts with one set of SQL operations.
 
@@ -131,7 +105,8 @@ class JobExecutionClaimStorageMixin:
                 placeholders = ",".join("?" for _ in chunk)
                 rows.extend(
                     connection.execute(
-                        "SELECT j.job_id, j.generation, j.status, j.active_execution_id, i.instance_id FROM jobs AS j "
+                        "SELECT j.job_id, j.generation, j.status, j.active_execution_id, i.instance_id, "
+                        "i.created_by_execution_id, i.last_execution_id FROM jobs AS j "
                         "LEFT JOIN job_instances AS i USING(node_name, job_id) "
                         f"WHERE j.node_name=? AND j.job_id IN ({placeholders})",
                         [node_name, *chunk],
@@ -145,9 +120,11 @@ class JobExecutionClaimStorageMixin:
         outcomes = []
         checked_owners = {}
         checked_pending_work = {}
+        producing_identities = {}
+        selected_job_roots = {}
         accepted_addresses = set()
         for batch in batches:
-            owner_error = JobExecutionClaimStorageMixin._execution_claim_owner_error(connection, batch, checked_owners)
+            owner_error = self._execution_claim_owner_error(connection, batch, checked_owners)
             if owner_error is not None:
                 outcomes.append((False, owner_error))
                 continue
@@ -169,6 +146,15 @@ class JobExecutionClaimStorageMixin:
             if any(node_rows[job_id]['active_execution_id'] is not None
                    or (batch.node_name, job_id) in accepted_addresses for job_id in batch.job_ids):
                 outcomes.append((False, RuntimeError('Jobs already claimed cannot receive another active execution')))
+                continue
+
+            try:
+                for job_id in batch.job_ids:
+                    row = node_rows[job_id]
+                    if row['last_execution_id'] is not None or row['created_by_execution_id'] is not None:
+                        self._read_job_owner_observation(connection, batch.node_name, job_id)
+            except Exception as error:
+                outcomes.append((False, error))
                 continue
 
             restart_error = None
@@ -201,6 +187,29 @@ class JobExecutionClaimStorageMixin:
                 outcomes.append((False, restart_error))
                 continue
 
+            key = batch.session_id, batch.component
+            if key not in producing_identities:
+                try:
+                    producing_identities[key] = self._read_component_producing_identity(connection, batch.component)
+                except Exception as error:
+                    producing_identities[key] = error
+            producing_identity = producing_identities[key]
+            if isinstance(producing_identity, Exception):
+                outcomes.append((False, producing_identity))
+                continue
+            shape_id, alignment_generation = producing_identity
+            selection_error = self._selected_job_claim_error(
+                connection, batch, node_rows, producing_identity, selected_job_roots,
+            )
+            if selection_error is not None:
+                outcomes.append((False, selection_error))
+                continue
+            if any(expected is not None and (
+                expected['owner']['shape_id'], expected['owner']['alignment_generation']
+            ) != producing_identity for expected in batch.expected_restarts or ()):
+                outcomes.append((False, RestartClaimChanged('Restart producing component changed before claim')))
+                continue
+
             admission_error = self._component_claim_error(connection, batch, checked_pending_work)
             if admission_error is not None:
                 outcomes.append((False, admission_error))
@@ -226,7 +235,8 @@ class JobExecutionClaimStorageMixin:
                 if batch.session_id is not None:
                     owner_data = {'session_id': batch.session_id, 'component': batch.component}
                     owners.append((execution_id, batch.node_name, job_id, generation,
-                                   batch.session_id, encode_component_key(batch.component), row['instance_id']))
+                                   batch.session_id, encode_component_key(batch.component), row['instance_id'],
+                                   shape_id, alignment_generation, row['created_by_execution_id']))
                 updates.append(
                     (
                         execution_id,
@@ -291,10 +301,13 @@ class JobExecutionClaimStorageMixin:
             if changed != len(updates):
                 raise RuntimeError('Job claim could not acquire every requested active execution')
             if owners:
-                connection.executemany(
-                    "INSERT INTO job_execution_owners(execution_id, node_name, job_id, generation, session_id, component_key, job_instance_id) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?)", owners,
-                )
+                changed = connection.executemany(
+                    "INSERT INTO job_execution_owners(execution_id, node_name, job_id, generation, session_id, "
+                    "component_key, job_instance_id, shape_id, alignment_generation, created_by_execution_id) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", owners,
+                ).rowcount
+                if changed != len(owners):
+                    raise RuntimeError('Job claim did not record every execution owner')
                 changed = connection.executemany(
                     'UPDATE job_instances SET last_execution_id=? WHERE node_name=? AND job_id=?',
                     [(owner[0], owner[1], owner[2]) for owner in owners],
@@ -384,11 +397,9 @@ class JobExecutionClaimStorageMixin:
         normalized = [self.validate_job_id(job_id) for job_id in job_ids]
         if session_id is not None:
             self._session_text(session_id, 'session_id')
-        session_capable = self._metadata_value('database_schema_version') == '5'
-        if not session_capable and (session_id is not None or component is not None):
-            raise RuntimeError('Explicit claim ownership requires a session-capable database')
-        if session_capable and (session_id is None or component is None):
-            raise RuntimeError('Job claims require explicit session_id and component in session-capable storage')
+        self._require_execution_session_storage()
+        if session_id is None or component is None:
+            raise RuntimeError('Job claims require explicit session_id and component in native storage')
         if not normalized:
             return []
         if len(normalized) != len(set(normalized)):

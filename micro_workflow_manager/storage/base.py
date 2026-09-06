@@ -209,7 +209,8 @@ class FileStorageBase:
         self.retry_fs(action)
         return path
 
-    def validate_node_name(self, node_name: str) -> str:
+    @staticmethod
+    def validate_node_name(node_name: str) -> str:
         if not isinstance(node_name, str) or not node_name or node_name in {".", ".."}:
             raise ValueError("Invalid node name")
 

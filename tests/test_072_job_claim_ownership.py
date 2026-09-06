@@ -20,53 +20,43 @@ STARTED_AT = '2026-09-05T12:00:00+00:00'
 
 
 @pytest.mark.parametrize('batch', [False, True])
-def test_version_four_claims_keep_ownerless_leases_events_and_release(tmp_path, batch):
-    storage = FileStorage(tmp_path)
-    for job_id in [1, 2]:
-        storage.create_job(Job(node_name='A', job_id=job_id, params={}))
-    if batch:
-        claims = storage.claim_job_executions_batch(
-            'A', [1, 2], started_at=STARTED_AT,
-            task_started_data={'task': 'extract'}, task_started_mask=[True, False],
-        )
-    else:
-        claims = [storage.claim_job_execution('A', job_id, started_at=STARTED_AT) for job_id in [1, 2]]
-
-    assert len({execution_id for _, execution_id in claims}) == 2
-    for job_id, (generation, execution_id) in zip([1, 2], claims):
-        assert generation == 0
-        control = storage.read_job_control('A', job_id)
-        assert control['active_execution_id'] == execution_id
-        assert control['active_pid'] == os.getpid()
-        assert storage.get_job_status('A', job_id) == 'running'
-        events = storage.read_job_events('A', job_id)
-        started = [event for event in events if event['event'] == 'started']
-        assert len(started) == 1
-        assert {key: value for key, value in started[0].items() if key not in {'time', 'event'}} == {
-            'previous_status': 'queued', 'status': 'running', 'started_at': STARTED_AT,
-            'generation': 0, 'execution_id': execution_id, 'pid': os.getpid(),
-        }
-        stored_event = storage.db_connection().execute(
-            "SELECT data_json FROM job_events WHERE node_name='A' AND job_id=? AND event='started'", (job_id,),
-        ).fetchone()[0]
-        assert stored_event == (
-            '{"previous_status":"queued","status":"running","started_at":"2026-09-05T12:00:00+00:00",'
-            f'"generation":0,"execution_id":"{execution_id}","pid":{os.getpid()}' + '}'
-        )
-        task_events = [event for event in events if event['event'] == 'task_started']
-        assert [event['task'] for event in task_events] == (['extract'] if batch and job_id == 1 else [])
-        if task_events:
-            assert storage.db_connection().execute(
-                "SELECT data_json FROM job_events WHERE node_name='A' AND job_id=? AND event='task_started'", (job_id,),
-            ).fetchone()[0] == '{"task":"extract"}'
-        storage.release_unstarted_job_execution('A', job_id, generation, execution_id)
-        assert storage.read_job_control('A', job_id)['active_execution_id'] is None
-        assert storage.get_job_status('A', job_id) == 'queued'
-        assert len([event for event in storage.read_job_events('A', job_id) if event['event'] == 'started']) == 1
-    tables = {row[0] for row in storage.db_connection().execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert 'job_execution_owners' not in tables
-    assert storage.db_connection().execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '4'
-    storage.close_database_connections()
+def test_native_claims_keep_owned_leases_events_and_release(tmp_path, batch):
+    storage = _owned_storage(tmp_path)
+    context = dict(session_id='int-17', component=('A', 'B'))
+    try:
+        if batch:
+            claims = storage.claim_job_executions_batch(
+                'A', [1, 2], started_at=STARTED_AT, **context,
+                task_started_data={'task': 'extract'}, task_started_mask=[True, False],
+            )
+        else:
+            claims = [storage.claim_job_execution('A', job_id, started_at=STARTED_AT, **context)
+                      for job_id in [1, 2]]
+        assert len({execution_id for _, execution_id in claims}) == 2
+        for job_id, (generation, execution_id) in zip([1, 2], claims):
+            assert generation == 0
+            owner = storage.get_job_execution_owner(execution_id)
+            assert owner['session_id'] == 'int-17' and owner['component'] == ('A', 'B')
+            assert owner['created_by_execution_id'] is None
+            control = storage.read_job_control('A', job_id)
+            assert control['active_execution_id'] == execution_id
+            assert control['active_pid'] == os.getpid()
+            assert storage.get_job_status('A', job_id) == 'running'
+            events = storage.read_job_events('A', job_id)
+            started, = [event for event in events if event['event'] == 'started']
+            assert (started['session_id'], started['execution_id'], started['component']) == (
+                'int-17', execution_id, ['A', 'B'],
+            )
+            assert started['previous_status'] == 'queued' and started['status'] == 'running'
+            task_events = [event for event in events if event['event'] == 'task_started']
+            assert [event['task'] for event in task_events] == (['extract'] if batch and job_id == 1 else [])
+            storage.release_unstarted_job_execution('A', job_id, generation, execution_id)
+            assert storage.read_job_control('A', job_id)['active_execution_id'] is None
+            assert storage.get_job_status('A', job_id) == 'queued'
+            assert storage.get_job_execution_owner(execution_id) == owner
+            assert len([event for event in storage.read_job_events('A', job_id) if event['event'] == 'started']) == 1
+    finally:
+        storage.close_database_connections()
 
 
 def _owned_storage(tmp_path):
@@ -105,6 +95,7 @@ def test_private_claims_commit_exact_execution_owners_and_matching_started_event
                 'execution_id': execution_id, 'node_name': node, 'job_id': job_id,
                 'generation': generation, 'session_id': session_id, 'component': expected_component,
                 'job_instance_id': storage.read_job_instance_id(node, job_id),
+                'shape_id': 1, 'alignment_generation': 0, 'created_by_execution_id': None,
             }
             assert storage.get_job_execution_owner(execution_id) == owner
             assert storage.read_job_control(node, job_id)['active_execution_id'] == execution_id
@@ -190,9 +181,12 @@ def test_claims_require_a_running_exact_owner_and_eligible_component(tmp_path, b
 @pytest.mark.parametrize('context', [
     {'session_id': 'int-17'}, {'component': ('A',)}, {'session_id': 'int-17', 'component': ('A',)},
 ])
-def test_version_four_refuses_explicit_claim_context_without_changing_jobs(tmp_path, batch, context):
-    storage = FileStorage(tmp_path)
+def test_native_claims_refuse_changed_schema_without_changing_jobs(tmp_path, batch, context):
+    storage = FileStorage._create_new_project_state(tmp_path)
     storage.create_job(Job(node_name='A', job_id=1, params={}))
+    storage.submit_db_mutation(lambda connection: connection.execute(
+        "UPDATE metadata SET value='4' WHERE key='database_schema_version'",
+    ))
     before = (storage.read_job_control('A', 1), storage.read_job_events('A', 1))
 
     with pytest.raises(RuntimeError, match='session-capable database'):
@@ -348,6 +342,7 @@ def test_simultaneous_single_claims_never_inherit_another_callers_context(
         'execution_id': execution_id, 'node_name': 'A', 'job_id': 1, 'generation': generation,
         'session_id': 'int-17', 'component': ('A', 'B'),
         'job_instance_id': storage.read_job_instance_id('A', 1),
+        'shape_id': 1, 'alignment_generation': 0, 'created_by_execution_id': None,
     }
     started = [event for event in storage.read_job_events('A', 1) if event['event'] == 'started']
     assert len(started) == 1

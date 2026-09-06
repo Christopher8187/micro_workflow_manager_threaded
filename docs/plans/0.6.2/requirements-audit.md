@@ -38,6 +38,14 @@ final source passed all 609 checks across 15 full surrounding modules, plus
 57 focused checks. CLI integration and wider lifecycle requirements remain
 unfinished; this bounded local change completes no whole requirement row.
 
+The [producing execution identity progress](execution-producing-identity-progress.md)
+records captured shape/alignment, durable job creator ancestry, exact selected
+root claims, and accepted child restart continuation. Integrated checks passed
+860 cases, and 181 additional affected-path cases passed on the final source.
+Both bounded Sol reviews returned PASS, as recorded in that progress document. Automatic ordinary child execution, full
+selected-job lifecycle, and durable managed-file ownership remain unfinished;
+no whole requirement receives completion credit from this increment.
+
 The [interval calculation](stage-s1a.md),
 [command retirement](stage-retirement.md), [shared topology](stage-topology.md),
 [retained scheduler repair](stage-scheduler-completion.md),
