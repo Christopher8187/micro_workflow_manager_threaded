@@ -4,7 +4,6 @@ from threading import Event
 from typing import Callable
 
 from ..errors import InvalidGraphError
-from ..models import CANCELLED, FAILED
 from .component_scheduler import allocate_api_pumps
 from .execution_scope import programmatic_execution
 from .dag_execution_operation import DagExecutionOperation
@@ -97,23 +96,13 @@ class DagSchedulerMixin(NodeSchedulerMixin):
             else None
         )
 
-        def refusal_target_terminal() -> bool:
-            if refuse_after is None:
+        def boundary_terminal(component) -> bool:
+            if component is None:
                 return False
-            return all(
-                self.node_complete(node_name)
-                or self.storage.get_node_status(node_name) in {FAILED, CANCELLED}
-                for node_name in refuse_after
+            state = self.storage.read_component_states(
+                [component], expected_shape=execution_context[2],
             )
-
-        def refusal_before_already_reached() -> bool:
-            if refuse_before is None:
-                return False
-            return all(
-                self.node_complete(node_name)
-                or self.storage.get_node_status(node_name) in {FAILED, CANCELLED}
-                for node_name in refuse_before
-            )
+            return state[component]['lifecycle'] in {'done', 'failed'}
 
         def unit_ready(unit: tuple[str, ...]) -> bool:
             if _operation is not None:
@@ -160,15 +149,11 @@ class DagSchedulerMixin(NodeSchedulerMixin):
                 # Keep the body error before executor cleanup can replace it.
                 cleanup.push(_operation.retain_exit_error)
             while True:
-                self.finalize_ready_nodes(skip_components=(
-                    in_flight if _operation is None else in_flight | _operation.suspended_units()
-                ))
-
-                if not admission_stopped and refusal_target_terminal():
+                if not admission_stopped and boundary_terminal(refuse_after):
                     admission_stopped = True
                     if refusal_event is not None:
                         refusal_event.set()
-                if not admission_stopped and refusal_before_already_reached():
+                if not admission_stopped and boundary_terminal(refuse_before):
                     admission_stopped = True
                     if refusal_event is not None:
                         refusal_event.set()
@@ -345,7 +330,4 @@ class DagSchedulerMixin(NodeSchedulerMixin):
                         wait(futures)
                         raise
 
-        self.finalize_ready_nodes(
-            skip_components=None if _operation is None else _operation.suspended_units(),
-        )
         return ran

@@ -5,16 +5,6 @@ import networkx as nx
 from micro_workflow_manager.system import MicroWorkflow
 
 
-def ready_for_run_set(workflow: MicroWorkflow, node: str, run_set: set[str], ignore_external: bool) -> bool:
-    component = workflow.component_for(node)
-    for previous in workflow.component_predecessors(component):
-        if previous not in run_set and ignore_external:
-            continue
-        if not workflow.node_complete(previous):
-            return False
-    return True
-
-
 def direct_incomplete_inputs(workflow: MicroWorkflow, nodes: set[str]) -> set[str]:
     blockers = set()
     for component in workflow.execution_components(list(nodes)):

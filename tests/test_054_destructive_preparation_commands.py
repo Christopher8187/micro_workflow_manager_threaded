@@ -5,6 +5,7 @@ from pathlib import Path
 from micro_workflow_manager import cli
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
+from tests.test_090_component_session_settlement import _close, _rows
 
 
 def _project(tmp_path: Path, monkeypatch) -> None:
@@ -66,11 +67,20 @@ def test_reset_requires_typed_confirmation_and_does_not_run(tmp_path, monkeypatc
     assert "Aborted mwf reset; requested reset was not applied" in aborted
     assert "bootstrap and router mounting may already have updated framework state" in aborted
 
-    assert cli.main(["reset", "A", "--dry-run"]) == 0
-    preview = capsys.readouterr().out
-    assert "requested reset was not applied" in preview
-    assert "bootstrap and router mounting may already have updated framework state" in preview
-    assert "no files, jobs, inputs, outputs, or statuses were changed" not in preview
+    storage = FileStorage(tmp_path)
+    try:
+        before_rows = _rows(storage)
+        before_files = {path.relative_to(tmp_path): path.read_bytes()
+                        for path in (tmp_path / 'node').rglob('*') if path.is_file()}
+        assert cli.main(["reset", "A", "--dry-run"]) == 0
+        preview = capsys.readouterr().out
+        assert "requested reset was not applied; no project state was changed" in preview
+        assert "user code was not loaded" in preview
+        assert _rows(storage) == before_rows
+        assert {path.relative_to(tmp_path): path.read_bytes()
+                for path in (tmp_path / 'node').rglob('*') if path.is_file()} == before_files
+    finally:
+        _close(storage)
 
     monkeypatch.setattr("builtins.input", lambda prompt: "reset")
     assert cli.main(["reset", "A"]) == 0

@@ -54,7 +54,7 @@ def test_ordinary_main_owns_real_component_claims_and_releases_its_scope(tmp_pat
         workflow.add_job(None, name)
 
     try:
-        assert run_nodes(workflow, ['A', 'B'], 'A', ignore_external=True) == 0
+        assert run_nodes(workflow, ['A', 'B'], 'A') == 0
         sessions = workflow.storage.list_execution_sessions()
         assert len(sessions) == 1
         main = sessions[0]
@@ -304,11 +304,15 @@ def test_native_heartbeat_cannot_change_a_finished_session_and_reuse_gets_a_new_
         assert workflow.storage.read_thread_overrides() == {}
         assert workflow.storage.read_api_total_limit() is None
         workflow.add_job(None, 'A')
-        assert run_nodes(workflow, ['A'], 'A') == 0
+        assert workflow.run_job('A', 2) == 'done'
         assert len(owners) == 2
         assert owners[0]['session_id'] == first['session_id']
         assert owners[1]['session_id'] != first['session_id']
-        assert workflow.storage.get_execution_session(owners[1]['session_id'])['outcome'] == 'done'
+        assert [owner['job_id'] for owner in owners] == [1, 2]
+        assert workflow.storage.get_execution_session(first['session_id']) == terminal
+        second = workflow.storage.get_execution_session(owners[1]['session_id'])
+        assert second['outcome'] == 'done'
+        assert second['selected_jobs'] == [('A', 2)]
         assert workflow.storage.get_component_reservation(('A',)) is None
         with pytest.raises(RuntimeError, match='No active execution session owns node A'):
             workflow.execution_claim_context('A')
@@ -419,24 +423,37 @@ def test_retrying_terminal_publication_preserves_the_failed_outcome(tmp_path, mo
     workflow.graph([('A', 'B')])
     original = workflow.storage.decide_execution_session_exit
     interrupted = False
+    attempts = []
+    preparation_error = ValueError('the original preparation failed')
 
     def finish(session_id, **kwargs):
         nonlocal interrupted
+        attempts.append((session_id, kwargs))
         if not interrupted:
             interrupted = True
             raise OSError('injected terminal publication failure')
         return original(session_id, **kwargs)
 
     def prepare():
-        raise ValueError('the original preparation failed')
+        raise preparation_error
 
     monkeypatch.setattr(workflow.storage, 'decide_execution_session_exit', finish)
     try:
-        with pytest.raises(OSError, match='injected terminal publication failure'):
+        with pytest.raises(ValueError, match='the original preparation failed') as observed:
             run_nodes(workflow, ['A'], 'A', prepare=prepare)
+        assert observed.value is preparation_error
+        assert any('injected terminal publication failure' in note for note in observed.value.__notes__)
         assert interrupted
+        assert len(attempts) == 1
         sessions = workflow.storage.list_execution_sessions()
         assert len(sessions) == 1
+        assert sessions[0]['status'] == 'running'
+        assert workflow.storage.get_component_reservation(('A',))['session_id'] == sessions[0]['session_id']
+        # An explicit retry uses the retained failed decision; unwinding does not retry it.
+        session_id, request = attempts[0]
+        workflow.storage.decide_execution_session_exit(session_id, **request)
+        assert len(attempts) == 2
+        sessions = workflow.storage.list_execution_sessions()
         assert sessions[0]['status'] == 'terminal'
         assert sessions[0]['outcome'] == 'failed'
         assert 'the original preparation failed' in sessions[0]['failures'][0]['error']
@@ -544,10 +561,10 @@ def test_process_workers_require_the_admitted_graph_shape(tmp_path, monkeypatch,
 
     try:
         if change == 'unchanged':
-            assert run_nodes(workflow, ['A', 'B'], 'A', ignore_external=True, prepare=prepare) == 0
+            assert run_nodes(workflow, ['A', 'B'], 'A', prepare=prepare) == 0
         else:
             with pytest.raises(Exception):
-                run_nodes(workflow, ['A', 'B'], 'A', ignore_external=True, prepare=prepare)
+                run_nodes(workflow, ['A', 'B'], 'A', prepare=prepare)
             assert not (tmp_path / 'handler-ran.txt').exists()
             for node in ('A', 'B'):
                 assert workflow.storage.get_job_status(node, 1) == 'queued'
@@ -617,12 +634,15 @@ def test_next_main_waits_for_terminal_reservations_to_be_released(tmp_path, monk
 
 
 @pytest.mark.parametrize('removed_count', [1, 2])
-def test_missing_reserved_scope_is_reported_during_terminal_cleanup(tmp_path, removed_count):
+def test_missing_reserved_scope_is_reported_during_terminal_cleanup(tmp_path, monkeypatch, removed_count):
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
 
-    def prepare():
+    original = workflow.storage.decide_execution_session_exit
+
+    def finish(session_id, **kwargs):
         session_id = workflow.storage.get_live_main_session()['session_id']
+        assert all(workflow.storage.get_component_state((node,))['lifecycle'] == 'done' for node in ('A', 'B'))
         with workflow.storage.db_transaction() as connection:
             keys = connection.execute(
                 'SELECT component_key FROM component_reservations WHERE session_id=? ORDER BY component_key',
@@ -631,10 +651,12 @@ def test_missing_reserved_scope_is_reported_during_terminal_cleanup(tmp_path, re
             assert len(keys) == 2
             connection.executemany('DELETE FROM component_reservations WHERE session_id=? AND component_key=?',
                                    [(session_id, row['component_key']) for row in keys[:removed_count]])
+        return original(session_id, **kwargs)
 
     try:
+        monkeypatch.setattr(workflow.storage, 'decide_execution_session_exit', finish)
         with pytest.raises(RuntimeError, match='reservation cleanup.*expected 2'):
-            run_nodes(workflow, ['A', 'B'], 'A', prepare=prepare)
+            run_nodes(workflow, ['A', 'B'], 'A')
         sessions = workflow.storage.list_execution_sessions()
         assert len(sessions) == 1
         assert sessions[0]['status'] == 'terminal'

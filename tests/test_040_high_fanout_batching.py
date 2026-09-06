@@ -6,6 +6,8 @@ import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from micro_workflow_manager import NodeInputFileSystem, cli
 from micro_workflow_manager.cli.cleanup import prepare_fresh_components
 from micro_workflow_manager.models import Job
@@ -281,7 +283,7 @@ def test_batch_registration_uses_one_job_transaction(tmp_path, monkeypatch):
     assert transactions == 1
 
 
-def test_schema_v1_upgrade_preserves_jobs_and_initializes_sequences(tmp_path):
+def test_native_reopen_preserves_sequence_and_incomplete_schema_refuses_mutation(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path)
     workflow.graph([])
 
@@ -293,6 +295,12 @@ def test_schema_v1_upgrade_preserves_jobs_and_initializes_sequences(tmp_path):
     workflow.start("explode", job_id=7, value=7)
     workflow.storage.close_thread_connection()
 
+    reopened = MicroWorkflow(project_dir=tmp_path)
+    assert reopened.storage.list_job_ids('explode') == [1, 7]
+    assert reopened.storage.next_job_id('explode') == 8
+    assert reopened.storage.reserve_job_ids('explode', 3) == [8, 9, 10]
+    reopened.storage.close_thread_connection()
+
     import sqlite3
 
     database = tmp_path / ".mwf" / "state.sqlite3"
@@ -303,24 +311,19 @@ def test_schema_v1_upgrade_preserves_jobs_and_initializes_sequences(tmp_path):
             "UPDATE metadata SET value='1' WHERE key='database_schema_version'"
         )
         connection.commit()
+        before = list(connection.iterdump())
     finally:
         connection.close()
 
-    # Simulate opening the upgraded package in a new Python process.
-    from micro_workflow_manager.storage.sqlite_state import SQLiteStateMixin
-
-    SQLiteStateMixin._initialized_databases.clear()
-    upgraded = MicroWorkflow(project_dir=tmp_path)
-    assert upgraded.storage.list_job_ids("explode") == [1, 7]
-    assert upgraded.storage.next_job_id("explode") == 8
-    assert upgraded.storage.reserve_job_ids("explode", 3) == [8, 9, 10]
-    upgraded.storage.close_thread_connection()
+    files = {path.relative_to(tmp_path): path.read_bytes() for path in (tmp_path / 'node').rglob('*') if path.is_file()}
+    with pytest.raises(RuntimeError, match='Incomplete SQLite execution-session schema'):
+        MicroWorkflow(project_dir=tmp_path)
 
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute(
-            "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone()[0] == "4"
+        assert list(connection.iterdump()) == before
+        assert connection.execute('SELECT job_id FROM jobs WHERE node_name=? ORDER BY job_id', ('explode',)).fetchall() == [(1,), (7,)]
+        assert {path.relative_to(tmp_path): path.read_bytes() for path in (tmp_path / 'node').rglob('*') if path.is_file()} == files
     finally:
         connection.close()
 
@@ -383,10 +386,15 @@ def test_cli_monitor_reports_all_batched_downstream_jobs_queued(tmp_path, monkey
         ["run", "preexplode", "--monitor", "--monitor-interval", "0.01"]
     ) == 0
     captured = capsys.readouterr()
-    assert "last run: run preexplode | status=done" in captured.err
 
     storage = workflow_storage = MicroWorkflow(project_dir=tmp_path).storage
     try:
+        session, = storage.list_execution_sessions()
+        assert session['command'] == 'run'
+        assert session['selected_components'] == [('preexplode',)]
+        assert (session['status'], session['outcome']) == ('terminal', 'done')
+        assert f"session={session['session_id']} kind=main command=run status=terminal" in captured.err
+        assert 'components=[preexplode] outcome=done' in captured.err
         counts = storage.node_job_summary("explode")["counts"]
         assert counts["queued"] == 160
         assert counts["running"] == 0

@@ -122,12 +122,16 @@ def test_runfrom_preserves_jobs_from_unselected_producer_component(tmp_path, mon
         },
     )
     capsys.readouterr()
-    assert cli.main(["runfrom", "A"]) == 0
+    assert cli.main(["runfrom", "A"]) == 1
     storage = FileStorage(tmp_path)
     assert storage.list_job_ids("C") == [1]
     first = storage.read_job_metadata("C", 1)
     assert first["producer_component"] == ("A",)
-    assert storage.get_job_status("C", 1) == "done"
+    assert storage.get_job_status("C", 1) == "queued"
+    assert storage.get_component_state(('A',))['lifecycle'] == 'done'
+    assert storage.get_component_state(('B',))['lifecycle'] == 'queued'
+    assert storage.get_component_state(('C',))['lifecycle'] == 'queued'
+    assert not (tmp_path / 'node' / 'C' / 'output' / 'A.txt').exists()
 
     assert cli.main(["runfrom", "B"]) == 0
     assert storage.list_job_ids("C") == [1, 2]
@@ -135,6 +139,12 @@ def test_runfrom_preserves_jobs_from_unselected_producer_component(tmp_path, mon
     assert storage.read_job_metadata("C", 2)["producer_component"] == ("B",)
     assert storage.get_job_status("C", 1) == "done"
     assert storage.get_job_status("C", 2) == "done"
+    retained_metadata = storage.read_job_metadata('C', 1)
+    retained_owner = storage.read_job_current_owner('C', 1)
+    retained_events = storage.read_job_events('C', 1)
+    retained_output = (tmp_path / 'node' / 'C' / 'output' / 'A.txt').read_bytes()
+    before_generation = {node: storage.get_component_state((node,))['alignment_generation']
+                         for node in ('A', 'B', 'C')}
 
     # Repeat-use regression: B's previous C job is removed and recreated, while
     # A's original job remains untouched.
@@ -142,6 +152,14 @@ def test_runfrom_preserves_jobs_from_unselected_producer_component(tmp_path, mon
     assert storage.list_job_ids("C") == [1, 2]
     assert storage.read_job_metadata("C", 1)["producer_component"] == ("A",)
     assert storage.read_job_metadata("C", 2)["producer_component"] == ("B",)
+    assert storage.read_job_metadata('C', 1) == retained_metadata
+    assert storage.read_job_current_owner('C', 1) == retained_owner
+    assert storage.read_job_events('C', 1) == retained_events
+    assert (tmp_path / 'node' / 'C' / 'output' / 'A.txt').read_bytes() == retained_output
+    for node in ('A', 'B', 'C'):
+        state = storage.get_component_state((node,))
+        assert state['lifecycle'] == 'done'
+        assert state['alignment_generation'] == before_generation[node] + (node != 'A')
 
 
 def test_one_job_failure_marks_whole_hoeflein_component_failed(tmp_path, monkeypatch):

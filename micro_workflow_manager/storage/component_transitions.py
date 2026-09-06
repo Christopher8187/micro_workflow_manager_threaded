@@ -1,7 +1,126 @@
 from micro_workflow_manager.component_identity import encode_component_key
+from .job_preparation import apply_job_preparation
 
 
 class ComponentTransitionStorageMixin:
+    def refuse_live_sessions_for_reset(self) -> None:
+        self._require_execution_session_storage()
+        self._refuse_live_sessions_for_reset(self.db_connection())
+
+    @staticmethod
+    def _refuse_live_sessions_for_reset(connection) -> None:
+        live = connection.execute(
+            "SELECT session_id FROM execution_sessions WHERE status='running' ORDER BY session_id",
+        ).fetchall()
+        if live:
+            raise RuntimeError('Reset requires no live execution sessions: ' + ', '.join(row['session_id'] for row in live))
+
+    def read_component_fresh_preparation(self, session_id: str, component, *, expected_shape: str) -> dict:
+        self._session_text(session_id, 'session_id')
+        return self._observe_component_preparation(session_id, component, expected_shape)
+
+    def read_component_reset_preparation(self, component, *, expected_shape: str) -> dict:
+        return self._observe_component_preparation(None, component, expected_shape)
+
+    def _observe_component_preparation(self, session_id, component, expected_shape):
+        self._require_execution_session_storage()
+        self._session_text(expected_shape, 'expected_shape')
+        members = self._session_component(component)
+        connection = self.db_connection()
+        connection.execute('SAVEPOINT mwf_component_preparation')
+        try:
+            return self._read_component_preparation(connection, session_id, members, expected_shape)
+        finally:
+            connection.execute('RELEASE SAVEPOINT mwf_component_preparation')
+
+    def _read_component_preparation(self, connection, session_id, members, expected_shape):
+        key = encode_component_key(members)
+        reservation = connection.execute(
+            'SELECT session_id FROM component_reservations WHERE component_key=?', (key,),
+        ).fetchone()
+        if session_id is None:
+            self._refuse_live_sessions_for_reset(connection)
+            if reservation is not None:
+                raise RuntimeError('Reset component retains a reservation: ' + key)
+        else:
+            owner = connection.execute(
+                'SELECT session.status, selected.component_key FROM execution_sessions AS session '
+                'LEFT JOIN session_components AS selected '
+                'ON selected.session_id=session.session_id AND selected.component_key=? '
+                'WHERE session.session_id=?', (key, session_id),
+            ).fetchone()
+            if owner is None or owner['status'] != 'running' or owner['component_key'] is None:
+                raise RuntimeError('Full preparation requires a running selected component owner: ' + key)
+            if reservation is None or reservation['session_id'] != session_id:
+                raise RuntimeError('Full preparation requires the exact component reservation: ' + key)
+            if connection.execute('SELECT 1 FROM session_jobs WHERE session_id=? LIMIT 1', (session_id,)).fetchone():
+                raise RuntimeError('Selected-job preparation cannot realign a full component')
+        if connection.execute(
+            'SELECT 1 FROM component_holds WHERE component_key=? LIMIT 1', (key,),
+        ).fetchone() or connection.execute(
+            'SELECT 1 FROM pending_component_executions WHERE component_key=? LIMIT 1', (key,),
+        ).fetchone():
+            raise RuntimeError('Full preparation cannot change a held or pending component: ' + key)
+        for node in members:
+            if connection.execute(
+                "SELECT 1 FROM jobs WHERE node_name=? AND (active_execution_id IS NOT NULL OR status='running' "
+                'OR active_pid IS NOT NULL OR active_thread_id IS NOT NULL OR active_started_at IS NOT NULL) LIMIT 1',
+                (node,),
+            ).fetchone():
+                raise RuntimeError('Full preparation cannot change active component jobs: ' + key)
+        state = self._read_component_state(connection, members)
+        if state is None or state['shape_json'] != expected_shape:
+            raise RuntimeError('Full preparation requires the expected producing graph shape')
+        if state['lifecycle'] == 'running':
+            raise RuntimeError('Full preparation cannot change a running component: ' + key)
+        return state
+
+    def complete_component_fresh_preparation(
+        self, session_id: str, component, *, expected_state: dict, job_preparation=(), keep_trace: bool = False,
+    ) -> int:
+        self._session_text(session_id, 'session_id')
+        return self._complete_component_preparation(session_id, component, expected_state, job_preparation, keep_trace)
+
+    def complete_component_reset_preparation(
+        self, component, *, expected_state: dict, job_preparation=(), keep_trace: bool = False,
+    ) -> int:
+        return self._complete_component_preparation(None, component, expected_state, job_preparation, keep_trace)
+
+    def _complete_component_preparation(self, session_id, component, expected_state, job_preparation, keep_trace):
+        self._require_execution_session_storage()
+        members = self._session_component(component)
+        expected = dict(expected_state)
+        fields = {'members', 'shape_json', 'lifecycle', 'stability', 'instability_origin',
+                  'misaligned', 'alignment_generation'}
+        if (set(expected) != fields or type(expected.get('alignment_generation')) is not int
+                or expected['alignment_generation'] < 0 or type(expected.get('misaligned')) is not bool
+                or type(expected.get('members')) is not tuple or expected['members'] != members):
+            raise ValueError('Full preparation requires an exact captured component observation')
+        expected_shape = self._session_text(expected.get('shape_json'), 'expected_shape')
+        key = encode_component_key(members)
+        preparations = tuple(job_preparation)
+        if preparations and (len(preparations) != len(members) or {plan.node for plan in preparations} != set(members)):
+            raise ValueError('Job preparation must cover the exact full component')
+
+        def complete(connection):
+            state = self._read_component_preparation(connection, session_id, members, expected_shape)
+            if state != expected:
+                raise RuntimeError('Component changed during full preparation: ' + key)
+            apply_job_preparation(connection, preparations, keep_trace=keep_trace)
+            changed = connection.execute(
+                "UPDATE component_states SET lifecycle='queued', stability=NULL, instability_origin=NULL, "
+                'misaligned=0, alignment_generation=alignment_generation+1 '
+                'WHERE component_key=? AND lifecycle=? AND stability IS ? AND instability_origin IS ? '
+                'AND misaligned=? AND alignment_generation=?',
+                (key, expected['lifecycle'], expected['stability'], expected['instability_origin'],
+                 int(expected['misaligned']), expected['alignment_generation']),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError('Component changed during full preparation: ' + key)
+            return expected['alignment_generation'] + 1
+
+        return self.submit_db_mutation(complete, wait=True, priority=0)
+
     def begin_sampled_component_resume(
         self, session_id: str, component, *, expected_alignment_generation: int,
     ) -> bool:

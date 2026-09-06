@@ -7,6 +7,8 @@ from pathlib import Path
 
 from micro_workflow_manager.models import QUEUED
 from micro_workflow_manager.system import MicroWorkflow
+from micro_workflow_manager.storage.job_preparation import apply_job_preparation, read_job_preparation
+from micro_workflow_manager.storage.preparation_files import stage_preparation_files
 
 from .files import remove_dir, remove_path, safe_node_dir, safe_node_name
 from .graph_utils import component_topological_nodes, expand_to_components
@@ -299,25 +301,68 @@ def prepare_fresh_components(
     selection and all of its remaining jobs are reset. Later components preserve
     jobs from unselected incoming branches.
     """
-    selected = {workflow.component_id(component) for component in components}
-    if not keep_trace:
-        # Include journals left orphaned by an earlier --keeptrace deletion.
-        # They are still potentially changed when these producers recreate the
-        # same node/job IDs, even though no current job row identifies them.
-        workflow.storage.clear_job_events_produced_by_components(selected)
-    removed = delete_jobs_generated_by_components(
-        workflow,
-        selected,
-        keep_trace=keep_trace,
+    with workflow.storage.interprocess_lock('active-run-state'):
+        context = workflow.execution_session_context
+        with workflow.lock:
+            snapshot = workflow.topology.snapshot()
+            selected = [workflow.component_id(component) for component in components]
+        if context is None:
+            workflow.storage.refuse_live_sessions_for_reset()
+            workflow.storage.register_component_topology(snapshot)
+            observations = {
+                component: workflow.storage.read_component_reset_preparation(component, expected_shape=snapshot.shape_json)
+                for component in selected
+            }
+        else:
+            if snapshot.shape_json != context[2]:
+                raise RuntimeError('Fresh preparation graph changed after admission')
+            observations = {
+                component: workflow.storage.read_component_fresh_preparation(
+                    context[0], component, expected_shape=context[2],
+                ) for component in selected
+            }
+        return _prepare_observed_components(root, workflow, selected, observations, context, keep_trace=keep_trace)
+
+
+def _prepare_observed_components(root, workflow, components, observations, context, *, keep_trace):
+    selected = set(components)
+    preparations = {
+        component: read_job_preparation(
+            workflow.storage, component, selected, reset_retained=True, preserve_external=position > 0,
+        ) for position, component in enumerate(components)
+    }
+    selected_nodes = {node for component in components for node in component}
+    outside = read_job_preparation(
+        workflow.storage, sorted(set(workflow.graph_obj) - selected_nodes), selected,
+        reset_retained=False, preserve_external=True,
     )
-    for index, component in enumerate(components):
-        reset_component_jobs_for_fresh_run(
-            root,
-            workflow,
-            component,
-            preserve_external_parent_jobs=index > 0,
-            keep_trace=keep_trace,
-        )
+    removed = {}
+    for component in components:
+        plans = preparations[component]
+        with stage_preparation_files(root, plans):
+            if context is None:
+                workflow.storage.complete_component_reset_preparation(
+                    component, expected_state=observations[component], job_preparation=plans, keep_trace=keep_trace,
+                )
+            else:
+                workflow.storage.complete_component_fresh_preparation(
+                    context[0], component, expected_state=observations[component],
+                    job_preparation=plans, keep_trace=keep_trace,
+                )
+        for plan in plans:
+            if plan.delete_ids:
+                removed[plan.node] = len(plan.delete_ids)
+        workflow.storage.notify_queue_changes(component)
+    for plan in outside:
+        if not plan.delete_ids and (keep_trace or not plan.orphan_ids):
+            continue
+        with stage_preparation_files(root, [plan]):
+            workflow.storage.submit_db_mutation(
+                lambda connection: apply_job_preparation(connection, [plan], keep_trace=keep_trace),
+            )
+        if plan.delete_ids:
+            removed[plan.node] = len(plan.delete_ids)
+        workflow.storage.notify_queue_change(plan.node)
     return removed
 
 

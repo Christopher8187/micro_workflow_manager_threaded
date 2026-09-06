@@ -372,30 +372,36 @@ def test_component_state_keeps_producing_shape_and_separate_split_identities(tmp
         _close(storage)
 
 
-def test_component_state_reader_refuses_version4_without_changing_raw_node_state(tmp_path):
+def test_native_storage_open_refuses_version4_and_preserves_raw_node_state(tmp_path):
     storage = FileStorage(tmp_path)
     try:
         storage.set_node_status('A', 'done')
         output = storage.node_output_dir('A') / 'user.txt'
         output.write_bytes(b'preserved user output')
-        before = tuple(storage.db_connection().execute(
-            "SELECT * FROM nodes WHERE node_name='A'"
-        ).fetchone())
-        with pytest.raises(RuntimeError, match='session-capable database'):
-            storage.get_component_state(('A',))
-        assert storage.get_node_status('A') == 'done'
-        assert tuple(storage.db_connection().execute(
-            "SELECT * FROM nodes WHERE node_name='A'"
-        ).fetchone()) == before
-        assert output.read_bytes() == b'preserved user output'
-        assert storage.db_connection().execute(
-            "SELECT name FROM sqlite_master WHERE name='component_states'"
-        ).fetchone() is None
-        assert storage.db_connection().execute(
-            "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone()[0] == '4'
+        database = storage.state_database_path()
     finally:
         _close(storage)
+    database.unlink()
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            'CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);'
+            "INSERT INTO metadata VALUES('database_schema_version', '4');"
+            'CREATE TABLE nodes(node_name TEXT PRIMARY KEY, status TEXT);'
+            "INSERT INTO nodes VALUES('A', 'done');"
+        )
+        before_rows = list(connection.iterdump())
+    before_files = {path.relative_to(tmp_path): path.read_bytes()
+                    for path in tmp_path.rglob('*') if path.is_file()}
+    with pytest.raises(RuntimeError, match='Unsupported MWF project format'):
+        FileStorage(tmp_path)
+    assert {path.relative_to(tmp_path): path.read_bytes()
+            for path in tmp_path.rglob('*') if path.is_file()} == before_files
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before_rows
+        assert connection.execute("SELECT status FROM nodes WHERE node_name='A'").fetchone()[0] == 'done'
+        assert connection.execute("SELECT name FROM sqlite_master WHERE name='component_states'").fetchone() is None
+        assert connection.execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '4'
+    assert output.read_bytes() == b'preserved user output'
 
 
 @pytest.mark.parametrize('damage', ['missing-table', 'origin-reference', 'boolean-check',

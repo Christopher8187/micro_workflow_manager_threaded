@@ -39,7 +39,8 @@ def test_component_observations_keep_exact_records_and_requested_order(tmp_path)
         _close(storage)
 
 
-def test_component_observations_use_one_snapshot_during_a_concurrent_change(tmp_path):
+@pytest.mark.parametrize('allow_missing', [False, True])
+def test_component_observations_use_one_snapshot_during_a_concurrent_change(tmp_path, allow_missing):
     storage = FileStorage._create_new_project_state(tmp_path)
     topology = ComponentTopology(nx.DiGraph([('A', 'C'), ('B', 'C')]), []).snapshot()
     storage.register_component_topology(topology)
@@ -62,7 +63,9 @@ def test_component_observations_use_one_snapshot_during_a_concurrent_change(tmp_
 
         connection.set_trace_callback(trace)
         try:
-            result = storage.read_component_states([('A',), ('B',)], expected_shape=topology.shape_json)
+            requested = [('A',), ('B',), ('absent',)] if allow_missing else [('A',), ('B',)]
+            options = {'allow_missing': True} if allow_missing else {}
+            result = storage.read_component_states(requested, expected_shape=topology.shape_json, **options)
             assert not connection.in_transaction
             return result
         finally:
@@ -83,9 +86,12 @@ def test_component_observations_use_one_snapshot_during_a_concurrent_change(tmp_
                 proceed.set()
             observed = future.result(timeout=15)
         assert not trace_errors
-        assert [(state['lifecycle'], state['alignment_generation']) for state in observed.values()] == [
+        assert [(observed[node]['lifecycle'], observed[node]['alignment_generation'])
+                for node in [('A',), ('B',)]] == [
             ('queued', 0), ('queued', 0),
         ]
+        if allow_missing:
+            assert observed[('absent',)] is None
     finally:
         proceed.set()
         _close(other)
@@ -93,8 +99,11 @@ def test_component_observations_use_one_snapshot_during_a_concurrent_change(tmp_
 
 
 @pytest.mark.parametrize('outer_transaction', [False, True])
-@pytest.mark.parametrize('damage', ['none', 'wrong-shape', 'missing-component', 'invalid-state'])
-def test_component_observation_cleanup_preserves_the_callers_transaction(tmp_path, outer_transaction, damage):
+@pytest.mark.parametrize('allow_missing', [False, True])
+@pytest.mark.parametrize('damage', ['none', 'wrong-shape', 'missing-component', 'missing-state', 'invalid-state'])
+def test_component_observation_cleanup_preserves_the_callers_transaction(
+    tmp_path, outer_transaction, allow_missing, damage,
+):
     storage = FileStorage._create_new_project_state(tmp_path)
     topology = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage.register_component_topology(topology)
@@ -104,7 +113,11 @@ def test_component_observation_cleanup_preserves_the_callers_transaction(tmp_pat
     if damage == 'wrong-shape':
         shape = topology.shape_json.replace('"B"', '"C"')
     elif damage == 'missing-component':
-        requested.append(('C',))
+        requested.insert(1, ('C',))
+    elif damage == 'missing-state':
+        storage.submit_db_mutation(lambda writer: writer.execute(
+            'DELETE FROM component_states WHERE component_key=?', ('["B"]',),
+        ))
     elif damage == 'invalid-state':
         def corrupt(writer):
             writer.execute('PRAGMA ignore_check_constraints=ON')
@@ -117,14 +130,18 @@ def test_component_observation_cleanup_preserves_the_callers_transaction(tmp_pat
         if outer_transaction:
             connection.execute('BEGIN IMMEDIATE')
             connection.execute('UPDATE component_states SET alignment_generation=7')
-        if damage == 'none':
-            observed = storage.read_component_states(requested, expected_shape=shape)
-            assert {state['alignment_generation'] for state in observed.values()} == {
+        options = {'allow_missing': True} if allow_missing else {}
+        if damage == 'none' or (damage == 'missing-component' and allow_missing):
+            observed = storage.read_component_states(requested, expected_shape=shape, **options)
+            assert list(observed) == requested
+            assert {state['alignment_generation'] for state in observed.values() if state is not None} == {
                 7 if outer_transaction else 0,
             }
+            if damage == 'missing-component':
+                assert observed[('C',)] is None
         else:
             with pytest.raises(RuntimeError):
-                storage.read_component_states(requested, expected_shape=shape)
+                storage.read_component_states(requested, expected_shape=shape, **options)
         assert connection.in_transaction is outer_transaction
         if outer_transaction:
             connection.rollback()

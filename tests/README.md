@@ -14,7 +14,7 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_037_advisory_lock_recovery.py` | Advisory-lock ownership, dead-process reclamation, and run-state cleanup when override binding or cleanup fails. |
 | `test_038_fresh_resume_restart_semantics.py` | Fresh run preparation, merge-branch preservation, descendant resume, active restart, and inline monitoring. |
 | `test_039_sqlite_contention_recovery.py` | Checkpoint writes, execution fences, asynchronous runtime observations, unassisted worker-connection cleanup, exact retained outputs after repeated API rounds, and repeated CLI merge runs. |
-| `test_040_high_fanout_batching.py` | Prepared payload batches, idempotent fan-out, job-ID reservation, schema upgrade, grouped publication, monitoring, and bulk fresh cleanup. |
+| `test_040_high_fanout_batching.py` | Prepared payload batches, idempotent fan-out, job-ID reservation, native reopen and damaged-schema refusal, grouped publication, monitoring, and bulk fresh cleanup. |
 | `test_041_live_component_pumping.py` | Live member refills, component status, lazy-source failure, late job IDs, Windows descendant paths, and monitoring during routing. |
 | `test_042_cooperative_api_scaling.py` | Cooperative API jobs, high logical concurrency, and pending aggregate API budgets. |
 | `test_043_waiting_nodes.py` | Intra-component waiting gates, monitor display, valid and invalid wait targets, and singleton behavior. |
@@ -65,8 +65,11 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_088_native_component_controls.py` | Removed component skip operation and preservation of successful skipped jobs during ordinary execution. |
 | `test_089_ordinary_component_start.py` | Guarded queued component start, exact ownership, transactional refusal and rollback, concurrent starts, and native reopen. |
 | `test_090_component_session_settlement.py` | Atomic component results and session exit, success within a live session, accepted restart ordering, lineage, stale ownership, unfinished-job refusal, and batch rollback. |
-| `test_091_component_state_observations.py` | Consistent component snapshots during concurrent writes, exact shape and state validation, and caller transaction preservation. |
+| `test_091_component_state_observations.py` | Consistent component snapshots during concurrent writes, exact ordering, optional absent-definition observations, damaged-state refusal, and caller transaction preservation. |
 | `test_092_native_component_lifecycle.py` | Public native component start and completion, nested calls, retained task results, exact accepted restarts before ordinary queued work, readiness, and terminal session cleanup. |
+| `test_093_native_cli_readiness.py` | Native parent readiness with raw-status disagreement, mutation-free refusal for absent parents, empty selected components, and native CLI stop boundaries. |
+| `test_094_native_fresh_preparation.py` | Full component preparation epochs, exact run and reset authority, preserved unrelated state, active-work refusal, and failed preparation recovery. |
+| `test_095_native_preparation_files.py` | Exact job-file removal with unattributed files preserved, staging and restoration, collision preservation, original-error retention, committed preparation with retained temporary files, refusal of links into unselected nodes, and changed job or orphan-journal refusal. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and replacement-runtime isolation after the old checkpoint deadline and stale-write attempt. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished work, missing expected rounds, and repeated-API slowdown beyond the fixed allowance; successful completion and exact allowance equality. |

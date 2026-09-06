@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from micro_workflow_manager.component_readiness import calculate_component_readiness
 from micro_workflow_manager.models import CANCELLED, FAILED, QUEUED, RUNNING
 from micro_workflow_manager.system import MicroWorkflow
 
@@ -21,17 +22,31 @@ def _component_notice(workflow: MicroWorkflow, node: str) -> list[str]:
     return component
 
 def _refuse_start_component_inputs(workflow: MicroWorkflow, node: str, command: str) -> bool:
-    component = workflow.component_for(node)
-    blockers = {
-        previous for previous in workflow.component_predecessors(component)
-        if not workflow.node_complete(previous)
-    }
+    with workflow.lock:
+        component = workflow.component_for(node)
+        parents = sorted(workflow.component_predecessor_components(component))
+        expected_shape = workflow.topology.graph_shape()
+    observed = workflow.storage.read_component_states(parents, expected_shape=expected_shape, allow_missing=True)
+    blockers = [parent for parent, state in observed.items()
+                if state is None or state['lifecycle'] != 'done']
+    reason = 'incomplete predecessor components'
     if not blockers:
-        return False
-    print(f"Cannot {command}: incomplete predecessor components: {', '.join(sorted(blockers))}")
+        readiness = calculate_component_readiness(
+            (state['lifecycle'], state['stability'], state['instability_origin'])
+            for state in observed.values()
+        )
+        if readiness is not None:
+            return False
+        blockers = parents
+        reason = 'incompatible predecessor component results'
+    labels = {parent: parent[0] if len(parent) == 1 else '{' + ', '.join(parent) + '}'
+              for parent in blockers}
+    print(f"Cannot {command}: {reason}: {', '.join(labels.values())}")
     print("Hoeflein components are scheduled on the quotient DAG; run or resume those predecessors first.")
-    for previous in sorted(blockers):
-        print(f"  {previous}: {workflow.storage.get_node_status(previous) or 'missing'}")
+    for parent in blockers:
+        state = observed[parent]
+        status = 'not initialized' if state is None else state['lifecycle']
+        print(f"  {labels[parent]}: {status}")
     return True
 
 def run_node(
@@ -53,7 +68,6 @@ def run_node(
     component = set(nodes)
 
     def prepare():
-        workflow.storage.set_node_status(node, RUNNING)
         removed = prepare_fresh_components(
             root,
             workflow,
@@ -65,7 +79,7 @@ def run_node(
             print(f"Removed jobs produced by Hoeflein component {{{', '.join(nodes)}}}: {summary}")
 
     return run_nodes(
-        workflow, nodes, node, ignore_external=False, command="run",
+        workflow, nodes, node, command="run",
         stats=stats, stats_interval=stats_interval, monitor=monitor,
         monitor_interval=monitor_interval, prepare=prepare,
     )
@@ -101,15 +115,8 @@ def run_from(
             )
     if _refuse_start_component_inputs(workflow, node, f"runfrom {node}"):
         return 1
-    external_descendant_blockers = direct_incomplete_inputs(workflow, set(nodes))
-    if external_descendant_blockers:
-        print(
-            "Partial runfrom: preserving work from external predecessor components "
-            f"and running this branch independently: {', '.join(sorted(external_descendant_blockers))}"
-        )
 
     def prepare():
-        workflow.storage.set_node_status(node, RUNNING)
         removed = prepare_fresh_components(
             root,
             workflow,
@@ -122,7 +129,7 @@ def run_from(
             print(f"Removed jobs produced by selected Hoeflein components {selected}: {summary}")
 
     return run_nodes(
-        workflow, nodes, node, ignore_external=True, command="runfrom",
+        workflow, nodes, node, command="runfrom",
         stats=stats, stats_interval=stats_interval, monitor=monitor,
         monitor_interval=monitor_interval, prepare=prepare,
         refuse_after_node=refuse_after_node,
@@ -176,7 +183,6 @@ def resume_node(
     _recover_finished_before_resume(workflow, nodes)
 
     blockers = direct_incomplete_inputs(workflow, set(nodes))
-    ignore_external = not not blockers
     if blockers:
         print("Resuming with incomplete external inputs:", ", ".join(sorted(blockers)))
 
@@ -188,14 +194,12 @@ def resume_node(
         workflow,
         nodes,
         node,
-        ignore_external=ignore_external,
         command="resume",
         stats=stats,
         stats_interval=stats_interval,
         monitor=monitor,
         monitor_interval=monitor_interval,
         prepare=prepare,
-        require_start_queued=False,
     )
 
 def resume_from(
@@ -234,7 +238,6 @@ def resume_from(
         )
 
     blockers = direct_incomplete_inputs(workflow, set(nodes))
-    ignore_external = not not blockers
     if blockers:
         print("Resuming with incomplete external inputs:", ", ".join(sorted(blockers)))
 
@@ -246,14 +249,12 @@ def resume_from(
         workflow,
         nodes,
         node,
-        ignore_external=ignore_external,
         command="resumefrom",
         stats=stats,
         stats_interval=stats_interval,
         monitor=monitor,
         monitor_interval=monitor_interval,
         prepare=prepare,
-        require_start_queued=False,
         refuse_after_node=refuse_after_node,
         refuse_before_node=refuse_before_node,
     )

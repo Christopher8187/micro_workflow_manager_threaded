@@ -8,6 +8,7 @@ import pytest
 from micro_workflow_manager import cli
 from micro_workflow_manager.storage import FileStorage
 from tests.state_helpers import seed_job
+from tests.test_090_component_session_settlement import _close, _rows
 
 
 def make_cli_project(tmp_path: Path, monkeypatch):
@@ -552,31 +553,48 @@ def test_reset_dag_node_does_not_reset_other_quotient_nodes(tmp_path, monkeypatc
         assert (tmp_path / "node" / node / "output" / "remove.txt").exists()
 
 
-def test_reset_component_uses_per_node_batch_preparation(tmp_path, monkeypatch, capsys):
+def test_reset_component_applies_job_preparation_atomically(tmp_path, monkeypatch, capsys):
     make_cleanup_component_project(tmp_path, monkeypatch)
     for node in ["B", "C"]:
         seed_dirty_node(tmp_path, node)
     capsys.readouterr()
 
-    calls = []
-    original = FileStorage.reset_jobs_for_run_batch
-
-    def record_batch(self, node_name, job_ids, *, preserve_events=True):
-        ids = tuple(job_ids)
-        calls.append((node_name, ids))
-        return original(
-            self,
-            node_name,
-            ids,
-            preserve_events=preserve_events,
-        )
-
     def reject_per_job_status(*args, **kwargs):
         raise AssertionError("mwf reset must not issue one status mutation per job")
 
-    monkeypatch.setattr(FileStorage, "reset_jobs_for_run_batch", record_batch)
     monkeypatch.setattr(FileStorage, "set_job_status", reject_per_job_status)
+    storage = FileStorage(tmp_path)
+    try:
+        complete = FileStorage.complete_component_reset_preparation
 
-    assert cli.main(["reset", "B", "--yes"]) == 0
-    capsys.readouterr()
-    assert sorted(calls) == [("B", (1,)), ("C", (1,))]
+        def inject_second_node_failure(self, *args, **kwargs):
+            self.submit_db_mutation(lambda connection: connection.execute(
+                'CREATE TRIGGER reject_second_node_reset BEFORE UPDATE OF status ON jobs '
+                "WHEN NEW.node_name='C' BEGIN SELECT RAISE(ABORT, 'second node preparation failed'); END",
+            ))
+            try:
+                return complete(self, *args, **kwargs)
+            finally:
+                self.submit_db_mutation(lambda connection: connection.execute('DROP TRIGGER reject_second_node_reset'))
+
+        before = _rows(storage)
+        before_files = {path.relative_to(tmp_path): path.read_bytes()
+                        for path in (tmp_path / 'node').rglob('*') if path.is_file()}
+        with monkeypatch.context() as fault:
+            fault.setattr(FileStorage, 'complete_component_reset_preparation', inject_second_node_failure)
+            assert cli.main(["reset", "B", "--yes"]) == 1
+        assert 'second node preparation failed' in capsys.readouterr().err
+        after = _rows(storage)
+        for table in ('jobs', 'job_instances', 'job_events', 'nodes'):
+            assert after[table] == before[table]
+        assert {path.relative_to(tmp_path): path.read_bytes()
+                for path in (tmp_path / 'node').rglob('*') if path.is_file()} == before_files
+        assert cli.main(["reset", "B", "--yes"]) == 0
+        capsys.readouterr()
+        for node in ('B', 'C'):
+            assert storage.get_job_status(node, 1) == 'queued'
+            assert not (tmp_path / 'node' / node / 'output' / 'remove.txt').exists()
+            assert not (tmp_path / 'node' / node / 'jobs' / '1' / 'output.json').exists()
+        assert storage.get_component_state(('B', 'C'))['lifecycle'] == 'queued'
+    finally:
+        _close(storage)
