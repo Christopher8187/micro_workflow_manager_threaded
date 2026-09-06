@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import zipfile
@@ -7,17 +8,15 @@ from pathlib import Path
 from types import ModuleType
 
 from micro_workflow_manager.graph import normalize_edges
-from micro_workflow_manager.legacy_runs import preflight_legacy_storage_creation
 from micro_workflow_manager.models import QUEUED
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.system import MicroWorkflow, normalize_workflow_runner
 
 from micro_workflow_manager.paths import config_file, mwf_dir
+from micro_workflow_manager.project_format import read_native_project_config
 from .extras.scaffold import ensure_project_sidecars, ensure_vscode_settings
-from .files import find_root, read_config, safe_node_name, write_json
-from .layout import ensure_runtime_layout
-from .active_run import refuse_live_legacy_migration
+from .files import find_root, read_config, safe_node_name
 
 
 def init_project(archive_path: str | None = None) -> int:
@@ -25,38 +24,29 @@ def init_project(archive_path: str | None = None) -> int:
     print("MWF project initialization")
     print(f"  working directory: {root}")
 
-    refuse_live_legacy_migration(root)
-    archive = _resolve_init_archive(root, archive_path)
+    existing = os.path.lexists(mwf_dir(root))
+    if existing:
+        read_native_project_config(root)
+        if archive_path is not None:
+            raise RuntimeError("Initialize a deployment archive in a separate fresh project directory")
+    else:
+        FileStorage._refuse_existing_runtime(root)
+    archive = None if existing else _resolve_init_archive(root, archive_path)
     if archive is not None:
         print(f"  deployment archive: {archive}")
         _extract_deployment_archive(archive, root)
-        refuse_live_legacy_migration(root)
     else:
         print("  deployment archive: none detected")
 
-    migrated = ensure_runtime_layout(root)
+    storage = FileStorage(root)
     path = config_file(root)
-    sidecars = ensure_project_sidecars(root)
+    ensure_project_sidecars(root)
 
-    if migrated:
-        print(f"Migrated legacy runtime state into: {mwf_dir(root)}")
-
-    if path.exists():
+    if existing:
         print(f"  project configuration already exists: {path}")
     else:
-        write_json(
-            path,
-            {
-                "version": 4,
-                "schema_version": CURRENT_STATE_SCHEMA_VERSION,
-                "graph_path": None,
-                "runner": "threaded",
-                "edges": [],
-            },
-        )
         print(f"  created project configuration: {path}")
 
-    storage = FileStorage(root)
     database_path = storage.state_database_path()
     print(f"  initialized SQLite state database: {database_path}")
 
@@ -140,8 +130,8 @@ def setup_graph(
     This command is the single explicit synchronization point.
     """
 
-    preflight_legacy_storage_creation(root)
     config = read_config(root)
+    storage = None if dry_run else FileStorage(root)
     previous_nodes = _nodes_from_edges(_stored_edges(config))
     path = _resolve_graph_path(root, config, graph_path, update=update)
     module = import_file(path)
@@ -162,10 +152,9 @@ def setup_graph(
         print("  nodes to add: " + (", ".join(new_nodes) if new_nodes else "(none)"))
         print("  nodes to delete: " + (", ".join(stale_nodes) if stale_nodes else "(none)"))
         print("  edge list changed: " + ("yes" if stored_edges != edges else "no"))
-        print("  graph synchronization was not applied; normal CLI bootstrap may already have migrated framework state")
+        print("  graph synchronization was not applied")
         return 0
 
-    config["version"] = 4
     config["schema_version"] = CURRENT_STATE_SCHEMA_VERSION
     config["graph_path"] = path.relative_to(root).as_posix()
     config["edges"] = edges
@@ -178,8 +167,8 @@ def setup_graph(
     # Store the new graph state before mounting routers. Router mounting may
     # materialize schemas/default jobs, and those writes must only target nodes
     # that have already passed the explicit synchronization step.
-    write_json(config_file(root), config)
-    _synchronize_node_folders(root, expected_nodes, stale_nodes)
+    storage.atomic_write_json(config_file(root), config)
+    _synchronize_node_folders(root, expected_nodes, stale_nodes, storage)
     ensure_vscode_settings(
         root,
         node_names=expected_nodes,
@@ -211,7 +200,6 @@ def load_workflow(
     *,
     require_synced: bool = True,
 ) -> MicroWorkflow:
-    preflight_legacy_storage_creation(root)
     config = read_config(root)
     config_schema = config.get("schema_version")
     if type(config_schema) is int and config_schema > CURRENT_STATE_SCHEMA_VERSION:
@@ -225,13 +213,6 @@ def load_workflow(
         raise RuntimeError("No graph set. Run: mwf graph src/graph.py")
 
     graph_file = resolve_stored_graph_path(root, graph_path)
-    module = import_file(graph_file)
-    edges = read_edges(module)
-
-    if require_synced:
-        require_graph_synced(root, config, edges)
-
-    graph_nodes = _nodes_from_edges(edges)
     workflow = MicroWorkflow(
         project_dir=root,
         runner=runner or config.get("runner", "threaded"),
@@ -239,6 +220,13 @@ def load_workflow(
         persist_graph=False,
         initialize_node_folders=False,
     )
+    module = import_file(graph_file)
+    edges = read_edges(module)
+
+    if require_synced:
+        require_graph_synced(root, config, edges)
+
+    graph_nodes = _nodes_from_edges(edges)
     workflow.graph(edges)
     # Static autostart declarations define the reverse reachability arcs used
     # to construct Hoeflein components before any job begins.
@@ -399,11 +387,12 @@ def _disk_node_names(root: Path) -> set[str]:
     return {path.name for path in node_root.iterdir() if path.is_dir()}
 
 
-def _synchronize_node_folders(root: Path, expected_nodes: set[str], stale_nodes: list[str]):
+def _synchronize_node_folders(
+    root: Path, expected_nodes: set[str], stale_nodes: list[str], storage: FileStorage,
+):
     node_root = root / "node"
     node_root.mkdir(parents=True, exist_ok=True)
 
-    storage = FileStorage(root)
     for node in stale_nodes:
         path = node_root / safe_node_name(node)
         if path.exists():

@@ -1,90 +1,108 @@
 from __future__ import annotations
 
-import shutil
 import sqlite3
 from pathlib import Path
 
 
 DATABASE_SCHEMA_VERSION = 5
-AUTOMATIC_SCHEMA_VERSION = 4
 SESSION_TABLES = frozenset({
     "execution_sessions", "session_components", "session_jobs",
     "graph_shapes", "component_definitions", "component_reservations", "component_holds",
-    "job_execution_owners", "component_states",
+    "job_execution_owners", "component_states", "job_instances",
 })
+SESSION_TRIGGERS = frozenset({"create_job_instance"})
+CORE_TABLES = frozenset({
+    "metadata", "nodes", "jobs", "job_events", "idempotency",
+    "default_job_specs", "advisory_locks", "job_sequences", "network_state",
+})
+NATIVE_TABLES = CORE_TABLES | SESSION_TABLES
 
 
 class SQLiteSchemaMixin:
-    """Schema creation, migration metadata, and integrity checks."""
+    """Native schema creation and integrity checks."""
 
-    def initialize_state_database(self, *, initial_schema_version: int = AUTOMATIC_SCHEMA_VERSION) -> Path:
+    def initialize_state_database(self, *, create: bool = False) -> Path:
         connection = self._new_db_connection()
-        required_tables = {
-            "metadata",
-            "nodes",
-            "jobs",
-            "job_events",
-            "idempotency",
-            "default_job_specs",
-            "advisory_locks",
-            "job_sequences",
-            "network_state",
-        }
         try:
             # WAL keeps monitor/inspect readers from blocking the scheduler's
             # short metadata writes. The WAL and SHM files are SQLite internals,
             # not per-job filesystem state.
-            connection.execute("PRAGMA journal_mode = WAL")
+            if create:
+                connection.execute("PRAGMA journal_mode = WAL")
             # All processes must decide the schema under the same SQLite write
             # transaction. A process must not publish a stale pre-lock version.
             connection.execute("BEGIN IMMEDIATE")
 
-            existing_tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            if initial_schema_version == 5:
+            if create:
+                existing_tables = {
+                    str(row[0]) for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
                 if existing_tables:
                     raise RuntimeError("Fresh session storage found an already initialized database")
-                self._fresh_database_owned = True
-            existing_version: int | None = None
-            if "metadata" in existing_tables:
-                row = connection.execute(
-                    "SELECT value FROM metadata WHERE key='database_schema_version'"
-                ).fetchone()
-                if row is not None:
-                    try:
-                        existing_version = int(row[0])
-                    except (TypeError, ValueError) as error:
-                        raise RuntimeError(
-                            "Invalid SQLite database_schema_version in .mwf/state.sqlite3"
-                        ) from error
-                    if existing_version > DATABASE_SCHEMA_VERSION:
-                        raise RuntimeError(
-                            "SQLite workflow state was written by a newer MWF schema "
-                            f"({existing_version} > {DATABASE_SCHEMA_VERSION}). "
-                            "Install a compatible newer package instead of downgrading."
-                        )
+                self._create_core_tables(connection)
+                self._create_execution_session_tables(connection)
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES('database_schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(DATABASE_SCHEMA_VERSION),),
+                )
+            else:
+                self.validate_native_database(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
-            session_tables = SESSION_TABLES
-            if existing_tables.intersection(session_tables) and existing_version != 5:
-                raise RuntimeError("Incomplete SQLite execution-session schema: missing version 5 marker")
-            target_version = max(existing_version or 0, initial_schema_version)
-            if target_version == 5:
-                required_tables.update(session_tables)
-                if existing_version == 5 and not required_tables.issubset(existing_tables):
-                    raise RuntimeError("Incomplete SQLite execution-session schema")
-                if existing_version == 5:
-                    self._validate_execution_session_schema(connection)
-            schema_is_current = (
-                existing_version == target_version
-                and required_tables.issubset(existing_tables)
+        return self.state_database_path()
+
+    @staticmethod
+    def validate_native_database(connection) -> None:
+        """Validate a caller-owned snapshot without modifying its database."""
+        existing_tables = {
+            str(row[0]) for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
             )
-            if not schema_is_current:
-                self._execute_schema_statements(connection,
-                    """
+        }
+        existing_version = None
+        if "metadata" in existing_tables:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='database_schema_version'"
+            ).fetchone()
+            if row is not None:
+                try:
+                    existing_version = int(row[0])
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError("Invalid SQLite database_schema_version in .mwf/state.sqlite3") from error
+                if type(row[0]) is not str or row[0] != str(existing_version):
+                    raise RuntimeError("Invalid SQLite database_schema_version in .mwf/state.sqlite3")
+                if existing_version > DATABASE_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        "SQLite workflow state was written by a newer MWF schema "
+                        f"({existing_version} > {DATABASE_SCHEMA_VERSION}). "
+                        "Install a compatible newer package instead of downgrading."
+                    )
+        existing_triggers = {
+            str(row[0]) for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        if (existing_tables.intersection(SESSION_TABLES)
+                or existing_triggers.intersection(SESSION_TRIGGERS)) and existing_version != DATABASE_SCHEMA_VERSION:
+            raise RuntimeError("Incomplete SQLite execution-session schema: missing version 5 marker")
+        if existing_version != DATABASE_SCHEMA_VERSION:
+            raise RuntimeError("Unsupported MWF project format. Use migration.md to prepare a separate fresh project.")
+        if not NATIVE_TABLES.issubset(existing_tables):
+            raise RuntimeError("Incomplete SQLite execution-session schema")
+        SQLiteSchemaMixin._validate_execution_session_schema(connection)
+
+    @staticmethod
+    def _create_core_tables(connection) -> None:
+        SQLiteSchemaMixin._execute_schema_statements(connection,
+            """
                     CREATE TABLE IF NOT EXISTS metadata (
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL
@@ -180,46 +198,7 @@ class SQLiteSchemaMixin:
                         updated_at REAL NOT NULL DEFAULT 0
                     );
                     """
-                )
-                if target_version == 5:
-                    self._create_execution_session_tables(connection)
-                    connection.execute(
-                        "INSERT INTO metadata(key, value) VALUES('legacy_file_metadata_imported', '1')"
-                    )
-                connection.execute(
-                    "INSERT INTO job_sequences(node_name, next_job_id) "
-                    "SELECT node_name, COALESCE(MAX(job_id), 0) + 1 FROM jobs GROUP BY node_name "
-                    "ON CONFLICT(node_name) DO UPDATE SET "
-                    "next_job_id=MAX(job_sequences.next_job_id, excluded.next_job_id)"
-                )
-                connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES('database_schema_version', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (str(target_version),),
-                )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-        self._migrate_legacy_metadata_once()
-        # 0.3.4 advisory locks are database rows. Reusable legacy lock files
-        # are safe to remove after the database is ready.
-        obsolete_locks = self.project_dir / ".mwf" / "locks"
-        if obsolete_locks.exists():
-            if obsolete_locks.is_dir():
-                shutil.rmtree(obsolete_locks)
-            else:
-                obsolete_locks.unlink()
-        legacy_locks = self.project_dir / ".mwf_locks"
-        if legacy_locks.exists():
-            if legacy_locks.is_dir():
-                shutil.rmtree(legacy_locks)
-            else:
-                legacy_locks.unlink()
-        return self.state_database_path()
+        )
 
     @staticmethod
     def _execute_schema_statements(connection, script: str) -> None:
@@ -236,19 +215,16 @@ class SQLiteSchemaMixin:
 
     @staticmethod
     def _validate_execution_session_schema(connection) -> None:
-        marker = connection.execute(
-            "SELECT value FROM metadata WHERE key='legacy_file_metadata_imported'"
-        ).fetchone()
-        if marker is None or marker[0] != "1":
-            raise RuntimeError("Incomplete SQLite execution-session schema: missing fresh-state marker")
-
         def objects(database):
-            placeholders = ",".join("?" for _ in SESSION_TABLES)
+            placeholders = ",".join("?" for _ in NATIVE_TABLES)
+            trigger_placeholders = ",".join("?" for _ in SESSION_TRIGGERS)
             return {
                 (row[0], row[1]): " ".join(row[2].split()) if row[2] is not None else None
                 for row in database.execute(
                     "SELECT type, name, sql FROM sqlite_master "
-                    f"WHERE tbl_name IN ({placeholders})", tuple(sorted(SESSION_TABLES)),
+                    f"WHERE tbl_name IN ({placeholders}) "
+                    f"OR (type='trigger' AND name IN ({trigger_placeholders}))",
+                    tuple(sorted(NATIVE_TABLES)) + tuple(sorted(SESSION_TRIGGERS)),
                 )
             }
 
@@ -256,6 +232,7 @@ class SQLiteSchemaMixin:
         # column checks, foreign keys and the partial main-slot uniqueness rule.
         reference = sqlite3.connect(":memory:")
         try:
+            SQLiteSchemaMixin._create_core_tables(reference)
             SQLiteSchemaMixin._create_execution_session_tables(reference)
             expected = objects(reference)
         finally:
@@ -263,9 +240,50 @@ class SQLiteSchemaMixin:
         actual = objects(connection)
         if actual != expected:
             raise RuntimeError("Incomplete SQLite execution-session schema: declarations differ")
+        missing_identity = connection.execute(
+            "SELECT 1 FROM jobs AS j LEFT JOIN job_instances AS i "
+            "ON i.node_name=j.node_name AND i.job_id=j.job_id "
+            "WHERE i.node_name IS NULL LIMIT 1"
+        ).fetchone()
+        orphan_identity = connection.execute(
+            "SELECT 1 FROM job_instances AS i LEFT JOIN jobs AS j "
+            "ON j.node_name=i.node_name AND j.job_id=i.job_id "
+            "WHERE j.node_name IS NULL LIMIT 1"
+        ).fetchone()
+        invalid_identity = connection.execute(
+            "SELECT 1 FROM job_instances WHERE typeof(instance_id)<>'text' "
+            "OR length(instance_id)<>32 OR length(CAST(instance_id AS BLOB))<>32 "
+            "OR instance_id GLOB '*[^0-9a-f]*' LIMIT 1"
+        ).fetchone()
+        if missing_identity or orphan_identity or invalid_identity:
+            raise RuntimeError("Incomplete SQLite execution-session schema: invalid job identities")
 
     @staticmethod
     def _create_execution_session_tables(connection) -> None:
+        connection.execute("""
+            CREATE TABLE job_instances (
+                node_name TEXT NOT NULL,
+                job_id INTEGER NOT NULL,
+                instance_id TEXT NOT NULL UNIQUE
+                    CHECK(typeof(instance_id)='text' AND length(instance_id)=32
+                          AND length(CAST(instance_id AS BLOB))=32
+                          AND instance_id NOT GLOB '*[^0-9a-f]*'),
+                last_execution_id TEXT REFERENCES job_execution_owners(execution_id),
+                PRIMARY KEY(node_name, job_id),
+                FOREIGN KEY(node_name, job_id) REFERENCES jobs(node_name, job_id)
+                    ON DELETE CASCADE
+            )
+        """)
+        connection.execute("""
+            CREATE TRIGGER create_job_instance AFTER INSERT ON jobs
+            BEGIN
+                INSERT INTO job_instances(node_name, job_id, instance_id)
+                VALUES(NEW.node_name, NEW.job_id, lower(hex(randomblob(16))));
+                SELECT RAISE(ABORT, 'Job instance identity was not created')
+                WHERE NOT EXISTS(SELECT 1 FROM job_instances
+                                 WHERE node_name=NEW.node_name AND job_id=NEW.job_id);
+            END
+        """)
         connection.execute("""
             CREATE TABLE execution_sessions (
                 session_id TEXT PRIMARY KEY,
@@ -367,6 +385,10 @@ class SQLiteSchemaMixin:
                 execution_id TEXT PRIMARY KEY,
                 node_name TEXT NOT NULL,
                 job_id INTEGER NOT NULL,
+                job_instance_id TEXT NOT NULL
+                    CHECK(typeof(job_instance_id)='text' AND length(job_instance_id)=32
+                          AND length(CAST(job_instance_id AS BLOB))=32
+                          AND job_instance_id NOT GLOB '*[^0-9a-f]*'),
                 generation INTEGER NOT NULL,
                 session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
                 component_key TEXT NOT NULL REFERENCES component_definitions(component_key)

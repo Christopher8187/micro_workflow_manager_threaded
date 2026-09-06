@@ -26,7 +26,7 @@ def seconds_since(value: Any) -> float | None:
     start = parse_iso(value)
     if start is None:
         return None
-    return max(0.0, (datetime.now() - start).total_seconds())
+    return max(0.0, (datetime.now(start.tzinfo) - start).total_seconds())
 
 def human_seconds(seconds: float | int | None) -> str:
     if seconds is None:
@@ -152,7 +152,7 @@ def node_stats(
 
 def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any]:
     selected = list(nodes) if nodes is not None else list(workflow.graph_obj.nodes)
-    run_state = workflow.storage.get_run_state()
+    sessions = workflow.storage.list_execution_sessions()
     summaries = workflow.storage.node_job_summaries(selected)
     api_node_names = {
         node_name
@@ -230,7 +230,7 @@ def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any
         "generated_at": now_iso(),
         "project_dir": str(workflow.storage.project_dir),
         "runner": workflow.runner,
-        "run_state": run_state,
+        "sessions": sessions,
         "running_nodes": running_nodes,
         "waiting_nodes": waiting_nodes,
         "totals": totals,

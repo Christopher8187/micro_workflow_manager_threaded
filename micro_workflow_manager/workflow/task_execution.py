@@ -64,8 +64,7 @@ class MountedTaskExecutionMixin:
     ):
         """Invoke one handler with at most one abandonable handler thread.
 
-        The current runner worker is the controller. Untimed programmatic jobs
-        execute directly. Timeout-supervised or actively restartable CLI jobs
+        The current runner worker is the controller. Owned non-fiber jobs
         run the user handler in exactly one daemon thread; the controller waits
         for completion, a centralized deadline, or a changed execution lease.
         """
@@ -318,9 +317,7 @@ class MountedTaskExecutionMixin:
                         total_timeout=mounted.timeout,
                         checkpoint_timeout=mounted.checkpoint_timeout,
                         runtime_sequence=runtime_sequence,
-                        force_abandonable=(
-                            self.active_job_restart_enabled and execution_id is not None
-                        ),
+                        force_abandonable=execution_id is not None,
                     )
                     ctx = JobContext(
                         system=self,

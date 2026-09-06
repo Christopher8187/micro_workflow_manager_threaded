@@ -179,7 +179,11 @@ def _print_plan(
         "  trace journals: "
         + ("would be preserved" if keep_trace else "would be cleared")
     )
-    print(f"  requested {command} was not applied; bootstrap and router mounting may already have updated framework state")
+    if getattr(workflow, "read_only", False):
+        print("  preview uses synchronized raw edges, AST-read autostart declarations, and persisted state; user code was not loaded")
+        print(f"  requested {command} was not applied; no project state was changed")
+    else:
+        print(f"  requested {command} was not applied; bootstrap and router mounting may already have updated framework state")
 
 
 def execute_destructive_command(

@@ -13,6 +13,8 @@ from typing import Any
 
 from micro_workflow_manager.models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED
 from micro_workflow_manager.processes import process_is_alive
+from micro_workflow_manager.session_liveness import execution_session_liveness
+from micro_workflow_manager.monitor_render import render_session_lines
 
 
 TERMINAL_EVENTS = {"done", "failed", "cancelled", "skipped"}
@@ -112,26 +114,45 @@ def _event_rows(storage, nodes: list[str], limit: int) -> list[dict[str, Any]]:
     return result
 
 
-def _writer_snapshot(storage, run_state: dict[str, Any]) -> dict[str, Any]:
-    local = storage.mutation_writer_diagnostics()
-    try:
-        active_pid = int(run_state.get("pid"))
-    except (TypeError, ValueError):
-        active_pid = None
-    if active_pid is None or active_pid == os.getpid():
-        return {**local, "source": "local", "age_seconds": 0.0}
+def _writer_snapshot(storage, session: dict[str, Any]) -> dict[str, Any]:
+    if session["pid"] == os.getpid():
+        return {**storage.mutation_writer_diagnostics(), "source": "local", "age_seconds": 0.0}
     persisted = storage.persisted_mutation_writer_diagnostics()
+    # A shared diagnostics file can belong to another host, a reused PID, or
+    # another writer. Attribute it only when the whole process identity agrees.
+    if any(persisted.get(key) != session[key] for key in ("hostname", "pid", "process_identity")):
+        return {"source": "unavailable", "age_seconds": None}
     try:
-        persisted_pid = int(persisted.get("pid"))
         updated_at = float(persisted.get("updated_at"))
     except (TypeError, ValueError):
-        return {**local, "source": "unavailable", "age_seconds": None}
-    if persisted_pid != active_pid:
-        return {**local, "source": "stale", "age_seconds": None}
+        return {"source": "unavailable", "age_seconds": None}
+    if not math.isfinite(updated_at):
+        return {"source": "unavailable", "age_seconds": None}
     return {
         **persisted,
         "source": "active-process",
         "age_seconds": max(0.0, time.time() - updated_at),
+    }
+
+
+def _session_diagnostics(storage, session: dict[str, Any]) -> dict[str, Any]:
+    liveness = execution_session_liveness(session)
+    # Liveness can remain valid with a nullable native process identity, but
+    # numeric PID equality alone cannot establish diagnostic attribution.
+    attributable = (
+        liveness.get("live") and liveness.get("same_host")
+        and liveness.get("process_identity_matches") is True
+    )
+    return {
+        "liveness": liveness,
+        "process": (
+            _pid_snapshot(session["pid"]) if attributable
+            else {"pid": session["pid"], "alive": None}
+        ),
+        "mutation_writer": (
+            _writer_snapshot(storage, session) if attributable
+            else {"source": "unavailable", "age_seconds": None}
+        ),
     }
 
 
@@ -144,7 +165,7 @@ def top_snapshot(
 ) -> dict[str, Any]:
     now_epoch = time.time()
     storage = workflow.storage
-    run_state = storage.get_run_state()
+    sessions = storage.list_execution_sessions()
     normalized = list(dict.fromkeys(nodes))
     counts: dict[str, dict[str, int]] = {node: {} for node in normalized}
     oldest_queued: dict[str, float] = {}
@@ -261,10 +282,15 @@ def top_snapshot(
         "generated_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "window_seconds": window_seconds,
         "event_driven": True,
-        "active_run": run_state,
-        "process": _pid_snapshot(run_state.get("pid")),
+        "sessions": sessions,
+        "session_diagnostics": {
+            session["session_id"]: _session_diagnostics(storage, session) for session in sessions
+        },
         "database": _database_snapshot(storage),
-        "mutation_writer": _writer_snapshot(storage, run_state),
+        "mutation_writer": {
+            **storage.mutation_writer_diagnostics(),
+            "source": "local", "scope": "observer-process", "age_seconds": 0.0,
+        },
         "totals": totals,
         "event_rate_per_second": len(recent_window) / window_seconds,
         "last_event_age_seconds": (
@@ -299,22 +325,13 @@ def _bytes(value: Any) -> str:
 
 def render_top(snapshot: dict[str, Any]) -> str:
     width = shutil.get_terminal_size((140, 40)).columns
-    run = snapshot["active_run"]
-    process = snapshot["process"]
     totals = snapshot["totals"]
     db = snapshot["database"]
     writer = snapshot["mutation_writer"]
     lines = [
         f"mwf top | {snapshot['generated_at']} | event cursor={db['latest_event_id']} "
         f"rate={snapshot['event_rate_per_second']:.1f}/s last={_seconds(snapshot['last_event_age_seconds'])}",
-        (
-            f"run={run.get('status', 'none')} command={run.get('command', '-')} "
-            f"pid={process.get('pid') or '-'} alive={process.get('alive', False)} "
-            f"rss={_bytes((process.get('rss_kib') or 0) * 1024)} "
-            f"threads={process.get('threads', '-')} strategy={run.get('api_startup_strategy', 'single')} "
-            f"windows={run.get('api_startup_windows', '1')} burst={run.get('api_max_admission_burst', '512')} "
-            f"rounds={run.get('api_admission_target_rounds', '4')} claim-tx={run.get('api_claim_transaction_rows', '192')}"
-        ),
+        *render_session_lines(snapshot["sessions"]),
         (
             f"jobs queued={totals['queued']} running={totals['running']} done={totals['done']} "
             f"failed={totals['failed']} cancelled={totals['cancelled']} skipped={totals['skipped']} | "
@@ -323,7 +340,7 @@ def render_top(snapshot: dict[str, Any]) -> str:
             f"db={_bytes(db['bytes'])} wal={_bytes(db['wal_bytes'])}"
         ),
         (
-            f"writer source={writer.get('source', '?')} age={_seconds(writer.get('age_seconds'))} "
+            f"writer source={writer.get('source', '?')} scope=observer-process age={_seconds(writer.get('age_seconds'))} "
             f"queued={writer.get('queued', 0)} urgent={writer.get('urgent', 0)} "
             f"durability-backlog={writer.get('durability_backlog', 0)} "
             f"active=p{writer.get('active_priority') if writer.get('active_priority') is not None else '-'}x{writer.get('active_batch_size', 0)} "
@@ -331,6 +348,27 @@ def render_top(snapshot: dict[str, Any]) -> str:
         ),
         "",
     ]
+    for session in snapshot["sessions"]:
+        diagnostics = snapshot["session_diagnostics"][session["session_id"]]
+        process = diagnostics["process"]
+        session_writer = diagnostics["mutation_writer"]
+        settings = session["details"]
+        rss = process.get("rss_kib")
+        lines.append(
+            f"session={session['session_id']} host={session['hostname'] or '-'} "
+            f"pid={process.get('pid') or '-'} alive={process.get('alive')} "
+            f"rss={_bytes(rss * 1024 if rss is not None else None)} "
+            f"threads={process.get('threads', '-')} "
+            f"writer source={session_writer['source']} "
+            f"age={_seconds(session_writer['age_seconds'])} "
+            f"liveness={diagnostics['liveness']['reason']} "
+            f"strategy={settings.get('api_startup_strategy', '-')} "
+            f"windows={settings.get('api_startup_windows', '-')} "
+            f"burst={settings.get('api_max_admission_burst', '-')} "
+            f"rounds={settings.get('api_admission_target_rounds', '-')} "
+            f"claim-tx={settings.get('api_claim_transaction_rows', '-')}"
+        )
+    lines.append("")
     header = (
         f"{'NODE':<24} {'STATE':<9} {'RUNNER':<8} {'LIMIT':>7} {'QUEUE':>7} "
         f"{'RUN':>6} {'DONE':>7} {'FAIL':>6} {'START/s':>8} {'FIN/s':>8} "

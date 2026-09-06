@@ -23,7 +23,8 @@ def normalize_workflow_runner(runner: str) -> str:
 
 
 class RunnerFactoryMixin:
-    def make_runner(self, node: JobNode, *, api_startup_lanes: int | None = None):
+    def make_runner(self, node: JobNode, *, execution_context, api_startup_lanes: int | None = None):
+        self.execution_claim_context(node.name, context=execution_context)
         effective_runner = node.runner_override or self.runner
 
         if effective_runner == "direct":
@@ -56,6 +57,7 @@ class RunnerFactoryMixin:
                 graph_path=self.process_graph_path,
                 allowed_run_nodes=self.allowed_run_nodes,
                 autostart_mode=self.autostart_mode,
+                execution_session_context=execution_context,
             )
 
         raise ValueError(f"Unknown runner: {effective_runner}")

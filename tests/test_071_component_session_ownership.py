@@ -22,7 +22,7 @@ assert 'networkx' not in sys.modules, 'Storage import loaded graph dependencies'
 assert 'micro_workflow_manager.topology' not in sys.modules
 storage = FileStorage(sys.argv[1])
 assert 'networkx' not in sys.modules, 'Ordinary storage creation loaded graph dependencies'
-assert storage.db_connection().execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '4'
+assert storage.db_connection().execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '5'
 assert storage.database_integrity_check() == 'ok'
 storage.close_database_connections()
 '''
@@ -338,13 +338,16 @@ def test_component_schema_damage_refuses_in_a_new_process_without_importing_lega
                 component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
                 hold_count INTEGER NOT NULL, PRIMARY KEY(session_id, component_key))''')
         else:
+            original = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name='job_execution_owners'"
+            ).fetchone()[0]
             connection.execute('DROP TABLE job_execution_owners')
-            session_reference = '' if damage == 'missing-owner-session-reference' else ' REFERENCES execution_sessions(session_id)'
-            component_reference = '' if damage == 'missing-owner-component-reference' else ' REFERENCES component_definitions(component_key)'
-            connection.execute(f'''CREATE TABLE job_execution_owners(
-                execution_id TEXT PRIMARY KEY, node_name TEXT NOT NULL, job_id INTEGER NOT NULL,
-                generation INTEGER NOT NULL, session_id TEXT NOT NULL{session_reference},
-                component_key TEXT NOT NULL{component_reference})''')
+            reference = (' REFERENCES execution_sessions(session_id)'
+                         if damage == 'missing-owner-session-reference'
+                         else ' REFERENCES component_definitions(component_key)')
+            changed = original.replace(reference, '')
+            assert changed != original, 'Damage fixture did not remove the named reference'
+            connection.execute(changed)
     legacy = tmp_path / 'node' / 'A' / 'node_state.json'
     legacy.parent.mkdir(parents=True)
     legacy.write_bytes(b'{"status":"failed"}')

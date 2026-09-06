@@ -3,6 +3,8 @@ from __future__ import annotations
 import secrets
 import sys
 
+from micro_workflow_manager.project_format import read_native_project_config
+
 from .cleanup import resolve_node_targets
 from .destructive import execute_destructive_command
 from .describe import describe_command
@@ -13,13 +15,13 @@ from .filter import inspect_filter
 from .inspect import inspect_command
 from .trace import trace_command
 from .layout import ensure_runtime_layout
-from .migration import migrate_command
 from .recovery import recover_command
 from .graph_utils import component_topological_nodes
 from .jobs import selected_job_ids_from_args
 from .monitoring import monitor_command
 from .top import top_command
 from .planning import print_run_plan
+from .preview import load_preview
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
 from .restart import restart_active_jobs, restart_active_scope
@@ -35,6 +37,7 @@ from .resource_limits import raise_open_file_limit
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    workflow = None
 
     try:
         if args.describe is not None:
@@ -51,15 +54,19 @@ def main(argv: list[str] | None = None) -> int:
             return init_project(args.archive)
 
         root = find_root()
+        read_native_project_config(root)
         # Engine is a strictly read-only visualization path. Dispatch it before
         # layout migration, SQLite initialization, or user graph imports.
         if args.command == "engine":
             return engine_command(root)
-        # Migration checks legacy liveness before changing layout or storage.
-        # Its preview also bypasses every mutating bootstrap operation.
-        if args.command == "migrate":
-            return migrate_command(root, dry_run=args.dry_run)
-        ensure_runtime_layout(root)
+        read_only_plan = (
+            args.command in {"run", "runfrom", "resume", "resumefrom"}
+            and args.plan and getattr(args, "job_mode", None) != "sample"
+        ) or (
+            args.command in {"reset", "resetfrom"} and args.dry_run
+        )
+        if not read_only_plan:
+            ensure_runtime_layout(root)
 
         if args.command == "copy":
             return copy_node_to_clipboard(root, safe_node_name(args.node))
@@ -105,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return doctor_command(root)
 
-        workflow = load_workflow(root, args.runner)
+        workflow = load_preview(root) if read_only_plan else load_workflow(root, args.runner)
 
         if args.command == "recover":
             return recover_command(root, workflow, dry_run=args.dry_run)
@@ -348,6 +355,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
+    finally:
+        if getattr(workflow, "read_only", False):
+            workflow.storage.close()
 
     return 0
 

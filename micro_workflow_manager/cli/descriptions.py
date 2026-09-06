@@ -37,7 +37,6 @@ COMMAND_HELP_DESCRIPTIONS = {
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "engine": "Open the synchronized workflow as a read-only, graph-only local browser view. Hoeflein components are collapsed into scheduling units.",
     "doctor": "Check graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges without executing jobs or applying repairs; normal CLI bootstrap may still migrate old runtime layout.",
-    "migrate": "Upgrade MWF-owned JSON and SQLite state schemas. User inputs, outputs, returned files, and provenance are never rewritten.",
     "inspect": "Inspect a node/job, list failed job IDs, or show node debug output.",
     "trace": "Render one job's chronological origin, task/fallback starts, ctx.trace objects, outputs, forwarded inputs, downstream jobs, and terminal state.",
     "filter": "Show the retry/fallback funnel, or list jobs at one stage boundary.",
@@ -65,7 +64,11 @@ A minimal beginning is:
   cd simple_flow
   mwf init
 
-Afterward, create a graph file and register it with mwf graph. If `.mwf/project.json` already exists, init preserves its configuration, upgrades sidecars, and ensures the SQLite schema is ready.
+Afterward, create a graph file and register it with mwf graph. Repeated init on
+a native 0.6.2 project preserves its configuration and stored work and refreshes
+editor sidecars. Older project formats are refused without modification. Use
+the external migration.md guide to prepare a separate revamped project with
+fresh native state. Deployment archives initialize a separate fresh directory.
 """,
     "copy": """
 `mwf copy classify` saves the complete `node/classify` tree and a matching SQLite job, status, and trace snapshot under `clipboard/classify`. It replaces an older saved copy without changing the live node or running task code. Use it as a project-scoped restoration point, not a source-control substitute or cross-project interchange format.
@@ -114,25 +117,6 @@ doctor reports that mismatch without creating the file or changing job status.
 A warning does not necessarily make the project unusable, while an ERROR causes
 a nonzero exit status suitable for a simple test script.
 """,
-    "migrate": """
-Migrate upgrades low-churn MWF JSON metadata and the SQLite scheduler schema.
-On the first 0.3.4 migration it imports legacy job identity/status, queue markers,
-events, checkpoints, execution generations, idempotency keys, default-job
-manifests, and summary indexes into `.mwf/state.sqlite3`. User `input.json`,
-`output.json`, node input/output folders, and historical per-job file trees are
-never moved into the framework database.
-
-Preview without creating the database or deleting legacy sidecars:
-  mwf migrate --dry-run
-
-Then apply the migration:
-  mwf migrate
-
-The importer removes only framework-owned legacy metadata after the transaction
-is durable. If JSON or SQLite state claims a newer incompatible schema, MWF
-refuses to downgrade it and asks you to install a compatible newer package.
-""",
-
     "inspect": """
 Inspect turns the hybrid file/SQLite state into a readable explanation. Node inspection
 shows predecessors, successors, component membership, status counts, runner,

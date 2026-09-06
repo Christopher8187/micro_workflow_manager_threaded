@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import shutil
 from pathlib import Path
 
+from micro_workflow_manager.project_format import is_link_or_reparse_point
+
 from micro_workflow_manager.models import (
-    JOB_VALID_STATUSES,
-    NODE_VALID_STATUSES,
     QUEUED,
     RUNNING,
     now,
@@ -15,168 +14,21 @@ from micro_workflow_manager.models import (
 
 
 class SQLiteStateTransferMixin:
-    """Legacy migration plus clipboard/export/import state transfer."""
-
-    def _migrate_legacy_metadata_once(self) -> None:
-        if self._metadata_value("legacy_file_metadata_imported") == "1":
-            return
-
-        node_root = self.project_dir / "node"
-        if node_root.is_dir():
-            for node_dir in sorted(path for path in node_root.iterdir() if path.is_dir()):
-                self._import_legacy_node(node_dir.name, node_dir)
-        self._set_metadata_value("legacy_file_metadata_imported", "1")
-
-    def _import_legacy_node(self, node_name: str, node_dir: Path) -> None:
-        node_state = self.read_json(node_dir / "node_state.json", default=None)
-        if isinstance(node_state, dict) and node_state.get("status") in NODE_VALID_STATUSES:
-            with self.db_transaction() as connection:
-                connection.execute(
-                    "INSERT INTO nodes(node_name, status) VALUES(?, ?) "
-                    "ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, "
-                    "updated_at=CURRENT_TIMESTAMP",
-                    (node_name, node_state["status"]),
-                )
-
-        jobs_dir = node_dir / "jobs"
-        if jobs_dir.is_dir():
-            for job_dir in sorted(
-                (path for path in jobs_dir.iterdir() if path.is_dir() and path.name.isdigit()),
-                key=lambda path: int(path.name),
-            ):
-                self._import_legacy_job(node_name, int(job_dir.name), job_dir)
-
-        idempotency_dir = node_dir / "idempotency"
-        if idempotency_dir.is_dir():
-            for path in idempotency_dir.glob("*.json"):
-                data = self.read_json(path, default=None)
-                if not isinstance(data, dict):
-                    continue
-                key = data.get("key")
-                job_id = data.get("job_id")
-                if isinstance(key, str) and type(job_id) is int:
-                    with self.db_transaction() as connection:
-                        connection.execute(
-                            "INSERT OR IGNORE INTO idempotency"
-                            "(node_name, key_hash, key_text, job_id) VALUES(?, ?, ?, ?)",
-                            (node_name, path.stem, key, job_id),
-                        )
-
-        manifest = self.read_json(node_dir / "default_jobs.json", default={})
-        if isinstance(manifest, dict):
-            with self.db_transaction() as connection:
-                for spec_key, spec in manifest.items():
-                    if spec_key == "schema_version" or not isinstance(spec, dict):
-                        continue
-                    start = spec.get("start_job_id")
-                    number = spec.get("number")
-                    signature = spec.get("params_signature")
-                    if type(start) is int and type(number) is int and isinstance(signature, str):
-                        connection.execute(
-                            "INSERT OR IGNORE INTO default_job_specs"
-                            "(node_name, spec_key, start_job_id, number, params_signature) "
-                            "VALUES(?, ?, ?, ?, ?)",
-                            (node_name, spec_key, start, number, signature),
-                        )
-
-        # Delete only framework-owned metadata after it is durable in SQLite.
-        for name in (
-            "node_state.json",
-            "default_jobs.json",
-            "job_index.json",
-            "job_index.dirty",
-        ):
-            self.remove_if_exists(node_dir / name)
-        for directory in (node_dir / "queued", node_dir / "idempotency"):
-            if directory.exists():
-                shutil.rmtree(directory)
-
-    def _import_legacy_job(self, node_name: str, job_id: int, job_dir: Path) -> None:
-        job_data = self.read_json(job_dir / "job.json", default=None)
-        if not isinstance(job_data, dict):
-            return
-        status_data = self.read_json(job_dir / "status.json", default=None)
-        status_data = status_data if isinstance(status_data, dict) else {}
-        status = status_data.get("status", QUEUED)
-        if status not in JOB_VALID_STATUSES:
-            status = QUEUED
-        control = self.read_json(job_dir / "execution.json", default=None)
-        control = control if isinstance(control, dict) else {}
-        runtime = self.read_json(job_dir / "runtime.json", default=None)
-        runtime_json = json.dumps(runtime, ensure_ascii=False) if isinstance(runtime, dict) else None
-        parent = job_data.get("parent")
-        parent_json = json.dumps(parent, ensure_ascii=False) if parent is not None else None
-        created_at = str(job_data.get("created_at") or "")
-        status_extra = {
-            key: value for key, value in status_data.items()
-            if key not in {"schema_version", "job_id", "node_name", "status"}
-        }
-        with self.db_transaction() as connection:
-            connection.execute(
-                "INSERT OR IGNORE INTO jobs("
-                "node_name, job_id, parent_json, created_at, status, status_json, "
-                "generation, active_execution_id, active_pid, active_thread_id, "
-                "active_started_at, restart_requested_at, restart_requested_by_pid, "
-                "restart_reason, runtime_json"
-                ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    node_name,
-                    job_id,
-                    parent_json,
-                    created_at,
-                    status,
-                    json.dumps(status_extra, ensure_ascii=False),
-                    int(control.get("generation", 0) or 0),
-                    control.get("active_execution_id"),
-                    control.get("active_pid"),
-                    control.get("active_thread_id"),
-                    control.get("active_started_at"),
-                    control.get("restart_requested_at"),
-                    control.get("restart_requested_by_pid"),
-                    control.get("restart_reason"),
-                    runtime_json,
-                ),
-            )
-            count = connection.execute(
-                "SELECT COUNT(*) FROM job_events WHERE node_name=? AND job_id=?",
-                (node_name, job_id),
-            ).fetchone()[0]
-            if count == 0:
-                events_path = job_dir / "events.jsonl"
-                if events_path.is_file():
-                    for raw in events_path.read_text(encoding="utf-8").splitlines():
-                        try:
-                            event_row = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(event_row, dict):
-                            continue
-                        event_name = str(event_row.pop("event", "event"))
-                        event_time = str(event_row.pop("time", ""))
-                        connection.execute(
-                            "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
-                            "VALUES(?, ?, ?, ?, ?)",
-                            (
-                                node_name,
-                                job_id,
-                                event_time,
-                                event_name,
-                                json.dumps(event_row, ensure_ascii=False, separators=(",", ":")),
-                            ),
-                        )
-
-        for name in ("job.json", "status.json", "execution.json", "runtime.json", "events.jsonl"):
-            self.remove_if_exists(job_dir / name)
+    """Native clipboard state transfer."""
 
     def delete_node_state(self, node_name: str) -> None:
         node_name = self.validate_node_name(node_name)
         with self.db_transaction() as connection:
-            connection.execute("DELETE FROM idempotency WHERE node_name=?", (node_name,))
-            connection.execute("DELETE FROM default_job_specs WHERE node_name=?", (node_name,))
-            connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
-            connection.execute("DELETE FROM jobs WHERE node_name=?", (node_name,))
-            connection.execute("DELETE FROM job_sequences WHERE node_name=?", (node_name,))
-            connection.execute("DELETE FROM nodes WHERE node_name=?", (node_name,))
+            self._delete_node_state(connection, node_name)
+
+    @staticmethod
+    def _delete_node_state(connection, node_name):
+        connection.execute("DELETE FROM idempotency WHERE node_name=?", (node_name,))
+        connection.execute("DELETE FROM default_job_specs WHERE node_name=?", (node_name,))
+        connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
+        connection.execute("DELETE FROM jobs WHERE node_name=?", (node_name,))
+        connection.execute("DELETE FROM job_sequences WHERE node_name=?", (node_name,))
+        connection.execute("DELETE FROM nodes WHERE node_name=?", (node_name,))
 
     def export_node_state(self, node_name: str, destination: Path) -> Path:
         """Write a cold SQLite snapshot used by ``mwf copy``/``mwf paste``."""
@@ -248,10 +100,9 @@ class SQLiteStateTransferMixin:
     def reconcile_pasted_node_state(self, node_name: str) -> dict[str, int]:
         """Make pasted payload folders and SQLite metadata immediately consistent.
 
-        Older clipboard snapshots may not contain a SQLite export, while a snapshot
-        captured during execution may contain stale ``running`` leases. Pasting is a
-        cold restore: missing metadata rows are rebuilt as queued jobs and running
-        rows are requeued with their execution leases cleared.
+        A native snapshot must describe every pasted job. A snapshot captured
+        during execution may contain stale running leases, which are cleared
+        when those jobs are requeued for the destination.
         """
         node_name = self.validate_node_name(node_name)
         jobs_root = self.project_dir / "node" / node_name / "jobs"
@@ -265,7 +116,6 @@ class SQLiteStateTransferMixin:
                     continue
                 payload_ids.add(job_id)
 
-        created = 0
         requeued = 0
         removed = 0
         with self.db_transaction() as connection:
@@ -273,6 +123,11 @@ class SQLiteStateTransferMixin:
                 "SELECT job_id, status FROM jobs WHERE node_name=?", (node_name,)
             ).fetchall()
             existing = {int(row["job_id"]): str(row["status"]) for row in existing_rows}
+
+            missing = sorted(payload_ids - set(existing))
+            if missing:
+                addresses = ', '.join(f'{node_name}/{job_id}' for job_id in missing)
+                raise RuntimeError(f'Clipboard payloads have no native job state: {addresses}')
 
             for job_id in sorted(set(existing) - payload_ids):
                 connection.execute(
@@ -288,19 +143,6 @@ class SQLiteStateTransferMixin:
                     (node_name, job_id),
                 )
                 removed += 1
-
-            for job_id in sorted(payload_ids - set(existing)):
-                connection.execute(
-                    "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
-                    "VALUES(?, ?, NULL, ?, ?, '{}')",
-                    (node_name, job_id, now(), QUEUED),
-                )
-                connection.execute(
-                    "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
-                    "VALUES(?, ?, ?, 'clipboard_restored', ?)",
-                    (node_name, job_id, now(), json.dumps({"status": QUEUED})),
-                )
-                created += 1
 
             connection.execute(
                 "INSERT INTO job_sequences(node_name, next_job_id) VALUES(?, ?) "
@@ -342,17 +184,14 @@ class SQLiteStateTransferMixin:
                     (node_name, QUEUED),
                 )
 
-        return {"created": created, "requeued": requeued, "removed": removed, "jobs": len(payload_ids)}
+        return {"requeued": requeued, "removed": removed, "jobs": len(payload_ids)}
 
     def import_node_state(self, node_name: str, source_path: Path) -> None:
         node_name = self.validate_node_name(node_name)
         source_path = Path(source_path)
-        if not source_path.is_file():
-            # A clipboard made before 0.3.4 has no database snapshot. Preserve
-            # its payload files and initialize an empty queued node.
-            self.delete_node_state(node_name)
-            return
-        snapshot = sqlite3.connect(source_path)
+        if is_link_or_reparse_point(source_path) or not source_path.is_file():
+            raise RuntimeError("Native clipboard state snapshot is missing or is not an ordinary file")
+        snapshot = sqlite3.connect(source_path.resolve().as_uri() + '?mode=ro', uri=True)
         snapshot.row_factory = sqlite3.Row
         try:
             node_row = snapshot.execute("SELECT node_name, status FROM node_state LIMIT 1").fetchone()
@@ -363,8 +202,8 @@ class SQLiteStateTransferMixin:
         finally:
             snapshot.close()
 
-        self.delete_node_state(node_name)
         with self.db_transaction() as connection:
+            self._delete_node_state(connection, node_name)
             if node_row is not None:
                 connection.execute(
                     "INSERT INTO nodes(node_name, status) VALUES(?, ?)",

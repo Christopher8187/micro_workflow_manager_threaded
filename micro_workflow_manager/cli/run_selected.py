@@ -126,51 +126,43 @@ def _run_selected_jobs(
             if not workflow.storage.job_exists(node, job_id):
                 raise RuntimeError(f"Job does not exist: {node}/{job_id}")
 
-    previous_allowed_run_nodes = workflow.allowed_run_nodes
-    previous_autostart_mode = workflow.autostart_mode
-    previous_restart_enabled = workflow.active_job_restart_enabled
-    workflow.allowed_run_nodes = {node}
-    workflow.autostart_mode = "queue"
-    workflow.active_job_restart_enabled = True
+    with active_workflow_run(
+        workflow,
+        queue_autostarts=True,
+        command=command,
+        start_node=node,
+        nodes=[node],
+        selected_jobs=job_ids,
+        selection_builder=selection_builder,
+        stats=stats,
+        stats_interval=stats_interval,
+        monitor=monitor,
+        monitor_interval=monitor_interval,
+    ) as finish_run:
+        execution_context = workflow.execution_session_context
+        # The run slot is claimed before any selected-job artifacts are
+        # reset, so a second run command cannot race with preparation.
+        if not job_ids:
+            raise RuntimeError(f"No jobs selected for {node}")
+        for job_id in job_ids:
+            if not workflow.storage.job_exists(node, job_id):
+                raise RuntimeError(f"Job does not exist: {node}/{job_id}")
+        workflow.storage.set_node_status(node, RUNNING)
+        for job_id in job_ids:
+            reset_job_for_run(
+                root,
+                workflow,
+                node,
+                job_id,
+                mark_queued=False,
+                keep_trace=keep_trace,
+            )
 
-    try:
-        with active_workflow_run(
-            workflow,
-            command=command,
-            start_node=node,
-            nodes=[node],
-            selected_jobs=job_ids,
-            selection_builder=selection_builder,
-            stats=stats,
-            stats_interval=stats_interval,
-            monitor=monitor,
-            monitor_interval=monitor_interval,
-        ) as finish_run:
-            # The run slot is claimed before any selected-job artifacts are
-            # reset, so a second run command cannot race with preparation.
-            if not job_ids:
-                raise RuntimeError(f"No jobs selected for {node}")
-            for job_id in job_ids:
-                if not workflow.storage.job_exists(node, job_id):
-                    raise RuntimeError(f"Job does not exist: {node}/{job_id}")
-            workflow.storage.set_node_status(node, RUNNING)
-            for job_id in job_ids:
-                reset_job_for_run(
-                    root,
-                    workflow,
-                    node,
-                    job_id,
-                    mark_queued=False,
-                    keep_trace=keep_trace,
-                )
-
-            jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
-            workflow.run_node_jobs(node, jobs, ignore_readiness=True)
-            finish_run("done")
-    finally:
-        workflow.allowed_run_nodes = previous_allowed_run_nodes
-        workflow.autostart_mode = previous_autostart_mode
-        workflow.active_job_restart_enabled = previous_restart_enabled
+        jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
+        workflow._run_node_jobs(
+            node, jobs, ignore_readiness=True, execution_context=execution_context,
+        )
+        finish_run("done")
 
     label = "sample jobs" if command == "run sample" else "jobs"
     print(f"Ran {label} for {node}:")

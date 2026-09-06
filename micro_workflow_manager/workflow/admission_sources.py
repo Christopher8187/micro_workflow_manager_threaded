@@ -35,6 +35,8 @@ class ClaimedQueuedJobSource:
         node_name: str,
         source,
         *,
+        session_id: str,
+        component: tuple[str, ...],
         task_started_data=None,
         required_params=None,
         allowed_params=None,
@@ -42,6 +44,8 @@ class ClaimedQueuedJobSource:
         self.storage = storage
         self.node_name = node_name
         self.source = source
+        self.session_id = session_id
+        self.component = component
         self.task_started_data = task_started_data
         self.required_params = set(required_params or ())
         self.allowed_params = set(allowed_params or ())
@@ -66,6 +70,8 @@ class ClaimedQueuedJobSource:
             started_at=started_at,
             task_started_data=self.task_started_data,
             task_started_mask=task_started_mask,
+            session_id=self.session_id,
+            component=self.component,
         )
         return [
             ClaimedJob(

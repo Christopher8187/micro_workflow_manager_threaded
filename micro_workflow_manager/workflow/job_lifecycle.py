@@ -17,6 +17,7 @@ from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
 from ..fibers import cancellation_scope, in_fiber_runtime
 from ..networking import network_attempt_context
 from ..storage.priorities import ADMISSION_PRIORITY
+from .execution_scope import programmatic_execution
 
 
 T = TypeVar("T")
@@ -64,100 +65,20 @@ class JobLifecycleMixin:
                 f"Job {node_name}/{job_id} generation {generation} was restarted"
             )
 
-    def _run_job_unfenced(
-        self,
-        node_name: str,
-        job_id: int,
-        *,
-        preloaded_job: Job | None = None,
-        defer_node_status_refresh: bool = False,
-    ):
-        """Run a job through the original low-overhead execution path.
+    def run_job(self, node_name: str, job_id: int, ignore_readiness: bool = False):
+        with programmatic_execution(
+            self, command='run_job', start_node=node_name,
+            nodes=[node_name], selected_jobs=[job_id],
+        ) as context:
+            return self._run_job(node_name, job_id, ignore_readiness, execution_context=context)
 
-        This path is used for normal programmatic MicroWorkflow calls. The CLI
-        enables the generation-fenced supervisor only while it owns an active
-        run/runfrom sequence.
-        """
-        job = preloaded_job or self.storage.load_job(node_name, job_id)
-        started_at = now()
-        started_perf = perf_counter()
-        self.storage.set_job_status(node_name, job_id, RUNNING, started_at=started_at)
-
-        try:
-            previous_node_name = getattr(self._job_context, "node_name", None)
-            previous_job_id = getattr(self._job_context, "job_id", None)
-            previous_generation = getattr(self._job_context, "generation", None)
-            previous_execution_id = getattr(self._job_context, "execution_id", None)
-            self._job_context.node_name = node_name
-            self._job_context.job_id = job_id
-            self._job_context.generation = 0
-            self._job_context.execution_id = None
-            try:
-                result = self.execute_with_fallbacks(
-                    job,
-                    execution_generation=0,
-                    execution_id=None,
-                )
-            finally:
-                self._job_context.node_name = previous_node_name
-                self._job_context.job_id = previous_job_id
-                self._job_context.generation = previous_generation
-                self._job_context.execution_id = previous_execution_id
-
-            self.storage.write_output(
-                node_name,
-                job_id,
-                {
-                    "status": DONE,
-                    "result_type": type(result).__name__,
-                    "result_repr": repr(result),
-                },
-            )
-            self.storage.set_job_status(
-                node_name,
-                job_id,
-                DONE,
-                started_at=started_at,
-                finished_at=now(),
-                duration_seconds=round(perf_counter() - started_perf, 6),
-            )
-
-            if (
-                not defer_node_status_refresh
-                and self.storage.get_node_status(node_name) != RUNNING
-            ):
-                self.refresh_node_status(node_name, allow_complete=False)
-            return result
-
-        except Exception as error:
-            self.storage.write_debug(node_name, f"job {job_id} failed: {error}")
-            self.storage.write_output(
-                node_name,
-                job_id,
-                {"status": FAILED, "error": safe_exception_repr(error)},
-            )
-            self.storage.set_job_status(
-                node_name,
-                job_id,
-                FAILED,
-                started_at=started_at,
-                finished_at=now(),
-                duration_seconds=round(perf_counter() - started_perf, 6),
-            )
-
-            if (
-                not defer_node_status_refresh
-                and self.storage.get_node_status(node_name) != RUNNING
-            ):
-                self.refresh_node_status(node_name, allow_complete=False)
-            raise JobFailedError(f"Job {node_name}/{job_id} failed") from error
-
-    def run_job(
+    def _run_job(
         self,
         node_name: str,
         job_id: int,
         ignore_readiness: bool = False,
         *,
+        execution_context,
         _preloaded_job: Job | None = None,
         _preclaimed_execution: tuple[int, str, str, float] | None = None,
         _task_started_pre_recorded: bool = False,
@@ -170,13 +91,9 @@ class JobLifecycleMixin:
         if node.main_task is None:
             raise InvalidJobError(f"Node {node_name} has no mounted task")
 
-        if not self.active_job_restart_enabled:
-            return self._run_job_unfenced(
-                node_name,
-                job_id,
-                preloaded_job=_preloaded_job,
-                defer_node_status_refresh=_defer_node_status_refresh,
-            )
+        if execution_context is None:
+            raise RuntimeError('Job execution requires an explicit native session scope')
+        self.execution_claim_context(node_name, context=execution_context)
 
         # The runner worker is now the attempt controller. It invokes the
         # fallback/retry pipeline synchronously and creates only one extra
@@ -195,11 +112,14 @@ class JobLifecycleMixin:
             if preclaimed_execution is None:
                 started_at = now()
                 started_perf = perf_counter()
+                session_id, component = self.execution_claim_context(node_name, context=execution_context)
                 generation, execution_id = self.storage.claim_job_execution(
                     node_name,
                     job_id,
                     started_at=started_at,
                     priority=claim_priority,
+                    session_id=session_id,
+                    component=component,
                 )
             else:
                 (

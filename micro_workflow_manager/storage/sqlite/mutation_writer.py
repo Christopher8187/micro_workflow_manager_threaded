@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import queue
 import sqlite3
 import time
@@ -12,6 +13,8 @@ from threading import Condition, Event, Lock, Thread, current_thread
 from time import monotonic
 from pathlib import Path
 from typing import Any, Callable, Hashable, TypeVar
+
+from micro_workflow_manager.processes import process_identity
 
 
 T = TypeVar("T")
@@ -204,6 +207,8 @@ class SQLiteMutationWriter:
         priorities = sorted({item[0] for item in queued})
         return {
             "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "process_identity": process_identity(os.getpid()),
             "updated_at": time.time(),
             "queued": len(queued),
             "urgent": sum(1 for item in queued if item[0] <= 5),

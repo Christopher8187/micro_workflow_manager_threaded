@@ -5,11 +5,10 @@ import pickle
 import sys
 from concurrent.futures import FIRST_COMPLETED, FIRST_EXCEPTION, ProcessPoolExecutor, wait
 from pathlib import Path
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 from typing import Callable, Iterable
 
 from micro_workflow_manager.graph import normalize_edges
-from micro_workflow_manager.legacy_runs import preflight_legacy_storage_creation
 
 from .base import BaseRunner
 
@@ -46,6 +45,7 @@ def _init_process_worker(
     graph_path: str,
     allowed_run_nodes: tuple[str, ...] | None,
     autostart_mode: str,
+    execution_session_context=None,
 ):
     """Build a fresh workflow inside each worker process.
 
@@ -55,13 +55,12 @@ def _init_process_worker(
     files, not anonymous in-memory functions.
     """
     from micro_workflow_manager.system import MicroWorkflow
+    from micro_workflow_manager.cli.autostart_scan import scan_autostarts
 
     global _PROCESS_WORKFLOW
 
     project = Path(project_dir).resolve()
     graph_file = Path(graph_path).resolve()
-    preflight_legacy_storage_creation(project)
-    module = _import_graph_file(graph_file)
     workflow = MicroWorkflow(
         project_dir=project,
         runner="direct",
@@ -69,19 +68,29 @@ def _init_process_worker(
         persist_graph=False,
         initialize_node_folders=False,
     )
+    if execution_session_context is None:
+        workflow.storage.close_database_connections()
+        raise RuntimeError('Process worker requires an explicit native session scope')
+    module = _import_graph_file(graph_file)
     edges = _read_edges(module)
     graph_nodes = {node for edge in edges for node in edge}
     workflow.graph(edges)
+    scanned_autostarts = scan_autostarts(graph_file.parent / "node_behavior")
+    workflow.set_autostart_edges(
+        (start, end)
+        for start, targets in scanned_autostarts.items()
+        for end in targets
+    )
+    session_id, components, expected_shape = execution_session_context
+    if workflow.topology.snapshot().shape_json != expected_shape:
+        raise RuntimeError('Process worker graph differs from the admitted execution graph')
+    workflow.execution_session_context = (session_id, MappingProxyType(dict(components)), expected_shape)
     workflow.include_node_dir(
         graph_file.parent / "node_behavior",
         allowed_node_names=graph_nodes,
     )
     workflow.allowed_run_nodes = None if allowed_run_nodes is None else set(allowed_run_nodes)
     workflow.autostart_mode = autostart_mode
-    # CLI runs pass an allowed run set and must honor second-terminal restart
-    # requests inside each worker. Programmatic process runs retain the original
-    # low-overhead execution path.
-    workflow.active_job_restart_enabled = allowed_run_nodes is not None
 
     _PROCESS_WORKFLOW = workflow
 
@@ -90,10 +99,11 @@ def _run_job_in_initialized_process(node_name: str, job_id: int):
     if _PROCESS_WORKFLOW is None:
         raise RuntimeError("Process worker was not initialized with a workflow")
 
-    result = _PROCESS_WORKFLOW.run_job(
+    result = _PROCESS_WORKFLOW._run_job(
         node_name=node_name,
         job_id=job_id,
         ignore_readiness=True,
+        execution_context=_PROCESS_WORKFLOW.execution_session_context,
     )
 
     try:
@@ -126,6 +136,7 @@ class ProcessPoolRunner(BaseRunner):
         graph_path: str | Path | None = None,
         allowed_run_nodes: set[str] | None = None,
         autostart_mode: str = "immediate",
+        execution_session_context=None,
     ):
         if type(max_processes) is not int or max_processes < 1:
             raise ValueError("max_processes must be an integer >= 1")
@@ -135,6 +146,10 @@ class ProcessPoolRunner(BaseRunner):
         self.graph_path = Path(graph_path).resolve() if graph_path is not None else None
         self.allowed_run_nodes = None if allowed_run_nodes is None else tuple(sorted(allowed_run_nodes))
         self.autostart_mode = autostart_mode
+        self.execution_session_context = (
+            None if execution_session_context is None
+            else (execution_session_context[0], tuple(execution_session_context[1].items()), execution_session_context[2])
+        )
 
     def _require_project_loader(self):
         if self.project_dir is None or self.graph_path is None:
@@ -160,6 +175,7 @@ class ProcessPoolRunner(BaseRunner):
                 str(self.graph_path),
                 self.allowed_run_nodes,
                 self.autostart_mode,
+                self.execution_session_context,
             ),
         )
 

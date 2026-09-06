@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Hashable, Iterator, TypeVar
 
 from micro_workflow_manager.paths import state_database_file
+from micro_workflow_manager.project_format import require_unchanged_path
 
 from .mutation_writer import SQLiteMutationWriter
 
@@ -37,10 +38,11 @@ class SQLiteConnectionMixin:
     _advisory_owner_registry: set[str] = set()
     _advisory_owner_registry_guard = threading.Lock()
 
-    def _init_sqlite_state(self, *, initial_schema_version: int = 4) -> None:
+    def _init_sqlite_state(self, *, create: bool = False) -> None:
         self._advisory_local = threading.local()
         raw_path = state_database_file(self.project_dir)
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        if not create and not raw_path.is_file():
+            raise RuntimeError("Native MWF project state is missing; initialize a separate fresh project")
         self._state_database_path_cached = raw_path.resolve()
         self._mutation_writer = SQLiteMutationWriter(self)
         path = self._state_database_path_cached
@@ -60,9 +62,10 @@ class SQLiteConnectionMixin:
             lock = self._db_init_locks.setdefault(path, threading.Lock())
         with lock:
             initialized_key = (path, os.getpid())
-            if initial_schema_version == 5 or initialized_key not in self._initialized_databases or not path.is_file():
-                self.initialize_state_database(initial_schema_version=initial_schema_version)
-                self._initialized_databases.add(initialized_key)
+            # A path previously opened in this process may now contain damaged
+            # or replaced state. Every new storage owner validates its schema.
+            self.initialize_state_database(create=create)
+            self._initialized_databases.add(initialized_key)
 
     def submit_db_mutation(
         self,
@@ -133,16 +136,26 @@ class SQLiteConnectionMixin:
         return path
 
     def _new_db_connection(self) -> sqlite3.Connection:
+        creation_paths = getattr(self, '_new_project_path_identities', ())
+        for path, identity in creation_paths:
+            require_unchanged_path(path, identity)
         connection = sqlite3.connect(
-            self.state_database_path(),
+            self.state_database_path().as_uri() + '?mode=rw',
+            uri=True,
             timeout=60.0,
             isolation_level=None,
             check_same_thread=False,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 60000")
-        connection.execute("PRAGMA synchronous = NORMAL")
+        try:
+            for path, identity in creation_paths:
+                require_unchanged_path(path, identity)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 60000")
+            connection.execute("PRAGMA synchronous = NORMAL")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @classmethod

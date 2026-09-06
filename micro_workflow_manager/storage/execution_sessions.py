@@ -108,9 +108,12 @@ class ExecutionSessionStorageMixin:
                 "INSERT INTO session_jobs(session_id, position, node_name, job_id) VALUES(?, ?, ?, ?)",
                 [(session_id, position, node, job_id) for position, (node, job_id) in enumerate(jobs)],
             )
+            row = connection.execute(
+                'SELECT * FROM execution_sessions WHERE session_id=?', (session_id,),
+            ).fetchone()
+            return self._execution_session_from_row(connection, row)
 
-        self.submit_db_mutation(create, wait=True, priority=0)
-        return self.get_execution_session(session_id)
+        return self.submit_db_mutation(create, wait=True, priority=0)
 
     def heartbeat_execution_session(self, session_id: str, heartbeat_at: str) -> bool:
         self._require_execution_session_storage()

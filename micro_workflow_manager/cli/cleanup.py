@@ -379,9 +379,7 @@ def reset_job_for_run(
         raise RuntimeError(f"Job does not exist: {node}/{job_id}")
     job_dir = workflow.storage.job_base_dir(node, job_id)
     remove_path(job_dir / "output.json")
-    if not keep_trace:
-        workflow.storage.clear_job_events(node, [job_id])
-    workflow.storage.set_job_status(node, job_id, QUEUED)
+    workflow.storage.reset_jobs_for_run_batch(node, [job_id], preserve_events=keep_trace)
     if mark_queued:
         workflow.storage.set_node_status(node, QUEUED)
 

@@ -127,8 +127,9 @@ class JobExecutionClaimStorageMixin:
                 placeholders = ",".join("?" for _ in chunk)
                 rows.extend(
                     connection.execute(
-                        "SELECT job_id, generation, status FROM jobs "
-                        f"WHERE node_name=? AND job_id IN ({placeholders})",
+                        "SELECT j.job_id, j.generation, j.status, j.active_execution_id, i.instance_id FROM jobs AS j "
+                        "LEFT JOIN job_instances AS i USING(node_name, job_id) "
+                        f"WHERE j.node_name=? AND j.job_id IN ({placeholders})",
                         [node_name, *chunk],
                     ).fetchall()
                 )
@@ -139,6 +140,7 @@ class JobExecutionClaimStorageMixin:
         events = []
         outcomes = []
         checked_owners = {}
+        accepted_addresses = set()
         for batch in batches:
             owner_error = JobExecutionClaimStorageMixin._execution_claim_owner_error(connection, batch, checked_owners)
             if owner_error is not None:
@@ -152,11 +154,24 @@ class JobExecutionClaimStorageMixin:
                 )))
                 continue
 
+            if any(type(node_rows[job_id]['instance_id']) is not str
+                   or len(node_rows[job_id]['instance_id']) != 32
+                   or any(character not in '0123456789abcdef' for character in node_rows[job_id]['instance_id'])
+                   for job_id in batch.job_ids):
+                outcomes.append((False, RuntimeError('Job claims require valid current job instances')))
+                continue
+
+            if any(node_rows[job_id]['active_execution_id'] is not None
+                   or (batch.node_name, job_id) in accepted_addresses for job_id in batch.job_ids):
+                outcomes.append((False, RuntimeError('Jobs already claimed cannot receive another active execution')))
+                continue
+
             results = []
             mask = batch.task_started_mask
             if mask is not None and len(mask) != len(batch.job_ids):
                 outcomes.append((False, ValueError("task_started_mask length mismatch")))
                 continue
+            accepted_addresses.update((batch.node_name, job_id) for job_id in batch.job_ids)
             for index, (job_id, execution_id) in enumerate(zip(batch.job_ids, batch.execution_ids)):
                 row = node_rows[job_id]
                 generation = int(row["generation"])
@@ -171,7 +186,7 @@ class JobExecutionClaimStorageMixin:
                 if batch.session_id is not None:
                     owner_data = {'session_id': batch.session_id, 'component': batch.component}
                     owners.append((execution_id, batch.node_name, job_id, generation,
-                                   batch.session_id, encode_component_key(batch.component)))
+                                   batch.session_id, encode_component_key(batch.component), row['instance_id']))
                 updates.append(
                     (
                         execution_id,
@@ -225,19 +240,27 @@ class JobExecutionClaimStorageMixin:
             outcomes.append((True, results))
 
         if updates:
-            connection.executemany(
+            changed = connection.executemany(
                 "UPDATE jobs SET active_execution_id=?, active_pid=?, "
                 "active_thread_id=?, active_started_at=?, "
                 "restart_requested_at=NULL, restart_requested_by_pid=NULL, "
                 "restart_reason=NULL, runtime_json=NULL, status=?, status_json=? "
-                "WHERE node_name=? AND job_id=? AND generation=?",
+                "WHERE node_name=? AND job_id=? AND generation=? AND active_execution_id IS NULL",
                 updates,
-            )
+            ).rowcount
+            if changed != len(updates):
+                raise RuntimeError('Job claim could not acquire every requested active execution')
             if owners:
                 connection.executemany(
-                    "INSERT INTO job_execution_owners(execution_id, node_name, job_id, generation, session_id, component_key) "
-                    "VALUES(?, ?, ?, ?, ?, ?)", owners,
+                    "INSERT INTO job_execution_owners(execution_id, node_name, job_id, generation, session_id, component_key, job_instance_id) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?)", owners,
                 )
+                changed = connection.executemany(
+                    'UPDATE job_instances SET last_execution_id=? WHERE node_name=? AND job_id=?',
+                    [(owner[0], owner[1], owner[2]) for owner in owners],
+                ).rowcount
+                if changed != len(owners):
+                    raise RuntimeError('Job claims require a current job instance for every owner')
             connection.executemany(
                 "INSERT INTO job_events(node_name, job_id, time, event, data_json) "
                 "VALUES(?, ?, ?, ?, ?)",
@@ -359,6 +382,90 @@ class JobExecutionClaimStorageMixin:
         result = dict(row)
         result['component'] = decode_component_key(result.pop('component_key'))
         return result
+
+    def read_job_current_owner(self, node_name: str, job_id: int) -> dict | None:
+        """Read the active claim or explicit last committed claim for this job."""
+        self._require_execution_session_storage()
+        node_name = self.validate_node_name(node_name)
+        job_id = self.validate_job_id(job_id)
+        return self._read_job_current_owner(self.db_connection(), node_name, job_id)
+
+    @staticmethod
+    def _read_job_current_owner(connection, node_name: str, job_id: int) -> dict | None:
+        observation = JobExecutionClaimStorageMixin._read_job_owner_observation(connection, node_name, job_id)
+        return None if observation is None else observation['owner']
+
+    def read_job_owner_observation(self, node_name: str, job_id: int) -> dict | None:
+        """Read one coherent job, ownership, and owning-session observation."""
+        self._require_execution_session_storage()
+        node_name = self.validate_node_name(node_name)
+        job_id = self.validate_job_id(job_id)
+        return self._read_job_owner_observation(self.db_connection(), node_name, job_id)
+
+    @staticmethod
+    def _read_job_owner_observation(connection, node_name: str, job_id: int) -> dict | None:
+        row = connection.execute(
+            'SELECT j.generation AS job_generation, j.status AS job_status, '
+            'j.active_execution_id, j.active_pid, j.active_started_at, '
+            'i.instance_id, i.last_execution_id, o.*, s.session_id AS owner_session, '
+            'selected.session_id AS selected_session, '
+            's.session_kind AS owner_session_kind, s.status AS owner_session_status, '
+            's.parent_session_id AS owner_parent_session, s.outcome AS owner_session_outcome, '
+            's.hostname AS owner_hostname, s.pid AS owner_pid, '
+            's.process_identity AS owner_process_identity, s.heartbeat_at AS owner_heartbeat, '
+            's.started_at AS owner_started_at, s.finished_at AS owner_finished_at '
+            'FROM jobs AS j LEFT JOIN job_instances AS i USING(node_name, job_id) '
+            'LEFT JOIN job_execution_owners AS o '
+            'ON o.execution_id=COALESCE(j.active_execution_id, i.last_execution_id) '
+            'LEFT JOIN execution_sessions AS s ON s.session_id=o.session_id '
+            'LEFT JOIN session_components AS selected '
+            'ON selected.session_id=o.session_id AND selected.component_key=o.component_key '
+            'WHERE j.node_name=? AND j.job_id=?', (node_name, job_id),
+        ).fetchone()
+        if row is None:
+            return None
+        instance = row['instance_id']
+        if (type(instance) is not str or len(instance) != 32
+                or any(character not in '0123456789abcdef' for character in instance)):
+            raise RuntimeError(f'Missing or damaged current job instance for {node_name}/{job_id}')
+        active = row['active_execution_id']
+        last = row['last_execution_id']
+        if active is not None and active != last:
+            raise RuntimeError(f'Ambiguous current execution ownership for {node_name}/{job_id}')
+        observation = {
+            'job_instance_id': instance, 'generation': row['job_generation'],
+            'status': row['job_status'], 'active_execution_id': active,
+            'active_pid': row['active_pid'], 'active_started_at': row['active_started_at'],
+            'state': 'unclaimed', 'owner': None, 'session': None,
+        }
+        if active is None and last is None:
+            return observation
+        if (row['execution_id'] is None or row['owner_session'] is None or row['selected_session'] is None
+                or row['node_name'] != node_name or row['job_id'] != job_id
+                or row['job_instance_id'] != instance
+                or type(row['generation']) is not int or row['generation'] < 0
+                or row['generation'] > row['job_generation']
+                or (active is not None and row['generation'] != row['job_generation'])):
+            raise RuntimeError(f'Damaged current execution ownership for {node_name}/{job_id}')
+        component = decode_component_key(row['component_key'])
+        if node_name not in component:
+            raise RuntimeError(f'Damaged current execution component for {node_name}/{job_id}')
+        observation['owner'] = {
+            'execution_id': row['execution_id'], 'node_name': row['node_name'],
+            'job_id': row['job_id'], 'generation': row['generation'],
+            'session_id': row['session_id'], 'component': component,
+            'job_instance_id': row['job_instance_id'],
+        }
+        observation['state'] = 'active' if active is not None else 'last'
+        observation['session'] = {
+            'session_id': row['owner_session'], 'session_kind': row['owner_session_kind'],
+            'status': row['owner_session_status'], 'parent_session_id': row['owner_parent_session'],
+            'outcome': row['owner_session_outcome'],
+            'hostname': row['owner_hostname'], 'pid': row['owner_pid'],
+            'process_identity': row['owner_process_identity'], 'heartbeat_at': row['owner_heartbeat'],
+            'started_at': row['owner_started_at'], 'finished_at': row['owner_finished_at'],
+        }
+        return observation
 
     def release_unstarted_job_execution(
         self,

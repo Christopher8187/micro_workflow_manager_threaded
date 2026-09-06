@@ -4,9 +4,9 @@ import json
 import shutil
 from pathlib import Path
 
-from micro_workflow_manager.paths import config_file
+from micro_workflow_manager.project_format import read_native_project_config
 
-from .layout import ensure_runtime_layout, has_project_marker
+from .layout import has_project_marker
 
 def safe_node_name(name: str) -> str:
     if not name or name in {".", ".."}:
@@ -52,13 +52,7 @@ def find_root(start: Path | None = None) -> Path:
     raise RuntimeError("Not an mwf project. Run: mwf init")
 
 def read_config(root: Path) -> dict:
-    ensure_runtime_layout(root)
-    path = config_file(root)
-
-    if not path.exists():
-        raise RuntimeError("Not an mwf project. Run: mwf init")
-
-    return json.loads(path.read_text(encoding="utf-8"))
+    return read_native_project_config(root)
 
 def write_json(path: Path, data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)

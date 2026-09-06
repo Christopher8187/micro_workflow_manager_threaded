@@ -5,6 +5,7 @@ from typing import Any
 
 from micro_workflow_manager.processes import process_identity, process_is_alive
 from micro_workflow_manager.legacy_runs import read_legacy_run_records
+from micro_workflow_manager.workflow.execution_session import refuse_competing_run
 
 
 from micro_workflow_manager.session_liveness import (
@@ -49,18 +50,3 @@ def refuse_live_legacy_migration(root: Path) -> None:
                 f"is alive ({path.relative_to(root).as_posix()}). "
                 "Wait for that run to finish or become stale before migrating."
             )
-
-
-def refuse_competing_run(storage_or_workflow):
-    active = live_active_run(storage_or_workflow)
-    if active is None:
-        return
-    command = active.get("command", "workflow")
-    run_id = active.get("run_id", "?")
-    pid = active.get("pid", "?")
-    raise RuntimeError(
-        f"A {command} sequence is already active (run {run_id}, process {pid}). "
-        "Do not start a competing run from a second terminal. To restart the "
-        "running and failed work in one active component, use: mwf restart <node>. "
-        "The explicit mwf restart <node> job <id> form is also available."
-    )

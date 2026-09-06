@@ -4,6 +4,7 @@ from typing import Any
 from ..errors import InvalidGraphError
 from ..models import Job, QUEUED
 from ..node import validate_positive_int
+from .execution_scope import programmatic_execution
 
 
 class JobCreationMixin:
@@ -424,13 +425,16 @@ class JobCreationMixin:
                 and self.component_id(current_node) == self.component_id(to_node)
             )
             if not same_component_spawn:
-                return [
-                    self.run_job(
-                        node_name=to_node,
-                        job_id=job.job_id,
-                        ignore_readiness=True,
-                    )
-                    for job in created
-                ]
+                with programmatic_execution(
+                    self, command='add_jobs', start_node=to_node, nodes=[to_node],
+                    selected_jobs=[job.job_id for job in created],
+                ) as context:
+                    return [
+                        self._run_job(
+                            node_name=to_node, job_id=job.job_id,
+                            ignore_readiness=True, execution_context=context,
+                        )
+                        for job in created
+                    ]
 
         return created

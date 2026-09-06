@@ -96,13 +96,6 @@ def build_parser() -> argparse.ArgumentParser:
         description=COMMAND_HELP_DESCRIPTIONS["doctor"],
     )
 
-    migrate_cmd = commands.add_parser(
-        "migrate",
-        help="Upgrade MWF-owned metadata to the current state schema.",
-        description=COMMAND_HELP_DESCRIPTIONS["migrate"],
-    )
-    migrate_cmd.add_argument("--dry-run", action="store_true", help="List metadata that would change without writing it.")
-
     inspect_cmd = commands.add_parser(
         "inspect",
         help="Explain a node/job, list failed job IDs, or show debug output.",

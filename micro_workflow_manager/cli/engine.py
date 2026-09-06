@@ -10,32 +10,12 @@ from pathlib import Path
 
 import networkx as nx
 
-from micro_workflow_manager.paths import LEGACY_CONFIG_NAME, config_file
+from micro_workflow_manager.project_format import read_native_project_config
 from micro_workflow_manager.topology import ComponentTopology
 
 from .autostart_scan import scan_autostarts
 from .files import safe_node_name
 from .project import resolve_stored_graph_path
-
-
-def _read_config_without_migration(root: Path) -> dict:
-    """Read synchronized project metadata without creating or migrating files."""
-    current = config_file(root)
-    legacy = root / LEGACY_CONFIG_NAME
-    if current.is_file():
-        path = current
-    elif legacy.is_file():
-        path = legacy
-    else:
-        raise RuntimeError("Not an mwf project. Run: mwf init")
-
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Cannot read MWF project configuration: {error}") from error
-    if not isinstance(value, dict):
-        raise RuntimeError("Invalid MWF project configuration: expected a JSON object")
-    return value
 
 
 def _stored_edges(config: dict) -> list[tuple[str, str]]:
@@ -81,7 +61,7 @@ def _read_autostart_edges(root: Path, config: dict, edges: list[tuple[str, str]]
 def build_engine_snapshot(root: Path) -> dict:
     """Build the graph-only engine model from synchronized, read-only metadata."""
     root = root.resolve()
-    config = _read_config_without_migration(root)
+    config = read_native_project_config(root)
     edges = _stored_edges(config)
     graph = nx.DiGraph()
     graph.add_edges_from(edges)

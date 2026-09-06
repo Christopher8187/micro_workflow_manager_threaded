@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from micro_workflow_manager.session_liveness import execution_session_liveness
+
 from .active_run import live_active_run
 
 from micro_workflow_manager.models import (
@@ -113,23 +115,44 @@ def inspect_node(workflow, node: str) -> int:
 
 def inspect_job(workflow, node: str, job_id: int) -> int:
     storage = workflow.storage
-    if not storage.job_exists(node, job_id):
+    ownership = storage.read_job_owner_observation(node, job_id)
+    if ownership is None:
         raise RuntimeError(f"Job does not exist: {node}/{job_id}")
     job = storage.load_job(node, job_id)
-    status = storage.read_job_status_data(node, job_id) or {"status": QUEUED}
-    control = storage.read_job_control(node, job_id)
+    if storage.read_job_instance_id(node, job_id) != ownership['job_instance_id']:
+        raise RuntimeError(f"Job {node}/{job_id} was replaced during inspection; retry the command")
     output = storage.read_json(storage.output_file(node, job_id), default=None)
     runtime = storage.read_job_runtime(node, job_id)
     events = storage.read_job_events(node, job_id)
     print(f"Job {node}/{job_id}")
-    print(f"  status: {status.get('status', QUEUED)}")
+    print(f"  status: {ownership['status']}")
+    print(f"  job instance: {ownership['job_instance_id']}")
     print(f"  parent: {job.parent or '(none)'}")
     print(f"  producer component: {', '.join(job.producer_component or ()) or '(none)'}")
     print(f"  job kind: {job.job_kind or 'root'}")
-    print(f"  generation: {control.get('generation', 0)}")
-    if control.get("active_execution_id"):
-        print(f"  active process: {control.get('active_pid')}")
-        print(f"  active since: {control.get('active_started_at')}")
+    print(f"  generation: {ownership['generation']}")
+    print(f"  execution ownership: {ownership['state']}")
+    owner = ownership['owner']
+    if owner is not None:
+        session = ownership['session']
+        liveness = execution_session_liveness(session)
+        print(f"  execution ID: {owner['execution_id']}")
+        print(f"  session ID: {owner['session_id']}")
+        print(f"  session kind: {session['session_kind']}")
+        print(f"  session status: {session['status']}")
+        print(f"  session liveness: {'live' if liveness['live'] else 'not live'}")
+        print(f"  session liveness reason: {liveness['reason']}")
+        print(f"  owner component: {', '.join(owner['component'])}")
+        print(f"  claimed generation: {owner['generation']}")
+        if session['parent_session_id'] is not None:
+            print(f"  parent session: {session['parent_session_id']}")
+        if session['outcome'] is not None:
+            print(f"  session outcome: {session['outcome']}")
+    if ownership['active_execution_id'] is not None:
+        pid = ownership['active_pid']
+        started_at = ownership['active_started_at']
+        print(f"  active process: {pid if pid is not None else '(not recorded)'}")
+        print(f"  active since: {started_at if started_at is not None else '(not recorded)'}")
     _print_runtime(runtime)
     _print_json("Input", job.params)
     if output is not None:

@@ -173,6 +173,10 @@ class JobCleanupStorageMixin:
                     f"WHERE node_name IN ({placeholders})",
                     [QUEUED, *chunk],
                 )
+                connection.execute(
+                    f'UPDATE job_instances SET last_execution_id=NULL WHERE node_name IN ({placeholders})',
+                    chunk,
+                )
 
             if mark_nodes_queued:
                 connection.executemany(
@@ -234,6 +238,11 @@ class JobCleanupStorageMixin:
                     "restart_requested_by_pid=NULL, restart_reason=NULL "
                     f"WHERE node_name=? AND job_id IN ({placeholders})",
                     [QUEUED, node_name, *chunk],
+                )
+                connection.execute(
+                    'UPDATE job_instances SET last_execution_id=NULL '
+                    f'WHERE node_name=? AND job_id IN ({placeholders})',
+                    [node_name, *chunk],
                 )
             previous = {int(row["job_id"]): str(row["status"]) for row in rows}
             connection.executemany(

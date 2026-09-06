@@ -71,7 +71,7 @@ def execution_session_liveness(
     ):
         return {
             "live": True,
-            "reason": "the legacy run PID is alive and its heartbeat is not stale",
+            "reason": "the recorded PID is alive and its heartbeat is not stale",
             "same_host": True,
             "pid_live": True,
             "process_identity_matches": None,
@@ -88,7 +88,7 @@ def execution_session_liveness(
     if same_host and pid_live and identity_matches is False:
         reason = "the recorded PID belongs to a different process instance"
     elif same_host and pid_live and recorded_identity is None and not heartbeat_fresh:
-        reason = "the legacy run heartbeat is stale; PID existence alone is ambiguous"
+        reason = "the session heartbeat is stale; PID existence alone is ambiguous"
     elif same_host and pid_live is False:
         reason = "the recorded process is no longer alive"
     elif not same_host:

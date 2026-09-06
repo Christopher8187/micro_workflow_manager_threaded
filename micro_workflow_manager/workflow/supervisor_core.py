@@ -397,12 +397,5 @@ class SchedulerSupervisor(
 
     def _write_run_heartbeat(self, heartbeat: dict[str, Any]):
         run_id = heartbeat["run_id"]
-        with self.storage.interprocess_lock("active-run-state"):
-            current = self.storage.get_run_state()
-            if current.get("run_id") != run_id or current.get("status") != "running":
-                with self._condition:
-                    if self._run_heartbeat is not None and self._run_heartbeat.get("run_id") == run_id:
-                        self._run_heartbeat = None
-                        self._condition.notify_all()
-                return
-            self.storage.update_run_state(heartbeat_at=now_iso())
+        if not self.storage.heartbeat_execution_session(run_id, now_iso()):
+            self.stop_run_heartbeat(run_id)

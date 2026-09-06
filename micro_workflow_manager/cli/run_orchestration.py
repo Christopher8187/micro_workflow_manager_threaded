@@ -64,13 +64,6 @@ def run_nodes(
     refuse_before_node: str | None = None,
 ) -> int:
     run_set = set(nodes)
-    previous_allowed_run_nodes = workflow.allowed_run_nodes
-    previous_autostart_mode = workflow.autostart_mode
-    previous_restart_enabled = workflow.active_job_restart_enabled
-
-    workflow.allowed_run_nodes = run_set
-    workflow.autostart_mode = "queue"
-    workflow.active_job_restart_enabled = True
     refusal_event = Event()
     refuse_after_component = (
         workflow.component_key(workflow.component_for(refuse_after_node))
@@ -108,148 +101,128 @@ def run_nodes(
             for item in refuse_before_component
         )
 
-    try:
-        with active_workflow_run(
-            workflow,
-            command=command,
-            start_node=start_node,
-            nodes=nodes,
-            refuse_after_node=refuse_after_node,
-            refuse_before_node=refuse_before_node,
-            stats=stats,
-            stats_interval=stats_interval,
-            monitor=monitor,
-            monitor_interval=monitor_interval,
-        ) as finish_run:
-            if prepare is not None:
-                prepare()
+    with active_workflow_run(
+        workflow,
+        queue_autostarts=True,
+        command=command,
+        start_node=start_node,
+        nodes=nodes,
+        refuse_after_node=refuse_after_node,
+        refuse_before_node=refuse_before_node,
+        stats=stats,
+        stats_interval=stats_interval,
+        monitor=monitor,
+        monitor_interval=monitor_interval,
+    ) as finish_run:
+        execution_context = workflow.execution_session_context
+        if prepare is not None:
+            prepare()
 
-            has_any_queued = any(workflow.storage.has_queued_jobs(item) for item in nodes)
-            if not has_any_queued:
-                if require_start_queued:
-                    workflow.storage.set_node_status(start_node, QUEUED)
-                    print(
-                        f"No queued jobs for {start_node}. "
-                        f"Create default jobs in node_behavior/{start_node}.py with "
-                        "router.create_job(number=..., params={...})."
-                    )
-                else:
-                    print("No failed, cancelled, stale-running, or queued jobs remain in the resume set.")
-                finish_run("done")
-                return 0
-
-            if workflow.runner in {"threaded", "api", "process"}:
-                ran = workflow.run_concurrently(
-                    nodes=nodes,
-                    ready_check=lambda item: ready_for_run_set(
-                        workflow,
-                        item,
-                        run_set,
-                        ignore_external,
-                    ),
-                    refuse_after_component=refuse_after_component,
-                    refuse_before_component=refuse_before_component,
-                    refusal_event=refusal_event,
-                    wait_deadlock_resolver=wait_deadlock_resolver,
-                    wait_deadlock_blocked_components=(
-                        wait_deadlock_resolver.blocked_components
-                        if wait_deadlock_resolver is not None else None
-                    ),
+        has_any_queued = any(workflow.storage.has_queued_jobs(item) for item in nodes)
+        if not has_any_queued:
+            if require_start_queued:
+                workflow.storage.set_node_status(start_node, QUEUED)
+                print(
+                    f"No queued jobs for {start_node}. "
+                    f"Create default jobs in node_behavior/{start_node}.py with "
+                    "router.create_job(number=..., params={...})."
                 )
             else:
-                ran = []
-                units = workflow.execution_components(nodes)
+                print("No failed, cancelled, stale-running, or queued jobs remain in the resume set.")
+            finish_run("done")
+            return 0
 
-                while True:
-                    workflow.finalize_ready_nodes()
-                    if refusal_target_terminal():
-                        refusal_event.set()
-                        break
-                    if refusal_before_already_reached():
-                        refusal_event.set()
-                        break
-                    ready_units = [
-                        unit
-                        for unit in units
-                        if any(workflow.storage.has_queued_jobs(node) for node in unit)
-                        and not (
-                            wait_deadlock_resolver is not None
-                            and unit in wait_deadlock_resolver.blocked_components
-                        )
-                        and all(
-                            ready_for_run_set(workflow, node, run_set, ignore_external)
-                            for node in unit
-                        )
-                    ]
+        if workflow.runner in {"threaded", "api", "process"}:
+            ran = workflow._run_concurrently(
+                execution_context=execution_context,
+                nodes=nodes,
+                ready_check=lambda item: ready_for_run_set(
+                    workflow,
+                    item,
+                    run_set,
+                    ignore_external,
+                ),
+                refuse_after_component=refuse_after_component,
+                refuse_before_component=refuse_before_component,
+                refusal_event=refusal_event,
+                wait_deadlock_resolver=wait_deadlock_resolver,
+                wait_deadlock_blocked_components=(
+                    wait_deadlock_resolver.blocked_components
+                    if wait_deadlock_resolver is not None else None
+                ),
+            )
+        else:
+            ran = []
+            units = workflow.execution_components(nodes)
 
-                    if not ready_units:
-                        break
-
-                    if (
-                        refuse_before_component is not None
-                        and refuse_before_component in ready_units
-                    ):
-                        refusal_event.set()
-                        break
-
-                    for unit in ready_units:
-                        ran.extend(workflow.run_component(
-                            set(unit), ignore_readiness=True,
-                            wait_deadlock_resolver=wait_deadlock_resolver,
-                        ))
-                        if refuse_after_component is not None and unit == refuse_after_component:
-                            refusal_event.set()
-                            break
-                    if refusal_event.is_set():
-                        break
-
-            workflow.finalize_ready_nodes()
-            if ignore_external:
-                # A partial runfrom may intentionally process one incoming branch
-                # of a later component before its other predecessors run. Mark a
-                # selected component complete for this branch when all jobs that
-                # currently exist are successful and quiescent. Future producers
-                # will queue new jobs and reactivate it.
-                for unit in workflow.execution_components(nodes):
-                    counts = [workflow.storage.job_status_counts(name) for name in unit]
-                    total = sum(sum(item.values()) for item in counts)
-                    failed = any(item.get(FAILED, 0) for item in counts)
-                    active = any(item.get(RUNNING, 0) or item.get(QUEUED, 0) for item in counts)
-                    successful = sum(item.get(DONE, 0) + item.get(SKIPPED, 0) for item in counts)
-                    if total > 0 and successful == total and not failed and not active:
-                        for name in unit:
-                            workflow.storage.set_node_status(name, "done")
-
-            if refusal_event.is_set():
-                if refuse_before_component is not None:
-                    finish_run("done")
-                    boundary = ", ".join(refuse_before_component)
-                    print(
-                        "Refused Hoeflein-component admission before "
-                        f"{{{boundary}}} started."
+            while True:
+                workflow.finalize_ready_nodes()
+                if refusal_target_terminal():
+                    refusal_event.set()
+                    break
+                if refusal_before_already_reached():
+                    refusal_event.set()
+                    break
+                ready_units = [
+                    unit
+                    for unit in units
+                    if any(workflow.storage.has_queued_jobs(node) for node in unit)
+                    and not (
+                        wait_deadlock_resolver is not None
+                        and unit in wait_deadlock_resolver.blocked_components
                     )
-                    queued_after = [
-                        item for item in nodes if workflow.storage.has_queued_jobs(item)
-                    ]
-                    if queued_after:
-                        print("Left queued for a later run:")
-                        for item in queued_after:
-                            print(f"  {item}")
-                    if ran:
-                        print("Ran:")
-                        for item in ran:
-                            print(f"  {item}")
-                    return 0
+                    and all(
+                        ready_for_run_set(workflow, node, run_set, ignore_external)
+                        for node in unit
+                    )
+                ]
 
-                failed_boundary = any(
-                    workflow.storage.get_node_status(item) in {FAILED, CANCELLED}
-                    for item in (refuse_after_component or ())
-                )
-                finish_run("failed" if failed_boundary else "done")
-                boundary = ", ".join(refuse_after_component or ())
+                if not ready_units:
+                    break
+
+                if (
+                    refuse_before_component is not None
+                    and refuse_before_component in ready_units
+                ):
+                    refusal_event.set()
+                    break
+
+                for unit in ready_units:
+                    ran.extend(workflow._run_component(
+                        set(unit), ignore_readiness=True,
+                        execution_context=execution_context,
+                        wait_deadlock_resolver=wait_deadlock_resolver,
+                    ))
+                    if refuse_after_component is not None and unit == refuse_after_component:
+                        refusal_event.set()
+                        break
+                if refusal_event.is_set():
+                    break
+
+        workflow.finalize_ready_nodes()
+        if ignore_external:
+            # A partial runfrom may intentionally process one incoming branch
+            # of a later component before its other predecessors run. Mark a
+            # selected component complete for this branch when all jobs that
+            # currently exist are successful and quiescent. Future producers
+            # will queue new jobs and reactivate it.
+            for unit in workflow.execution_components(nodes):
+                counts = [workflow.storage.job_status_counts(name) for name in unit]
+                total = sum(sum(item.values()) for item in counts)
+                failed = any(item.get(FAILED, 0) for item in counts)
+                active = any(item.get(RUNNING, 0) or item.get(QUEUED, 0) for item in counts)
+                successful = sum(item.get(DONE, 0) + item.get(SKIPPED, 0) for item in counts)
+                if total > 0 and successful == total and not failed and not active:
+                    for name in unit:
+                        workflow.storage.set_node_status(name, "done")
+
+        if refusal_event.is_set():
+            if refuse_before_component is not None:
+                finish_run("done")
+                boundary = ", ".join(refuse_before_component)
                 print(
-                    "Refused further Hoeflein-component admission after "
-                    f"{{{boundary}}} terminated."
+                    "Refused Hoeflein-component admission before "
+                    f"{{{boundary}}} started."
                 )
                 queued_after = [
                     item for item in nodes if workflow.storage.has_queued_jobs(item)
@@ -262,39 +235,57 @@ def run_nodes(
                     print("Ran:")
                     for item in ran:
                         print(f"  {item}")
-                return 1 if failed_boundary else 0
+                return 0
 
-            blocked = [node for node in nodes if workflow.storage.has_queued_jobs(node)]
+            failed_boundary = any(
+                workflow.storage.get_node_status(item) in {FAILED, CANCELLED}
+                for item in (refuse_after_component or ())
+            )
+            finish_run("failed" if failed_boundary else "done")
+            boundary = ", ".join(refuse_after_component or ())
+            print(
+                "Refused further Hoeflein-component admission after "
+                f"{{{boundary}}} terminated."
+            )
+            queued_after = [
+                item for item in nodes if workflow.storage.has_queued_jobs(item)
+            ]
+            if queued_after:
+                print("Left queued for a later run:")
+                for item in queued_after:
+                    print(f"  {item}")
+            if ran:
+                print("Ran:")
+                for item in ran:
+                    print(f"  {item}")
+            return 1 if failed_boundary else 0
 
-            if blocked:
-                finish_run("blocked")
-                print("Stopped before these queued nodes became ready:")
-                for node in blocked:
-                    status = workflow.storage.get_node_status(node) or "missing"
-                    print(f"  {node}: {status}")
-                return 1
+        blocked = [node for node in nodes if workflow.storage.has_queued_jobs(node)]
 
-            unfinished = [node for node in nodes if not workflow.node_complete(node)]
+        if blocked:
+            finish_run("blocked")
+            print("Stopped before these queued nodes became ready:")
+            for node in blocked:
+                status = workflow.storage.get_node_status(node) or "missing"
+                print(f"  {node}: {status}")
+            return 1
 
-            if unfinished:
-                finish_run("incomplete")
-                print("These nodes did not complete:")
-                for node in unfinished:
-                    status = workflow.storage.get_node_status(node) or "missing"
-                    job_count = len(workflow.storage.list_jobs(node))
-                    queued_count = len(workflow.storage.queued_job_ids(node))
-                    print(f"  {node}: {status}, jobs={job_count}, queued={queued_count}")
-                print("This usually means an upstream task did not create the expected downstream jobs.")
-                return 1
+        unfinished = [node for node in nodes if not workflow.node_complete(node)]
 
-            finish_run("done")
-            print("Ran:")
-            for node in ran:
-                print(f"  {node}")
+        if unfinished:
+            finish_run("incomplete")
+            print("These nodes did not complete:")
+            for node in unfinished:
+                status = workflow.storage.get_node_status(node) or "missing"
+                job_count = len(workflow.storage.list_jobs(node))
+                queued_count = len(workflow.storage.queued_job_ids(node))
+                print(f"  {node}: {status}, jobs={job_count}, queued={queued_count}")
+            print("This usually means an upstream task did not create the expected downstream jobs.")
+            return 1
 
-            return 0
+        finish_run("done")
+        print("Ran:")
+        for node in ran:
+            print(f"  {node}")
 
-    finally:
-        workflow.allowed_run_nodes = previous_allowed_run_nodes
-        workflow.autostart_mode = previous_autostart_mode
-        workflow.active_job_restart_enabled = previous_restart_enabled
+        return 0

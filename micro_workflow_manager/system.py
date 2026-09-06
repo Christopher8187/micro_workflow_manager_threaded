@@ -1,5 +1,5 @@
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 
 import networkx as nx
 
@@ -15,6 +15,8 @@ from .storage import FileStorage
 from .workflow.workflow_registration import WorkflowRegistrationMixin
 from .fibers import FiberLocal
 from .api_limits import allocate_api_capacity
+
+_CURRENT_EXECUTION_CONTEXT = object()
 
 
 class MicroWorkflow(
@@ -54,6 +56,7 @@ class MicroWorkflow(
         self.autostart_edges: set[tuple[str, str]] = set()
         self.nodes: dict[str, JobNode] = {}
         self.lock = RLock()
+        self._execution_entry_lock = Lock()
         self._included_routers: set[object] = set()
         self.scheduler_supervisor = SchedulerSupervisor(self)
 
@@ -72,11 +75,7 @@ class MicroWorkflow(
         # CLI safety controls. Normal library use keeps immediate autostarts.
         self.allowed_run_nodes: set[str] | None = None
         self.autostart_mode = "immediate"
-        # The CLI enables generation-fenced job restarts for active run/runfrom
-        # sessions. Programmatic workflows keep the original direct execution
-        # path unless they explicitly opt in, avoiding supervisory thread and
-        # filesystem-polling overhead.
-        self.active_job_restart_enabled = False
+        self.execution_session_context = None
 
         # Job-spawn context. A task may create more jobs with autostart=True,
         # but those spawned jobs must be treated like newly-created entities in
@@ -87,6 +86,18 @@ class MicroWorkflow(
         # Non-fatal graph/router configuration reminders collected while routers
         # mount. CLI loading prints these to stderr once per invocation.
         self.configuration_notices: list[str] = []
+
+    def execution_claim_context(self, node_name: str, *, context=_CURRENT_EXECUTION_CONTEXT):
+        if context is _CURRENT_EXECUTION_CONTEXT:
+            context = self.execution_session_context
+        elif context is None:
+            raise RuntimeError('Execution requires an explicit native session scope')
+        if context is not self.execution_session_context:
+            raise RuntimeError('Execution scope no longer belongs to this workflow')
+        if context is None or node_name not in context[1]:
+            raise RuntimeError(f'No active execution session owns node {node_name}')
+        return context[0], context[1][node_name]
+
     def _refresh_runtime_limits(self) -> dict[str, int]:
         path = self.storage.thread_overrides_file()
         try:

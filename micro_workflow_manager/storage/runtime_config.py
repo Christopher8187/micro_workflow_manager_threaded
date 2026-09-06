@@ -60,12 +60,8 @@ class RuntimeConfigStorageMixin:
         bound_run_id = state.get("run_id")
         if bound_run_id is None:
             return True
-        run_state = self.get_run_state()
-        return (
-            isinstance(run_state, dict)
-            and run_state.get("status") == "running"
-            and run_state.get("run_id") == bound_run_id
-        )
+        session = self.get_execution_session(bound_run_id)
+        return session is not None and session['status'] == 'running'
 
     def read_runtime_limit_state(self) -> dict[str, Any]:
         state = self.read_thread_override_state()

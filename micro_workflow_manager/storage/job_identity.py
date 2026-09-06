@@ -16,6 +16,24 @@ from micro_workflow_manager.models import Job, QUEUED
 class JobIdentityStorageMixin:
     """Idempotency, job IDs, and default-job declarations."""
 
+    def read_job_instance_id(self, node_name: str, job_id: int) -> str | None:
+        """Read the durable identity of a job in private version-5 storage."""
+        self._require_execution_session_storage()
+        node_name = self.validate_node_name(node_name)
+        job_id = self.validate_job_id(job_id)
+        row = self.db_connection().execute(
+            "SELECT i.instance_id FROM jobs AS j LEFT JOIN job_instances AS i "
+            "ON i.node_name=j.node_name AND i.job_id=j.job_id "
+            "WHERE j.node_name=? AND j.job_id=?", (node_name, job_id),
+        ).fetchone()
+        if row is None:
+            return None
+        identity = row["instance_id"]
+        if (type(identity) is not str or len(identity) != 32
+                or any(character not in "0123456789abcdef" for character in identity)):
+            raise RuntimeError(f"Incomplete job instance identity for {node_name!r}/{job_id}")
+        return identity
+
     def idempotency_key_hash(self, key: str) -> str:
         if not isinstance(key, str) or not key.strip():
             raise ValueError("idempotency_key must be a non-empty string")

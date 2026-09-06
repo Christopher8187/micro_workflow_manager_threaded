@@ -6,6 +6,7 @@ import networkx as nx
 
 from ..errors import InvalidGraphError
 from ..models import FAILED, QUEUED, RUNNING, WAITING
+from .execution_scope import programmatic_execution
 
 
 WAIT_BLOCKING_JOB_STATUSES = {QUEUED, RUNNING, FAILED}
@@ -180,6 +181,29 @@ class ComponentSchedulerMixin:
         wait_deadlock_resolver=None,
         api_pump_allocations: dict[str, int] | None = None,
     ) -> list[str]:
+        members = set(component)
+        if not members:
+            return []
+        with self.lock:
+            if members != self.component_for(sorted(members)[0]):
+                raise ValueError('Execution requires one complete current component')
+        with programmatic_execution(
+            self, command='run_component', start_node=sorted(members)[0], nodes=sorted(members),
+        ) as context:
+            return self._run_component(
+                members, ignore_readiness, wait_deadlock_resolver, api_pump_allocations,
+                execution_context=context,
+            )
+
+    def _run_component(
+        self,
+        component: set[str] | tuple[str, ...] | list[str],
+        ignore_readiness: bool = False,
+        wait_deadlock_resolver=None,
+        api_pump_allocations: dict[str, int] | None = None,
+        *,
+        execution_context,
+    ) -> list[str]:
         """Pump one Hoeflein component until it is quiescent.
 
         A waiting node is admitted only after every selected peer has no queued,
@@ -189,6 +213,10 @@ class ComponentSchedulerMixin:
         component_set = set(component)
         if not component_set:
             return []
+        for node_name in component_set:
+            _, owned_component = self.execution_claim_context(node_name, context=execution_context)
+            if set(owned_component) != component_set:
+                raise RuntimeError('Execution requires the complete admitted component')
         if not ignore_readiness and not self.component_ready(component_set):
             raise InvalidGraphError(f"Hoeflein component {sorted(component_set)} is not ready yet")
 
@@ -235,8 +263,9 @@ class ComponentSchedulerMixin:
                     startable = [override]
                 try:
                     for node_name in startable:
-                        self.run_queued_node_jobs(
+                        self._run_queued_node_jobs(
                             node_name,
+                            execution_context=execution_context,
                             ignore_readiness=True,
                             _defer_final_status_refresh=True,
                         )
@@ -286,9 +315,10 @@ class ComponentSchedulerMixin:
 
             def run_node_worker(node_name: str):
                 try:
-                    return self.run_queued_node_jobs(
+                    return self._run_queued_node_jobs(
                         node_name,
                         True,
+                        execution_context=execution_context,
                         _stop_event=stop_event,
                         _live_until_event=(stop_event if node_name in live_nodes else None),
                         _live_ready_event=live_ready_events.get(node_name),

@@ -14,8 +14,34 @@ def _fit(text: Any, width: int) -> str:
         return value[:width]
     return (value[: width - 1] + "…").ljust(width)
 
+
+def render_session_lines(sessions: list[dict[str, Any]]) -> list[str]:
+    if not sessions:
+        return ["execution sessions: none"]
+    lines = ["Execution sessions:"]
+    for session in sessions:
+        components = "; ".join(
+            ",".join(component) for component in session["selected_components"]
+        )
+        line = (
+            f"  session={session['session_id']} kind={session['session_kind']} "
+            f"command={session['command']} status={session['status']} "
+            f"parent={session['parent_session_id'] or '-'} "
+            f"components=[{components}]"
+        )
+        if session["status"] == "running":
+            line += f" elapsed={human_seconds(seconds_since(session['started_at']))}"
+        else:
+            line += f" outcome={session['outcome'] or '-'} finished={session['finished_at'] or '-'}"
+        if session["selected_jobs"]:
+            line += " jobs=" + ",".join(f"{node}/{job}" for node, job in session["selected_jobs"])
+        lines.append(line)
+        for failure in session["failures"]:
+            lines.append(f"    failure={failure}")
+    return lines
+
+
 def render_snapshot(snapshot: dict[str, Any]) -> str:
-    run_state = snapshot.get("run_state") or {}
     totals = snapshot["totals"]
     lines: list[str] = []
 
@@ -23,25 +49,7 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
     lines.append(title)
     lines.append("=" * len(title))
 
-    if run_state.get("status") == "running":
-        command = run_state.get("command", "run")
-        start_node = run_state.get("start_node", "?")
-        elapsed = human_seconds(seconds_since(run_state.get("started_at")))
-        selected = run_state.get("nodes") or []
-        selected_text = ", ".join(selected) if selected else "all graph nodes"
-        lines.append(
-            f"active run: {command} {start_node} | status=running | elapsed={elapsed} | nodes={selected_text}"
-        )
-    else:
-        lines.append("active run: none")
-        if run_state:
-            command = run_state.get("command", "run")
-            start_node = run_state.get("start_node", "?")
-            state_status = run_state.get("status", "unknown")
-            finished_at = run_state.get("finished_at") or "?"
-            lines.append(
-                f"last run: {command} {start_node} | status={state_status} | finished={finished_at}"
-            )
+    lines.extend(render_session_lines(snapshot["sessions"]))
 
     running_nodes = snapshot.get("running_nodes") or []
     running_text = ", ".join(running_nodes) if running_nodes else "none"

@@ -4,7 +4,7 @@ import shutil
 import uuid
 from pathlib import Path
 
-from micro_workflow_manager.legacy_runs import preflight_legacy_storage_creation
+from micro_workflow_manager.project_format import is_link_or_reparse_point
 from micro_workflow_manager.storage import FileStorage
 
 from .extras.scaffold import ensure_vscode_settings
@@ -21,7 +21,7 @@ def copy_node_to_clipboard(root: Path, node: str) -> int:
     source = root / "node" / node
     if not source.is_dir():
         raise RuntimeError(f"Node folder does not exist: {source}")
-    preflight_legacy_storage_creation(root)
+    storage = FileStorage(root)
     destination = clipboard_root(root) / node
     temporary = clipboard_root(root) / f".{node}.copying-{uuid.uuid4().hex}"
     clipboard_root(root).mkdir(parents=True, exist_ok=True)
@@ -29,7 +29,6 @@ def copy_node_to_clipboard(root: Path, node: str) -> int:
         shutil.rmtree(temporary)
     print(f"Copying node/{node} to clipboard/{node} ...")
     shutil.copytree(source, temporary)
-    storage = FileStorage(root)
     storage.export_node_state(node, temporary / SNAPSHOT_NAME)
     file_count = sum(1 for item in temporary.rglob("*") if item.is_file())
     if destination.exists():
@@ -47,7 +46,10 @@ def paste_node_from_clipboard(root: Path, node: str) -> int:
     source = clipboard_root(root) / node
     if not source.is_dir():
         raise RuntimeError(f"Clipboard does not contain node {node!r}: {source}")
-    preflight_legacy_storage_creation(root)
+    storage = FileStorage(root)
+    snapshot = source / SNAPSHOT_NAME
+    if is_link_or_reparse_point(snapshot) or not snapshot.is_file():
+        raise RuntimeError("Native clipboard state snapshot is missing or is not an ordinary file")
     node_root = root / "node"
     destination = node_root / node
     temporary = node_root / f".{node}.pasting-{uuid.uuid4().hex}"
@@ -62,7 +64,6 @@ def paste_node_from_clipboard(root: Path, node: str) -> int:
         print(f"Removing current node folder: {destination}")
         shutil.rmtree(destination)
     temporary.replace(destination)
-    storage = FileStorage(root)
     storage.import_node_state(node, source / SNAPSHOT_NAME)
     reconciled = storage.reconcile_pasted_node_state(node)
     if storage.get_node_status(node) is None:
@@ -73,7 +74,7 @@ def paste_node_from_clipboard(root: Path, node: str) -> int:
     print("  SQLite job state and trace journals restored and synchronized immediately")
     print(
         f"  jobs available: {reconciled['jobs']} "
-        f"(rebuilt: {reconciled['created']}, requeued: {reconciled['requeued']}, "
+        f"(requeued: {reconciled['requeued']}, "
         f"removed stale rows: {reconciled['removed']})"
     )
     ensure_vscode_settings(root)

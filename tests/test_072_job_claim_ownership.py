@@ -104,6 +104,7 @@ def test_private_claims_commit_exact_execution_owners_and_matching_started_event
             owner = {
                 'execution_id': execution_id, 'node_name': node, 'job_id': job_id,
                 'generation': generation, 'session_id': session_id, 'component': expected_component,
+                'job_instance_id': storage.read_job_instance_id(node, job_id),
             }
             assert storage.get_job_execution_owner(execution_id) == owner
             assert storage.read_job_control(node, job_id)['active_execution_id'] == execution_id
@@ -346,6 +347,7 @@ def test_simultaneous_single_claims_never_inherit_another_callers_context(
     assert storage.get_job_execution_owner(execution_id) == {
         'execution_id': execution_id, 'node_name': 'A', 'job_id': 1, 'generation': generation,
         'session_id': 'int-17', 'component': ('A', 'B'),
+        'job_instance_id': storage.read_job_instance_id('A', 1),
     }
     started = [event for event in storage.read_job_events('A', 1) if event['event'] == 'started']
     assert len(started) == 1

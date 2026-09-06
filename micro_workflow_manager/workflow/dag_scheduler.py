@@ -9,10 +9,22 @@ from ..storage.job_sources import LiveRefreshableQueuedJobObjectSource, Prefetch
 from .admission_sources import ClaimedJob, ClaimedQueuedJobSource, StoppingJobSource
 from .component_scheduler import allocate_api_pumps
 from .live_start import wait_for_live_component_release
+from .execution_scope import programmatic_execution
+
+
 class DagSchedulerMixin:
     def run(self):
+        nodes = list(self.graph_obj.nodes)
+        if not nodes:
+            return []
+        with programmatic_execution(self, command='run', start_node=nodes[0], nodes=nodes) as context:
+            return self._run(execution_context=context)
+
+    def _run(self, *, execution_context):
+        for node_name in self.graph_obj.nodes:
+            self.execution_claim_context(node_name, context=execution_context)
         if self.runner in {"threaded", "api", "process"}:
-            return self.run_concurrently()
+            return self._run_concurrently(execution_context=execution_context)
 
         ran = []
 
@@ -23,16 +35,27 @@ class DagSchedulerMixin:
                 break
 
             for node_name in ready:
-                self.run_node(node_name)
+                self._run_node(node_name, execution_context=execution_context)
                 ran.append(node_name)
 
         return ran
 
     def run_concurrently(
+        self, nodes: list[str] | None = None,
+        ready_check: Callable[[str], bool] | None = None, **kwargs,
+    ) -> list[str]:
+        selected = list(self.graph_obj.nodes) if nodes is None else list(nodes)
+        if not selected:
+            return []
+        with programmatic_execution(self, command='run_concurrently', start_node=selected[0], nodes=selected) as context:
+            return self._run_concurrently(nodes, ready_check, execution_context=context, **kwargs)
+
+    def _run_concurrently(
         self,
         nodes: list[str] | None = None,
         ready_check: Callable[[str], bool] | None = None,
         *,
+        execution_context,
         refuse_after_component: tuple[str, ...] | None = None,
         refuse_before_component: tuple[str, ...] | None = None,
         refusal_event: Event | None = None,
@@ -49,6 +72,9 @@ class DagSchedulerMixin:
         units = self.execution_components(nodes)
         if not units:
             return []
+        for unit in units:
+            for node_name in unit:
+                self.execution_claim_context(node_name, context=execution_context)
 
         def default_ready_check(node_name: str) -> bool:
             return self.node_ready(node_name)
@@ -203,11 +229,12 @@ class DagSchedulerMixin:
                         for node_name in ready_api_by_unit[unit]
                     }
                     future = executor.submit(
-                        self.run_component,
+                        self._run_component,
                         set(unit),
                         True,
                         wait_deadlock_resolver,
                         unit_api_pumps,
+                        execution_context=execution_context,
                     )
                     futures[future] = unit
                     future_api_pumps[future] = unit_api_pumps
@@ -245,6 +272,11 @@ class DagSchedulerMixin:
         return ran
 
     def run_node(self, node_name: str, ignore_readiness: bool = False):
+        with programmatic_execution(self, command='run_node', start_node=node_name, nodes=[node_name]) as context:
+            return self._run_node(node_name, ignore_readiness, execution_context=context)
+
+    def _run_node(self, node_name: str, ignore_readiness: bool = False, *, execution_context):
+        self.execution_claim_context(node_name, context=execution_context)
         component = self.component_for(node_name)
         if not ignore_readiness and not self.component_ready(component):
             raise InvalidGraphError(f"Hoeflein component {sorted(component)} is not ready yet")
@@ -252,16 +284,23 @@ class DagSchedulerMixin:
         # The programmatic API follows the same semantics as ``mwf run NODE``:
         # naming any member of a Hoeflein component pumps the whole component.
         if len(component) > 1 or self.component_is_cyclic(component):
-            return self.run_component(component, ignore_readiness=True)
+            return self._run_component(component, ignore_readiness=True, execution_context=execution_context)
 
         self.storage.set_node_status(node_name, RUNNING)
-        return self.run_queued_node_jobs(node_name=node_name, ignore_readiness=True)
+        return self._run_queued_node_jobs(node_name=node_name, ignore_readiness=True, execution_context=execution_context)
 
     def run_queued_node_jobs(
+        self, node_name: str, ignore_readiness: bool = False, **kwargs,
+    ):
+        with programmatic_execution(self, command='run_queued_node_jobs', start_node=node_name, nodes=[node_name]) as context:
+            return self._run_queued_node_jobs(node_name, ignore_readiness, execution_context=context, **kwargs)
+
+    def _run_queued_node_jobs(
         self,
         node_name: str,
         ignore_readiness: bool = False,
         *,
+        execution_context,
         _stop_event: Event | None = None,
         _live_until_event: Event | None = None,
         _live_ready_event: Event | None = None,
@@ -270,6 +309,7 @@ class DagSchedulerMixin:
         _api_startup_lanes: int | None = None,
     ):
         """Run all currently queued jobs for one node using a lazy job source."""
+        self.execution_claim_context(node_name, context=execution_context)
         if not ignore_readiness and not self.node_ready(node_name):
             raise InvalidGraphError(f"Node {node_name} is not ready yet")
 
@@ -280,7 +320,9 @@ class DagSchedulerMixin:
             return []
 
         self.storage.set_node_status(node_name, RUNNING)
-        runner = self.make_runner(node, api_startup_lanes=_api_startup_lanes)
+        runner = self.make_runner(
+            node, execution_context=execution_context, api_startup_lanes=_api_startup_lanes,
+        )
 
         refreshable = bool(
             getattr(runner, "supports_refreshable_job_source", False)
@@ -329,7 +371,6 @@ class DagSchedulerMixin:
                     )
             if (
                 refreshable
-                and self.active_job_restart_enabled
                 and getattr(runner, "preclaims_job_bursts", False)
             ):
                 main_task = self.nodes[node_name].main_task
@@ -342,10 +383,13 @@ class DagSchedulerMixin:
                         "repeat_index": 1,
                         "previous_error": None,
                     }
+                session_id, component = self.execution_claim_context(node_name, context=execution_context)
                 job_source = ClaimedQueuedJobSource(
                     self.storage,
                     node_name,
                     job_source,
+                    session_id=session_id,
+                    component=component,
                     task_started_data=task_started_data,
                     required_params=(main_task.required_params if main_task is not None else None),
                     allowed_params=(main_task.allowed_params if main_task is not None else None),
@@ -374,7 +418,8 @@ class DagSchedulerMixin:
 
             try:
                 if isinstance(item, ClaimedJob):
-                    return self.run_job(
+                    return self._run_job(
+                        execution_context=execution_context,
                         node_name=item.job.node_name,
                         job_id=item.job.job_id,
                         ignore_readiness=True,
@@ -389,14 +434,16 @@ class DagSchedulerMixin:
                         _defer_node_status_refresh=True,
                     )
                 if isinstance(item, Job):
-                    return self.run_job(
+                    return self._run_job(
+                        execution_context=execution_context,
                         node_name=item.node_name,
                         job_id=item.job_id,
                         ignore_readiness=True,
                         _preloaded_job=item,
                         _defer_node_status_refresh=True,
                     )
-                return self.run_job(
+                return self._run_job(
+                    execution_context=execution_context,
                     node_name=node_name,
                     job_id=item,
                     ignore_readiness=True,
@@ -435,10 +482,25 @@ class DagSchedulerMixin:
         return result
 
     def run_node_jobs(
+        self, node_name: str, jobs: list[Job], ignore_readiness: bool = False,
+    ):
+        jobs = list(jobs)
+        if any(job.node_name != node_name for job in jobs):
+            raise ValueError('All selected jobs must belong to the requested node')
+        if not jobs:
+            return []
+        with programmatic_execution(
+            self, command='run_node_jobs', start_node=node_name, nodes=[node_name],
+            selected_jobs=[job.job_id for job in jobs],
+        ) as context:
+            return self._run_node_jobs(node_name, jobs, ignore_readiness, execution_context=context)
+
+    def _run_node_jobs(
         self,
         node_name: str,
         jobs: list[Job],
         ignore_readiness: bool = False,
+        *, execution_context,
     ):
         """Run a specific list of jobs from one node.
 
@@ -446,6 +508,9 @@ class DagSchedulerMixin:
         job-selection mode. The supplied jobs are the only jobs executed; other
         queued jobs on the same node are left untouched.
         """
+        self.execution_claim_context(node_name, context=execution_context)
+        if any(job.node_name != node_name for job in jobs):
+            raise ValueError('All selected jobs must belong to the requested node')
         if not ignore_readiness and not self.node_ready(node_name):
             raise InvalidGraphError(f"Node {node_name} is not ready yet")
 
@@ -457,13 +522,14 @@ class DagSchedulerMixin:
 
         self.storage.set_node_status(node_name, RUNNING)
 
-        runner = self.make_runner(node)
+        runner = self.make_runner(node, execution_context=execution_context)
 
         try:
             result = runner.run_jobs(
                 node_name=node_name,
                 jobs=jobs,
-                run_one=lambda job: self.run_job(
+                run_one=lambda job: self._run_job(
+                    execution_context=execution_context,
                     node_name=job.node_name,
                     job_id=job.job_id,
                     ignore_readiness=True,
@@ -481,10 +547,21 @@ class DagSchedulerMixin:
         return result
 
     def run_jobs(
+        self, node_name: str, job_ids: list[int], ignore_readiness: bool = False,
+    ):
+        if not job_ids:
+            return []
+        with programmatic_execution(
+            self, command='run_jobs', start_node=node_name, nodes=[node_name], selected_jobs=job_ids,
+        ) as context:
+            return self._run_jobs(node_name, job_ids, ignore_readiness, execution_context=context)
+
+    def _run_jobs(
         self,
         node_name: str,
         job_ids: list[int],
         ignore_readiness: bool = False,
+        *, execution_context,
     ):
         """Run selected job IDs from one node.
 
@@ -493,7 +570,8 @@ class DagSchedulerMixin:
         """
         if not job_ids: return []
         jobs = [self.storage.load_job(node_name, job_id) for job_id in job_ids]
-        return self.run_node_jobs(
+        return self._run_node_jobs(
+            execution_context=execution_context,
             node_name=node_name,
             jobs=jobs,
             ignore_readiness=ignore_readiness,
