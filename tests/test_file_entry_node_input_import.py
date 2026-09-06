@@ -21,4 +21,4 @@ def test_filesystem_entry_mkdir_binds_node_input_type_without_name_error(tmp_pat
     workflow.start("A")
     assert workflow.run_job("A", 1, ignore_readiness=True) == "done"
     assert (tmp_path / "node" / "A" / "output" / "local").is_dir()
-    assert (tmp_path / "node" / "B" / "input" / "routed" / "value.txt").read_text() == "ok"
+    assert (tmp_path / "node" / "B" / "input" / "A" / "routed" / "value.txt").read_text() == "ok"

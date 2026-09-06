@@ -65,6 +65,19 @@ Declare filesystem objects beside the NodeRouter and bind them inside a task:
 - `OutputFileSystem` reads and writes the current node's single output prefix;
 - `NodeInputFileSystem` writes a connected node's input and routes jobs there.
 
+In MWF 0.6.2, forwarding `evidence/source.json` from raw node A to B writes
+`node/B/input/A/evidence/source.json`. The visible prefix is the actual producing
+raw node, including inside a Hoeflein component. It contains no producer job
+number. `NodeInputFileSystem` applies its bound `base` below that producer
+prefix, including for `write_jsons()` batches.
+
+The receiver names the producer explicitly, for example
+`ctx.input_path("A", "evidence", "source.json")`. Receiving-input listings use
+fixed-depth patterns such as `ctx.input_files("A/*.json")`. Recursive input
+listing and `**` patterns are rejected. Input `read_jsons()` defaults to a
+fixed-depth read; output `read_jsons()` retains its recursive default. Output
+tree traversal remains available.
+
 These objects keep path containment, generation fencing, Windows extended-path
 support, and trace events inside the framework boundary. Use raw paths for
 source or other files outside MWF-managed data only when the project explicitly

@@ -12,6 +12,7 @@ from .file_helpers import (
     _mkdir,
     _relative_parts,
     _source_path,
+    _validate_input_pattern,
     _write_bytes_file,
     _write_text_file,
 )
@@ -157,7 +158,7 @@ class FileSystemEntry(os.PathLike[str]):
         self,
         pattern: str = "*.json",
         *,
-        recursive: bool = True,
+        recursive: bool | None = None,
         encoding: str | None = None,
     ) -> list[tuple[str, Any]]:
         """Read a bounded JSON set under one execution-generation check.
@@ -170,6 +171,10 @@ class FileSystemEntry(os.PathLike[str]):
         Returned paths are relative POSIX names, sorted deterministically.
         """
 
+        if recursive is None:
+            recursive = self.scope not in ('input', 'node_input')
+        if self.scope in ('input', 'node_input'):
+            _validate_input_pattern(pattern, recursive=recursive)
         _relative_parts(pattern.replace("*", "x").replace("?", "x"))
         # Resolving the bound root performs the pre-read execution check.
         root = self.path
@@ -294,6 +299,8 @@ class FileSystemEntry(os.PathLike[str]):
         return self._glob(pattern, recursive=True)
 
     def _glob(self, pattern: str, *, recursive: bool) -> list["FileSystemEntry"]:
+        if self.scope in ('input', 'node_input'):
+            _validate_input_pattern(pattern, recursive=recursive)
         _relative_parts(pattern.replace("*", "x").replace("?", "x"))
         root = self.path
         paths: Iterator[Path] = root.rglob(pattern) if recursive else root.glob(pattern)

@@ -36,7 +36,7 @@ def test_filesystem_objects_read_write_copy_and_route(tmp_path: Path):
             result,
             overwrite=True,
         )
-        review_input.add_job(ctx, result_file="one/result.json")
+        review_input.add_job(ctx, result_file="prepare/one/result.json")
         return result.relative_path
 
     @workflow.task("review")
@@ -46,9 +46,10 @@ def test_filesystem_objects_read_write_copy_and_route(tmp_path: Path):
     workflow.start("prepare")
     assert workflow.run_job("prepare", 1, ignore_readiness=True) == "one/result.json"
     assert json.loads(
-        (tmp_path / "node" / "review" / "input" / "one" / "result.json").read_text()
+        (tmp_path / "node" / "review" / "input" / "prepare" / "one" / "result.json").read_text()
     ) == {"number": 5}
-    assert workflow.storage.load_job("review", 1).params == {"result_file": "one/result.json"}
+    assert workflow.storage.load_job("review", 1).params == {"result_file": "prepare/one/result.json"}
+    assert workflow.run_job("review", 1, ignore_readiness=True) == {"number": 5}
 
 
 def test_per_job_file_apis_are_not_public():

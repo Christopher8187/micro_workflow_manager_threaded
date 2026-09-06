@@ -11,6 +11,7 @@ from .paths import relative_posix
 from .file_helpers import (
     _copy_file,
     _format_template,
+    _relative_file_parts,
     _relative_parts,
     _write_bytes_file,
     _write_text_file,
@@ -291,10 +292,12 @@ class NodeInputFileSystem(FileSystem):
         entries: list[tuple[str, Any]],
         *,
         overwrite: bool = False,
+        **values: Any,
     ) -> list[Path]:
+        root = self.bind(ctx, **values)
         texts = [
             (
-                filename,
+                root.file(*_relative_file_parts(filename)).relative_path,
                 json.dumps(value, ensure_ascii=False, indent=2) + "\n",
             )
             for filename, value in entries
@@ -337,14 +340,14 @@ class NodeInputFileSystem(FileSystem):
 
     def _append_text(self, ctx, relative: str, content: str, *, encoding: str) -> Path:
         handle = self.handle(ctx)
-        target = ctx.system.storage.input_path(self.node_name, relative)
+        target = handle.input_path(relative)
         return handle._guarded(
             lambda: ctx.system.storage.append_text(target, content, encoding=encoding)
         )
 
     def _delete(self, ctx, relative: str, *, missing_ok: bool) -> None:
         handle = self.handle(ctx)
-        target = ctx.system.storage.input_path(self.node_name, relative)
+        target = handle.input_path(relative)
 
         def remove():
             if missing_ok:

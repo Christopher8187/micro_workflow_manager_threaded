@@ -9,8 +9,10 @@ from typing import Any, Callable, TypeVar
 
 from .errors import JobRestartedError, JobTimeoutError
 from .fibers import in_fiber_runtime
+from .file_helpers import _relative_file_parts, _relative_parts
 from .models import Job
 from .paths import relative_posix
+from .project_format import is_link_or_reparse_point
 
 def _event_value(value: Any, *, depth: int = 0) -> Any:
     """Convert trace/event payloads to durable JSON without surprising callers."""
@@ -202,15 +204,26 @@ class NodeHandle(_ExecutionChecks):
 
     @property
     def input_dir(self) -> Path:
-        return self._guarded(lambda: self.system.storage.node_input_dir(self.to_node))
+        return self.input_path()
 
     def input_path(self, *parts: str) -> Path:
-        return self._guarded(lambda: self.system.storage.input_path(self.to_node, *parts))
+        return self._guarded(lambda: self.system.storage.input_path(self.to_node, self._input_name(*parts)))
+
+    def _input_name(self, *parts: str) -> str:
+        producer = self.system.storage.validate_node_name(self.from_node)
+        receiver = self.system.storage.validate_node_name(self.to_node)
+        name = '/'.join((producer, *_relative_parts(*parts)))
+        root = self.system.storage.project_dir
+        target = root / 'node' / receiver / 'input' / name
+        if any(is_link_or_reparse_point(path) for path in (target, *target.parents)
+               if path.is_relative_to(root)):
+            raise ValueError(f'Unsafe managed input path: {target}')
+        return name
 
     def write_input(self, filename: str, content: str, *, overwrite: bool = False) -> Path:
         path = self._guarded(
             lambda: self.system.storage.write_node_input_text(
-                self.to_node, filename, content, overwrite=overwrite
+                self.to_node, self._input_name(*_relative_file_parts(filename)), content, overwrite=overwrite
             )
         )
         self._record_event(
@@ -223,7 +236,7 @@ class NodeHandle(_ExecutionChecks):
     def write_input_bytes(self, filename: str, content: bytes, *, overwrite: bool = False) -> Path:
         path = self._guarded(
             lambda: self.system.storage.write_node_input_bytes(
-                self.to_node, filename, content, overwrite=overwrite
+                self.to_node, self._input_name(*_relative_file_parts(filename)), content, overwrite=overwrite
             )
         )
         self._record_event(
@@ -241,9 +254,19 @@ class NodeHandle(_ExecutionChecks):
         encoding: str = "utf-8",
     ) -> list[Path]:
         """Write many text inputs to the target node under one execution guard."""
+        if not isinstance(entries, list):
+            raise TypeError('entries must be a list of (filename, content) pairs')
+        qualified = []
+        for entry in entries:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise TypeError('each entry must be a (filename, content) tuple')
+            filename, content = entry
+            if not isinstance(filename, str) or not filename:
+                raise ValueError('batch input filenames must be non-empty strings')
+            qualified.append((self._input_name(*_relative_file_parts(filename)), content))
         paths = self._guarded(
             lambda: self.system.storage.write_node_input_texts(
-                self.to_node, entries, overwrite=overwrite, encoding=encoding
+                self.to_node, qualified, overwrite=overwrite, encoding=encoding
             )
         )
         root = self.system.storage.node_input_dir(self.to_node)
@@ -264,7 +287,11 @@ class NodeHandle(_ExecutionChecks):
     ) -> Path:
         path = self._guarded(
             lambda: self.system.storage.copy_to_node_input(
-                self.to_node, source, filename=filename, overwrite=overwrite
+                self.to_node, source,
+                filename=self._input_name(*_relative_file_parts(
+                    Path(source).name if filename is None else filename,
+                )),
+                overwrite=overwrite,
             )
         )
         root = self.system.storage.node_input_dir(self.to_node)

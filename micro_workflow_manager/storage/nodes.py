@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from shutil import copy2
 
+from micro_workflow_manager.file_helpers import _validate_input_pattern
 from micro_workflow_manager.models import QUEUED
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 
@@ -129,10 +130,11 @@ class NodeFileStorageMixin:
         recursive: bool = False,
         files_only: bool = True,
     ) -> list[Path]:
+        _validate_input_pattern(pattern, recursive=recursive)
         self.validate_relative_pattern(pattern)
         root = self.node_input_dir(node_name)
 
-        paths = root.rglob(pattern) if recursive else root.glob(pattern)
+        paths = root.glob(pattern)
 
         result = sorted(
             path for path in paths

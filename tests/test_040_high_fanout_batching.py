@@ -181,7 +181,7 @@ def test_high_fanout_batch_creates_one_job_per_object_without_autostart(tmp_path
         for index in range(1, object_count + 1):
             rel = f"book/section/items/{index:06d}.json"
             entries.append((rel, {"order": [1, index], "statement": str(index)}))
-            params.append({"record_file": rel})
+            params.append({"record_file": f"preexplode/{rel}"})
             keys.append(f"record:{rel}")
         target.write_jsons(ctx, entries, overwrite=True)
         jobs = target.add_jobs(
@@ -211,7 +211,7 @@ def test_high_fanout_batch_creates_one_job_per_object_without_autostart(tmp_path
     assert workflow.storage.get_node_status("explode") == "queued"
     assert len(workflow.storage.list_job_ids("explode")) == object_count
     assert json.loads(
-        (tmp_path / "node" / "explode" / "input" / "book" / "section" / "items" / "000400.json").read_text()
+        (tmp_path / "node" / "explode" / "input" / "preexplode" / "book" / "section" / "items" / "000400.json").read_text()
     )["statement"] == "400"
 
 

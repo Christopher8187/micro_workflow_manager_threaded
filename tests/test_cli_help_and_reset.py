@@ -224,7 +224,7 @@ router = NodeRouter("disintegrate")
 router.create_job(number=1)
 @router.task
 def run(ctx):
-    text = ctx.input_path("page.txt").read_text(encoding="utf-8")
+    text = ctx.input_path("tagify", "page.txt").read_text(encoding="utf-8")
     ctx.write_output("combined.txt", text)
     return text
 """.strip(),

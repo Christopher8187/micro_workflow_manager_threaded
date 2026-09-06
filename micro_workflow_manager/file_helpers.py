@@ -9,6 +9,11 @@ from typing import Any
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
+def _validate_input_pattern(pattern: str, *, recursive: bool) -> None:
+    if recursive or '**' in pattern:
+        raise ValueError('Receiving input reads must use exact paths or fixed-depth patterns')
+
+
 def _relative_parts(*parts: str | os.PathLike[str]) -> tuple[str, ...]:
     """Normalize user-facing paths to portable, safe relative parts."""
     normalized: list[str] = []
@@ -27,6 +32,14 @@ def _relative_parts(*parts: str | os.PathLike[str]) -> tuple[str, ...]:
                 raise ValueError("filesystem paths cannot contain '..'")
             normalized.append(part)
     return tuple(normalized)
+
+
+def _relative_file_parts(*parts: str | os.PathLike[str]) -> tuple[str, ...]:
+    normalized = _relative_parts(*parts)
+    if not normalized:
+        raise ValueError('Input filenames must contain a non-empty relative file path')
+    return normalized
+
 
 def _format_template(template: str, values: dict[str, Any]) -> tuple[str, ...]:
     if not template:
