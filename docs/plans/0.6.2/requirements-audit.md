@@ -12,6 +12,11 @@ preserves the [verified native integration boundary](native-foundation-progress.
 The separate [restart continuation boundary](native-restart-progress.md) passed
 all 330 final surrounding checks and its bounded correction reviews.
 
+The [guarded queued component start](ordinary-component-start.md) is an accepted
+private storage increment. It preserves exact component state and
+ownership through one transition. Shared public lifecycle activation remains
+unfinished.
+
 The [interval calculation](stage-s1a.md),
 [command retirement](stage-retirement.md), [shared topology](stage-topology.md),
 [retained scheduler repair](stage-scheduler-completion.md),

@@ -6,6 +6,65 @@ from micro_workflow_manager.component_identity import decode_component_key, enco
 class ComponentStateStorageMixin:
     """Persist private component lifecycle records at their producing shape."""
 
+    def begin_queued_component_execution(
+        self, session_id: str, component, *, expected_shape: str,
+        expected_alignment_generation: int,
+    ) -> bool:
+        """Start one aligned queued component while its selected session owns it."""
+        self._require_execution_session_storage()
+        self._session_text(session_id, 'session_id')
+        self._session_text(expected_shape, 'expected_shape')
+        key = encode_component_key(self._session_component(component))
+        if type(expected_alignment_generation) is not int or expected_alignment_generation < 0:
+            raise ValueError('Expected alignment generation must be a nonnegative integer')
+
+        def begin(connection):
+            owner = connection.execute(
+                'SELECT session.status, reservation.session_id AS owner, selected.component_key AS selected_key '
+                'FROM execution_sessions AS session '
+                'LEFT JOIN component_reservations AS reservation ON reservation.component_key=? '
+                'LEFT JOIN session_components AS selected '
+                'ON selected.session_id=session.session_id AND selected.component_key=? '
+                'WHERE session.session_id=?', (key, key, session_id),
+            ).fetchone()
+            if owner is None or owner['status'] != 'running':
+                raise RuntimeError('Component start requires an existing running session: ' + session_id)
+            if owner['owner'] != session_id:
+                raise RuntimeError('Component start requires the exact component reservation: ' + key)
+            if owner['selected_key'] is None:
+                raise RuntimeError('Component is outside the session selected scope: ' + key)
+            state = connection.execute(
+                'SELECT d.component_key, g.shape_json, s.component_key AS state_key, '
+                's.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, '
+                'origin.session_kind AS origin_kind '
+                'FROM component_definitions d '
+                'LEFT JOIN graph_shapes g USING(shape_id) '
+                'LEFT JOIN component_states s USING(component_key) '
+                'LEFT JOIN execution_sessions origin ON origin.session_id=s.instability_origin '
+                'WHERE d.component_key=?', (key,),
+            ).fetchone()
+            if state is None:
+                raise RuntimeError('Unknown component: ' + key)
+            if state['state_key'] is None or state['shape_json'] is None:
+                raise RuntimeError('Incomplete component state or producing graph shape')
+            self._validate_component_state_row(state)
+            if state['shape_json'] != expected_shape:
+                raise RuntimeError('Component start requires the expected producing graph shape')
+            if (state['lifecycle'] != 'queued' or state['misaligned'] != 0
+                    or state['alignment_generation'] != expected_alignment_generation):
+                raise RuntimeError('Start requires an aligned queued component at the expected generation')
+            changed = connection.execute(
+                "UPDATE component_states SET lifecycle='running' "
+                "WHERE component_key=? AND lifecycle='queued' AND misaligned=0 AND alignment_generation=? "
+                "AND stability IS NULL AND instability_origin IS NULL",
+                (key, expected_alignment_generation),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError('Component changed before start: ' + key)
+            return True
+
+        return self.submit_db_mutation(begin, wait=True, priority=0)
+
     def begin_sampled_component_resume(
         self, session_id: str, component, *, expected_alignment_generation: int,
     ) -> bool:
