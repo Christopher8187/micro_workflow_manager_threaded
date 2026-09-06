@@ -1198,8 +1198,7 @@ def test_partial_component_restart_runs_only_accepted_successor_before_remaining
     for node in ('A', 'B'):
         workflow.add_job(None, node)
         workflow.add_job(None, node)
-    untouched = {node: (storage.read_job_control(node, 2), storage.read_job_events(node, 2))
-                 for node in ('A', 'B')}
+    untouched = {node: storage.read_job_control(node, 2) for node in ('A', 'B')}
     decide = storage.decide_execution_session_exit
 
     def pause_failed_decision(*args, **kwargs):
@@ -1241,7 +1240,12 @@ def test_partial_component_restart_runs_only_accepted_successor_before_remaining
         for node in ('A', 'B'):
             assert storage.get_job_status(node, 2) == 'queued'
             assert storage.read_job_current_owner(node, 2) is None
-            assert (storage.read_job_control(node, 2), storage.read_job_events(node, 2)) == untouched[node]
+            assert storage.read_job_control(node, 2) == untouched[node]
+            assert [{key: value for key, value in event.items() if key != 'time'}
+                    for event in storage.read_job_events(node, 2)] == [
+                {'event': 'queued', 'previous_status': 'queued', 'status': 'queued'},
+            ]
+            assert not storage.output_file(node, 2).exists()
             assert storage.get_node_status(node) == ('queued' if entry == 'run' and node == 'A' else 'failed')
         assert storage.read_job_current_owner('A', 1)['session_id'] == owner['session_id']
         for component in workflow.execution_components():

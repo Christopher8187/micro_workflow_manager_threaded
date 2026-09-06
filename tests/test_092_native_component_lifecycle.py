@@ -11,9 +11,19 @@ from threading import Event
 import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeRouter
-from micro_workflow_manager.errors import JobFailedError
+from micro_workflow_manager.errors import InvalidGraphError, JobFailedError
 from micro_workflow_manager.storage import FileStorage
 from tests.test_090_component_session_settlement import _close, _rows
+
+
+def _assert_prepared_unstarted(storage, node, job_id):
+    assert [{key: value for key, value in event.items() if key != 'time'}
+            for event in storage.read_job_events(node, job_id)] == [
+        {'event': 'queued', 'previous_status': 'queued', 'status': 'queued'},
+    ]
+    assert storage.get_job_status(node, job_id) == 'queued'
+    assert storage.read_job_current_owner(node, job_id) is None
+    assert not storage.output_file(node, job_id).exists()
 
 
 @pytest.mark.parametrize('runner', ['direct', 'threaded'])
@@ -105,14 +115,21 @@ def test_custom_readiness_can_only_narrow_native_component_admission(tmp_path, p
     workflow.include_routers(parent, child)
     workflow.add_job(None, 'A')
     workflow.add_job(None, 'B')
+    storage.register_component_topology(workflow.topology.snapshot())
     try:
         if parent_done:
             workflow.run_component({'A'})
         parent_events = storage.read_job_events('A', 1)
         child_events = storage.read_job_events('B', 1)
         calls.clear()
+        before = _rows(storage)
         expected = ['B'] if parent_done and predicate_allows else []
-        assert workflow.run_concurrently(nodes=['B'], ready_check=ready_check) == expected
+        if parent_done:
+            assert workflow.run_concurrently(nodes=['B'], ready_check=ready_check) == expected
+        else:
+            with pytest.raises(InvalidGraphError, match='not ready for fresh preparation'):
+                workflow.run_concurrently(nodes=['B'], ready_check=ready_check)
+            assert _rows(storage) == before
         assert calls == expected
         assert checks == [] if not parent_done else checks and set(checks) == {'B'}
         assert storage.read_job_events('A', 1) == parent_events
@@ -120,10 +137,18 @@ def test_custom_readiness_can_only_narrow_native_component_admission(tmp_path, p
         assert storage.get_component_state(('B',))['lifecycle'] == ('done' if expected else 'queued')
         assert storage.get_job_status('B', 1) == ('done' if expected else 'queued')
         if not expected:
-            assert storage.read_job_events('B', 1) == child_events
+            if parent_done:
+                _assert_prepared_unstarted(storage, 'B', 1)
+            else:
+                assert storage.read_job_events('B', 1) == child_events
+                assert storage.read_job_current_owner('B', 1) is None
             assert not storage.output_file('B', 1).exists()
-        session = storage.list_execution_sessions()[-1]
-        assert (session['status'], session['outcome']) == ('terminal', 'done')
+        sessions = storage.list_execution_sessions()
+        if parent_done:
+            assert len(sessions) == 2
+            assert all((session['status'], session['outcome']) == ('terminal', 'done') for session in sessions)
+        else:
+            assert sessions == []
         assert storage.get_component_reservation(('B',)) is None
     finally:
         _close(storage)
@@ -177,7 +202,6 @@ def test_child_admission_refuses_a_parent_changed_after_observation(tmp_path, mo
         finally:
             storage.db_connection().set_trace_callback(None)
 
-    child_events = storage.read_job_events('B', 1)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(run)
@@ -195,7 +219,7 @@ def test_child_admission_refuses_a_parent_changed_after_observation(tmp_path, mo
         assert not trace_errors
         assert child_calls == []
         assert storage.get_component_state(('B',))['lifecycle'] == 'queued'
-        assert storage.read_job_events('B', 1) == child_events
+        _assert_prepared_unstarted(storage, 'B', 1)
         assert storage.get_component_reservation(('B',)) is None
     finally:
         proceed.set()
@@ -223,7 +247,6 @@ def test_failed_parent_settles_with_session_and_leaves_child_unstarted(tmp_path)
     workflow.include_routers(parent, child)
     workflow.add_job(None, 'A')
     workflow.add_job(None, 'B')
-    child_events = storage.read_job_events('B', 1)
     try:
         with pytest.raises(JobFailedError):
             workflow.run()
@@ -234,7 +257,7 @@ def test_failed_parent_settles_with_session_and_leaves_child_unstarted(tmp_path)
         assert storage.get_component_state(('B',))['lifecycle'] == 'queued'
         assert storage.get_job_status('A', 1) == 'failed'
         assert storage.get_job_status('B', 1) == 'queued'
-        assert storage.read_job_events('B', 1) == child_events
+        _assert_prepared_unstarted(storage, 'B', 1)
         session, = storage.list_execution_sessions()
         assert (session['status'], session['outcome']) == ('terminal', 'failed')
         assert storage.get_component_reservation(('A',)) is None
@@ -494,7 +517,7 @@ def test_failed_session_publication_retains_the_original_job_error(tmp_path, mon
     def changed_pending_record(*args, **kwargs):
         if not before_decision:
             storage.submit_db_mutation(lambda connection: connection.execute(
-                'UPDATE pending_component_executions SET alignment_generation=1',
+                'UPDATE pending_component_executions SET alignment_generation=alignment_generation+1',
             ))
             before_decision.append(_rows(storage))
         return decide(*args, **kwargs)
@@ -620,7 +643,6 @@ def work(ctx):
     for node in ('A', 'B', 'C'):
         workflow.add_job(None, node)
     storage = workflow.storage
-    child_events = storage.read_job_events('C', 1)
     at_decision, proceed = Event(), Event()
     decide = storage.decide_execution_session_exit
 
@@ -675,7 +697,7 @@ def work(ctx):
         assert storage.get_component_state(('C',))['lifecycle'] == expected_states['C']
         assert storage.get_job_status('C', 1) == expected_states['C']
         if not catch_failure:
-            assert storage.read_job_events('C', 1) == child_events
+            _assert_prepared_unstarted(storage, 'C', 1)
         events = {node: storage.read_job_events(node, 1) for node in ('A', 'B', 'C')}
         outputs = {node: storage.output_file(node, 1).read_bytes() for node in ('A', 'B')}
         for node in ('A', 'B'):
@@ -789,10 +811,21 @@ def test_full_dag_completes_empty_parents_before_starting_their_children(tmp_pat
         assert all(state['lifecycle'] == 'done' for state in states.values())
         events = storage.read_job_events('B', 1)
         assert len([event for event in events if event['event'] == 'started']) == 1
-        assert getattr(workflow, entry)() == []
-        assert storage.read_job_events('B', 1) == events
+        first_owner = storage.read_job_current_owner('B', 1)
+        instance = storage.read_job_instance_id('B', 1)
+        assert all(state['alignment_generation'] == 1 for state in states.values())
+        assert getattr(workflow, entry)() == ['B']
+        assert observations == [('done', 'stable', None), ('done', 'stable', None)]
+        assert storage.read_job_instance_id('B', 1) == instance
+        second_owner = storage.read_job_current_owner('B', 1)
+        assert second_owner['execution_id'] != first_owner['execution_id']
+        assert second_owner['session_id'] != first_owner['session_id']
+        assert second_owner['alignment_generation'] == 2
+        assert len([event for event in storage.read_job_events('B', 1) if event['event'] == 'started']) == 1
         for node in ('A', 'B'):
-            assert storage.get_component_state((node,)) == states[node]
+            state = storage.get_component_state((node,))
+            assert (state['lifecycle'], state['stability'], state['instability_origin']) == ('done', 'stable', None)
+            assert state['alignment_generation'] == 2
             assert storage.get_component_reservation((node,)) is None
         sessions = storage.list_execution_sessions()
         assert len(sessions) == 2
@@ -840,7 +873,7 @@ def test_accepted_restart_runs_before_a_damaged_terminal_receipt_is_rejected(tmp
                 )
                 assert command.returncode == 0, command.stdout + command.stderr
                 storage.submit_db_mutation(lambda connection: connection.execute(
-                    'UPDATE pending_component_executions SET alignment_generation=1',
+                    'UPDATE pending_component_executions SET alignment_generation=alignment_generation+1',
                 ))
             finally:
                 proceed.set()
@@ -898,7 +931,6 @@ def test_nested_component_restart_repairs_only_the_accepted_job_and_preserves_pa
     workflow.add_job(None, 'B')
     if nested_jobs == 2:
         workflow.add_job(None, 'B')
-    untouched_events = storage.read_job_events('B', 2) if nested_jobs == 2 else None
     decide = storage.decide_execution_session_exit
 
     def ordered_decision(*args, **kwargs):
@@ -945,7 +977,7 @@ def test_nested_component_restart_repairs_only_the_accepted_job_and_preserves_pa
         )
         if nested_jobs == 2:
             assert storage.get_job_status('B', 2) == 'queued'
-            assert storage.read_job_events('B', 2) == untouched_events
+            _assert_prepared_unstarted(storage, 'B', 2)
             assert not storage.output_file('B', 2).exists()
         assert storage.get_component_state(('C',))['lifecycle'] == 'queued'
         session, = storage.list_execution_sessions()
@@ -1086,7 +1118,6 @@ def test_mixed_parent_and_nested_restarts_stop_ordinary_work_until_nested_repair
     workflow.include_routers(parent, nested, child)
     for node in ('A', 'A', 'B', 'C'):
         workflow.add_job(None, node)
-    untouched_events = storage.read_job_events('A', 2)
     decide = storage.decide_execution_session_exit
 
     def pause_failure(*args, **kwargs):
@@ -1137,7 +1168,7 @@ def test_mixed_parent_and_nested_restarts_stop_ordinary_work_until_nested_repair
         assert storage.get_job_status('A', 1) == 'done'
         assert storage.get_job_status('A', 2) == ('done' if repair_nested else 'queued')
         if not repair_nested:
-            assert storage.read_job_events('A', 2) == untouched_events
+            _assert_prepared_unstarted(storage, 'A', 2)
             assert not storage.output_file('A', 2).exists()
         assert json.loads(storage.output_file('A', 1).read_text(encoding='utf-8'))['result_repr'] == "{'retained': 1}"
         assert storage.get_component_state(('A',))['lifecycle'] == ('done' if repair_nested else 'failed')
@@ -1294,7 +1325,6 @@ def test_all_accepted_nested_repairs_finish_before_any_ordinary_remainder(tmp_pa
     workflow.include_routers(parent, *nested, child)
     for node in ('A', 'B', 'D', 'C', 'B', 'D'):
         workflow.add_job(None, node)
-    untouched_events = {node: storage.read_job_events(node, 2) for node in ('B', 'D')}
     decide = storage.decide_execution_session_exit
 
     def pause_decision(*args, **kwargs):
@@ -1339,7 +1369,7 @@ def test_all_accepted_nested_repairs_finish_before_any_ordinary_remainder(tmp_pa
             assert storage.get_component_state((node,))['lifecycle'] == ('failed' if ordinary_fails else 'done')
             if ordinary_fails and node not in ordinary_calls:
                 assert storage.get_job_status(node, 2) == 'queued'
-                assert storage.read_job_events(node, 2) == untouched_events[node]
+                _assert_prepared_unstarted(storage, node, 2)
                 assert not storage.output_file(node, 2).exists()
             else:
                 assert storage.get_job_status(node, 2) == ('failed' if ordinary_fails else 'done')

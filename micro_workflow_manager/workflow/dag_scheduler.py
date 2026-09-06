@@ -17,6 +17,7 @@ class DagSchedulerMixin(NodeSchedulerMixin):
             return []
         with programmatic_execution(
             self, command='run', start_node=nodes[0], nodes=nodes, include_driver=True, include_parent=True,
+            fresh=True,
         ) as (context, driver, parent):
             return self._run(execution_context=context, _session_driver=driver, _task_parent=parent)
 
@@ -39,6 +40,7 @@ class DagSchedulerMixin(NodeSchedulerMixin):
         with programmatic_execution(
             self, command='run_concurrently', start_node=selected[0], nodes=selected,
             include_driver=True, include_parent=True,
+            fresh=True,
         ) as (context, driver, parent):
             return self._run_concurrently(
                 nodes, ready_check, execution_context=context, _session_driver=driver, _task_parent=parent, **kwargs,

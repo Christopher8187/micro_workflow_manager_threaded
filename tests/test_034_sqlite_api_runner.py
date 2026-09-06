@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import textwrap
@@ -130,47 +129,20 @@ def test_api_runner_fills_max_threads_for_io_jobs(tmp_path):
     workflow.storage.close_database_connections()
 
 
-def test_legacy_metadata_is_imported_once_without_moving_payloads(tmp_path):
-    job_dir = tmp_path / "node" / "A" / "jobs" / "1"
+def test_old_metadata_is_refused_without_moving_or_importing_payloads(tmp_path):
+    (tmp_path / '.mwf').mkdir()
+    (tmp_path / '.mwf' / 'project.json').write_text('{"version":4}', encoding='utf-8')
+    job_dir = tmp_path / 'node' / 'A' / 'jobs' / '1'
     job_dir.mkdir(parents=True)
-    (tmp_path / "node" / "A" / "queued").mkdir()
-    (tmp_path / "node" / "A" / "queued" / "1.queued").write_text("", encoding="utf-8")
-    idem_dir = tmp_path / "node" / "A" / "idempotency"
-    idem_dir.mkdir()
-    key = "source:1:A"
-    key_hash = hashlib.sha256(key.encode()).hexdigest()
-    (idem_dir / f"{key_hash}.json").write_text(
-        json.dumps({"key": key, "job_id": 1}), encoding="utf-8"
-    )
-    (tmp_path / "node" / "A" / "node_state.json").write_text(
-        json.dumps({"status": "failed"}), encoding="utf-8"
-    )
-    (job_dir / "job.json").write_text(
-        json.dumps({"job_id": 1, "node_name": "A", "parent": None, "created_at": "old"}),
-        encoding="utf-8",
-    )
-    (job_dir / "status.json").write_text(
-        json.dumps({"status": "failed", "error": "legacy"}), encoding="utf-8"
-    )
-    (job_dir / "events.jsonl").write_text(
-        json.dumps({"time": "old", "event": "created"}) + "\n", encoding="utf-8"
-    )
-    (job_dir / "input.json").write_text('{"value": 7}', encoding="utf-8")
-    (job_dir / "output.json").write_text('{"status": "failed"}', encoding="utf-8")
-
-    storage = FileStorage(tmp_path)
-    assert storage.get_node_status("A") == "failed"
-    assert storage.get_job_status("A", 1) == "failed"
-    assert storage.read_job_status_data("A", 1)["error"] == "legacy"
-    assert storage.read_job_events("A", 1)[0]["event"] == "created"
-    assert storage.lookup_idempotent_job("A", key).job_id == 1
-    assert (job_dir / "input.json").read_text() == '{"value": 7}'
-    assert (job_dir / "output.json").read_text() == '{"status": "failed"}'
-    assert not (job_dir / "job.json").exists()
-    assert not (job_dir / "status.json").exists()
-    assert not (tmp_path / "node" / "A" / "queued").exists()
-    assert not idem_dir.exists()
-    storage.close_database_connections()
+    (job_dir / 'job.json').write_text('{"job_id":1,"node_name":"A"}', encoding='utf-8')
+    (job_dir / 'status.json').write_text('{"status":"failed"}', encoding='utf-8')
+    (job_dir / 'input.json').write_text('{"value":7}', encoding='utf-8')
+    (job_dir / 'output.json').write_text('{"status":"failed"}', encoding='utf-8')
+    before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()}
+    with pytest.raises(RuntimeError, match='Unsupported MWF project format'):
+        FileStorage(tmp_path)
+    assert {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()} == before
+    assert not (tmp_path / '.mwf' / 'state.sqlite3').exists()
 
 
 def test_init_removes_old_top_level_node_icon_association(tmp_path, monkeypatch):
@@ -208,13 +180,13 @@ def test_api_runner_aliases_normalize_to_api():
 
 
 def test_newer_sqlite_schema_is_rejected_without_downgrade(tmp_path):
-    database = tmp_path / ".mwf" / "state.sqlite3"
-    database.parent.mkdir()
+    storage = FileStorage(tmp_path)
+    database = storage.state_database_path()
+    storage.close_database_connections()
     connection = sqlite3.connect(database)
     try:
-        connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         connection.execute(
-            "INSERT INTO metadata(key, value) VALUES('database_schema_version', '999')"
+            "UPDATE metadata SET value='999' WHERE key='database_schema_version'"
         )
         connection.commit()
     finally:
@@ -247,7 +219,7 @@ def test_doctor_reports_orphan_job_payload_folder(tmp_path, monkeypatch, capsys)
     assert "job payload folders without SQLite rows in A: 99" in capsys.readouterr().out
 
 
-def test_cli_migrate_dry_run_preserves_legacy_lock_directory(tmp_path, monkeypatch, capsys):
+def test_retired_migrate_command_preserves_old_lock_directory(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     mwf_dir = tmp_path / ".mwf"
     mwf_dir.mkdir()
@@ -259,13 +231,15 @@ def test_cli_migrate_dry_run_preserves_legacy_lock_directory(tmp_path, monkeypat
     locks.mkdir()
     (locks / "legacy.lock").write_text("0", encoding="utf-8")
 
-    assert cli.main(["migrate", "--dry-run"]) == 0
-    capsys.readouterr()
+    with pytest.raises(SystemExit) as error:
+        cli.main(["migrate", "--dry-run"])
+    assert error.value.code == 2
+    assert "invalid choice: 'migrate'" in capsys.readouterr().err
     assert (locks / "legacy.lock").is_file()
     assert not (mwf_dir / "state.sqlite3").exists()
 
 
-def test_paste_rebuilds_legacy_payload_jobs_and_runs_immediately(tmp_path, monkeypatch):
+def test_paste_refuses_missing_native_snapshot_without_rebuilding_payload_jobs(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _write_cli_project(tmp_path, runner="direct")
     assert cli.main(["init"]) == 0
@@ -282,14 +256,13 @@ def test_paste_rebuilds_legacy_payload_jobs_and_runs_immediately(tmp_path, monke
         encoding="utf-8",
     )
 
-    assert cli.main(["paste", "A"]) == 0
+    before = {path.relative_to(tmp_path / 'node' / 'A'): path.read_bytes()
+              for path in (tmp_path / 'node' / 'A').rglob('*') if path.is_file()}
+    assert cli.main(['paste', 'A']) == 1
     storage = FileStorage(tmp_path)
-    assert storage.get_job_status("A", 7) == "queued"
-    assert storage.get_node_status("A") == "queued"
-    storage.close_database_connections()
-    assert cli.main(["run", "A", "job", "7", "--runner", "direct"]) == 0
-    storage = FileStorage(tmp_path)
-    assert storage.get_job_status("A", 7) == DONE
+    assert not storage.job_exists('A', 7)
+    assert {path.relative_to(tmp_path / 'node' / 'A'): path.read_bytes()
+            for path in (tmp_path / 'node' / 'A').rglob('*') if path.is_file()} == before
     storage.close_database_connections()
 
 

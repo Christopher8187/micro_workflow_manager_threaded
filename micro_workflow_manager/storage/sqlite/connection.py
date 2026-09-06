@@ -35,11 +35,11 @@ class SQLiteConnectionMixin:
     # the correct guard and avoids a same-thread finalizer deadlock.
     _connection_registry_guard = threading.RLock()
     _storage_path_refcounts: dict[tuple[Path, int], int] = {}
+    _advisory_local = threading.local()
     _advisory_owner_registry: set[str] = set()
     _advisory_owner_registry_guard = threading.Lock()
 
     def _init_sqlite_state(self, *, create: bool = False) -> None:
-        self._advisory_local = threading.local()
         raw_path = state_database_file(self.project_dir)
         if not create and not raw_path.is_file():
             raise RuntimeError("Native MWF project state is missing; initialize a separate fresh project")

@@ -38,7 +38,7 @@ def test_ordinary_cli_start_uses_native_parent_readiness(
     )
     workflow = load_workflow(tmp_path)
     try:
-        assert workflow.run_concurrently(nodes=['A'], ready_check=lambda _: False) == []
+        workflow.storage.register_component_topology(workflow.topology.snapshot())
     finally:
         _close(workflow.storage)
     if parent_done:
@@ -242,7 +242,7 @@ def test_runfrom_distant_merge_preserves_unselected_native_parent(tmp_path, monk
     )
     workflow = load_workflow(tmp_path)
     try:
-        assert workflow.run_concurrently(nodes=['A'], ready_check=lambda _: False) == []
+        workflow.storage.register_component_topology(workflow.topology.snapshot())
     finally:
         _close(workflow.storage)
     if parent_done:

@@ -43,8 +43,18 @@ records captured shape/alignment, durable job creator ancestry, exact selected
 root claims, and accepted child restart continuation. Integrated checks passed
 860 cases, and 181 additional affected-path cases passed on the final source.
 Both bounded Sol reviews returned PASS, as recorded in that progress document. Automatic ordinary child execution, full
-selected-job lifecycle, and durable managed-file ownership remain unfinished;
+selected-job lifecycle, and the remaining managed-file integration remain unfinished;
 no whole requirement receives completion credit from this increment.
+
+The [managed input ownership progress](managed-input-ownership-progress.md)
+records immutable producing executions, ambiguous path claimants, synchronous
+batch restoration, and coherent ownership reads. The final 22-module selection
+passed all 774 checks, including the corrected native controls. Both independent
+reviews returned bounded PASS. Receiver causes, cleanup, guards, and crash
+recovery remain pending. The same change includes
+[automatic programmatic fresh preparation](programmatic-fresh-preparation.md),
+with native parent preflight and exact admitted selection checks. No whole
+requirement receives completion credit from this increment.
 
 The [interval calculation](stage-s1a.md),
 [command retirement](stage-retirement.md), [shared topology](stage-topology.md),
@@ -315,8 +325,8 @@ component-state work, release, the whole issue, or final Astra review.
 | 44-PRP-003 | The visible receiving path does not expose the producer job ID. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-PRP-001 | S3 | pending | pending | pending | pending |
 | 44-PRP-004 | The visible receiving path does not invent a Hoeflein-component name. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-PRP-001 | S3 | pending | pending | pending | pending |
 | 44-PRP-005 | Publications inside a component use the actual producing raw-node name in the visible path. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-PRP-001 | S3 | pending | pending | pending | pending |
-| 44-PRP-006 | Private publication ownership records the producing component execution. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-SES-030, 44-SES-031 | S3 | pending | pending | pending | pending |
-| 44-PRP-007 | Private publication ownership records the producing raw node and job. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-PRP-006 | S3 | pending | pending | pending | pending |
+| 44-PRP-006 | Private publication ownership records the producing component execution. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-SES-030, 44-SES-031 | S3 | partial: [managed input ownership](managed-input-ownership-progress.md#implemented-behavior) | [774 final combined checks](managed-input-ownership-progress.md#final-source-and-review) | [bounded Standards PASS](../../../../testing_ground/issue-45/managed-input-ownership-standards-review.md) and [bounded Spec PASS](../../../../testing_ground/issue-45/managed-input-ownership-spec-review.md) | partial; cleanup, causes, guards, and recovery remain pending |
+| 44-PRP-007 | Private publication ownership records the producing raw node and job. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-PRP-006 | S3 | partial: [managed input ownership](managed-input-ownership-progress.md#implemented-behavior) | [774 final combined checks](managed-input-ownership-progress.md#final-source-and-review) | [bounded Standards PASS](../../../../testing_ground/issue-45/managed-input-ownership-standards-review.md) and [bounded Spec PASS](../../../../testing_ground/issue-45/managed-input-ownership-spec-review.md) | partial; cleanup, causes, guards, and recovery remain pending |
 | 44-PRP-008 | Publication ownership supports selected preparation, trace lineage, and misalignment causes. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-PRP-006, 44-PRP-007 | S3 | pending | pending | pending | pending |
 | 44-PRP-009 | Receiving-input access is exact or fixed-depth, including `ctx.input_path("A", "evidence", "source.json")` and `ctx.input_files("A/*.md")`. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-PRP-001 | S3 | pending | pending | pending | pending |
 | 44-PRP-010 | Receiving input is not discovered recursively. | 44-FCR, `Producer-qualified input and fresh preparation` | 44-PRP-009 | S3 | pending | pending | pending | pending |

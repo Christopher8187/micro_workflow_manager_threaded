@@ -137,7 +137,7 @@ class ComponentSchedulerMixin(ComponentFailureCleanupMixin):
                 raise ValueError('Execution requires one complete current component')
         with programmatic_execution(
             self, command='run_component', start_node=sorted(members)[0], nodes=sorted(members),
-            include_driver=True, include_parent=True,
+            include_driver=True, include_parent=True, fresh=True,
         ) as (context, driver, parent):
             return self._run_component(
                 members, ignore_readiness, wait_deadlock_resolver, api_pump_allocations,

@@ -226,7 +226,13 @@ def test_queued_preparation_failure_preserves_unclaimed_job_and_finishes_node(tm
         assert storage.get_job_status('A', 1) == 'queued'
         assert storage.read_job_current_owner('A', 1) is None
         assert storage.read_job_control('A', 1) == before_control
-        assert storage.read_job_events('A', 1) == before_events
+        if entry == 'run_node':
+            assert [{key: value for key, value in event.items() if key != 'time'}
+                    for event in storage.read_job_events('A', 1)] == [
+                {'event': 'queued', 'previous_status': 'queued', 'status': 'queued'},
+            ]
+        else:
+            assert storage.read_job_events('A', 1) == before_events
         assert _snapshot(storage)[1] == before_files
         sessions = storage.list_execution_sessions()
         assert len(sessions) == 1

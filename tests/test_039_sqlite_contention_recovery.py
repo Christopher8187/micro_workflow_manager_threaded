@@ -6,11 +6,41 @@ import textwrap
 import time
 from pathlib import Path
 
+import networkx as nx
+import pytest
+
 from micro_workflow_manager import cli
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.storage.sqlite_state import SQLiteStateMixin
 from micro_workflow_manager.system import MicroWorkflow
+from micro_workflow_manager.topology import ComponentTopology
+from tests.test_090_component_session_settlement import _close
+
+
+@pytest.fixture
+def native_claim(tmp_path):
+    storage = FileStorage(tmp_path)
+    graph = nx.DiGraph()
+    graph.add_node('merge')
+    snapshot = ComponentTopology(graph, []).snapshot()
+    storage.register_component_topology(snapshot)
+    storage.create_execution_session(
+        'checkpoint-owner', session_kind='main', command='run',
+        start_component=('merge',), selected_components=[('merge',)],
+        started_at='2026-09-06T12:00:00', hostname='worker.example',
+        pid=os.getpid(), process_identity='test-process',
+    )
+    storage.reserve_execution_components('checkpoint-owner', expected_shape=snapshot.shape_json)
+    storage.create_job(Job(job_id=1, node_name='merge', params={}))
+    generation, execution_id = storage.claim_job_execution(
+        'merge', 1, started_at='2026-09-06T12:00:00',
+        session_id='checkpoint-owner', component=('merge',),
+    )
+    try:
+        yield storage, generation, execution_id
+    finally:
+        _close(storage)
 
 
 def _connection_count(storage: FileStorage) -> int:
@@ -22,9 +52,8 @@ def _connection_count(storage: FileStorage) -> int:
     )
 
 
-def test_checkpoint_runtime_is_one_database_write_without_advisory_lock(tmp_path, monkeypatch):
-    storage = FileStorage(tmp_path)
-    storage.create_job(Job(job_id=1, node_name="merge", params={}))
+def test_checkpoint_runtime_is_one_database_write_without_advisory_lock(tmp_path, monkeypatch, native_claim):
+    storage, generation, execution_id = native_claim
 
     calls = 0
     original = storage.db_transaction
@@ -43,7 +72,8 @@ def test_checkpoint_runtime_is_one_database_write_without_advisory_lock(tmp_path
         ),
     )
 
-    running = {"watch_id": "watch-1", "state": "running", "checkpoint_name": "load"}
+    common = {'watch_id': 'watch-1', 'generation': generation, 'execution_id': execution_id}
+    running = {**common, 'state': 'running', 'checkpoint_name': 'load'}
     storage.write_job_runtime("merge", 1, running)
     assert calls == 1
     assert storage.read_job_runtime("merge", 1)["checkpoint_name"] == "load"
@@ -51,22 +81,18 @@ def test_checkpoint_runtime_is_one_database_write_without_advisory_lock(tmp_path
     storage.write_job_runtime(
         "merge",
         1,
-        {"watch_id": "watch-1", "state": "timed_out", "checkpoint_name": "load"},
+        {**common, "state": "timed_out", "checkpoint_name": "load"},
     )
     storage.write_job_runtime(
         "merge",
         1,
-        {"watch_id": "watch-1", "state": "running", "checkpoint_name": "late"},
+        {**common, "state": "running", "checkpoint_name": "late"},
     )
     assert storage.read_job_runtime("merge", 1)["state"] == "timed_out"
 
 
-def test_async_runtime_completion_can_follow_terminal_publication(tmp_path):
-    storage = FileStorage(tmp_path)
-    storage.create_job(Job(job_id=1, node_name="merge", params={}))
-    generation, execution_id = storage.claim_job_execution(
-        "merge", 1, started_at="2026-07-21T12:00:00"
-    )
+def test_async_runtime_completion_can_follow_terminal_publication(tmp_path, native_claim):
+    storage, generation, execution_id = native_claim
 
     storage.write_job_runtime(
         "merge",
@@ -119,12 +145,8 @@ def test_async_runtime_completion_can_follow_terminal_publication(tmp_path):
     assert storage.read_job_runtime("merge", 1)["state"] == "completed"
 
 
-def test_pending_async_checkpoints_coalesce_to_latest_observation(tmp_path, monkeypatch):
-    storage = FileStorage(tmp_path)
-    storage.create_job(Job(job_id=1, node_name="merge", params={}))
-    generation, execution_id = storage.claim_job_execution(
-        "merge", 1, started_at="2026-07-21T12:00:00"
-    )
+def test_pending_async_checkpoints_coalesce_to_latest_observation(tmp_path, monkeypatch, native_claim):
+    storage, generation, execution_id = native_claim
     queued = []
     original = storage.submit_grouped_db_mutation
 
@@ -160,9 +182,8 @@ def test_pending_async_checkpoints_coalesce_to_latest_observation(tmp_path, monk
     future.set_result(outcomes[0][1])
     assert storage.read_job_runtime("merge", 1)["checkpoint_name"] == "write"
 
-def test_execution_fence_uses_filesystem_lock_not_sqlite_advisory_rows(tmp_path, monkeypatch):
-    storage = FileStorage(tmp_path)
-    storage.create_job(Job(job_id=1, node_name="merge", params={}))
+def test_execution_fence_uses_filesystem_lock_not_sqlite_advisory_rows(tmp_path, monkeypatch, native_claim):
+    storage, generation, execution_id = native_claim
 
     monkeypatch.setattr(
         storage,
@@ -170,9 +191,6 @@ def test_execution_fence_uses_filesystem_lock_not_sqlite_advisory_rows(tmp_path,
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("restart-fenced file writes must bypass SQLite advisory locks")
         ),
-    )
-    generation, execution_id = storage.claim_job_execution(
-        "merge", 1, started_at="2026-07-19T12:00:00"
     )
     target = tmp_path / "node" / "merge" / "output" / "jobs" / "1" / "command.txt"
     storage.run_guarded_job_side_effect(
@@ -211,7 +229,6 @@ def test_repeated_api_rounds_release_worker_connections_and_preserve_outputs(tmp
     def sink(ctx):
         return None
 
-    workflow.active_job_restart_enabled = True
     # Repeated-use timing belongs to benchmarks/benchmark_repeated_api_rounds.py.
     try:
         for round_number in (1, 2, 3):
@@ -297,7 +314,8 @@ def test_cli_repeated_merge_runs_with_threads_override_and_monitor(tmp_path, mon
             ["run", "merge", "--monitor", "--monitor-interval", "0.01"]
         ) == 0
         captured = capsys.readouterr()
-        assert "last run: run merge | status=done" in captured.err
+        assert 'kind=main command=run status=terminal' in captured.err
+        assert 'components=[merge] outcome=done' in captured.err
         assert "database is locked" not in captured.err
         debug_path = tmp_path / "node" / "merge" / "debug.txt"
         if debug_path.exists():

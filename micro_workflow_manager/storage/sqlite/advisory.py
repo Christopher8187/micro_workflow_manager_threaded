@@ -6,7 +6,9 @@ import socket
 import threading
 import time
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Any
+
+from greenlet import getcurrent
 from uuid import uuid4
 
 from micro_workflow_manager.processes import process_is_alive
@@ -117,7 +119,11 @@ class SQLiteAdvisoryLockMixin:
             if held is None:
                 held = {}
                 self._advisory_local.held = held
-            existing = held.get(safe_name)
+            # Thread locals separate OS threads; the actual greenlet prevents
+            # copied contexts and sibling API tasks from inheriting a hold.
+            # Share this map across storage objects for the same database.
+            key = (os.getpid(), getcurrent(), self.state_database_path(), safe_name)
+            existing = held.get(key)
             if existing is not None:
                 existing["count"] += 1
                 try:
@@ -127,55 +133,52 @@ class SQLiteAdvisoryLockMixin:
                 return
 
             owner = self._new_advisory_owner()
-            deadline = time.monotonic() + timeout
-            delay = 0.005
-            while True:
-                acquired = False
-                now_value = time.time()
-                with self.db_transaction() as connection:
-                    row = connection.execute(
-                        "SELECT owner, expires_at FROM advisory_locks WHERE name = ?",
-                        (safe_name,),
-                    ).fetchone()
-                    reclaimable = row is None
-                    if row is not None:
-                        reclaimable = self._advisory_lock_is_reclaimable(
-                            str(row["owner"]),
-                            float(row["expires_at"]),
-                            now_value,
-                        )
-                    if reclaimable:
-                        connection.execute(
-                            "INSERT INTO advisory_locks(name, owner, acquired_at, expires_at) "
-                            "VALUES(?, ?, ?, ?) "
-                            "ON CONFLICT(name) DO UPDATE SET "
-                            "owner=excluded.owner, acquired_at=excluded.acquired_at, "
-                            "expires_at=excluded.expires_at",
-                            (safe_name, owner, now_value, now_value + lease_seconds),
-                        )
-                        acquired = True
-                if acquired:
-                    break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"Timed out acquiring MWF lock {safe_name!r}")
-                time.sleep(delay)
-                delay = min(0.2, delay * 1.5)
-
+            acquired = False
+            # Register before COMMIT can notify and yield to another fiber.
+            # A just-committed row must already have a live local owner.
             self._register_advisory_owner(owner)
-            held[safe_name] = {"owner": owner, "count": 1}
             try:
+                deadline = time.monotonic() + timeout
+                delay = 0.005
+                while True:
+                    now_value = time.time()
+                    with self.db_transaction() as connection:
+                        row = connection.execute(
+                            "SELECT owner, expires_at FROM advisory_locks WHERE name = ?",
+                            (safe_name,),
+                        ).fetchone()
+                        reclaimable = row is None
+                        if row is not None:
+                            reclaimable = self._advisory_lock_is_reclaimable(
+                                str(row["owner"]), float(row["expires_at"]), now_value,
+                            )
+                        if reclaimable:
+                            connection.execute(
+                                "INSERT INTO advisory_locks(name, owner, acquired_at, expires_at) "
+                                "VALUES(?, ?, ?, ?) "
+                                "ON CONFLICT(name) DO UPDATE SET "
+                                "owner=excluded.owner, acquired_at=excluded.acquired_at, "
+                                "expires_at=excluded.expires_at",
+                                (safe_name, owner, now_value, now_value + lease_seconds),
+                            )
+                            acquired = True
+                    if acquired:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out acquiring MWF lock {safe_name!r}")
+                    time.sleep(delay)
+                    delay = min(0.2, delay * 1.5)
+
+                held[key] = {"owner": owner, "count": 1}
                 yield
             finally:
-                state = held.get(safe_name)
-                if state is not None:
-                    state["count"] -= 1
-                    if state["count"] <= 0:
-                        held.pop(safe_name, None)
-                        try:
-                            with self.db_transaction() as connection:
-                                connection.execute(
-                                    "DELETE FROM advisory_locks WHERE name = ? AND owner = ?",
-                                    (safe_name, owner),
-                                )
-                        finally:
-                            self._unregister_advisory_owner(owner)
+                held.pop(key, None)
+                try:
+                    if acquired:
+                        with self.db_transaction() as connection:
+                            connection.execute(
+                                "DELETE FROM advisory_locks WHERE name = ? AND owner = ?",
+                                (safe_name, owner),
+                            )
+                finally:
+                    self._unregister_advisory_owner(owner)

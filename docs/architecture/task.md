@@ -71,6 +71,19 @@ raw node, including inside a Hoeflein component. It contains no producer job
 number. `NodeInputFileSystem` applies its bound `base` below that producer
 prefix, including for `write_jsons()` batches.
 
+Managed forwarding records the exact producing execution independently of
+optional trace. Each batch waits for a durable ownership and trace decision.
+A synchronous file or metadata failure restores the prior files. If restoration
+cannot complete, MWF retains recovery material and refuses further managed
+publication and ownership reads for that receiver. Full crash recovery remains
+under implementation for 0.6.2.
+
+An overwritten or appended path can retain several producing executions.
+Overwriting an existing unowned file also preserves that predecessor in the
+ownership record. Ambiguous ownership refuses automatic owner selection;
+current byte-writing behavior is retained. Explicit unique-name copies record
+ownership against the actual path returned to the task.
+
 The receiver names the producer explicitly, for example
 `ctx.input_path("A", "evidence", "source.json")`. Receiving-input listings use
 fixed-depth patterns such as `ctx.input_files("A/*.json")`. Recursive input

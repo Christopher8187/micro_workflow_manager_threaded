@@ -17,6 +17,7 @@ class NodeSchedulerMixin:
     def run_node(self, node_name: str, ignore_readiness: bool = False):
         with programmatic_execution(
             self, command='run_node', start_node=node_name, nodes=[node_name], include_driver=True, include_parent=True,
+            fresh=True,
         ) as (context, driver, parent):
             return self._run_node(
                 node_name, ignore_readiness, execution_context=context, _session_driver=driver,

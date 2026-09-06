@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from .input_schema import INPUT_TABLES, create_input_tables
+
 
 DATABASE_SCHEMA_VERSION = 5
 SESSION_TABLES = frozenset({
@@ -16,7 +18,7 @@ CORE_TABLES = frozenset({
     "metadata", "nodes", "jobs", "job_events", "idempotency",
     "default_job_specs", "advisory_locks", "job_sequences", "network_state",
 })
-NATIVE_TABLES = CORE_TABLES | SESSION_TABLES
+NATIVE_TABLES = CORE_TABLES | SESSION_TABLES | INPUT_TABLES
 
 
 class SQLiteSchemaMixin:
@@ -430,6 +432,8 @@ class SQLiteSchemaMixin:
                 created_by_execution_id TEXT REFERENCES job_execution_owners(execution_id)
             )
         """)
+
+        create_input_tables(connection)
 
     def database_integrity_check(self) -> str:
         row = self.db_connection().execute("PRAGMA quick_check").fetchone()

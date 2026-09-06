@@ -117,6 +117,7 @@ def test_run_start_does_not_publish_running_state_when_override_binding_fails(
     monkeypatch,
 ):
     workflow = MicroWorkflow(project_dir=tmp_path)
+    workflow.graph([('A', 'B')])
 
     def fail_bind(_run_id: str):
         raise TimeoutError("synthetic thread-overrides failure")
@@ -132,7 +133,11 @@ def test_run_start_does_not_publish_running_state_when_override_binding_fails(
         ):
             pass
 
-    assert workflow.storage.get_run_state() == {}
+    session, = workflow.storage.list_execution_sessions()
+    assert session['status'] == 'terminal' and session['outcome'] == 'failed'
+    assert workflow.storage.get_live_main_session() is None
+    assert workflow.storage.get_component_reservation(('A',)) is None
+    assert not (tmp_path / '.mwf' / 'run.json').exists()
 
 
 def test_run_is_marked_terminal_even_when_override_cleanup_fails(
@@ -141,6 +146,7 @@ def test_run_is_marked_terminal_even_when_override_cleanup_fails(
     capsys,
 ):
     workflow = MicroWorkflow(project_dir=tmp_path)
+    workflow.graph([('A', 'B')])
 
     def fail_cleanup(_run_id: str):
         raise TimeoutError("synthetic cleanup failure")
@@ -155,6 +161,9 @@ def test_run_is_marked_terminal_even_when_override_cleanup_fails(
     ) as finish:
         finish("done")
 
-    state = workflow.storage.get_run_state()
-    assert state["status"] == "done"
+    state, = workflow.storage.list_execution_sessions()
+    assert state['status'] == 'terminal' and state['outcome'] == 'done'
+    assert workflow.storage.get_live_main_session() is None
+    assert workflow.storage.get_component_reservation(('A',)) is None
+    assert not (tmp_path / '.mwf' / 'run.json').exists()
     assert "temporary thread override could not be removed" in capsys.readouterr().err

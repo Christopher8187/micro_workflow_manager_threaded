@@ -339,20 +339,7 @@ class NodeInputFileSystem(FileSystem):
         )
 
     def _append_text(self, ctx, relative: str, content: str, *, encoding: str) -> Path:
-        handle = self.handle(ctx)
-        target = handle.input_path(relative)
-        return handle._guarded(
-            lambda: ctx.system.storage.append_text(target, content, encoding=encoding)
-        )
+        return self.handle(ctx).append_input_text(relative, content, encoding=encoding)
 
     def _delete(self, ctx, relative: str, *, missing_ok: bool) -> None:
-        handle = self.handle(ctx)
-        target = handle.input_path(relative)
-
-        def remove():
-            if missing_ok:
-                ctx.system.storage.remove_if_exists(target)
-            else:
-                target.unlink()
-
-        handle._guarded(remove)
+        self.handle(ctx).delete_input(relative, missing_ok=missing_ok)

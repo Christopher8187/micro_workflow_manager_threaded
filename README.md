@@ -214,6 +214,12 @@ before the boundary component starts. `refuseafter BOUNDARY` lets it terminate,
 then stops later admission. Already-running parallel components are joined and
 later queued work can be continued with `resumefrom`.
 
+In Python, each independent `run()`, `run_concurrently()`, `run_node()`, or
+`run_component()` performs full fresh preparation of its selected components.
+Repeating the call requeues retained root jobs and clears selected output before
+execution. Blocked external parents refuse before preparation. Nested task calls,
+selected-job calls, and queue-only calls do not perform this full preparation.
+
 ## Jobs, parameters, and routing
 
 The first task parameter is `ctx`. Remaining Python parameters define accepted

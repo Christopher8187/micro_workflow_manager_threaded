@@ -9,7 +9,8 @@ from typing import Any, Callable, TypeVar
 
 from .errors import JobRestartedError, JobTimeoutError
 from .fibers import in_fiber_runtime
-from .file_helpers import _relative_file_parts, _relative_parts
+from .file_helpers import _relative_parts
+from .storage.input_publication_files import InputFileChange
 from .models import Job
 from .paths import relative_posix
 from .project_format import is_link_or_reparse_point
@@ -222,30 +223,30 @@ class NodeHandle(_ExecutionChecks):
             raise ValueError(f'Unsafe managed input path: {target}')
         return name
 
+    def _publish_inputs(self, changes) -> list[Path]:
+        current = getattr(self.system._job_context, 'execution_id', None)
+        if current is not None and current != self.execution_id:
+            raise RuntimeError('Input producer execution differs from the current task')
+        changes = tuple(changes)
+        events = []
+        for change in changes:
+            if change.kind == 'delete':
+                events.append(None)
+                continue
+            details = ({'source': str(change.content), 'content_type': 'file'}
+                       if change.kind == 'copy' else _content_preview(change.content))
+            events.append(dict(self._event_fields(), **details))
+        return self._guarded(lambda: self.system.storage.publish_managed_inputs(
+            self.from_node, self.from_job_id, self.execution_generation,
+            self.execution_id, self.to_node, changes, event_data=events,
+        ))
+
     def write_input(self, filename: str, content: str, *, overwrite: bool = False) -> Path:
-        path = self._guarded(
-            lambda: self.system.storage.write_node_input_text(
-                self.to_node, self._input_name(*_relative_file_parts(filename)), content, overwrite=overwrite
-            )
-        )
-        self._record_event(
-            "input_forwarded", target_node=self.to_node,
-            path=f"{self.to_node}/input/{relative_posix(path, self.system.storage.node_input_dir(self.to_node))}",
-            **_content_preview(content),
-        )
+        path, = self._publish_inputs([InputFileChange(filename, 'text', content, overwrite)])
         return path
 
     def write_input_bytes(self, filename: str, content: bytes, *, overwrite: bool = False) -> Path:
-        path = self._guarded(
-            lambda: self.system.storage.write_node_input_bytes(
-                self.to_node, self._input_name(*_relative_file_parts(filename)), content, overwrite=overwrite
-            )
-        )
-        self._record_event(
-            "input_forwarded", target_node=self.to_node,
-            path=f"{self.to_node}/input/{relative_posix(path, self.system.storage.node_input_dir(self.to_node))}",
-            **_content_preview(content),
-        )
+        path, = self._publish_inputs([InputFileChange(filename, 'bytes', content, overwrite)])
         return path
 
     def write_inputs(
@@ -253,31 +254,20 @@ class NodeHandle(_ExecutionChecks):
         entries: list[tuple[str, str]],
         *,
         overwrite: bool = False,
-        encoding: str = "utf-8",
+        encoding: str = 'utf-8',
     ) -> list[Path]:
-        """Write many text inputs to the target node under one execution guard."""
+        """Publish one batch's input bytes and producing executions together."""
         if not isinstance(entries, list):
             raise TypeError('entries must be a list of (filename, content) pairs')
-        qualified = []
+        changes = []
         for entry in entries:
             if not isinstance(entry, tuple) or len(entry) != 2:
                 raise TypeError('each entry must be a (filename, content) tuple')
             filename, content = entry
             if not isinstance(filename, str) or not filename:
                 raise ValueError('batch input filenames must be non-empty strings')
-            qualified.append((self._input_name(*_relative_file_parts(filename)), content))
-        paths = self._guarded(
-            lambda: self.system.storage.write_node_input_texts(
-                self.to_node, qualified, overwrite=overwrite, encoding=encoding
-            )
-        )
-        root = self.system.storage.node_input_dir(self.to_node)
-        for path, (_filename, content) in zip(paths, entries):
-            self._record_event(
-                "input_forwarded", target_node=self.to_node,
-                path=f"{self.to_node}/input/{relative_posix(path, root)}",
-                **_content_preview(content),
-            )
+            changes.append(InputFileChange(filename, 'text', content, overwrite, encoding))
+        paths = self._publish_inputs(changes)
         return paths
 
     def add_input_file(
@@ -287,25 +277,25 @@ class NodeHandle(_ExecutionChecks):
         *,
         overwrite: bool = False,
     ) -> Path:
-        path = self._guarded(
-            lambda: self.system.storage.copy_to_node_input(
-                self.to_node, source,
-                filename=self._input_name(*_relative_file_parts(
-                    Path(source).name if filename is None else filename,
-                )),
-                overwrite=overwrite,
-            )
-        )
-        root = self.system.storage.node_input_dir(self.to_node)
-        self._record_event(
-            "input_forwarded", target_node=self.to_node,
-            path=f"{self.to_node}/input/{relative_posix(path, root)}",
-            source=str(source), content_type="file", size=path.stat().st_size if path.exists() else None,
-        )
+        source = Path(source)
+        path, = self._publish_inputs([
+            InputFileChange(source.name if filename is None else filename, 'copy', source, overwrite),
+        ])
         return path
 
     def add_input_files(self, sources, *, overwrite: bool = False) -> list[Path]:
-        return [self.add_input_file(source, overwrite=overwrite) for source in sources]
+        sources = [Path(source) for source in sources]
+        paths = self._publish_inputs([
+            InputFileChange(source.name, 'copy', source, overwrite) for source in sources
+        ])
+        return paths
+
+    def append_input_text(self, filename: str, content: str, *, encoding: str = 'utf-8') -> Path:
+        path, = self._publish_inputs([InputFileChange(filename, 'append', content, encoding=encoding)])
+        return path
+
+    def delete_input(self, filename: str, *, missing_ok: bool = True) -> None:
+        self._publish_inputs([InputFileChange(filename, 'delete', missing_ok=missing_ok)])
 
     add_file = add_input_file
     add_files = add_input_files

@@ -18,6 +18,7 @@ from .component_states import ComponentStateStorageMixin
 from .execution import JobExecutionStorageMixin
 from .execution_sessions import ExecutionSessionStorageMixin
 from .events import JobEventStorageMixin
+from .input_publications import InputPublicationStorageMixin
 from .job_index import JobIndexStorageMixin
 from .jobs import JobFileStorageMixin
 from .nodes import NodeFileStorageMixin
@@ -28,6 +29,7 @@ from .state_events import StateEventStorageMixin
 
 
 class FileStorage(
+    InputPublicationStorageMixin,
     ComponentDefinitionStorageMixin,
     ComponentHoldStorageMixin,
     ComponentReservationStorageMixin,
