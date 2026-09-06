@@ -6,7 +6,9 @@ import networkx as nx
 
 from ..errors import InvalidGraphError
 from ..models import FAILED, QUEUED, RUNNING, WAITING
+from ..storage.execution_terminal import TerminalOwnerExpectation
 from .execution_scope import programmatic_execution
+from .component_execution_operation import ComponentExecutionOperation
 
 
 WAIT_BLOCKING_JOB_STATUSES = {QUEUED, RUNNING, FAILED}
@@ -91,7 +93,10 @@ class ComponentSchedulerMixin:
             WAIT_BLOCKING_JOB_STATUSES,
         )
 
-    def _finalize_failed_component(self, component: set[str], error: BaseException) -> None:
+    def _finalize_failed_component(
+        self, component: set[str], error: BaseException, *, execution_context,
+        publish_failure=True, operation=None,
+    ) -> None:
         """Publish one failed SCC only after no local runner can still mutate it.
 
         A hard resource failure can occur after a handler wrote its output but
@@ -103,6 +108,8 @@ class ComponentSchedulerMixin:
         """
         component = set(component)
         recovery_error = repr(error)
+        candidates = {} if operation is None else operation.abandoned_attempts()
+        attempts, owners = {}, {}
 
         # Normal handler failures already publish their terminal state before a
         # runner unwinds. Preserve the no-scan hot failure path in that common
@@ -116,10 +123,41 @@ class ComponentSchedulerMixin:
                 running = []
             if running:
                 running_by_node[node_name] = running
+            for job in running:
+                try:
+                    job_id = int(job['job_id'])
+                    observed = self.storage.read_job_owner_observation(node_name, job_id)
+                    owner = None if observed is None else observed['owner']
+                    if (owner is None or owner['session_id'] != execution_context[0]
+                            or owner['component'] != execution_context[1].get(node_name)
+                            or set(owner['component']) != component
+                            or observed['status'] != RUNNING
+                            or observed['active_execution_id'] != owner['execution_id']
+                            or observed['session']['status'] != 'running'):
+                        continue
+                    attempt = (node_name, job_id, owner['generation'], owner['execution_id'])
+                    candidate = candidates.get((node_name, job_id))
+                    if candidate is not None and candidate != attempt:
+                        continue
+                    reservation = self.storage.get_component_reservation(owner['component'])
+                    if reservation is None or reservation['session_id'] != owner['session_id']:
+                        continue
+                    attempts[(node_name, job_id)] = attempt
+                    owners[(node_name, job_id)] = TerminalOwnerExpectation(
+                        owner['session_id'], owner['component'], owner['job_instance_id'],
+                    )
+                    if operation is not None:
+                        operation.record_cleanup_attempt(*attempt)
+                except BaseException:
+                    # Leave damaged or unreadable ownership for the session's
+                    # active-claim exit check instead of guessing an execution.
+                    pass
 
         if running_by_node:
             try:
-                self.storage.reconcile_terminal_outputs(component)
+                self.storage.reconcile_terminal_outputs(
+                    component, execution_attempts=attempts, execution_owners=owners,
+                )
             except BaseException:
                 # Preserve the original component error. Remaining RUNNING rows
                 # are handled below once descriptor/database pressure subsides.
@@ -132,18 +170,21 @@ class ComponentSchedulerMixin:
                 continue
             for job in running:
                 try:
-                    self.storage.set_job_status(
-                        node_name,
-                        int(job["job_id"]),
-                        FAILED,
-                        error=recovery_error,
-                        recovered_after_component_abort=True,
+                    job_id = int(job['job_id'])
+                    attempt = attempts.get((node_name, job_id))
+                    if attempt is None:
+                        continue
+                    self.storage.finalize_job_execution(
+                        node_name, job_id, attempt[2], attempt[3], FAILED,
+                        expected_owner=owners[(node_name, job_id)],
+                        error=recovery_error, recovered_after_component_abort=True,
                     )
                 except BaseException:
                     # Failure cleanup is best effort and must never replace the
                     # original error being raised to the caller.
                     pass
-        self.mark_component_failed(component)
+        if publish_failure:
+            self.mark_component_failed(component)
 
     def _waiting_startable_nodes(
         self,
@@ -189,10 +230,11 @@ class ComponentSchedulerMixin:
                 raise ValueError('Execution requires one complete current component')
         with programmatic_execution(
             self, command='run_component', start_node=sorted(members)[0], nodes=sorted(members),
-        ) as context:
+            include_driver=True,
+        ) as (context, driver):
             return self._run_component(
                 members, ignore_readiness, wait_deadlock_resolver, api_pump_allocations,
-                execution_context=context,
+                execution_context=context, _session_driver=driver,
             )
 
     def _run_component(
@@ -203,6 +245,8 @@ class ComponentSchedulerMixin:
         api_pump_allocations: dict[str, int] | None = None,
         *,
         execution_context,
+        _session_driver=None,
+        _operation=None,
     ) -> list[str]:
         """Pump one Hoeflein component until it is quiescent.
 
@@ -220,7 +264,13 @@ class ComponentSchedulerMixin:
         if not ignore_readiness and not self.component_ready(component_set):
             raise InvalidGraphError(f"Hoeflein component {sorted(component_set)} is not ready yet")
 
-        ran: list[str] = []
+        if _session_driver is not None:
+            operation = ComponentExecutionOperation(
+                self, component_set, execution_context, wait_deadlock_resolver, api_pump_allocations,
+            )
+            return _session_driver.drive(operation)
+
+        ran: list[str] = [] if _operation is None else _operation.ran
         component_nodes = list(self.component_key(component_set))
 
         api_nodes = {
@@ -244,8 +294,11 @@ class ComponentSchedulerMixin:
 
         while True:
             queued_nodes = self._component_queued_nodes(component_nodes)
+            if _operation is not None:
+                queued_nodes = _operation.selected_queued_nodes(queued_nodes)
             if not queued_nodes:
-                self.refresh_component_status(component_set, allow_complete=True)
+                if _operation is None:
+                    self.refresh_component_status(component_set, allow_complete=True)
                 return ran
 
             if self.runner == "direct":
@@ -258,7 +311,8 @@ class ComponentSchedulerMixin:
                 if not startable:
                     override = resolve_wait_deadlock(queued_nodes, blocking_nodes)
                     if override is None:
-                        self.refresh_component_status(component_set)
+                        if _operation is None:
+                            self.refresh_component_status(component_set)
                         return ran
                     startable = [override]
                 try:
@@ -268,10 +322,16 @@ class ComponentSchedulerMixin:
                             execution_context=execution_context,
                             ignore_readiness=True,
                             _defer_final_status_refresh=True,
+                            _component_operation=_operation,
+                            _restart_job_ids=(None if _operation is None else _operation.restart_job_ids(node_name)),
                         )
-                        ran.append(node_name)
-                except Exception:
-                    self.mark_component_failed(component_set)
+                        if _operation is None or node_name not in ran:
+                            ran.append(node_name)
+                except BaseException as error:
+                    self._finalize_failed_component(
+                        component_set, error, publish_failure=_operation is None,
+                        execution_context=execution_context, operation=_operation,
+                    )
                     raise
                 continue
 
@@ -300,6 +360,7 @@ class ComponentSchedulerMixin:
                 and not self.nodes[node_name].waiting
                 and (self.nodes[node_name].runner_override or self.runner)
                 in {"threaded", "api"}
+                and (_operation is None or not (_operation.stop_admission or _operation.replacement_epoch))
             }
             live_ready_events = {
                 node_name: Event()
@@ -325,13 +386,16 @@ class ComponentSchedulerMixin:
                         _live_start_event=(live_start_event if node_name in live_nodes else None),
                         _defer_final_status_refresh=True,
                         _api_startup_lanes=api_pump_allocations.get(node_name),
+                        _component_operation=_operation,
+                        _restart_job_ids=(None if _operation is None else _operation.restart_job_ids(node_name)),
                     )
                 finally:
                     self.storage.close_thread_connection()
 
             futures = {}
             active_nodes: set[str] = set()
-            work_nodes: set[str] = set(queued_nodes)
+            work_nodes = set(queued_nodes) if _operation is None else _operation.work_nodes
+            work_nodes.update(queued_nodes)
             first_error = None
 
             def submit_node(node_name: str) -> None:
@@ -371,12 +435,15 @@ class ComponentSchedulerMixin:
                         try:
                             future.result()
                         except BaseException as error:
+                            if _operation is not None:
+                                _operation.record_pump_error(error)
                             if first_error is None:
                                 first_error = error
                             stop_event.set()
                             wake_live_sources()
                             break
-                        ran.append(node_name)
+                        if _operation is None or node_name not in ran:
+                            ran.append(node_name)
                         # A resident ordinary pump should return only after the
                         # component stop event. If an implementation returns
                         # early, immediately restore the invariant rather than
@@ -394,6 +461,8 @@ class ComponentSchedulerMixin:
                         component_nodes, WAIT_BLOCKING_JOB_STATUSES
                     )
                     queued_set = observed[QUEUED]
+                    if _operation is not None:
+                        queued_set = set(_operation.selected_queued_nodes(queued_set))
                     work_nodes.update(queued_set)
                     running_job_nodes = observed[RUNNING]
                     blocking_nodes = set().union(*observed.values())
@@ -465,7 +534,17 @@ class ComponentSchedulerMixin:
                     # that prevents a terminal component with hundreds of live
                     # jobs still owned by one member.
                     executor.shutdown(wait=True, cancel_futures=True)
-                    self._finalize_failed_component(component_set, first_error)
+                    if _operation is not None:
+                        for future in futures:
+                            if not future.cancelled():
+                                try:
+                                    future.result()
+                                except BaseException as error:
+                                    _operation.record_pump_error(error)
+                    self._finalize_failed_component(
+                        component_set, first_error, publish_failure=_operation is None,
+                        execution_context=execution_context, operation=_operation,
+                    )
                 else:
                     executor.shutdown(wait=True)
                     # Quiescence can become visible just before a node worker
@@ -476,10 +555,15 @@ class ComponentSchedulerMixin:
                         try:
                             future.result()
                         except BaseException as error:
-                            first_error = error
-                            break
+                            if first_error is None:
+                                first_error = error
+                            if _operation is not None:
+                                _operation.record_pump_error(error)
                     if first_error is not None:
-                        self._finalize_failed_component(component_set, first_error)
+                        self._finalize_failed_component(
+                            component_set, first_error, publish_failure=_operation is None,
+                            execution_context=execution_context, operation=_operation,
+                        )
                     else:
                         # Resident live pumps normally finish only after the
                         # coordinator has already observed global quiescence, so
@@ -490,10 +574,11 @@ class ComponentSchedulerMixin:
                         for node_name in component_nodes:
                             if node_name in work_nodes and node_name not in ran:
                                 ran.append(node_name)
-                        self.refresh_component_status(
-                            component_set,
-                            allow_complete=not self.component_has_queued_jobs(component_set),
-                        )
+                        if _operation is None:
+                            self.refresh_component_status(
+                                component_set,
+                                allow_complete=not self.component_has_queued_jobs(component_set),
+                            )
             if first_error is not None:
                 raise first_error
             return ran

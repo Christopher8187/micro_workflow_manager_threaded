@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from threading import Event
+from itertools import islice
+from threading import Event, Lock
 from time import perf_counter
+from typing import Callable
 
 from ..models import Job, now
 
@@ -16,14 +18,19 @@ class ClaimedJob:
     started_at: str
     started_perf: float
     task_started_recorded: bool = False
+    on_abandoned: Callable[[str, int, int, str, bool], None] | None = None
 
     def abandon_unstarted(self) -> None:
-        self.storage.release_unstarted_job_execution(
-            self.job.node_name,
-            self.job.job_id,
-            self.generation,
-            self.execution_id,
-        )
+        released = False
+        try:
+            released = self.storage.release_unstarted_job_execution(
+                self.job.node_name, self.job.job_id, self.generation, self.execution_id,
+            )
+        finally:
+            if self.on_abandoned is not None:
+                self.on_abandoned(
+                    self.job.node_name, self.job.job_id, self.generation, self.execution_id, released,
+                )
 
 
 class ClaimedQueuedJobSource:
@@ -40,6 +47,7 @@ class ClaimedQueuedJobSource:
         task_started_data=None,
         required_params=None,
         allowed_params=None,
+        on_abandoned=None,
     ):
         self.storage = storage
         self.node_name = node_name
@@ -49,6 +57,7 @@ class ClaimedQueuedJobSource:
         self.task_started_data = task_started_data
         self.required_params = set(required_params or ())
         self.allowed_params = set(allowed_params or ())
+        self.on_abandoned = on_abandoned
 
     def pull(self, max_items: int) -> list[ClaimedJob]:
         jobs = self.source.pull(max_items)
@@ -81,6 +90,7 @@ class ClaimedQueuedJobSource:
                 execution_id=execution_id,
                 started_at=started_at,
                 started_perf=started_perf,
+                on_abandoned=self.on_abandoned,
                 task_started_recorded=(
                     self.task_started_data is not None
                     and (task_started_mask is None or task_started_mask[index])
@@ -108,6 +118,8 @@ class StoppingJobSource:
 
     def __init__(self, source, stop_event: Event):
         self.source = source
+        self.iterator = None
+        self.iterator_lock = Lock()
         self.stop_event = stop_event
 
     def pull(self, max_items: int):
@@ -115,11 +127,17 @@ class StoppingJobSource:
             return []
         pull = getattr(self.source, "pull", None)
         if not callable(pull):
-            raise TypeError("wrapped source does not support pull")
+            with self.iterator_lock:
+                if self.iterator is None:
+                    self.iterator = iter(self.source)
+                return list(islice(self.iterator, max_items))
         return pull(max_items)
 
     def __iter__(self):
-        for item in self.source:
+        with self.iterator_lock:
+            if self.iterator is None:
+                self.iterator = iter(self.source)
+        for item in self.iterator:
             if self.stop_event.is_set():
                 return
             yield item

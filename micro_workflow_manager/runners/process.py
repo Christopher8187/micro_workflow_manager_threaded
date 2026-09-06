@@ -95,7 +95,7 @@ def _init_process_worker(
     _PROCESS_WORKFLOW = workflow
 
 
-def _run_job_in_initialized_process(node_name: str, job_id: int):
+def _run_job_in_initialized_process(node_name: str, job_id: int, expected_restart=None):
     if _PROCESS_WORKFLOW is None:
         raise RuntimeError("Process worker was not initialized with a workflow")
 
@@ -104,6 +104,7 @@ def _run_job_in_initialized_process(node_name: str, job_id: int):
         job_id=job_id,
         ignore_readiness=True,
         execution_context=_PROCESS_WORKFLOW.execution_session_context,
+        _expected_restart=expected_restart,
     )
 
     try:
@@ -218,7 +219,10 @@ class ProcessPoolRunner(BaseRunner):
 
         return results_by_index
 
-    def run_job_source(self, node_name: str, job_source: Iterable, run_one: Callable):
+    def run_job_source(
+        self, node_name: str, job_source: Iterable, run_one: Callable, *,
+        on_outcome=None, get_restart_expectation=None,
+    ):
         """Run jobs from a lazy source without loading every job first."""
         iterator = iter(job_source)
         futures = {}
@@ -233,7 +237,7 @@ class ProcessPoolRunner(BaseRunner):
                     return False
 
                 try:
-                    job_id = next(iterator)
+                    item = next(iterator)
                 except StopIteration:
                     source_exhausted = True
                     return False
@@ -241,28 +245,49 @@ class ProcessPoolRunner(BaseRunner):
                 future = executor.submit(
                     _run_job_in_initialized_process,
                     node_name,
-                    job_id,
+                    getattr(item, 'job_id', item),
+                    None if get_restart_expectation is None else get_restart_expectation(item),
                 )
-                futures[future] = job_id
+                futures[future] = item
                 return True
 
-            submit_one()
+            def collect(future):
+                item = futures.pop(future)
+                if future.cancelled():
+                    return None
+                try:
+                    value = future.result()
+                except BaseException as error:
+                    if on_outcome is not None:
+                        on_outcome(item, error=error)
+                    return error
+                if on_outcome is not None:
+                    on_outcome(item, value=value)
+                results.append(value)
+                return None
 
-            while futures:
-                while len(futures) < self.max_processes and submit_one():
-                    pass
+            try:
+                submit_one()
 
-                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                while futures:
+                    while len(futures) < self.max_processes and submit_one():
+                        pass
 
-                for future in done:
-                    futures.pop(future)
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
 
-                    try:
-                        results.append(future.result())
-                    except Exception as error:
-                        for pending in futures:
-                            pending.cancel()
-                        wait(futures)
-                        raise error
+                    for future in done:
+                        error = collect(future)
+                        if error is not None:
+                            raise error
+            except BaseException:
+                for pending in futures:
+                    pending.cancel()
+                wait(futures)
+                # Source and submission errors still require all already
+                # submitted outcomes. Waiting alone would lose the failed
+                # attempts needed to admit an explicitly accepted successor.
+                for pending in list(futures):
+                    collect(pending)
+                raise
 
         return results

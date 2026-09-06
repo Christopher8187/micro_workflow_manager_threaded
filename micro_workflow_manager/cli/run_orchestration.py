@@ -83,24 +83,6 @@ def run_nodes(
         else None
     )
 
-    def refusal_target_terminal() -> bool:
-        if refuse_after_component is None:
-            return False
-        return all(
-            workflow.node_complete(item)
-            or workflow.storage.get_node_status(item) in {FAILED, CANCELLED}
-            for item in refuse_after_component
-        )
-
-    def refusal_before_already_reached() -> bool:
-        if refuse_before_component is None:
-            return False
-        return all(
-            workflow.node_complete(item)
-            or workflow.storage.get_node_status(item) in {FAILED, CANCELLED}
-            for item in refuse_before_component
-        )
-
     with active_workflow_run(
         workflow,
         queue_autostarts=True,
@@ -132,72 +114,21 @@ def run_nodes(
             finish_run("done")
             return 0
 
-        if workflow.runner in {"threaded", "api", "process"}:
-            ran = workflow._run_concurrently(
-                execution_context=execution_context,
-                nodes=nodes,
-                ready_check=lambda item: ready_for_run_set(
-                    workflow,
-                    item,
-                    run_set,
-                    ignore_external,
-                ),
-                refuse_after_component=refuse_after_component,
-                refuse_before_component=refuse_before_component,
-                refusal_event=refusal_event,
-                wait_deadlock_resolver=wait_deadlock_resolver,
-                wait_deadlock_blocked_components=(
-                    wait_deadlock_resolver.blocked_components
-                    if wait_deadlock_resolver is not None else None
-                ),
-            )
-        else:
-            ran = []
-            units = workflow.execution_components(nodes)
-
-            while True:
-                workflow.finalize_ready_nodes()
-                if refusal_target_terminal():
-                    refusal_event.set()
-                    break
-                if refusal_before_already_reached():
-                    refusal_event.set()
-                    break
-                ready_units = [
-                    unit
-                    for unit in units
-                    if any(workflow.storage.has_queued_jobs(node) for node in unit)
-                    and not (
-                        wait_deadlock_resolver is not None
-                        and unit in wait_deadlock_resolver.blocked_components
-                    )
-                    and all(
-                        ready_for_run_set(workflow, node, run_set, ignore_external)
-                        for node in unit
-                    )
-                ]
-
-                if not ready_units:
-                    break
-
-                if (
-                    refuse_before_component is not None
-                    and refuse_before_component in ready_units
-                ):
-                    refusal_event.set()
-                    break
-
-                for unit in ready_units:
-                    ran.extend(workflow._run_component(
-                        set(unit), ignore_readiness=True,
-                        execution_context=execution_context,
-                        wait_deadlock_resolver=wait_deadlock_resolver,
-                    ))
-                    if refuse_after_component is not None and unit == refuse_after_component:
-                        refusal_event.set()
-                        break
-                if refusal_event.is_set():
-                    break
+        ran = workflow._run_concurrently(
+            execution_context=execution_context,
+            _session_driver=finish_run,
+            _sequential=workflow.runner not in {'threaded', 'api', 'process'},
+            nodes=nodes,
+            ready_check=lambda item: ready_for_run_set(workflow, item, run_set, ignore_external),
+            refuse_after_component=refuse_after_component,
+            refuse_before_component=refuse_before_component,
+            refusal_event=refusal_event,
+            wait_deadlock_resolver=wait_deadlock_resolver,
+            wait_deadlock_blocked_components=(
+                wait_deadlock_resolver.blocked_components
+                if wait_deadlock_resolver is not None else None
+            ),
+        )
 
         workflow.finalize_ready_nodes()
         if ignore_external:

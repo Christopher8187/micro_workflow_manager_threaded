@@ -246,16 +246,22 @@ def test_native_heartbeat_cannot_change_a_finished_session_and_reuse_gets_a_new_
     original = workflow.storage.heartbeat_execution_session
     calls = 0
     owners = []
+    heartbeat_times = []
+    delayed_outcomes = []
 
     def heartbeat(session_id, heartbeat_at):
         nonlocal calls
         calls += 1
+        heartbeat_times.append(heartbeat_at)
         delayed = calls == 2
         if delayed:
             stale_heartbeat.set()
             assert release_heartbeat.wait(15), 'The late heartbeat was not released'
         try:
-            return original(session_id, heartbeat_at)
+            changed = original(session_id, heartbeat_at)
+            if delayed:
+                delayed_outcomes.append(changed)
+            return changed
         finally:
             if delayed:
                 heartbeat_finished.set()
@@ -283,7 +289,9 @@ def test_native_heartbeat_cannot_change_a_finished_session_and_reuse_gets_a_new_
         assert workflow.api_total_limit_override() == 3
         assert stale_heartbeat.wait(10), 'The supervisor did not schedule two native heartbeats'
         live = workflow.storage.get_execution_session(first['session_id'])
-        assert live['heartbeat_at'] > first['heartbeat_at']
+        # The initial read can already include the first published heartbeat.
+        # The second call is still held before publication at this point.
+        assert live['heartbeat_at'] == heartbeat_times[0]
         release_task.set()
         assert future.result(timeout=10) == 0
         terminal = workflow.storage.get_execution_session(first['session_id'])
@@ -291,6 +299,7 @@ def test_native_heartbeat_cannot_change_a_finished_session_and_reuse_gets_a_new_
         assert workflow.storage.get_component_reservation(('A',)) is None
         release_heartbeat.set()
         assert heartbeat_finished.wait(10)
+        assert delayed_outcomes == [False]
         assert workflow.storage.get_execution_session(first['session_id']) == terminal
         assert workflow.storage.read_thread_overrides() == {}
         assert workflow.storage.read_api_total_limit() is None
@@ -408,7 +417,7 @@ def test_failed_session_record_read_during_creation_cannot_leave_a_running_main(
 def test_retrying_terminal_publication_preserves_the_failed_outcome(tmp_path, monkeypatch):
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
-    original = workflow.storage.finish_execution_session
+    original = workflow.storage.decide_execution_session_exit
     interrupted = False
 
     def finish(session_id, **kwargs):
@@ -421,7 +430,7 @@ def test_retrying_terminal_publication_preserves_the_failed_outcome(tmp_path, mo
     def prepare():
         raise ValueError('the original preparation failed')
 
-    monkeypatch.setattr(workflow.storage, 'finish_execution_session', finish)
+    monkeypatch.setattr(workflow.storage, 'decide_execution_session_exit', finish)
     try:
         with pytest.raises(OSError, match='injected terminal publication failure'):
             run_nodes(workflow, ['A'], 'A', prepare=prepare)
@@ -562,14 +571,16 @@ def test_next_main_waits_for_terminal_reservations_to_be_released(tmp_path, monk
     release = Event()
     second_attempt = Event()
     second_entered = Event()
-    original_release = first.storage.release_execution_components
+    original_decision = first.storage.decide_execution_session_exit
     original_lock = second.storage.interprocess_lock
 
-    def gated_release(session_id):
+    def gated_decision(session_id, **kwargs):
+        decision = original_decision(session_id, **kwargs)
         assert first.storage.get_execution_session(session_id)['status'] == 'terminal'
+        assert first.storage.get_component_reservation(('A',)) is None
         terminal.set()
         assert release.wait(20), 'The terminal teardown check did not release its gate'
-        return original_release(session_id)
+        return decision
 
     @contextmanager
     def observe_admission(name, **kwargs):
@@ -580,7 +591,7 @@ def test_next_main_waits_for_terminal_reservations_to_be_released(tmp_path, monk
                 second_entered.set()
             yield
 
-    monkeypatch.setattr(first.storage, 'release_execution_components', gated_release)
+    monkeypatch.setattr(first.storage, 'decide_execution_session_exit', gated_decision)
     monkeypatch.setattr(second.storage, 'interprocess_lock', observe_admission)
     pool = ThreadPoolExecutor(max_workers=2)
     first_future = pool.submit(run_nodes, first, ['A'], 'A')

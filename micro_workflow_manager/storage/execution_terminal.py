@@ -10,9 +10,17 @@ from micro_workflow_manager.models import CANCELLED, DONE, FAILED, RUNNING, SKIP
 
 
 from .priorities import TERMINAL_PRIORITY
+from ..component_identity import encode_component_key
 
 
 TERMINAL_REFRESH_SECONDS = 0.001
+
+
+@dataclass(slots=True, frozen=True)
+class TerminalOwnerExpectation:
+    session_id: str
+    component: tuple[str, ...]
+    job_instance_id: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -23,6 +31,7 @@ class TerminalUpdate:
     execution_id: str
     status: str
     extra: dict[str, Any]
+    expected_owner: TerminalOwnerExpectation | None = None
 
 
 class JobTerminalStorageMixin:
@@ -36,6 +45,8 @@ class JobTerminalStorageMixin:
         lease_execution_id: str,
         status: str,
         priority: int = TERMINAL_PRIORITY,
+        *,
+        expected_owner: TerminalOwnerExpectation | None = None,
         **extra,
     ) -> None:
         """Publish one terminal update through the single SQLite writer.
@@ -56,6 +67,7 @@ class JobTerminalStorageMixin:
             execution_id=lease_execution_id,
             status=status,
             extra=dict(extra),
+            expected_owner=expected_owner,
         )
         self.submit_grouped_db_mutation(
             ("terminal",),
@@ -97,7 +109,7 @@ class JobTerminalStorageMixin:
                     ).fetchall()
                 )
         rows_by_key = {
-            (str(row["node_name"]), int(row["job_id"])): row
+            (str(row["node_name"]), int(row["job_id"])): dict(row)
             for row in rows
         }
         event_time = datetime.now().isoformat(timespec="milliseconds")
@@ -118,11 +130,36 @@ class JobTerminalStorageMixin:
                 continue
 
             active_execution_id = row["active_execution_id"]
-            if active_execution_id is None and str(row["status"]) == update.status:
-                outcomes.append((True, None))
-                continue
-            if active_execution_id != update.execution_id:
+            already_terminal = active_execution_id is None and str(row["status"]) == update.status
+            if active_execution_id != update.execution_id and not already_terminal:
                 outcomes.append((False, self._terminal_restart_error(update)))
+                continue
+
+            if update.expected_owner is not None:
+                try:
+                    observed = self._read_job_owner_observation(connection, update.node_name, update.job_id)
+                    owner = observed['owner']
+                    expected = update.expected_owner
+                    reservation = connection.execute(
+                        'SELECT session_id FROM component_reservations WHERE component_key=?',
+                        (encode_component_key(expected.component),),
+                    ).fetchone()
+                    if (owner is None or owner['execution_id'] != update.execution_id
+                            or owner['generation'] != update.generation
+                            or owner['job_instance_id'] != expected.job_instance_id
+                            or owner['session_id'] != expected.session_id
+                            or owner['component'] != expected.component
+                            or observed['session']['status'] != 'running'
+                            or reservation is None or reservation['session_id'] != expected.session_id):
+                        raise RuntimeError(
+                            f'Execution ownership changed during terminal cleanup for {update.node_name}/{update.job_id}'
+                        )
+                except (RuntimeError, ValueError) as error:
+                    outcomes.append((False, error))
+                    continue
+
+            if already_terminal:
+                outcomes.append((True, None))
                 continue
 
             previous_status = str(row["status"])
@@ -150,6 +187,10 @@ class JobTerminalStorageMixin:
                 ),
             ))
             outcomes.append((True, None))
+            # Later submissions for this job see the accepted result even
+            # before the grouped SQL writes run below.
+            row['status'] = update.status
+            row['active_execution_id'] = None
 
         if status_updates:
             connection.executemany(
@@ -203,6 +244,9 @@ class JobTerminalStorageMixin:
     def reconcile_terminal_outputs(
         self,
         node_names: list[str] | tuple[str, ...] | set[str] | None = None,
+        *,
+        execution_attempts=None,
+        execution_owners=None,
     ) -> int:
         """Recover output-backed terminal jobs whose SQLite update was lost.
 
@@ -229,6 +273,11 @@ class JobTerminalStorageMixin:
         for row in rows:
             node_name = str(row["node_name"])
             job_id = int(row["job_id"])
+            if execution_attempts is not None:
+                attempt = execution_attempts.get((node_name, job_id))
+                if (attempt is None or int(row["generation"]) != attempt[2]
+                        or str(row["active_execution_id"]) != attempt[3]):
+                    continue
             output = self.read_json(self.output_file(node_name, job_id), default=None)
             if not isinstance(output, dict):
                 continue
@@ -264,6 +313,7 @@ class JobTerminalStorageMixin:
                         "execution_id": str(row["active_execution_id"]),
                         "recovered_from_output": True,
                     },
+                    expected_owner=None if execution_owners is None else execution_owners[(node_name, job_id)],
                 )
             )
 

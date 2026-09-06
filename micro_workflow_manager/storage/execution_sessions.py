@@ -8,6 +8,10 @@ from micro_workflow_manager.session_liveness import execution_session_liveness
 from micro_workflow_manager.component_identity import component_key, decode_component_key, encode_component_key
 
 
+class ExecutionSessionHasActiveJobs(RuntimeError):
+    """Joined work still has unsettled active claims in its owned scope."""
+
+
 class ExecutionSessionStorageMixin:
     """Persist exact execution-session records in SQLite."""
 
@@ -148,6 +152,153 @@ class ExecutionSessionStorageMixin:
             ).rowcount == 1
 
         return self.submit_db_mutation(finish, wait=True, priority=0)
+
+    def decide_execution_session_exit(
+        self, session_id: str, *, outcome: str, finished_at: str,
+        failures: list | None = None, restart_attempts=(), rejected_restarts=None,
+        exhausted_restarts=None, failed_nodes=(),
+    ) -> dict:
+        """Continue accepted successors or end the session in one writer decision."""
+        self._require_execution_session_storage()
+        self._session_text(session_id, 'session_id')
+        self._session_text(outcome, 'outcome')
+        self._session_time(finished_at, 'finished_at')
+        if failures is not None and not isinstance(failures, list):
+            raise ValueError('Session failures must be an ordered list')
+        failure_data = json.dumps(failures if failures is not None else [])
+        attempts = tuple(restart_attempts)
+        rejected = dict(rejected_restarts or {})
+        exhausted = dict(exhausted_restarts or {})
+        failed_nodes = tuple(self.validate_node_name(node) for node in failed_nodes)
+        if failed_nodes and outcome != 'failed':
+            raise ValueError('Failed node publication requires a failed session outcome')
+
+        def decide(connection):
+            session = connection.execute(
+                'SELECT status FROM execution_sessions WHERE session_id=?', (session_id,),
+            ).fetchone()
+            if session is None or session['status'] != 'running':
+                raise RuntimeError(f'Execution session {session_id} is missing or already terminal')
+            owned_nodes = {
+                node for row in connection.execute(
+                    'SELECT selected.component_key FROM session_components AS selected '
+                    'JOIN component_reservations AS reservation USING(component_key) '
+                    'WHERE selected.session_id=? AND reservation.session_id=?',
+                    (session_id, session_id),
+                ) for node in decode_component_key(row['component_key'])
+            }
+            selected_nodes = {
+                node for row in connection.execute(
+                    'SELECT component_key FROM session_components WHERE session_id=?', (session_id,),
+                ) for node in decode_component_key(row['component_key'])
+            }
+            # Joined execution has no active work left. Include reserved nodes
+            # even when their active-owner pointer is damaged or contradictory.
+            # Previously selected work can remain active under another owner,
+            # but only with a valid current claim and that owner's reservation.
+            active = None
+            for row in connection.execute(
+                'SELECT job.node_name, job.job_id, job.generation, job.active_execution_id, '
+                'owner.session_id FROM jobs AS job '
+                'LEFT JOIN job_execution_owners AS owner ON owner.execution_id=job.active_execution_id '
+                'WHERE job.active_execution_id IS NOT NULL',
+            ):
+                unsettled = row['session_id'] == session_id or row['node_name'] in owned_nodes
+                if not unsettled and row['node_name'] in selected_nodes:
+                    try:
+                        observed = self._read_job_owner_observation(connection, row['node_name'], row['job_id'])
+                        owner = observed['owner']
+                        reservation = connection.execute(
+                            'SELECT session_id FROM component_reservations WHERE component_key=?',
+                            (encode_component_key(owner['component']),),
+                        ).fetchone()
+                        unsettled = (reservation is None or reservation['session_id'] != owner['session_id']
+                                     or observed['session']['status'] != 'running')
+                    except (RuntimeError, ValueError):
+                        unsettled = True
+                if unsettled:
+                    active = row
+                    break
+            if active is not None:
+                raise ExecutionSessionHasActiveJobs(
+                    f'Execution session {session_id} still owns active job '
+                    f'{active["node_name"]}/{active["job_id"]}, generation {active["generation"]}, '
+                    f'execution {active["active_execution_id"]}; recovery is required'
+                )
+            selected_jobs = {tuple(row) for row in connection.execute(
+                'SELECT node_name, job_id FROM session_jobs WHERE session_id=?', (session_id,),
+            )}
+            replacements = {}
+            for node, job_id, generation, execution_id in attempts:
+                if selected_jobs and (node, job_id) not in selected_jobs:
+                    continue
+                observed = self._read_job_owner_observation(connection, node, job_id)
+                owner = None if observed is None else observed['owner']
+                if (owner is None or owner['session_id'] != session_id
+                        or owner['execution_id'] != execution_id
+                        or owner['generation'] != generation
+                        or observed['generation'] <= generation
+                        or observed['status'] != 'queued'
+                        or observed['active_execution_id'] is not None):
+                    continue
+                reservation = connection.execute(
+                    'SELECT session_id FROM component_reservations WHERE component_key=?',
+                    (encode_component_key(owner['component']),),
+                ).fetchone()
+                if reservation is None or reservation['session_id'] != session_id:
+                    raise RuntimeError('Restart owner no longer holds its component reservation')
+                marker = connection.execute(
+                    'SELECT restart_requested_at FROM jobs WHERE node_name=? AND job_id=?',
+                    (node, job_id),
+                ).fetchone()['restart_requested_at']
+                previous = rejected.get((node, job_id)) or exhausted.get((node, job_id))
+                if previous is not None:
+                    if (observed['job_instance_id'] != previous['job_instance_id']
+                            or owner != previous['owner']
+                            or observed['generation'] <= previous['generation']):
+                        continue
+                    # A rejected claim or exhausted setup retry needs a later
+                    # accepted request. The event, generation, owner, and marker
+                    # must still agree in this same writer decision.
+                    event = connection.execute(
+                        "SELECT time, data_json FROM job_events WHERE node_name=? AND job_id=? "
+                        "AND event='restart_requested' ORDER BY event_id DESC LIMIT 1",
+                        (node, job_id),
+                    ).fetchone()
+                    data = {} if event is None else json.loads(event['data_json'])
+                    if (event is None or event['time'] != marker
+                            or data.get('generation') != observed['generation']
+                            or data.get('job_instance_id') != observed['job_instance_id']
+                            or data.get('execution_id') != execution_id
+                            or data.get('session_id') != session_id
+                            or data.get('component') != list(owner['component'])):
+                        continue
+                if marker is not None:
+                    replacements[(node, job_id)] = {
+                        'job_instance_id': observed['job_instance_id'],
+                        'generation': observed['generation'], 'owner': owner,
+                        'restart_requested_at': marker,
+                    }
+            if replacements:
+                return {'restarts': replacements, 'released': 0}
+            if failed_nodes:
+                if not set(failed_nodes) <= owned_nodes:
+                    raise RuntimeError('Failed nodes are outside the session reserved scope')
+                connection.executemany(
+                    "UPDATE nodes SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE node_name=?",
+                    [(node,) for node in failed_nodes],
+                )
+            connection.execute(
+                "UPDATE execution_sessions SET status='terminal', outcome=?, finished_at=?, failures_json=? "
+                "WHERE session_id=? AND status='running'",
+                (outcome, finished_at, failure_data, session_id),
+            )
+            released = connection.execute(
+                'DELETE FROM component_reservations WHERE session_id=?', (session_id,),
+            ).rowcount
+            return {'restarts': {}, 'released': released}
+
+        return self.submit_db_mutation(decide, wait=True, priority=0)
 
     def get_execution_session(self, session_id: str) -> dict | None:
         self._require_execution_session_storage()

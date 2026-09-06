@@ -173,13 +173,19 @@ def test_threaded_lazy_source_failure_terminates_run_and_monitor(tmp_path, monke
     captured = capsys.readouterr()
 
     assert elapsed < 5.0
-    state = FileStorage(tmp_path).get_run_state()
-    assert state["status"] == "failed"
-    assert FileStorage(tmp_path).get_node_status("explode") == "failed"
-    assert FileStorage(tmp_path).get_node_status("handler") == "failed"
+    storage = FileStorage(tmp_path)
+    sessions = storage.list_execution_sessions()
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session['status'] == 'terminal'
+    assert session['outcome'] == 'failed'
+    assert storage.get_live_main_session() is None
+    assert storage.get_component_reservation(('explode', 'handler')) is None
+    assert storage.get_node_status("explode") == "failed"
+    assert storage.get_node_status("handler") == "failed"
     final = captured.err.rsplit("--- mwf final monitor snapshot ---", 1)[1]
-    assert "active run: none" in final
-    assert "last run: run explode | status=failed" in final
+    assert f"session={session['session_id']} kind=main command=run status=terminal" in final
+    assert 'outcome=failed' in final
 
 
 def test_windows_extended_length_descendant_is_safe():

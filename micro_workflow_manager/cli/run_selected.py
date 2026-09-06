@@ -161,6 +161,7 @@ def _run_selected_jobs(
         jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
         workflow._run_node_jobs(
             node, jobs, ignore_readiness=True, execution_context=execution_context,
+            _session_driver=finish_run,
         )
         finish_run("done")
 

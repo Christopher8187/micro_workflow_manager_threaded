@@ -17,6 +17,10 @@ from micro_workflow_manager.component_identity import decode_component_key, enco
 from .priorities import ADMISSION_PRIORITY
 
 
+class RestartClaimChanged(RuntimeError):
+    """A captured replacement no longer matches the row at claim time."""
+
+
 @dataclass(slots=True, frozen=True)
 class ExecutionClaimBatch:
     node_name: str
@@ -30,6 +34,7 @@ class ExecutionClaimBatch:
     task_started_mask: tuple[bool, ...] | None = None
     session_id: str | None = None
     component: tuple[str, ...] | None = None
+    expected_restarts: tuple[dict | None, ...] | None = None
 
     @property
     def mutation_weight(self) -> int:
@@ -166,6 +171,36 @@ class JobExecutionClaimStorageMixin:
                 outcomes.append((False, RuntimeError('Jobs already claimed cannot receive another active execution')))
                 continue
 
+            restart_error = None
+            for job_id, expected in zip(batch.job_ids, batch.expected_restarts or ()):
+                if expected is None:
+                    continue
+                observed = JobExecutionClaimStorageMixin._read_job_owner_observation(
+                    connection, batch.node_name, job_id,
+                )
+                marker = connection.execute(
+                    'SELECT restart_requested_at FROM jobs WHERE node_name=? AND job_id=?',
+                    (batch.node_name, job_id),
+                ).fetchone()
+                owner = None if observed is None else observed['owner']
+                if (observed is None or owner is None
+                        or observed['job_instance_id'] != expected['job_instance_id']
+                        or observed['generation'] != expected['generation']
+                        or observed['status'] != QUEUED
+                        or observed['active_execution_id'] is not None
+                        or owner != expected['owner']
+                        or owner['session_id'] != batch.session_id
+                        or owner['component'] != batch.component
+                        or marker is None or marker['restart_requested_at'] is None
+                        or marker['restart_requested_at'] != expected['restart_requested_at']):
+                    restart_error = RestartClaimChanged(
+                        f'Restart target changed before claim: {batch.node_name}/{job_id}'
+                    )
+                    break
+            if restart_error is not None:
+                outcomes.append((False, restart_error))
+                continue
+
             results = []
             mask = batch.task_started_mask
             if mask is not None and len(mask) != len(batch.job_ids):
@@ -277,6 +312,7 @@ class JobExecutionClaimStorageMixin:
         priority: int = ADMISSION_PRIORITY,
         session_id: str | None = None,
         component=None,
+        expected_restart: dict | None = None,
     ) -> tuple[int, str]:
         node_name = self.validate_node_name(node_name)
         job_id = self.validate_job_id(job_id)
@@ -284,6 +320,11 @@ class JobExecutionClaimStorageMixin:
         if session_id is not None:
             self._session_text(session_id, 'session_id')
         component = self._session_component(component) if component is not None else None
+        if expected_restart is not None:
+            return self.claim_job_executions_batch(
+                node_name, [job_id], started_at=started_at, priority=priority,
+                session_id=session_id, component=component, expected_restarts=[expected_restart],
+            )[0]
         key = (node_name, priority, session_id, component)
         with self._claim_batch_lock:
             batch = self._claim_batches.get(key)
@@ -331,6 +372,7 @@ class JobExecutionClaimStorageMixin:
         task_started_mask: list[bool] | tuple[bool, ...] | None = None,
         session_id: str | None = None,
         component=None,
+        expected_restarts=None,
     ) -> list[tuple[int, str]]:
         """Claim one preloaded API admission burst in one state mutation."""
         node_name = self.validate_node_name(node_name)
@@ -346,6 +388,8 @@ class JobExecutionClaimStorageMixin:
             return []
         if len(normalized) != len(set(normalized)):
             raise ValueError("job_ids contains duplicates")
+        if expected_restarts is not None and len(expected_restarts) != len(normalized):
+            raise ValueError('expected_restarts must match the claimed job list')
         batch = ExecutionClaimBatch(
             node_name=node_name,
             job_ids=tuple(normalized),
@@ -362,6 +406,14 @@ class JobExecutionClaimStorageMixin:
             ),
             session_id=session_id,
             component=self._session_component(component) if component is not None else None,
+            expected_restarts=None if expected_restarts is None else tuple(
+                None if expected is None else {
+                    'job_instance_id': expected['job_instance_id'],
+                    'generation': expected['generation'],
+                    'owner': dict(expected['owner']),
+                    'restart_requested_at': expected['restart_requested_at'],
+                } for expected in expected_restarts
+            ),
         )
         return self.submit_grouped_db_mutation(
             ("execution-claims", priority),
@@ -473,7 +525,7 @@ class JobExecutionClaimStorageMixin:
         job_id: int,
         generation: int,
         execution_id: str,
-    ) -> None:
+    ) -> bool:
         """Requeue a preclaimed item that a failed burst never started."""
         job_id = self.validate_job_id(job_id)
         event_time = datetime.now().isoformat(timespec="milliseconds")
@@ -510,4 +562,10 @@ class JobExecutionClaimStorageMixin:
 
         changed = self.submit_db_mutation(release, priority=0)
         if changed:
-            self.notify_queue_change(node_name)
+            try:
+                self.notify_queue_change(node_name)
+            except Exception:
+                # The release is already durable. A failed wake cannot turn it
+                # into an abandoned claim; queue readers also have a poll fallback.
+                pass
+        return bool(changed)

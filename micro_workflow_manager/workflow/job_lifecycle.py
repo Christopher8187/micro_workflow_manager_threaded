@@ -83,6 +83,7 @@ class JobLifecycleMixin:
         _preclaimed_execution: tuple[int, str, str, float] | None = None,
         _task_started_pre_recorded: bool = False,
         _defer_node_status_refresh: bool = False,
+        _expected_restart: dict | None = None,
     ):
         if not ignore_readiness and not self.node_ready(node_name):
             raise InvalidGraphError(f"Node {node_name} is not ready yet")
@@ -120,7 +121,9 @@ class JobLifecycleMixin:
                     priority=claim_priority,
                     session_id=session_id,
                     component=component,
+                    expected_restart=_expected_restart,
                 )
+                _expected_restart = None
             else:
                 (
                     generation,
@@ -222,6 +225,12 @@ class JobLifecycleMixin:
                     "restart was being prepared; stale completion discarded",
                 )
                 continue
+            except BaseException as error:
+                # The handler's claim must survive an output or terminal-write
+                # failure even if restart removes it from the running rows
+                # before component cleanup begins.
+                error.execution_attempt = (node_name, job_id, generation, execution_id)
+                raise
 
             if (
                 not _defer_node_status_refresh
@@ -234,4 +243,6 @@ class JobLifecycleMixin:
             error = payload
             if isinstance(error, BaseException) and not isinstance(error, Exception):
                 raise error
-            raise JobFailedError(f"Job {node_name}/{job_id} failed") from error
+            failure = JobFailedError(f"Job {node_name}/{job_id} failed")
+            failure.execution_attempt = (node_name, job_id, generation, execution_id)
+            raise failure from error

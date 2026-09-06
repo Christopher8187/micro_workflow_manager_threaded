@@ -378,3 +378,27 @@ including a reused numeric job ID, receives ownership only on a new claim and
 must not inherit the previous work's owner. Preserve old owner rows while live
 execution, recovery, or retained lineage needs them. Diagnostic trace clearing
 alone never clears operational ownership.
+
+## Q10: Dynamic component discovery during admitted execution
+
+Status: awaiting Christopher's decision. The preceding nine approved answers
+remain settled.
+
+A running task can discover an autostart relationship that merges components
+after a session has captured its graph, reserved scope, and assigned claims.
+AQ3 permits dynamic relationships and requires the actual producing graph and
+membership to remain historical authority. The membership rules require fresh
+preparation for changed membership with reusable history, and automatic
+reconciliation without reusable work. They do not specify how discovery changes
+already active claims and reservations.
+
+Root's recommendation, presented for decision, is to refuse the triggering
+operation, retain the discovered relationship and existing work, and apply the
+settled membership rules before the next admission. The alternative is live
+component merging, which needs additional rules for active jobs and sessions.
+Neither behavior is implemented on the strength of this recommendation.
+
+Known-shape programmatic ownership, predeclared autostarts, and top-level
+autostart without a newly discovered relationship remain independent.
+Do not impose a declaration-only requirement or silently relabel existing
+claims while this decision is pending.

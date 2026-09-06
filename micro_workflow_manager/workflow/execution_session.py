@@ -10,11 +10,53 @@ from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
 
 from micro_workflow_manager import __version__
-from micro_workflow_manager.errors import safe_exception_repr
+from micro_workflow_manager.errors import JobFailedError, safe_exception_repr
 from micro_workflow_manager.monitor import InlineMonitorReporter, InlineStatsReporter, now_iso
 from micro_workflow_manager.processes import process_identity
+from micro_workflow_manager.storage.execution_claims import RestartClaimChanged
+from micro_workflow_manager.storage.execution_sessions import ExecutionSessionHasActiveJobs
 if TYPE_CHECKING:
     from micro_workflow_manager.system import MicroWorkflow
+
+
+class ExecutionSessionDriver:
+    """Retain an execution operation until its owning session decides to end."""
+
+    def __init__(self, finish, is_finished):
+        self.finish = finish
+        self._is_finished = is_finished
+
+    @property
+    def finished(self):
+        return self._is_finished()
+
+    def __call__(self, status, error=None):
+        return self.finish(status, error)
+
+    def drive(self, operation, runner=None, run_one=None):
+        unrelated_error = None
+        while True:
+            try:
+                result = operation.run(runner, run_one) if runner is not None else operation.run()
+            except BaseException as error:
+                failure = unrelated_error or operation.primary_error(error)
+                if not isinstance(failure, (JobFailedError, RestartClaimChanged)):
+                    unrelated_error = failure
+            else:
+                if unrelated_error is None:
+                    return result
+                failure = unrelated_error
+            replacements = self.finish(
+                'failed', safe_exception_repr(failure),
+                restart_attempts=operation.failed_attempts(),
+                rejected_restarts=operation.rejected_restarts(),
+                exhausted_restarts=operation.exhausted_restarts(),
+                body_exception=failure,
+                failed_nodes=operation.failed_nodes(),
+            )
+            if not replacements:
+                raise failure
+            operation.resume(replacements, stop_admission=unrelated_error is not None)
 
 
 def refuse_competing_run(storage_or_workflow):
@@ -142,38 +184,68 @@ def _execution_session(
     created = False
     reserved = False
     finished = False
+    exit_failed = False
     terminal_request = None
     body_error = None
     stats_reporter = None
     monitor_reporter = None
 
-    def finish(status: str, error: str | None = None):
-        nonlocal finished, terminal_request
-        if finished:
-            return
-        if terminal_request is None:
-            terminal_request = (status, error)
-        status, error = terminal_request
-
-        reporter_cleanup_error = None
+    def stop_local_reporting():
+        cleanup_error = None
         for reporter in (stats_reporter, monitor_reporter):
             if reporter is not None:
                 try:
                     reporter.stop_periodic()
-                except BaseException as cleanup_error:
-                    if reporter_cleanup_error is None:
-                        reporter_cleanup_error = cleanup_error
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
         workflow.scheduler_supervisor.stop_run_heartbeat(run_id)
+        return cleanup_error
+
+    def finish(
+        status: str, error: str | None = None, *, restart_attempts=(),
+        rejected_restarts=None, exhausted_restarts=None, body_exception=None, failed_nodes=(),
+    ):
+        nonlocal finished, exit_failed, terminal_request, body_error
+        if finished or exit_failed:
+            return
+        if body_exception is not None:
+            body_error = body_exception
+        if terminal_request is None:
+            terminal_request = (status, error)
+        status, error = terminal_request
+
+        try:
+            with workflow.storage.interprocess_lock("active-run-state"):
+                decision = workflow.storage.decide_execution_session_exit(
+                    run_id, outcome=status, finished_at=now_iso(),
+                    failures=[] if error is None else [{'error': error}],
+                    restart_attempts=restart_attempts,
+                    rejected_restarts=rejected_restarts,
+                    exhausted_restarts=exhausted_restarts,
+                    failed_nodes=failed_nodes,
+                )
+                if decision['restarts']:
+                    terminal_request = None
+                    return decision['restarts']
+                finished = True
+        except ExecutionSessionHasActiveJobs as decision_error:
+            # A rejected terminal decision leaves durable ownership available
+            # for recovery. Retire this caller's reporters without retrying the
+            # decision during context-manager unwinding.
+            exit_failed = True
+            stop_local_reporting()
+            if body_error is not None:
+                note = f'Execution session exit failed: {safe_exception_repr(decision_error)}'
+                body_error.__notes__ = [*getattr(body_error, '__notes__', ()), note]
+                raise body_error
+            raise
+
+        reporter_cleanup_error = stop_local_reporting()
         override_cleanup_error: Exception | None = None
         with workflow.storage.interprocess_lock("active-run-state"):
-            if not workflow.storage.finish_execution_session(
-                run_id, outcome=status, finished_at=now_iso(),
-                failures=[] if error is None else [{'error': error}],
-            ):
-                raise RuntimeError(f'Execution session {run_id} is missing or already terminal')
-            finished = True
             try:
-                released = workflow.storage.release_execution_components(run_id)
+                released = decision['released']
                 if reserved and released != len(selected_components):
                     raise RuntimeError(
                         f'Execution session {run_id} reservation cleanup released {released}, '
@@ -232,7 +304,7 @@ def _execution_session(
         monitor_reporter = InlineMonitorReporter(
             workflow, nodes=nodes, enabled=monitor, interval=monitor_interval,
         ).start()
-        yield finish
+        yield ExecutionSessionDriver(finish, lambda: finished)
     except BaseException as error:
         body_error = error
         if created and not finished:

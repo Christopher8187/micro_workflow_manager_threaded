@@ -3,254 +3,66 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
-from micro_workflow_manager.models import CANCELLED, FAILED, QUEUED, RUNNING
 from micro_workflow_manager.storage import FileStorage
 
-from .active_run import live_active_run
 from .files import find_root, safe_node_name
 from .jobs import selected_job_ids_from_args
 from .layout import ensure_runtime_layout
 
 
-RETRYABLE_FINISHED_STATUSES = {FAILED, CANCELLED}
-
-
-@dataclass(slots=True)
-class RestartTarget:
-    node: str
-    job_id: int
-    mode: str
-    control: dict
-
-
-def _require_active_run(storage: FileStorage) -> dict:
-    active = live_active_run(storage)
-    if active is None:
-        raise RuntimeError(
-            "mwf restart is only available from a second terminal while an MWF "
-            "run sequence is active. Use mwf resume or mwf resumefrom after the "
-            "original sequence has ended; resume first registers output-backed "
-            "finished jobs before requeueing the remaining work."
-        )
-    return active
-
-
-def _restart_mode(
-    storage: FileStorage,
-    node: str,
-    job_id: int,
-    *,
-    active: dict | None,
-) -> tuple[str, dict]:
-    if active is None:
-        _require_active_run(storage)
-    if not storage.job_exists(node, job_id):
-        raise RuntimeError(f"Job does not exist: {node}/{job_id}")
-
-    status = storage.get_job_status(node, job_id)
-    control = storage.read_job_control(node, job_id)
-    if status == RUNNING and control.get("active_execution_id"):
-        return "running", control
-    if status in RETRYABLE_FINISHED_STATUSES:
-        return "failed", control
-    if status == QUEUED:
-        raise RuntimeError(
-            f"Job {node}/{job_id} is queued, not running or failed. The active "
-            "scheduler already owns queued work."
-        )
-    raise RuntimeError(
-        f"Job {node}/{job_id} has status {status!r}. Restart accepts an active "
-        "running job or a failed/cancelled job; it never resets done work."
-    )
-
-
-def _active_component_nodes(active: dict, node: str) -> list[str]:
-    active_nodes = set(active.get("nodes") or [])
-    if node not in active_nodes:
-        raise RuntimeError(
-            f"Node {node} is not part of active {active.get('command', 'workflow')} "
-            f"run {active.get('run_id', '?')}."
-        )
-
-    components = active.get("components")
-    if isinstance(components, dict):
-        stored = components.get(node)
-        if isinstance(stored, list) and stored:
-            result = [str(name) for name in stored if str(name) in active_nodes]
-            if node in result:
-                return result
-    # Compatibility with run records created before component membership was
-    # persisted. Such records can safely provide singleton restart semantics.
-    return [node]
-
-
-def _scope_targets(
-    storage: FileStorage,
-    active: dict,
-    node: str,
-    *,
-    failed_only: bool,
-) -> tuple[list[str], list[RestartTarget]]:
-    nodes = _active_component_nodes(active, node)
-    targets: list[RestartTarget] = []
-    for node_name in nodes:
-        for job_id in storage.list_job_ids(node_name):
-            status = storage.get_job_status(node_name, job_id)
-            control = storage.read_job_control(node_name, job_id)
-            if not failed_only and status == RUNNING and control.get("active_execution_id"):
-                targets.append(RestartTarget(node_name, job_id, "running", control))
-            elif status in RETRYABLE_FINISHED_STATUSES:
-                targets.append(RestartTarget(node_name, job_id, "failed", control))
-    return nodes, targets
-
-
-def _apply_restart_targets(
-    storage: FileStorage,
-    active: dict,
-    targets: list[RestartTarget],
-) -> list[dict]:
-    restarted = []
-    touched_nodes: set[str] = set()
-    for target in targets:
-        if target.mode == "running":
-            item = storage.request_active_job_restart(
-                target.node,
-                target.job_id,
-                requested_by_pid=os.getpid(),
-                reason=(
-                    "second-terminal restart inside active "
-                    f"{active.get('command', 'workflow')} run {active.get('run_id', '?')}"
-                ),
-            )
+def _restart_owned(root, node, *, job_ids=None, failed_only=False, dry_run=False):
+    storage = FileStorage(root)
+    try:
+        component_plan = None
+        if job_ids is None:
+            component_plan = storage.plan_owned_component_restart(node, failed_only=failed_only)
+            targets = component_plan['targets']
         else:
-            item = storage.request_job_restart(
-                target.node,
-                target.job_id,
-                requested_by_pid=os.getpid(),
-                reason="manual retry of failed/cancelled job",
+            targets = storage.plan_owned_job_restarts([(node, job_id) for job_id in job_ids])
+        if dry_run:
+            print('Restart dry run:')
+            for target in targets:
+                print(
+                    f"  would restart {target['node']}/{target['job_id']} "
+                    f"in session {target['owner']['session_id']} "
+                    f"component {{{', '.join(target['owner']['component'])}}} "
+                    f"from generation {target['generation']}"
+                )
+        else:
+            restarted = storage.request_owned_job_restarts(
+                targets, requested_by_pid=os.getpid(), component_plan=component_plan,
             )
-        item["mode"] = target.mode
-        restarted.append(item)
-        touched_nodes.add(target.node)
-
-    if touched_nodes:
-        storage.set_node_statuses({node_name: RUNNING for node_name in touched_nodes})
-        storage.notify_queue_change()
-    return restarted
-
-
-def _print_restart_result(active: dict, restarted: list[dict]) -> None:
-    print(
-        f"Restarted inside active {active.get('command', 'workflow')} "
-        f"run {active.get('run_id', '?')}:"
-    )
-    for item in restarted:
-        label = "active restart" if item["mode"] == "running" else "failed-job retry"
-        print(
-            f"  {item['node']}/{item['job_id']} ({label}) "
-            f"generation {item['previous_generation']} -> {item['generation']}"
-        )
-    print("The existing run remains in control; no second workflow was started.")
+            for item in restarted:
+                print(
+                    f"Restarted {item['node']}/{item['job_id']} in session {item['session_id']}: "
+                    f"generation {item['previous_generation']} -> {item['generation']}"
+                )
+                for warning in item['warnings']:
+                    print(warning, file=sys.stderr)
+        if not targets and component_plan is not None:
+            print(
+                f"No matching jobs in session {component_plan['session_id']} "
+                f"component {{{', '.join(component_plan['component'])}}}."
+            )
+        return 0
+    finally:
+        storage.close_database_connections()
 
 
 def restart_active_scope(
-    root: Path,
-    node: str,
-    *,
-    failed_only: bool = False,
-    dry_run: bool = False,
+    root: Path, node: str, *, failed_only: bool = False, dry_run: bool = False,
 ) -> int:
-    """Restart component-wide running/failed work inside the active sequence."""
-    storage = FileStorage(root)
-    active = _require_active_run(storage)
-    nodes, targets = _scope_targets(
-        storage,
-        active,
-        node,
-        failed_only=failed_only,
-    )
-    scope = "failed/cancelled jobs" if failed_only else "running and failed/cancelled jobs"
-
-    if dry_run:
-        print(
-            f"Restart dry run inside active {active.get('command', 'workflow')} "
-            f"run {active.get('run_id', '?')}:"
-        )
-        print(f"  component scope: {', '.join(nodes)}")
-        print(f"  selection: {scope}")
-        for target in targets:
-            action = (
-                "replace active generation"
-                if target.mode == "running"
-                else "requeue failed job"
-            )
-            print(
-                f"  would {action} {target.node}/{target.job_id} "
-                f"from generation {target.control.get('generation', 0)}"
-            )
-        if not targets:
-            print("  no matching jobs")
-        print("  no execution generation, status, output, or files were changed")
-        return 0
-
-    restarted = _apply_restart_targets(storage, active, targets)
-    if not restarted:
-        print(
-            f"No {scope} were found in active component "
-            f"{{{', '.join(nodes)}}}."
-        )
-        return 0
-    _print_restart_result(active, restarted)
-    return 0
+    """Restart eligible work in the node's persisted reserved component."""
+    return _restart_owned(root, node, failed_only=failed_only, dry_run=dry_run)
 
 
 def restart_active_jobs(
-    root: Path,
-    node: str,
-    job_ids: list[int],
-    *,
-    dry_run: bool = False,
+    root: Path, node: str, job_ids: list[int], *, dry_run: bool = False,
 ) -> int:
-    """Compatibility path for explicitly selected active job IDs."""
-    storage = FileStorage(root)
-    active = _require_active_run(storage)
-    active_nodes = set(active.get("nodes") or [])
-
-    targets: list[RestartTarget] = []
-    for job_id in job_ids:
-        mode, control = _restart_mode(storage, node, job_id, active=active)
-        if node not in active_nodes:
-            raise RuntimeError(
-                f"Node {node} is not part of active {active.get('command', 'workflow')} "
-                f"run {active.get('run_id', '?')}."
-            )
-        targets.append(RestartTarget(node, job_id, mode, control))
-
-    if dry_run:
-        print(
-            f"Restart dry run inside active {active.get('command', 'workflow')} "
-            f"run {active.get('run_id', '?')}:"
-        )
-        for target in targets:
-            action = (
-                "replace active generation"
-                if target.mode == "running"
-                else "requeue failed job"
-            )
-            print(
-                f"  would {action} {target.node}/{target.job_id} "
-                f"from generation {target.control.get('generation', 0)}"
-            )
-        print("  no execution generation, status, output, or files were changed")
-        return 0
-
-    restarted = _apply_restart_targets(storage, active, targets)
-    _print_restart_result(active, restarted)
-    return 0
-
+    """Restart explicit jobs through their exact native execution owner."""
+    return _restart_owned(root, node, job_ids=job_ids, dry_run=dry_run)
 
 def restart_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
@@ -293,4 +105,6 @@ def restart_cli(argv: list[str]) -> int:
         )
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
+        for note in getattr(error, '__notes__', ()):
+            print(note, file=sys.stderr)
         return 1

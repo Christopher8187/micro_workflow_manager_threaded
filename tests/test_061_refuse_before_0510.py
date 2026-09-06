@@ -103,10 +103,17 @@ def test_runfrom_refuse_stops_before_boundary_and_preserves_queued_job(
     assert storage.list_job_ids("B") == [1]
     assert storage.get_job_status("B", 1) == "queued"
     assert storage.list_job_ids("C") == []
-    run_state = storage.get_run_state()
-    assert run_state["status"] == "done"
-    assert run_state["refuse_before_node"] == "B"
-    assert run_state["refuse_after_node"] is None
+    sessions = storage.list_execution_sessions()
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session['status'] == 'terminal'
+    assert session['outcome'] == 'done'
+    assert session['details']['refuse_before_node'] == 'B'
+    assert session['details']['refuse_after_node'] is None
+    assert session['selected_components'] == [('A',), ('B',), ('C',)]
+    assert storage.get_live_main_session() is None
+    for component in session['selected_components']:
+        assert storage.get_component_reservation(component) is None
 
     # An ordinary resume from the boundary consumes the preserved remainder.
     assert cli.main(["resumefrom", "B"]) == 0

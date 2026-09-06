@@ -2,11 +2,36 @@
 
 Status: requirements preparation only. This record does not accept an implementation stage or perform the final GPT-6 Astra review.
 
+## Later compatibility cancellation
+
+Christopher's [one-model scope change](single-model-scope.md), relayed on
+2026-09-05 from `Check issue 45 progress (2)`, supersedes every older obligation
+to support old project specifications alongside the new model. Legacy import,
+conversion, backfill, legacy-only reconstruction, dual schema execution modes,
+and compatibility-only adapters, tests, and reviews are cancelled. They are
+not deferred blockers. Historical verification is preserved without requiring
+completion of cancelled work. Native current-version functionality and data
+preservation remain required. This implementation task writes the external
+`C:/Business/product/migration.md` guide at the end from the final runtime.
+
+## Architectural decisions after the scope change
+
+- AQ2, AQ4, and Q7 remain historical decisions. Their legacy conversion,
+  migration-window, and missing-historical-membership behaviors require no
+  runtime implementation.
+- AQ1 remains applicable only to current-version read-only previews. Its narrow
+  existing-SQLite coordination-file allowance creates no migration path and
+  permits no schema, job, workflow-data, or new-file mutation.
+- AQ3 still requires native state to persist the actual producing graph and
+  exact component membership. Its legacy migration application is cancelled.
+- AQ5, AQ6, Q8, and Q9 remain fully applicable to native lineage, current or
+  last operational ownership, and its fresh-preparation or deletion boundary.
+
 ## Authority order
 
 When sources differ, apply them in this order:
 
-1. Later architectural answers that Christopher records on the implementation task after a grilling.
+1. Christopher's later explicit instructions, including the [published one-model scope change](https://github.com/Christopher8187/product/issues/45#approved-scope-change-one-new-project-model), its [local scope record](single-model-scope.md), and approved architectural answers.
 2. [Implement and verify the agreed MWF 0.6.2 workflow-management changes, approved execution procedure](https://github.com/Christopher8187/product/issues/45#approved-execution-procedure), including its later comments.
 3. [Settle the MWF workflow-management model for 0.6.2, final consolidated resolution](https://github.com/Christopher8187/product/issues/44#issuecomment-5539997969), together with its still-active [cross-session architecture clarification](https://github.com/Christopher8187/product/issues/44#issuecomment-5463708247).
 4. Current MWF repository instructions and documentation from published 0.6.1, where the workflow-management resolution does not deliberately change them.
@@ -33,8 +58,9 @@ An old proposal, an old implementation observation, or work assigned to a later 
 | [Settle the MWF workflow-management model for 0.6.2, cross-session clarification](https://github.com/Christopher8187/product/issues/44#issuecomment-5463708247) | Applicable gate | Requires code and behavior compatibility and agreement with internal MWF responsibility, state ownership, and scheduling. | Continues after the behavioral text was consolidated. Any material inconsistency is an explicit HITL question. |
 | [Settle the MWF workflow-management model for 0.6.2, initial resolution](https://github.com/Christopher8187/product/issues/44#issuecomment-5539334756) | Superseded | Historical source for the grilling outcome. | Replaced by the final consolidated resolution. Do not implement its differing session, selected-job, reset, preview, or trace details. |
 | [Settle the MWF workflow-management model for 0.6.2, adversarial audit](https://github.com/Christopher8187/product/issues/44#issuecomment-5539538661) | Superseded as standalone requirements | Historical source that exposed omissions and ambiguities in the initial resolution. | Its approved corrections are folded into the final consolidated resolution. Do not combine the audit and final text as two independent specifications. |
-| [Settle the MWF workflow-management model for 0.6.2, final consolidated resolution](https://github.com/Christopher8187/product/issues/44#issuecomment-5539997969) | Authoritative behavior | Every runtime, CLI, planning, session, storage, migration, compatibility, removal, documentation, AFSR, skill, and regression clause recorded in `requirements-audit.md`. | It supersedes the initial resolution and audit while preserving the cross-session clarification. |
-| [Implement and verify the agreed MWF 0.6.2 workflow-management changes](https://github.com/Christopher8187/product/issues/45) | Authoritative execution procedure | Advance approval, branch and baseline, requirement tracking, dependency-based stages, TDD, stage reviews, blocker handling, repeated grilling, checkpointing, final review gate, and closure. | [Comment 1](https://github.com/Christopher8187/product/issues/45#issuecomment-5539339011) points to the initial the workflow-management resolution resolution and is replaced by comments 2 and 3. [Comment 2](https://github.com/Christopher8187/product/issues/45#issuecomment-5539543789) is a historical hold. [Comment 3](https://github.com/Christopher8187/product/issues/45#issuecomment-5540001255) points to the final consolidated resolution. [Comment 4](https://github.com/Christopher8187/product/issues/45#issuecomment-5542515065) predates the later approved execution procedure; its statement that approval rules were unchanged is explicitly superseded by the current body's bounded advance approval. It still confirms Issues #22 and #44 as prerequisites. |
+| [Settle the MWF workflow-management model for 0.6.2, final consolidated resolution](https://github.com/Christopher8187/product/issues/44#issuecomment-5539997969) | Authoritative behavior subject to the later one-model scope | Runtime, CLI, planning, native session, storage, noncancelled compatibility, removal, documentation, AFSR, skill, and regression clauses recorded in `requirements-audit.md`. | It supersedes the initial resolution and audit while preserving the cross-session clarification. The later one-model instruction cancels only its legacy import, migration, backfill, and old-only adapter clauses. |
+| [Implement and verify the agreed MWF 0.6.2 workflow-management changes](https://github.com/Christopher8187/product/issues/45) | Authoritative execution procedure subject to the later one-model scope | Advance approval, branch and baseline, requirement tracking, dependency-based stages, TDD, stage reviews, blocker handling, repeated grilling, checkpointing, final review gate, and closure. | [Comment 1](https://github.com/Christopher8187/product/issues/45#issuecomment-5539339011) points to the initial the workflow-management resolution resolution and is replaced by comments 2 and 3. [Comment 2](https://github.com/Christopher8187/product/issues/45#issuecomment-5539543789) is a historical hold. [Comment 3](https://github.com/Christopher8187/product/issues/45#issuecomment-5540001255) points to the final consolidated resolution. [Comment 4](https://github.com/Christopher8187/product/issues/45#issuecomment-5542515065) predates the later approved execution procedure; its statement that approval rules were unchanged is explicitly superseded by the current body's bounded advance approval. It still confirms Issues #22 and #44 as prerequisites. The later one-model instruction partially supersedes the procedure's migration clauses. |
+| Christopher's 2026-09-05 one-model instruction relayed from local task `Check issue 45 progress (2)` | Latest authoritative scope | One fresh native 0.6.2 project model, removal of old-state machinery, preservation of old projects and data, native reopen and rollback, and the final Parent Repo migration guide. | Cancels legacy-only runtime work without changing native 0.6.2 behavior, the issue procedure outside migration, packaging boundaries, or production permissions. Recorded in [one-model scope](single-model-scope.md). |
 | [Package and publish the MWF 0.6.2 workflow-management tree](https://github.com/Christopher8187/product/issues/46) | Downstream only | Builds and publishes the approved 0.6.2 wheel after the implementation task passes and records the source and package identities used by 0.6.3. | Packaging, release publication, and production changes are outside the implementation task. the implementation task hands off to #46 after completion. |
 | [Settle the long-term main and repository Wayfinder structure](https://github.com/Christopher8187/product/issues/49#issuecomment-5543790791) | Applicable sequencing only | Long-lived Main and repository Wayfinders, continuous dependency handoffs, and parallel post-0.6.2 repository routes. | It adds no MWF 0.6.2 runtime behavior. Repository Wayfinder creation follows the packaging task. |
 | Local preparation task `Find objective for issue #45` | Applicable approval record | Confirms the repeating implement, review, grill, implement cycle; reviewer scaling; evidence-based disagreement resolution; bounded advance approval; test-first sections; checkpoint rules; and final-review timing. | the implementation task contains the saved procedure. The full task remains mandatory for the final Astra reviewer, for a Sol reviewer facing an architectural problem, and as the last check before deferral. A summary is insufficient. |
@@ -50,10 +76,10 @@ the implementation task excludes implementation or repair of example graphs and 
 
 The six implementation stages retain the implementation task's proposed order, with these recorded adjustments:
 
-1. S1 includes a read-only bootstrap seam before any preview implementation. A preview cannot be verified as read-only if storage migration, state mounting, starter-job creation, or session reservation still happens first.
+1. S1 includes a read-only bootstrap seam before any preview implementation. A preview cannot be verified as read-only if project-state initialization, state mounting, starter-job creation, or session reservation still happens first.
 2. S2 moves component identity and alignment-generation storage ahead of S3. S3 needs exact component rows, generations, session ownership, and reservation or guard primitives before it can implement publication cleanup, misalignment, and membership repair safely.
 3. S5 owns live-session controls, but their storage and ownership prerequisites stay in S2. S5 adds interrupt semantics, transfers, holds, fences, restart, recovery, and thread behavior only after S2 establishes exact session and job ownership. S6 performs the final integration across these seams and updates all user and agent-facing text.
-4. [Command retirement](stage-retirement.md) moves 44-CMD-025 through 44-CMD-028 and 44-REC-041 ahead of the remaining S4/S6 work. Removing the four commands is independently settled and does not depend on blocked preview or migration work.
+4. [Command retirement](stage-retirement.md) moves 44-CMD-025 through 44-CMD-028 and 44-REC-041 ahead of the remaining S4/S6 work. Removing the four commands is independently settled and does not depend on remaining preview work. The former legacy migration dependency is cancelled.
 
 No stage is accepted by this preparation. Implementation and review status is maintained in [requirements-audit.md](requirements-audit.md).
 

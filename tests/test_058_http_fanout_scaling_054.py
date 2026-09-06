@@ -1,6 +1,5 @@
 import asyncio
 import threading
-from types import SimpleNamespace
 
 import httpx
 
@@ -13,7 +12,6 @@ from micro_workflow_manager.networking import (
 )
 from micro_workflow_manager.runners.api import ApiRunner, _LaneCoordinator
 from micro_workflow_manager.workflow.component_scheduler import allocate_api_pumps
-from micro_workflow_manager.workflow.dag_scheduler import DagSchedulerMixin
 
 
 def test_preclaimed_api_burst_records_first_task_started_in_claim_batch(tmp_path):
@@ -345,75 +343,72 @@ def test_api_pump_vector_never_starves_a_node_when_nodes_exceed_cpu_budget():
     assert sum(allocations.values()) == len(limits)
 
 
-def test_later_dag_wave_remains_inside_running_nodes_global_pump_budget(monkeypatch):
+def test_later_dag_wave_remains_inside_running_nodes_global_pump_budget(tmp_path, monkeypatch):
     from micro_workflow_manager.workflow import component_scheduler
 
     monkeypatch.setattr(component_scheduler.os, "cpu_count", lambda: 16)
-    queued = {"A": True, "B": True, "C": False}
+    monkeypatch.delenv("MWF_API_STARTUP_STRATEGY", raising=False)
+    workflow = MicroWorkflow(tmp_path, runner="api", persist_graph=False)
+    workflow.graph([("A", "C")])
     allocations: dict[str, int] = {}
+    allocation_calls = []
+    allocation_lock = threading.Lock()
+    b_started = threading.Event()
+    b_finished = threading.Event()
+    release_b = threading.Event()
     c_started = threading.Event()
 
-    class Storage:
-        @staticmethod
-        def has_queued_jobs(node_name):
-            return queued[node_name]
-
-    class Scheduler(DagSchedulerMixin):
-        runner = "api"
-        storage = Storage()
-        _active_api_nodes = None
-        nodes = {
-            name: SimpleNamespace(runner_override=None, waiting=False)
-            for name in queued
-        }
-
-        @staticmethod
-        def execution_components(_nodes=None):
-            return [("A",), ("B",), ("C",)]
-
-        @staticmethod
-        def node_ready(_node_name):
-            return True
-
-        @staticmethod
-        def effective_max_threads(_node_name):
-            return 1400
-
-        @staticmethod
-        def requested_max_threads(_node_name):
-            return 1400
-
-        @classmethod
-        def active_api_admission_nodes(cls):
-            return cls._active_api_nodes
-
-        @classmethod
-        def set_active_api_admission_nodes(cls, nodes):
-            cls._active_api_nodes = None if nodes is None else frozenset(nodes)
-
-        @staticmethod
-        def finalize_ready_nodes(skip_components=None):
-            return None
-
-        @staticmethod
-        def run_component(component, _ignore, _resolver, api_pump_allocations):
-            node_name = next(iter(component))
-            allocations[node_name] = api_pump_allocations[node_name]
-            queued[node_name] = False
-            if node_name == "A":
-                queued["C"] = True
-            elif node_name == "B":
-                assert c_started.wait(5)
-            elif node_name == "C":
+    def work(ctx):
+        if ctx.current_node == "A":
+            assert b_started.wait(20)
+        elif ctx.current_node == "B":
+            b_started.set()
+            assert release_b.wait(20)
+            b_finished.set()
+        else:
+            try:
+                assert b_started.is_set() and not b_finished.is_set()
                 c_started.set()
-            return [node_name]
+            finally:
+                release_b.set()
+        return ctx.current_node
 
-    assert set(Scheduler().run_concurrently()) == {"A", "B", "C"}
-    assert allocations["A"] + allocations["B"] == 21
-    # A has finished when C becomes ready, but B's ten pumps still count. C
-    # receives the remaining eleven rather than a fresh isolated twelve.
-    assert allocations["B"] + allocations["C"] == 21
-    assert allocations["C"] >= 1
+    for name in ("A", "B", "C"):
+        router = NodeRouter(name, runner="api", max_threads=1400)
+        router.task(work)
+        workflow.include_routers(router)
+        workflow.add_job(None, name)
+
+    run_component = workflow._run_component
+
+    def observe_allocations(component, ignore_readiness=False, wait_deadlock_resolver=None,
+                            api_pump_allocations=None, **kwargs):
+        with allocation_lock:
+            allocation_calls.append(tuple(sorted(component)))
+            allocations.update(api_pump_allocations or {})
+        return run_component(component, ignore_readiness, wait_deadlock_resolver,
+                             api_pump_allocations, **kwargs)
+
+    monkeypatch.setattr(workflow, "_run_component", observe_allocations)
+    try:
+        assert set(workflow.run()) == {"A", "B", "C"}
+        assert c_started.is_set() and b_finished.is_set()
+        assert sorted(allocation_calls) == [('A',), ('B',), ('C',)]
+        assert allocations["A"] + allocations["B"] == 21
+        # B's non-preemptive pumps remain charged when the later C wave starts.
+        assert allocations["B"] + allocations["C"] == 21
+        assert allocations["C"] >= 1
+        sessions = workflow.storage.list_execution_sessions()
+        assert len(sessions) == 1 and sessions[0]['status'] == 'terminal'
+        assert sessions[0]['outcome'] == 'done'
+        for name in ("A", "B", "C"):
+            assert workflow.storage.get_job_status(name, 1) == 'done'
+            assert workflow.storage.read_job_current_owner(name, 1)['session_id'] == sessions[0]['session_id']
+            assert workflow.storage.read_job_control(name, 1)['active_execution_id'] is None
+            assert workflow.storage.get_component_reservation((name,)) is None
+    finally:
+        release_b.set()
+        workflow.storage.close_database_connections()
 
 
 def test_adaptive_lane_shards_conserve_the_declared_concurrency_exactly():

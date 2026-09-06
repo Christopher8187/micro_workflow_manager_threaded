@@ -53,13 +53,13 @@ def test_hoeflein_late_feedback_is_consumed_after_member_queue_drains(tmp_path):
     observed: list[tuple[str, int]] = []
     lock = threading.Lock()
     pump_calls = {"A": 0, "B": 0}
-    original_run_queued = workflow.run_queued_node_jobs
+    original_run_queued = workflow._run_queued_node_jobs
 
     def count_pumps(node_name, *args, **kwargs):
         pump_calls[node_name] += 1
         return original_run_queued(node_name, *args, **kwargs)
 
-    workflow.run_queued_node_jobs = count_pumps  # type: ignore[method-assign]
+    workflow._run_queued_node_jobs = count_pumps  # type: ignore[method-assign]
 
     a = NodeRouter("A", runner="threaded", max_threads=4)
     a.create_job(params={"depth": 0})
@@ -196,14 +196,14 @@ def test_ordinary_hoeflein_members_are_resident_before_first_feedback(tmp_path):
     b_pump_started = threading.Event()
     observed: list[bool] = []
 
-    original_run_queued = workflow.run_queued_node_jobs
+    original_run_queued = workflow._run_queued_node_jobs
 
     def observed_run_queued(node_name, *args, **kwargs):
         if node_name == "B":
             b_pump_started.set()
         return original_run_queued(node_name, *args, **kwargs)
 
-    workflow.run_queued_node_jobs = observed_run_queued  # type: ignore[method-assign]
+    workflow._run_queued_node_jobs = observed_run_queued  # type: ignore[method-assign]
 
     a = NodeRouter("A", runner="threaded", max_threads=2)
     a.create_job(params={"seed": 1})
@@ -313,7 +313,7 @@ def test_threaded_payload_loader_oserror_propagates_and_component_joins(tmp_path
         assert workflow.storage.get_node_status(node_name) == "failed"
 
 
-def test_failed_component_cleanup_never_leaves_stale_running_rows(tmp_path):
+def test_failed_component_cleanup_never_leaves_stale_running_rows(tmp_path, monkeypatch):
     """Terminal SCC failure converts abandoned RUNNING leases into retryable failures."""
     workflow = MicroWorkflow(tmp_path, runner="threaded")
     workflow.graph([("A", "B"), ("B", "A")])
@@ -332,15 +332,29 @@ def test_failed_component_cleanup_never_leaves_stale_running_rows(tmp_path):
     workflow.include_router(a)
     workflow.include_router(b)
     job = workflow.add_job(None, "B")
-    workflow.storage.set_job_status("B", job.job_id, "running", synthetic=True)
+    output_error = OSError(24, "Too many open files")
+    write_output = workflow.storage.write_output
 
-    workflow._finalize_failed_component({"A", "B"}, OSError(24, "Too many open files"))
+    def fail_output(node_name, job_id, output):
+        if node_name == "B":
+            raise output_error
+        return write_output(node_name, job_id, output)
+
+    monkeypatch.setattr(workflow.storage, "write_output", fail_output)
+    with pytest.raises(OSError) as caught:
+        workflow.run_component({"A", "B"})
+    assert caught.value is output_error
 
     counts = workflow.storage.job_status_counts("B")
     assert counts.get("running", 0) == 0
     assert counts.get("failed", 0) == 1
     status = workflow.storage.read_job_status_data("B", job.job_id)
     assert status["recovered_after_component_abort"] is True
+    owner = workflow.storage.read_job_current_owner("B", job.job_id)
+    assert owner['generation'] == 0
+    assert workflow.storage.read_job_control("B", job.job_id)['active_execution_id'] is None
+    assert workflow.storage.get_execution_session(owner['session_id'])['outcome'] == 'failed'
+    assert workflow.storage.get_component_reservation(('A', 'B')) is None
     assert workflow.storage.get_node_status("A") == "failed"
     assert workflow.storage.get_node_status("B") == "failed"
 

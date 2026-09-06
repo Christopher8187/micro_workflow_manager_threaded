@@ -188,6 +188,8 @@ def test_quiescence_join_surfaces_late_node_worker_failure(tmp_path, monkeypatch
         routers.append(router)
     workflow.add_job(None, "A")
 
+    late_error = RuntimeError("late worker failure")
+
     def finish_after_quiescence(node_name, _ignore_readiness, **kwargs):
         kwargs["_live_ready_event"].set()
         assert kwargs["_live_start_event"].wait(1)
@@ -195,13 +197,22 @@ def test_quiescence_join_surfaces_late_node_worker_failure(tmp_path, monkeypatch
             workflow.storage.set_job_status("A", 1, "done")
         assert kwargs["_stop_event"].wait(1)
         if node_name == "A":
-            raise RuntimeError("late worker failure")
+            raise late_error
         return []
 
-    monkeypatch.setattr(workflow, "run_queued_node_jobs", finish_after_quiescence)
+    monkeypatch.setattr(workflow, "_run_queued_node_jobs", finish_after_quiescence)
 
-    with pytest.raises(RuntimeError, match="late worker failure"):
+    with pytest.raises(RuntimeError, match="late worker failure") as observed:
         workflow.run_component({"A", "B"}, ignore_readiness=True)
 
+    assert observed.value is late_error
     assert workflow.storage.get_node_status("A") == "failed"
     assert workflow.storage.get_node_status("B") == "failed"
+    sessions = workflow.storage.list_execution_sessions()
+    assert len(sessions) == 1
+    assert sessions[0]['status'] == 'terminal'
+    assert sessions[0]['outcome'] == 'failed'
+    assert workflow.storage.get_component_reservation(('A', 'B')) is None
+    assert workflow.storage.get_live_main_session() is None
+    assert workflow.storage.get_job_status('A', 1) == 'done'
+    assert not workflow.storage.nodes_with_job_statuses(('A', 'B'), {'running'})
