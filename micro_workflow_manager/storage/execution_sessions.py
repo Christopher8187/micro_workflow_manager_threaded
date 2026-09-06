@@ -156,7 +156,7 @@ class ExecutionSessionStorageMixin:
     def decide_execution_session_exit(
         self, session_id: str, *, outcome: str, finished_at: str,
         failures: list | None = None, restart_attempts=(), rejected_restarts=None,
-        exhausted_restarts=None, failed_nodes=(),
+        exhausted_restarts=None, failed_nodes=(), component_outcomes=(),
     ) -> dict:
         """Continue accepted successors or end the session in one writer decision."""
         self._require_execution_session_storage()
@@ -172,6 +172,9 @@ class ExecutionSessionStorageMixin:
         failed_nodes = tuple(self.validate_node_name(node) for node in failed_nodes)
         if failed_nodes and outcome != 'failed':
             raise ValueError('Failed node publication requires a failed session outcome')
+        component_outcomes = self._normalize_component_terminal_outcomes(component_outcomes)
+        if any(component.lifecycle == 'failed' for component in component_outcomes) and outcome != 'failed':
+            raise ValueError('Failed component publication requires a failed session outcome')
 
         def decide(connection):
             session = connection.execute(
@@ -179,6 +182,7 @@ class ExecutionSessionStorageMixin:
             ).fetchone()
             if session is None or session['status'] != 'running':
                 raise RuntimeError(f'Execution session {session_id} is missing or already terminal')
+            self._validate_component_terminal_outcomes(connection, session_id, component_outcomes)
             owned_nodes = {
                 node for row in connection.execute(
                     'SELECT selected.component_key FROM session_components AS selected '
@@ -281,6 +285,19 @@ class ExecutionSessionStorageMixin:
                     }
             if replacements:
                 return {'restarts': replacements, 'released': 0}
+            if component_outcomes:
+                supplied_keys = {encode_component_key(result.component) for result in component_outcomes}
+                running_keys = {row[0] for row in connection.execute(
+                    'SELECT state.component_key FROM component_states AS state '
+                    'JOIN component_reservations AS reservation USING(component_key) '
+                    "WHERE reservation.session_id=? AND state.lifecycle='running'", (session_id,),
+                )}
+                if running_keys - supplied_keys:
+                    raise RuntimeError('Terminal settlement omitted an owned running component')
+            reserved_count = connection.execute(
+                'SELECT COUNT(*) FROM component_reservations WHERE session_id=?', (session_id,),
+            ).fetchone()[0]
+            self._publish_component_terminal_outcomes(connection, component_outcomes)
             if failed_nodes:
                 if not set(failed_nodes) <= owned_nodes:
                     raise RuntimeError('Failed nodes are outside the session reserved scope')
@@ -288,14 +305,18 @@ class ExecutionSessionStorageMixin:
                     "UPDATE nodes SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE node_name=?",
                     [(node,) for node in failed_nodes],
                 )
-            connection.execute(
+            finished = connection.execute(
                 "UPDATE execution_sessions SET status='terminal', outcome=?, finished_at=?, failures_json=? "
                 "WHERE session_id=? AND status='running'",
                 (outcome, finished_at, failure_data, session_id),
-            )
+            ).rowcount
+            if finished != 1:
+                raise RuntimeError('Execution session changed before terminal settlement')
             released = connection.execute(
                 'DELETE FROM component_reservations WHERE session_id=?', (session_id,),
             ).rowcount
+            if released != reserved_count:
+                raise RuntimeError('Execution session reservations changed before terminal settlement')
             return {'restarts': {}, 'released': released}
 
         return self.submit_db_mutation(decide, wait=True, priority=0)
