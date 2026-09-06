@@ -12,7 +12,7 @@ from ..errors import (
     JobRestartedError,
     JobTimeoutError,
 )
-from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
+from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, Job, now
 from ..fibers import cancellation_scope, in_fiber_runtime
 from ..networking import network_attempt_context
 
@@ -58,9 +58,6 @@ class JobExecutionApiMixin:
             reason="retry_job API",
         )
         self.storage.set_node_status(node_name, QUEUED)
-
-    def skip_node(self, node_name: str):
-        self.storage.set_node_status(node_name, SKIPPED)
 
     def mark_node_done(self, node_name: str):
         self.storage.set_node_status(node_name, DONE)

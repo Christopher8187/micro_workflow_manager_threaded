@@ -15,6 +15,9 @@ Help labels the option deprecated, and use prints a warning. The existing
 set/reset behavior remains functional with no removal date or session-specific
 form.
 
+The 0.6.2 development branch removes `MicroWorkflow.skip_node()`. Skipped
+jobs remain supported; the removed operation cannot skip an entire component.
+
 ## What changed in 0.6.1
 
 - Reorganized current documentation around the root README, authoritative
