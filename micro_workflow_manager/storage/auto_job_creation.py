@@ -25,7 +25,9 @@ class AutoJobPublish:
     parent_event_job_id: int | None
     parent_event_data: dict[str, Any] | None
     producer_execution_id: str | None = None
+    expected_shape: str | None = None
     published_dir: Path | None = None
+    arrival_identity: tuple | None = None
 
 
 class AutoJobCreationStorageMixin:
@@ -42,6 +44,7 @@ class AutoJobCreationStorageMixin:
         idempotency_key: str | None = None,
         parent_event: tuple[str, int, dict[str, Any]] | None = None,
         producer_execution_id: str | None = None,
+        expected_shape: str | None = None,
     ) -> Job:
         """Prepare one payload, then allocate and publish it in one mutation.
 
@@ -51,6 +54,7 @@ class AutoJobCreationStorageMixin:
         move the file, insert the job/event, and advance the sequence together.
         """
         node_name = self.validate_node_name(node_name)
+        self.validate_job_receiver_shape(node_name, expected_shape=expected_shape)
         provisional = Job(
             job_id=1,
             node_name=node_name,
@@ -104,24 +108,40 @@ class AutoJobCreationStorageMixin:
             parent_event_job_id=parent_event_job_id,
             parent_event_data=parent_event_data,
             producer_execution_id=producer_execution_id,
+            expected_shape=expected_shape,
         )
 
+        future = None
         try:
-            created, job_id = self.submit_grouped_db_mutation(
+            future = self.submit_grouped_db_mutation(
                 ("auto-job-publish",),
                 publish,
                 self._apply_auto_job_publishes,
+                wait=False,
                 priority=0,
                 collect_seconds=0.001,
             )
-        except BaseException:
+            created, job_id = future.result()
+        except BaseException as error:
+            # Drain an interrupted waiter before deciding whether payloads can
+            # be removed. The queued writer may still commit that exact job.
+            if future is not None:
+                while not future.done():
+                    try:
+                        future.result()
+                    except BaseException:
+                        pass
             if publish.published_dir is not None:
-                shutil.rmtree(publish.published_dir, ignore_errors=True)
+                self.discard_prepared_jobs([Job(
+                    node_name=node_name, job_id=int(publish.published_dir.name), params=provisional.params,
+                )], publication_error=error)
             raise
         finally:
             self.remove_if_exists(staging_input)
 
         if created:
+            if publish.arrival_identity is not None:
+                self._component_arrival_latches[node_name] = publish.arrival_identity
             self.notify_queue_change(node_name)
             return Job(
                 job_id=job_id,
@@ -217,19 +237,20 @@ class AutoJobCreationStorageMixin:
                     )
             next_ids[node_name] = next_job_id
 
-        published: list[Path] = []
+        published: list[AutoJobPublish] = []
         try:
             for item, job_id in pending:
                 item_node = item.provisional.node_name
-                final_dir = self.job_dir(item_node, job_id)
+                final_dir = self.job_base_dir(item_node, job_id)
+                final_dir.mkdir(exist_ok=False)
+                item.published_dir = final_dir
+                published.append(item)
                 final_input = self.input_file(item_node, job_id)
                 self.retry_fs(
                     lambda source=item.staging_input, target=final_input: os.replace(
                         source, target
                     )
                 )
-                item.published_dir = final_dir
-                published.append(final_dir)
 
             if pending:
                 connection.executemany(
@@ -249,6 +270,10 @@ class AutoJobCreationStorageMixin:
                 for item, job_id in pending:
                     self._record_job_producer(
                         connection, item.provisional.node_name, job_id, item.producer_execution_id,
+                    )
+                for item, job_id in pending:
+                    item.arrival_identity = self._mark_component_job_arrival(
+                        connection, item.provisional.node_name, job_id, expected_shape=item.expected_shape,
                     )
                 self.insert_job_created_events(
                     connection,
@@ -329,9 +354,17 @@ class AutoJobCreationStorageMixin:
                     "VALUES(?, ?, ?, ?, ?)",
                     parent_events,
                 )
-        except BaseException:
-            for path in published:
-                shutil.rmtree(path, ignore_errors=True)
+        except BaseException as error:
+            for item in published:
+                try:
+                    shutil.rmtree(item.published_dir)
+                except BaseException as cleanup_error:
+                    error.__notes__ = [*getattr(error, '__notes__', ()),
+                                      f'Auto job input cleanup failed: {cleanup_error}']
+                else:
+                    # Releasing this address ends our ownership. The failed
+                    # caller must not later clean a newly prepared replacement.
+                    item.published_dir = None
             raise
         if any(outcome is None for outcome in outcomes):
             raise RuntimeError("auto-job publish group lost an outcome")

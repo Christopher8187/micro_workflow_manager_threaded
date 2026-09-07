@@ -7,6 +7,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -17,14 +18,7 @@ class JobBatchStorageMixin:
     """Prepared and bulk job creation."""
 
     def prepare_jobs_batch(self, jobs: list[Job]) -> list[Path]:
-        """Write unpublished job inputs outside the registration lock.
-
-        Reserved auto IDs are unique and the jobs are not query-visible until
-        the later SQLite commit. Their first ``input.json`` therefore does not
-        need the temporary-file-plus-replace sequence used when overwriting a
-        visible file. A direct exclusive create removes one open and one rename
-        from every routed job, which is significant on Windows.
-        """
+        """Claim unpublished job directories and write their inputs before SQL."""
         if not jobs:
             return []
         node_names = {job.node_name for job in jobs}
@@ -36,9 +30,14 @@ class JobBatchStorageMixin:
         for job in jobs:
             self.json_text(Path("input.json"), job.params)
 
-        written_dirs = [self.job_dir(job.node_name, job.job_id) for job in jobs]
+        written_dirs = [self.job_base_dir(job.node_name, job.job_id) for job in jobs]
+        prepared_jobs = []
+        prepared_lock = Lock()
 
         def write_job_payload(job: Job) -> None:
+            self.job_base_dir(job.node_name, job.job_id).mkdir(exist_ok=False)
+            with prepared_lock:
+                prepared_jobs.append(job)
             input_path = self.input_file(job.node_name, job.job_id)
             input_text = self.json_text(input_path, job.params)
 
@@ -62,15 +61,44 @@ class JobBatchStorageMixin:
                     thread_name_prefix="mwf-job-publish",
                 ) as executor:
                     list(executor.map(write_job_payload, jobs))
-        except BaseException:
-            for job_dir in written_dirs:
-                shutil.rmtree(job_dir, ignore_errors=True)
+        except BaseException as error:
+            self.discard_prepared_jobs(prepared_jobs, publication_error=error)
             raise
         return written_dirs
 
-    def discard_prepared_jobs(self, jobs: list[Job]) -> None:
+    def discard_prepared_jobs(self, jobs: list[Job], *, publication_error: BaseException | None = None) -> None:
+        try:
+            self._discard_unregistered_job_inputs(jobs)
+        except BaseException as cleanup_error:
+            if publication_error is None:
+                raise
+            publication_error.__notes__ = [
+                *getattr(publication_error, '__notes__', ()),
+                f'Job publication retained prepared files because cleanup failed: {cleanup_error}',
+            ]
+
+    def _discard_unregistered_job_inputs(self, jobs):
+        by_node = {}
         for job in jobs:
-            shutil.rmtree(self.job_base_dir(job.node_name, job.job_id), ignore_errors=True)
+            by_node.setdefault(job.node_name, []).append(job.job_id)
+        for node_name, job_ids in by_node.items():
+            # A failed caller can observe a successful COMMIT followed by a
+            # notification error. Protect any live job, including a replacement
+            # at the same numeric address. Serialize with explicit publishers
+            # and the SQLite writer while deciding which directories are unused.
+            with self.interprocess_lock(f'node-{node_name}-jobs'), self._database_write_lock():
+                connection = self._new_db_connection()
+                try:
+                    connection.execute('BEGIN IMMEDIATE')
+                    for job_id in job_ids:
+                        live = connection.execute(
+                            'SELECT 1 FROM jobs WHERE node_name=? AND job_id=?', (node_name, job_id),
+                        ).fetchone()
+                        if live is None:
+                            shutil.rmtree(self.job_base_dir(node_name, job_id), ignore_errors=True)
+                finally:
+                    connection.rollback()
+                    connection.close()
 
     def commit_prepared_jobs_batch(
         self,
@@ -78,6 +106,7 @@ class JobBatchStorageMixin:
         *,
         idempotency_keys: list[str | None] | None = None,
         producer_execution_id: str | None = None,
+        expected_shape: str | None = None,
     ) -> list[Job]:
         """Commit prepared job payloads with one SQLite transaction."""
         if not jobs:
@@ -147,6 +176,9 @@ class JobBatchStorageMixin:
             )
             for job in jobs:
                 self._record_job_producer(connection, job.node_name, job.job_id, producer_execution_id)
+            arrival_identity = self._mark_component_job_arrival(
+                connection, node_name, jobs[0].job_id, expected_shape=expected_shape,
+            )
             self.insert_job_created_events(
                 connection,
                 [
@@ -174,6 +206,8 @@ class JobBatchStorageMixin:
                 "next_job_id=MAX(job_sequences.next_job_id, excluded.next_job_id)",
                 (node_name, max(ids) + 1),
             )
+        if arrival_identity is not None:
+            self._component_arrival_latches[node_name] = arrival_identity
         self.notify_queue_change(node_name)
         return jobs
 
@@ -183,6 +217,7 @@ class JobBatchStorageMixin:
         *,
         idempotency_keys: list[str | None] | None = None,
         producer_execution_id: str | None = None,
+        expected_shape: str | None = None,
     ) -> tuple[list[Job], dict[str, int]]:
         """Atomically resolve idempotency races and commit the remaining jobs."""
         if not jobs:
@@ -205,6 +240,7 @@ class JobBatchStorageMixin:
                 raise ValueError("batch contains duplicate idempotency keys")
             requested[key_hash] = key
 
+        arrival_identity = None
         with self.db_transaction() as connection:
             for job in jobs:
                 self._validate_job_producer(connection, job, producer_execution_id)
@@ -284,6 +320,9 @@ class JobBatchStorageMixin:
                 )
                 for job in commit_jobs:
                     self._record_job_producer(connection, job.node_name, job.job_id, producer_execution_id)
+                arrival_identity = self._mark_component_job_arrival(
+                    connection, node_name, commit_jobs[0].job_id, expected_shape=expected_shape,
+                )
                 self.insert_job_created_events(
                     connection,
                     [
@@ -304,6 +343,8 @@ class JobBatchStorageMixin:
                     (node_name, QUEUED),
                 )
         if commit_jobs:
+            if arrival_identity is not None:
+                self._component_arrival_latches[node_name] = arrival_identity
             self.notify_queue_change(node_name)
         return commit_jobs, existing_by_key
 
@@ -312,22 +353,25 @@ class JobBatchStorageMixin:
         jobs: list[Job],
         *,
         idempotency_keys: list[str | None] | None = None,
+        expected_shape: str | None = None,
     ) -> list[Job]:
         """Prepare and commit many jobs; callers may split the phases for concurrency."""
+        if jobs:
+            self.validate_job_receiver_shape(jobs[0].node_name, expected_shape=expected_shape)
         self.prepare_jobs_batch(jobs)
         try:
             return self.commit_prepared_jobs_batch(
-                jobs, idempotency_keys=idempotency_keys
+                jobs, idempotency_keys=idempotency_keys, expected_shape=expected_shape,
             )
-        except BaseException:
-            self.discard_prepared_jobs(jobs)
+        except BaseException as error:
+            self.discard_prepared_jobs(jobs, publication_error=error)
             raise
 
-    def ensure_job(self, job: Job) -> Job:
+    def ensure_job(self, job: Job, *, expected_shape: str | None = None) -> Job:
         self.validate_job_id(job.job_id)
         self.json_text(Path("input.json"), job.params)
         if not self.job_exists(job.node_name, job.job_id):
-            self.create_job(job)
+            self.create_job(job, expected_shape=expected_shape)
             return job
 
         existing_params = self.read_json(self.input_file(job.node_name, job.job_id), default={})

@@ -77,6 +77,7 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_100_native_advisory_ownership.py` | Exact greenlet lock ownership, nesting across storage instances, independent API locks, copied contexts, helper threads, and protection during commit notification. |
 | `test_101_programmatic_fresh_preparation.py` | Repeated independent full preparation, retained root inputs, queue-only and selected-job preservation, preparation failure restoration, parent preflight, and admission selection checks. |
 | `test_102_component_input_arrivals.py` | Managed-input receiver misalignment, first causes, generation repair, rollback, process contention, local result caching, and damaged-history refusal. |
+| `test_103_component_job_arrivals.py` | Managed-job receiver causes, creator identity, shape refusal, publication rollback, directory ownership, process and grouped races, damaged history, and interrupted waits. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and replacement-runtime isolation after the old checkpoint deadline and stale-write attempt. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished work, missing expected rounds, and repeated-API slowdown beyond the fixed allowance; successful completion and exact allowance equality. |

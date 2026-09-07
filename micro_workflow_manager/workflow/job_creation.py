@@ -105,7 +105,7 @@ class JobCreationMixin:
                     job for job in requested_jobs if job.job_id not in existing_ids
                 ]
                 if missing_jobs:
-                    self.storage.create_jobs_batch(missing_jobs)
+                    self.storage.create_jobs_batch(missing_jobs, expected_shape=self.topology.snapshot().shape_json)
                     changed_any_job = True
 
                 for job in requested_jobs:
@@ -234,6 +234,9 @@ class JobCreationMixin:
                 record_parent_event(existing)
                 return existing
 
+        expected_shape = self.topology.snapshot().shape_json
+        self.storage.validate_job_receiver_shape(to_node, expected_shape=expected_shape)
+
         parent = None
         if from_node is not None:
             parent = {
@@ -242,10 +245,14 @@ class JobCreationMixin:
             }
 
         if job_id is not None:
-            # Explicit IDs retain the cross-process compatibility lock because
-            # their payload path is known before SQLite can reject a collision.
+            # Resolve a key again after serializing explicit-ID publishers.
             with self.storage.interprocess_lock(f"node-{to_node}-jobs"):
                 with node.lock:
+                    if idempotency_key is not None:
+                        existing = self.storage.lookup_idempotent_job(to_node, idempotency_key)
+                        if existing is not None:
+                            record_parent_event(existing)
+                            return existing
                     if self.storage.job_exists(to_node, job_id):
                         raise ValueError(f"Job {to_node}/{job_id} already exists")
                     job = Job(
@@ -256,10 +263,11 @@ class JobCreationMixin:
                         producer_component=producer_component,
                         job_kind=job_kind,
                     )
-                    self.storage.create_job(job, producer_execution_id=_parent_execution_id)
-                    if idempotency_key is not None:
-                        self.storage.record_idempotent_job(to_node, idempotency_key, job_id)
-                    self.storage.set_node_status(to_node, QUEUED)
+                    job = self.storage.create_job(
+                        job, producer_execution_id=_parent_execution_id, expected_shape=expected_shape,
+                        idempotency_key=idempotency_key,
+                    )
+                    job_id = job.job_id
                     record_parent_event(job)
         else:
             # Stage the unpublished input first, then allocate its ID and
@@ -272,6 +280,7 @@ class JobCreationMixin:
                 job_kind=job_kind,
                 idempotency_key=idempotency_key,
                 producer_execution_id=_parent_execution_id,
+                expected_shape=expected_shape,
                 parent_event=(
                     (from_node, _parent_job_id, _parent_event_data)
                     if (
@@ -375,6 +384,9 @@ class JobCreationMixin:
             for index, key in enumerate(idempotency_keys)
             if key is None or key not in existing_by_key
         ]
+        expected_shape = self.topology.snapshot().shape_json
+        if missing_indexes:
+            self.storage.validate_job_receiver_shape(to_node, expected_shape=expected_shape)
         reserved_ids = (
             self.storage.reserve_job_ids(to_node, len(missing_indexes))
             if missing_indexes
@@ -414,12 +426,13 @@ class JobCreationMixin:
                     new_jobs,
                     idempotency_keys=new_keys,
                     producer_execution_id=_parent_execution_id,
+                    expected_shape=expected_shape,
                 )
             )
-        except BaseException:
-            # The transaction did not commit, so every prepared directory is
-            # disposable. Never remove committed payloads during result loading.
-            self.storage.discard_prepared_jobs(new_jobs)
+        except BaseException as error:
+            # A notification can fail after COMMIT. Cleanup preserves live jobs
+            # and retains the original error when its own decision is uncertain.
+            self.storage.discard_prepared_jobs(new_jobs, publication_error=error)
             raise
 
         committed_ids = {job.job_id for job in committed}

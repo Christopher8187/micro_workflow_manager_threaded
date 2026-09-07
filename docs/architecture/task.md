@@ -78,14 +78,18 @@ cannot complete, MWF retains recovery material and refuses further managed
 publication and ownership reads for that receiver. Full crash recovery remains
 under implementation for 0.6.2.
 
-Managed input changes mark done, sampled, or failed receivers misaligned while
-preserving their jobs and output. The same publication decision records one first
+Managed input changes and newly created jobs mark done, sampled, or failed receivers
+misaligned while preserving their established results. The publication decision records one first
 cause per receiving raw node and alignment generation, using the actual changed
-path. Queued and running receivers stay aligned. Repeated arrivals retain the
-first cause; manual filesystem edits trigger no detection. Full fresh preparation
-advances the generation and removes old causes from the current view. Job-arrival
-causes, preparation-driven causes, and public trace integration remain under
-implementation. See [receiver input progress](../plans/0.6.2/receiver-input-misalignment-progress.md).
+path or created job. An arrival does not set misalignment while a receiver is
+queued or running. Repeated arrivals retain the first cause; manual filesystem
+edits trigger no detection. Full fresh preparation
+advances the generation and removes old causes from the current view. Idempotent
+job reuse creates no arrival. Job causes retain the receiving instance even after
+trace clearing, deletion, or numeric ID reuse. Preparation-driven causes and public
+trace integration remain under implementation. See
+[receiver input progress](../plans/0.6.2/receiver-input-misalignment-progress.md) and
+[managed job progress](../plans/0.6.2/managed-job-arrivals-progress.md).
 
 An overwritten or appended path can retain several producing executions.
 Overwriting an existing unowned file also preserves that predecessor in the

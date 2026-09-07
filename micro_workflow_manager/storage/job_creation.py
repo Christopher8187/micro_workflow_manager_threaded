@@ -39,52 +39,40 @@ class JobCreationStorageMixin(AutoJobCreationStorageMixin):
             "created_at": str(row["created_at"]),
         }
 
-    def create_job(self, job: Job, *, producer_execution_id: str | None = None):
+    def create_job(self, job: Job, *, producer_execution_id: str | None = None,
+                   expected_shape: str | None = None, idempotency_key: str | None = None) -> Job:
         self.validate_job_id(job.job_id)
-        self.json_text(Path("input.json"), job.params)
+        input_text = self.json_text(Path("input.json"), job.params)
         if self.job_exists(job.node_name, job.job_id):
             raise ValueError(f"Job {job.node_name}/{job.job_id} already exists")
-
-        job_dir = self.job_dir(job.node_name, job.job_id)
-        input_path = self.input_file(job.node_name, job.job_id)
-        self.atomic_write_json(input_path, job.params)
-        parent_json = self._job_parent_json(job)
-        try:
-            with self.db_transaction() as connection:
-                self._validate_job_producer(connection, job, producer_execution_id)
-                connection.execute(
-                    "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
-                    "VALUES(?, ?, ?, ?, ?, '{}')",
-                    (job.node_name, job.job_id, parent_json, job.created_at, QUEUED),
-                )
-                self._record_job_producer(connection, job.node_name, job.job_id, producer_execution_id)
-        except BaseException:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            raise
-        self.append_job_created_event(
-            job.node_name,
-            job.job_id,
-            status=QUEUED,
-            parent=job.parent,
-            producer_component=list(job.producer_component or ()),
-            job_kind=job.job_kind,
+        self.validate_job_receiver_shape(job.node_name, expected_shape=expected_shape)
+        created, actual_id = self._commit_single_job(
+            job, idempotency_key=idempotency_key, producer_execution_id=producer_execution_id,
+            expected_shape=expected_shape, input_text=input_text,
         )
-        self.advance_job_sequence(job.node_name, job.job_id + 1)
-        self.notify_queue_change(job.node_name)
+        if not created:
+            return self.load_job(job.node_name, actual_id)
+        return job
 
     def commit_prepared_job_resolving_idempotency(
         self,
         job: Job,
         *,
         idempotency_key: str | None = None,
+        producer_execution_id: str | None = None,
+        expected_shape: str | None = None,
     ) -> tuple[bool, int]:
-        """Publish one prepared job through the grouped queue-state writer.
+        """Register an already prepared input through the queue-state writer."""
+        return self._commit_single_job(
+            job, idempotency_key=idempotency_key, producer_execution_id=producer_execution_id,
+            expected_shape=expected_shape,
+        )
 
-        ID reservation happens before payload I/O. This final transaction
-        combines job registration, the created event, idempotency, node queue
-        state, and sequence advancement. Concurrent producers therefore pay one
-        group commit instead of a chain of advisory-lock transactions.
-        """
+    def _commit_single_job(
+        self, job, *, idempotency_key=None, producer_execution_id=None,
+        expected_shape=None, input_text=None,
+    ):
+        """Resolve identity before creating a new input and its durable job."""
         job_id = self.validate_job_id(job.job_id)
         key_hash = (
             self.idempotency_key_hash(idempotency_key)
@@ -104,7 +92,12 @@ class JobCreationStorageMixin(AutoJobCreationStorageMixin):
             separators=(",", ":"),
         )
 
+        arrival_identity = None
+        created_input = None
+
         def publish(connection):
+            nonlocal arrival_identity, created_input
+            self._validate_job_producer(connection, job, producer_execution_id)
             if idempotency_key is not None:
                 row = connection.execute(
                     "SELECT i.key_text, i.job_id FROM idempotency AS i "
@@ -126,10 +119,22 @@ class JobCreationStorageMixin(AutoJobCreationStorageMixin):
             if collision is not None:
                 raise ValueError(f"Job {job.node_name}/{job_id} already exists")
 
+            if input_text is not None:
+                input_directory = self.job_base_dir(job.node_name, job_id)
+                input_directory.mkdir(exist_ok=False)
+                created_input = input_directory
+                input_path = self.input_file(job.node_name, job_id)
+                with input_path.open('x', encoding='utf-8') as file:
+                    file.write(input_text)
+
             connection.execute(
                 "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
                 "VALUES(?, ?, ?, ?, ?, '{}')",
                 (job.node_name, job_id, parent_json, job.created_at, QUEUED),
+            )
+            self._record_job_producer(connection, job.node_name, job_id, producer_execution_id)
+            arrival_identity = self._mark_component_job_arrival(
+                connection, job.node_name, job_id, expected_shape=expected_shape,
             )
             self.insert_job_created_events(
                 connection,
@@ -155,7 +160,34 @@ class JobCreationStorageMixin(AutoJobCreationStorageMixin):
             )
             return True, job_id
 
-        result = self.submit_db_mutation(publish, priority=0)
+        def publish_with_cleanup(connection):
+            nonlocal created_input
+            try:
+                return publish(connection)
+            except BaseException as error:
+                if created_input is not None:
+                    try:
+                        shutil.rmtree(created_input)
+                        created_input = None
+                    except BaseException as cleanup_error:
+                        error.__notes__ = [*getattr(error, '__notes__', ()),
+                                          f'Job input cleanup failed: {cleanup_error}']
+                raise
+
+        future = self.submit_db_mutation(publish_with_cleanup, priority=0, wait=False)
+        try:
+            result = future.result()
+        except BaseException as error:
+            while not future.done():
+                try:
+                    future.result()
+                except BaseException:
+                    pass
+            if created_input is not None:
+                self.discard_prepared_jobs([job], publication_error=error)
+            raise
         if result[0]:
+            if arrival_identity is not None:
+                self._component_arrival_latches[job.node_name] = arrival_identity
             self.notify_queue_change(job.node_name)
         return result

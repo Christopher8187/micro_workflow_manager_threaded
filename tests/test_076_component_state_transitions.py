@@ -57,13 +57,14 @@ def test_sampled_resume_preserves_finished_interrupt_lineage_under_new_main_owne
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         storage.register_component_topology(snapshot)
+        storage.create_job(Job(node_name='A', job_id=1, params={'source': 'prior-input'}))
         _session(storage, 'int-origin', 'interrupt', component)
         assert storage.finish_execution_session(
             'int-origin', outcome='done', finished_at='2026-09-05T12:01:00+00:00',
         ) is True
         origin = storage.get_execution_session('int-origin')
         assert (origin['session_kind'], origin['status']) == ('interrupt', 'terminal')
-        # No completion transition exists yet. Seed its established sampled result.
+        # Seed a native sampled result after its existing job was created.
         assert storage.submit_db_mutation(lambda connection: connection.execute(
             "UPDATE component_states SET lifecycle='sampled', stability='unstable', "
             "instability_origin='int-origin', alignment_generation=7 WHERE component_key=?",
@@ -76,7 +77,6 @@ def test_sampled_resume_preserves_finished_interrupt_lineage_under_new_main_owne
         assert storage.get_component_reservation(component) == {
             'members': component, 'session_id': 'main-resume',
         }
-        storage.create_job(Job(node_name='A', job_id=1, params={'source': 'prior-input'}))
         storage.set_node_status('A', 'done')
         output = storage.node_output_dir('A') / 'established.txt'
         output.write_bytes(b'established output')
@@ -167,13 +167,13 @@ def test_sampled_resume_refuses_invalid_session_ownership_without_mutation(tmp_p
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         storage.register_component_topology(snapshot)
+        storage.create_job(Job(node_name='A', job_id=1, params={'source': 'prior-input'}))
         assert storage.submit_db_mutation(lambda connection: connection.execute(
             "UPDATE component_states SET lifecycle='sampled', stability='stable', "
             "alignment_generation=7 WHERE component_key=?", (encode_component_key(('A',)),),
         ).rowcount) == 1
         _session(storage, 'main-resume', 'main', ('A',))
         assert storage.reserve_execution_components('main-resume', expected_shape=snapshot.shape_json) is True
-        storage.create_job(Job(node_name='A', job_id=1, params={'source': 'prior-input'}))
         actor = 'main-resume'
         if ownership == 'unknown-session':
             actor = 'unknown'
@@ -218,6 +218,7 @@ def test_sampled_resume_requires_current_aligned_sampled_state(
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         storage.register_component_topology(snapshot)
+        storage.create_job(Job(node_name='A', job_id=1, params={'source': 'prior-input'}))
         assert storage.submit_db_mutation(lambda connection: connection.execute(
             'UPDATE component_states SET lifecycle=?, stability=?, misaligned=?, '
             'alignment_generation=? WHERE component_key=?',
@@ -225,7 +226,6 @@ def test_sampled_resume_requires_current_aligned_sampled_state(
         ).rowcount) == 1
         _session(storage, 'main-resume', 'main', ('A',))
         assert storage.reserve_execution_components('main-resume', expected_shape=snapshot.shape_json) is True
-        storage.create_job(Job(node_name='A', job_id=1, params={'source': 'prior-input'}))
         before = _component_rows(storage), _other_rows(storage)
 
         with pytest.raises(RuntimeError, match='aligned sampled component at the expected generation'):
