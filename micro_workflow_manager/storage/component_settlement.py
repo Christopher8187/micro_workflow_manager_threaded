@@ -45,11 +45,13 @@ class ComponentSettlementStorageMixin:
         stability, origin = row['stability'], row['instability_origin']
         if type(ready) is not int or ready not in (0, 1):
             raise RuntimeError('Invalid pending component completion metadata')
-        if (row['execution_kind'] not in ('full', 'jobs')
+        if (row['execution_kind'] not in ('full', 'jobs', 'resume')
                 or row['starting_lifecycle'] not in ('queued', 'sampled', 'done', 'failed')
                 or type(row['starting_misaligned']) is not int or row['starting_misaligned'] not in (0, 1)
                 or (row['execution_kind'] == 'full'
                     and (row['starting_lifecycle'] != 'queued' or row['starting_misaligned'] != 0))
+                or (row['execution_kind'] == 'resume'
+                    and (row['starting_lifecycle'] != 'sampled' or row['starting_misaligned'] != 0))
                 or (row['starting_lifecycle'] == 'queued' and row['starting_misaligned'] != 0)):
             raise RuntimeError('Invalid pending component execution kind or starting state')
         valid = ((stability == 'stable' and origin is None)
@@ -95,7 +97,7 @@ class ComponentSettlementStorageMixin:
                     != (outcome.stability, outcome.instability_origin)):
                 raise RuntimeError('Component completion cannot replace recorded successful lineage')
             state = connection.execute(
-                'SELECT d.component_key, g.shape_json, s.component_key AS state_key, '
+                'SELECT d.component_key, d.shape_id, g.shape_json, s.component_key AS state_key, '
                 's.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, '
                 'origin.session_kind AS origin_kind '
                 'FROM component_definitions d '
@@ -111,6 +113,17 @@ class ComponentSettlementStorageMixin:
                     or state['misaligned'] != pending['starting_misaligned']
                     or state['alignment_generation'] != outcome.expected_alignment_generation):
                 raise RuntimeError('Component settlement requires the expected aligned running state: ' + key)
+            if (pending['execution_kind'] == 'resume'
+                    and (state['stability'], state['instability_origin'])
+                    != (pending['stability'], pending['instability_origin'])):
+                raise RuntimeError('Sampled resume lost its retained successful lineage')
+            if pending['execution_kind'] == 'resume':
+                self._match_component_successful_result(
+                    connection, outcome.component,
+                    (state['shape_id'], outcome.expected_alignment_generation),
+                    ('sampled', pending['stability'], pending['instability_origin']),
+                    require_present=True,
+                )
             if outcome.lifecycle != 'failed':
                 if state['stability'] is not None and (
                     state['stability'], state['instability_origin']

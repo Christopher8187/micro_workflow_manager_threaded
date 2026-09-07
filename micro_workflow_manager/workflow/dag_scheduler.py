@@ -122,7 +122,7 @@ class DagSchedulerMixin(NodeSchedulerMixin):
                     # driver must consume its accepted restart before this DAG
                     # can continue from the published result.
                     return False
-            needs_execution = state['lifecycle'] == 'queued' or any(
+            needs_execution = state['lifecycle'] in {'queued', 'sampled'} or any(
                 self.storage.has_queued_jobs(node_name) for node_name in unit
             )
             return (needs_execution and self.component_ready(set(unit))

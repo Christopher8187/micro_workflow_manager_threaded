@@ -12,6 +12,11 @@ matches Parent Repo
 `603EE27F7E2BCEF75BD25B4F6FB3FB660E8EFA8F77BB98DA3F3D97DB096748CC`.
 None of these nine questions remains open within its recorded scope.
 
+Christopher settled [Q10](#q10-dynamic-component-discovery-during-admitted-execution)
+on 2026-09-07: merging components during an admitted run is unsupported and
+assumed not to occur. The autostart redesign is deferred to approximately
+0.6.4. Q10 is no longer an unanswered 0.6.2 architecture blocker.
+
 These decisions supplement
 [Implement and verify the agreed MWF 0.6.2 workflow-management changes](https://github.com/Christopher8187/product/issues/45).
 Decision approval does not implement behavior, satisfy verification, or accept
@@ -381,24 +386,34 @@ alone never clears operational ownership.
 
 ## Q10: Dynamic component discovery during admitted execution
 
-Status: awaiting Christopher's decision. The preceding nine approved answers
-remain settled.
+**Status: settled by Christopher, 2026-09-07.** The intended cycle is to change
+code, run it, then change code again. Component merging during an admitted run
+is unsupported and assumed not to occur. If job-scoped programmatic autostart
+discovers a relationship that would merge active components, treat that case
+as unsupported project misuse or a limitation of the existing autostart API,
+not as a supported behavior that 0.6.2 must implement.
 
-A running task can discover an autostart relationship that merges components
-after a session has captured its graph, reserved scope, and assigned claims.
-AQ3 permits dynamic relationships and requires the actual producing graph and
-membership to remain historical authority. The membership rules require fresh
-preparation for changed membership with reusable history, and automatic
-reconciliation without reusable work. They do not specify how discovery changes
-already active claims and reservations.
+Christopher intends a later redesign toward node-scoped programmatic autostart
+initialized explicitly in code, approximately in 0.6.4. This is future scope,
+not a requirement to redesign autostart or add a new declaration API in 0.6.2.
 
-Root's recommendation, presented for decision, is to refuse the triggering
-operation, retain the discovered relationship and existing work, and apply the
-settled membership rules before the next admission. The alternative is live
-component merging, which needs additional rules for active jobs and sessions.
-Neither behavior is implemented on the strength of this recommendation.
+The earlier recommendation to retain a runtime discovery, refuse its triggering
+operation, and reconcile that discovery before a later admission was not
+approved. Neither that mechanism nor live merging is required by this answer.
+Do not add special discovery retention, automatic retry/reconciliation, active
+claim relabelling, reservation expansion, or a new recovery scheme for this
+unsupported case merely to close Q10. Do not claim graceful handling that has
+not been implemented. Existing guards may still refuse unsupported changes.
 
-Known-shape programmatic ownership, predeclared autostarts, and top-level
-autostart without a newly discovered relationship remain independent.
-Do not impose a declaration-only requirement or silently relabel existing
-claims while this decision is pending.
+This decision supersedes the earlier pending-Q10 restrictions and any reading
+of AQ3 that requires supporting component merging during an admitted run.
+The actual producing graph and membership remain historical authority. The
+already agreed membership-change rules for code changes between runs remain
+applicable; this decision does not cancel their implementation or verification.
+Known-shape autostarts and supported job creation within admitted membership
+remain in scope. Q10 no longer blocks independent or dependent 0.6.2 work on
+the assumption of a fixed admitted membership.
+
+Source: Christopher's explicit answer in the monitoring conversation on
+2026-09-07, followed by his explicit request to relay it to the implementation
+task. Earlier reviews that call Q10 undecided are historical on this point.

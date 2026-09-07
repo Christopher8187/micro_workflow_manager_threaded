@@ -390,12 +390,11 @@ Use `mwf <command> --help` for syntax and `mwf --describe <command>` for a longe
 explanation. Every executable command has both forms, including `copy`, `paste`,
 `filter`, and `top`.
 
-Current bootstrap behavior matters when interpreting observational commands and
-previews. Before most commands, MWF may migrate an older runtime layout. Commands
-that mount routers may also refresh schemas or create declared starter jobs.
-Only `engine` and `migrate --dry-run` bypass those bootstrap paths. A preview or
-observational command still avoids running jobs or applying its advertised
-mutation; it is not a promise that no framework-owned byte changes.
+Run and resume `--plan` paths, reset and recover `--dry-run` paths, and empty
+samples observe native project state before runtime initialization. They do not
+import user code, mount routers, create jobs, reserve sessions, or change durable
+project data. Execution commands can mount routers and create their declared jobs.
+`graph --dry-run` has its own graph-loading path.
 
 | Intent | Commands | Current behavior |
 | --- | --- | --- |
@@ -406,18 +405,34 @@ mutation; it is not a promise that no framework-owned byte changes.
 | Control a live sequence | `restart`, `threads` | Fence selected active jobs or change run-scoped concurrency without starting another scheduler. |
 | Prepare a rerun | `reset`, `resetfrom` | Fresh preparation without task execution, with component-aware scope. |
 | Preserve node state | `copy`, `paste` | Save or restore a node tree with its SQLite node snapshot. |
-| Maintain state and deployment | `recover`, `migrate`, `deploy` | Recover a dead owner, update MWF-owned metadata, or build and transfer a filtered archive. |
+| Maintain state and deployment | `recover`, `deploy` | Recover a dead owner or build and transfer a filtered archive. |
 
 `run NODE` selects NODE's Hoeflein component. Explicit `job` or `jobs` selection
-is supported for a singleton node. Deterministic `sample COUNT` runs are designed
-to isolate a SHA-256-ranked subset. Current tests establish deterministic
-selection, preservation of unselected work, and planning that does not apply the
-sample run. They do not yet establish routed-descendant or component-circulation
-isolation. Use `--plan` and `--expect-population` to review and guard a sample.
+runs the addressed roots and their newly created causal work inside that
+component. Unrelated existing jobs remain unselected. Publications to other
+components are allowed; those receivers do not enter execution.
+
+Sampling accepts a count or percentage, such as `mwf run A sample 5` or
+`mwf run A sample 25%`. Percentages round up after the optional `--status`
+filter. Named assignments, such as `sample A=25% B=50%`, select members of the
+same component. Use counts or percentages consistently; omitted members receive
+zero roots. A zero selection is read-only and creates no execution session.
+
+The sample plan prints its seed, selected job IDs, population and input digests,
+and a replay command. Use `--plan` to inspect it, then pass its printed
+`--expect-population` value to refuse changed eligible work or inputs before
+preparation. A status change that leaves a job outside the filter does not
+invalidate that guard. Sampled execution retains its exact selection and native ownership in
+the session history and uses the same causal execution rules as explicit jobs.
 
 `resume` and `resumefrom` preserve successful work. They reconcile terminal
 `output.json` records before requeueing eligible unsuccessful work. Use them
-after a partial failure when completed jobs should remain completed.
+after a partial failure when completed jobs should remain completed. An aligned
+sampled component keeps its established lineage while the remaining work runs.
+It becomes done when all remaining eligible work succeeds and no unprocessed
+work remains. A failed resumed attempt retains the prior sampled result
+for repair. Incompatible parent lineage or conflicting retained history refuses
+before preparation; misaligned sampled work requires fresh preparation.
 
 `restart` is a second-terminal control for an active sequence. It advances the
 execution generation of selected running or failed jobs and leaves the original

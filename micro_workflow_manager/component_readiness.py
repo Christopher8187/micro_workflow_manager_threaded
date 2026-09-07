@@ -45,3 +45,22 @@ def calculate_component_readiness(
     if blocked:
         return blocked_result
     return result if result is not None else ('stable', None, False)
+
+
+def calculate_sampled_resume_lineage(
+    stability: str | None,
+    instability_origin: str | None,
+    parent_readiness: tuple[str, str | None, bool],
+) -> tuple[str, str | None] | None:
+    """Retain an established sampled result when current parents remain compatible."""
+    retained = stability, instability_origin
+    if not (
+        retained == ('stable', None)
+        or (stability == 'unstable'
+            and isinstance(instability_origin, str)
+            and bool(instability_origin))
+    ):
+        raise ValueError('invalid sampled component result')
+    if parent_readiness[0] == 'unstable' and retained != parent_readiness[:2]:
+        return None
+    return retained

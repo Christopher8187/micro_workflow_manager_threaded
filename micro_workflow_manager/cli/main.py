@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import secrets
 import sys
 
 from micro_workflow_manager.project_format import read_native_project_config
@@ -16,6 +15,7 @@ from .inspect import inspect_command
 from .trace import trace_command
 from .layout import ensure_runtime_layout
 from .recovery import recover_command
+from .recovery_preview import print_recovery_preview
 from .graph_utils import component_topological_nodes
 from .jobs import selected_job_ids_from_args
 from .monitoring import monitor_command
@@ -27,8 +27,8 @@ from .project import init_project, load_workflow, setup_graph
 from .restart import restart_active_jobs, restart_active_scope
 from .threads import threads_command, update_declared_threads
 from .deploy import deploy_command
-from .run import resume_from, resume_node, run_from, run_node, run_sampled_jobs, run_selected_jobs
-from .sampling import parse_sample_count, parse_sample_statuses, plan_sample, print_sample_plan
+from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs
+from .sampling import sample_command
 from .validation import require_node
 from .node_clipboard import copy_node_to_clipboard, paste_node_from_clipboard
 from .resource_limits import raise_open_file_limit
@@ -59,11 +59,13 @@ def main(argv: list[str] | None = None) -> int:
         # layout migration, SQLite initialization, or user graph imports.
         if args.command == "engine":
             return engine_command(root)
+        if args.command == "run" and args.job_mode == "sample":
+            return sample_command(root, args)
         read_only_plan = (
             args.command in {"run", "runfrom", "resume", "resumefrom"}
-            and args.plan and getattr(args, "job_mode", None) != "sample"
+            and args.plan
         ) or (
-            args.command in {"reset", "resetfrom"} and args.dry_run
+            args.command in {"reset", "resetfrom", "recover"} and args.dry_run
         )
         if not read_only_plan:
             ensure_runtime_layout(root)
@@ -113,6 +115,10 @@ def main(argv: list[str] | None = None) -> int:
             return doctor_command(root)
 
         workflow = load_preview(root) if read_only_plan else load_workflow(root, args.runner)
+        if read_only_plan:
+            recovery_result = print_recovery_preview(workflow, quiet_if_empty=args.command != "recover")
+            if args.command == "recover":
+                return recovery_result
 
         if args.command == "recover":
             return recover_command(root, workflow, dry_run=args.dry_run)
@@ -194,35 +200,6 @@ def main(argv: list[str] | None = None) -> int:
         require_node(workflow, node)
 
         if args.command == "run":
-            if args.job_mode == "sample":
-                count = parse_sample_count(args.job_specs)
-                statuses = parse_sample_statuses(args.sample_status)
-                seed = args.seed or secrets.token_hex(16)
-                if args.plan:
-                    plan = plan_sample(
-                        workflow,
-                        node,
-                        count,
-                        seed=seed,
-                        statuses=statuses,
-                        expected_population=args.expect_population,
-                    )
-                    print_sample_plan(plan)
-                    return 0
-                return run_sampled_jobs(
-                    root,
-                    workflow,
-                    node,
-                    count,
-                    seed=seed,
-                    statuses=statuses,
-                    expected_population=args.expect_population,
-                    stats=args.stats,
-                    stats_interval=args.stats_interval,
-                    monitor=args.monitor,
-                    monitor_interval=args.monitor_interval,
-                    keep_trace=args.keeptrace,
-                )
             if args.seed is not None or args.sample_status is not None or args.expect_population is not None:
                 raise RuntimeError("--seed, --status, and --expect-population require: mwf run <node> sample <count>")
             job_ids = selected_job_ids_from_args(args.job_mode, args.job_specs)

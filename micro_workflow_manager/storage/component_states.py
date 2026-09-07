@@ -171,6 +171,30 @@ class ComponentStateStorageMixin(
         expected_alignment_generation: int, successful_lineage, expected_parent_states=None, task_parent=None,
     ) -> bool:
         """Start one aligned queued component while its selected session owns it."""
+        return self._begin_component_execution(
+            session_id, component, expected_shape=expected_shape,
+            expected_alignment_generation=expected_alignment_generation,
+            successful_lineage=successful_lineage, expected_parent_states=expected_parent_states,
+            task_parent=task_parent, starting_lifecycle='queued',
+        )
+
+    def begin_sampled_component_execution(
+        self, session_id: str, component, *, expected_shape: str,
+        expected_alignment_generation: int, successful_lineage, expected_parent_states=None, task_parent=None,
+    ) -> bool:
+        """Resume one aligned sampled component while retaining its successful lineage."""
+        return self._begin_component_execution(
+            session_id, component, expected_shape=expected_shape,
+            expected_alignment_generation=expected_alignment_generation,
+            successful_lineage=successful_lineage, expected_parent_states=expected_parent_states,
+            task_parent=task_parent, starting_lifecycle='sampled',
+        )
+
+    def _begin_component_execution(
+        self, session_id: str, component, *, expected_shape: str,
+        expected_alignment_generation: int, successful_lineage, expected_parent_states, task_parent,
+        starting_lifecycle: str,
+    ) -> bool:
         self._require_execution_session_storage()
         self._session_text(session_id, 'session_id')
         self._session_text(expected_shape, 'expected_shape')
@@ -191,7 +215,8 @@ class ComponentStateStorageMixin(
         def begin(connection):
             self._validate_component_task_parent(connection, session_id, task_parent)
             owner = connection.execute(
-                'SELECT session.status, reservation.session_id AS owner, selected.component_key AS selected_key '
+                'SELECT session.status, session.command, reservation.session_id AS owner, '
+                'selected.component_key AS selected_key '
                 'FROM execution_sessions AS session '
                 'LEFT JOIN component_reservations AS reservation ON reservation.component_key=? '
                 'LEFT JOIN session_components AS selected '
@@ -204,8 +229,11 @@ class ComponentStateStorageMixin(
                 raise RuntimeError('Component start requires the exact component reservation: ' + key)
             if owner['selected_key'] is None:
                 raise RuntimeError('Component is outside the session selected scope: ' + key)
+            if (starting_lifecycle == 'sampled'
+                    and owner['command'] not in ('resume', 'resumefrom')):
+                raise RuntimeError('Sampled component execution requires a resume session')
             state = connection.execute(
-                'SELECT d.component_key, g.shape_json, s.component_key AS state_key, '
+                'SELECT d.component_key, d.shape_id, g.shape_json, s.component_key AS state_key, '
                 's.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, '
                 'origin.session_kind AS origin_kind '
                 'FROM component_definitions d '
@@ -236,32 +264,50 @@ class ComponentStateStorageMixin(
                     raise RuntimeError('Nested component execution has no matching recorded start')
                 self._validate_pending_component_row(connection, pending)
                 return False
-            if (state['lifecycle'] != 'queued' or state['misaligned'] != 0
+            if (state['lifecycle'] != starting_lifecycle or state['misaligned'] != 0
                     or state['alignment_generation'] != expected_alignment_generation):
-                raise RuntimeError('Start requires an aligned queued component at the expected generation')
+                raise RuntimeError(
+                    f'Start requires an aligned {starting_lifecycle} component at the expected generation'
+                )
             if proposal is None:
                 raise ValueError('Component start requires its calculated successful lineage')
+            retained_lineage = (state['stability'], state['instability_origin'])
+            if (starting_lifecycle == 'queued' and retained_lineage != (None, None)):
+                raise RuntimeError('Queued component start cannot retain successful lineage')
+            if (starting_lifecycle == 'sampled'
+                    and retained_lineage != (proposal.stability, proposal.instability_origin)):
+                raise RuntimeError('Sampled resume cannot replace retained successful lineage')
+            execution_kind = 'resume' if starting_lifecycle == 'sampled' else 'full'
             self._validate_pending_component_row(connection, {
                 'completion_ready': 0, 'stability': proposal.stability,
                 'instability_origin': proposal.instability_origin,
-                'execution_kind': 'full', 'starting_lifecycle': 'queued', 'starting_misaligned': 0,
+                'execution_kind': execution_kind, 'starting_lifecycle': starting_lifecycle,
+                'starting_misaligned': 0,
             })
+            if starting_lifecycle == 'sampled':
+                self._match_component_successful_result(
+                    connection, proposal.component, (state['shape_id'], state['alignment_generation']),
+                    ('sampled', *retained_lineage), record_missing=True,
+                )
             for parent, observed in parents.items():
                 if self._read_component_state(connection, parent) != observed:
                     raise RuntimeError('Component parent changed before start: ' + encode_component_key(parent))
             changed = connection.execute(
                 "UPDATE component_states SET lifecycle='running' "
-                "WHERE component_key=? AND lifecycle='queued' AND misaligned=0 AND alignment_generation=? "
-                "AND stability IS NULL AND instability_origin IS NULL",
-                (key, expected_alignment_generation),
+                "WHERE component_key=? AND lifecycle=? AND misaligned=0 AND alignment_generation=? "
+                "AND stability IS ? AND instability_origin IS ?",
+                (key, starting_lifecycle, expected_alignment_generation, *retained_lineage),
             ).rowcount
             if changed != 1:
                 raise RuntimeError('Component changed before start: ' + key)
             recorded = connection.execute(
                 'INSERT INTO pending_component_executions '
-                '(session_id, component_key, shape_id, alignment_generation, stability, instability_origin) '
-                'SELECT ?, component_key, shape_id, ?, ?, ? FROM component_definitions WHERE component_key=?',
-                (session_id, expected_alignment_generation, proposal.stability, proposal.instability_origin, key),
+                '(session_id, component_key, shape_id, alignment_generation, stability, instability_origin, '
+                'execution_kind, starting_lifecycle, starting_misaligned) '
+                'SELECT ?, component_key, shape_id, ?, ?, ?, ?, ?, 0 '
+                'FROM component_definitions WHERE component_key=?',
+                (session_id, expected_alignment_generation, proposal.stability, proposal.instability_origin,
+                 execution_kind, starting_lifecycle, key),
             ).rowcount
             if recorded != 1:
                 raise RuntimeError('Component start was not recorded: ' + key)

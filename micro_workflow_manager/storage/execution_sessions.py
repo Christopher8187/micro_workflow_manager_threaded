@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
 from datetime import datetime
 
 from micro_workflow_manager.session_liveness import execution_session_liveness
 from .session_selection import SessionSelectionStorageMixin
+from .session_admission import SessionAdmissionStorageMixin
 from micro_workflow_manager.component_identity import component_key, decode_component_key, encode_component_key
 
 
@@ -13,7 +13,7 @@ class ExecutionSessionHasActiveJobs(RuntimeError):
     """Joined work still has unsettled active claims in its owned scope."""
 
 
-class ExecutionSessionStorageMixin(SessionSelectionStorageMixin):
+class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissionStorageMixin):
     """Persist exact execution-session records in SQLite."""
 
     def _require_execution_session_storage(self) -> None:
@@ -40,94 +40,6 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin):
             raise ValueError("A selected component needs member node names")
         return component_key(self.validate_node_name(node) for node in component)
 
-    def create_execution_session(
-        self,
-        session_id: str,
-        *,
-        session_kind: str,
-        command: str,
-        start_component,
-        selected_components,
-        selected_jobs=(),
-        parent_session_id: str | None = None,
-        started_at: str,
-        hostname: str,
-        pid: int,
-        process_identity: str | None,
-        details: dict | None = None,
-    ) -> dict:
-        self._require_execution_session_storage()
-        self._session_text(session_id, "session_id")
-        self._session_text(command, "command")
-        self._session_text(hostname, "hostname")
-        self._session_time(started_at, "started_at")
-        if session_kind not in {"main", "interrupt"}:
-            raise ValueError("session_kind must be main or interrupt")
-        if type(pid) is not int or pid < 1:
-            raise ValueError("pid must be a positive integer")
-        if process_identity is not None:
-            self._session_text(process_identity, "process_identity")
-        if parent_session_id is not None:
-            self._session_text(parent_session_id, "parent_session_id")
-            if session_kind != "interrupt" or parent_session_id == session_id:
-                raise ValueError("An interrupt session must have a distinct parent")
-        if details is not None and not isinstance(details, dict):
-            raise ValueError("Session details must be an object")
-        if not isinstance(selected_components, Sequence) or isinstance(selected_components, (str, bytes)):
-            raise ValueError("Selected components must be an ordered sequence")
-        if not isinstance(selected_jobs, Sequence) or isinstance(selected_jobs, (str, bytes)):
-            raise ValueError("Selected jobs must be an ordered sequence")
-        start_component = self._session_component(start_component)
-        component_keys = [self._session_component(component) for component in selected_components]
-        if start_component not in component_keys:
-            raise ValueError("The starting component must be selected")
-        nodes = set()
-        for component in component_keys:
-            if nodes.intersection(component):
-                raise ValueError("Selected components must not overlap")
-            nodes.update(component)
-        jobs = []
-        for node, job_id in selected_jobs:
-            node = self.validate_node_name(node)
-            job_id = self.validate_job_id(job_id)
-            if node not in nodes:
-                raise ValueError("Selected jobs must belong to selected components")
-            jobs.append((node, job_id))
-        components = [encode_component_key(component) for component in component_keys]
-
-        def create(connection):
-            job_roots = []
-            for position, (node, job_id) in enumerate(jobs):
-                observed = self._read_job_owner_observation(connection, node, job_id)
-                if observed is None:
-                    raise RuntimeError(f'Selected job does not exist at session admission: {node}/{job_id}')
-                job_roots.append((session_id, position, node, job_id, observed['job_instance_id']))
-            selection_kind = 'jobs' if job_roots else 'components'
-            connection.execute(
-                "INSERT INTO execution_sessions("
-                "session_id, session_kind, parent_session_id, command, selection_kind, start_component, "
-                "status, started_at, heartbeat_at, hostname, pid, process_identity, details_json) "
-                "VALUES(?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
-                (session_id, session_kind, parent_session_id, command, selection_kind,
-                 encode_component_key(start_component), started_at, started_at,
-                 hostname, pid, process_identity, json.dumps(details or {})),
-            )
-            connection.executemany(
-                "INSERT INTO session_components(session_id, position, component_key) VALUES(?, ?, ?)",
-                [(session_id, position, component) for position, component in enumerate(components)],
-            )
-            recorded = connection.executemany(
-                "INSERT INTO session_jobs(session_id, position, node_name, job_id, job_instance_id) "
-                "VALUES(?, ?, ?, ?, ?)", job_roots,
-            ).rowcount
-            if recorded != len(job_roots):
-                raise RuntimeError('Session admission did not record every selected job instance')
-            row = connection.execute(
-                'SELECT * FROM execution_sessions WHERE session_id=?', (session_id,),
-            ).fetchone()
-            return self._execution_session_from_row(connection, row)
-
-        return self.submit_db_mutation(create, wait=True, priority=0)
 
     def heartbeat_execution_session(self, session_id: str, heartbeat_at: str) -> bool:
         self._require_execution_session_storage()

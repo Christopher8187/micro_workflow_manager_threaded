@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import networkx as nx
 
-from ..component_readiness import calculate_component_readiness
+from ..component_readiness import calculate_component_readiness, calculate_sampled_resume_lineage
 from ..errors import InvalidGraphError
 from ..storage.component_states import ComponentTerminalOutcome
 from ..topology import ComponentTopology
@@ -60,16 +60,26 @@ class ComponentStateMixin:
         )
         if readiness is None:
             raise InvalidGraphError(f'Hoeflein component {list(component)} is not ready yet')
-        self.storage.begin_queued_component_execution(
+        successful_lineage = readiness[:2]
+        begin = self.storage.begin_queued_component_execution
+        if state['lifecycle'] == 'sampled':
+            successful_lineage = calculate_sampled_resume_lineage(
+                state['stability'], state['instability_origin'], readiness,
+            )
+            if successful_lineage is None:
+                raise InvalidGraphError(
+                    f'Hoeflein component {list(component)} has an incompatible sampled result'
+                )
+            begin = self.storage.begin_sampled_component_execution
+        begin(
             session_id, component, expected_shape=expected_shape,
             expected_alignment_generation=state['alignment_generation'],
             expected_parent_states=observations,
-            successful_lineage=(readiness[0], readiness[1]),
-            task_parent=task_parent,
+            successful_lineage=successful_lineage, task_parent=task_parent,
         )
         return ComponentTerminalOutcome(
             component, expected_shape, state['alignment_generation'],
-            'done', readiness[0], readiness[1],
+            'done', *successful_lineage,
         )
 
     def set_autostart_edges(self, edges) -> None:

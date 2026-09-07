@@ -14,48 +14,55 @@ class ComponentReservationConflict(RuntimeError):
 class ComponentReservationStorageMixin:
     """Reserve the exact selected component scope retained by a session."""
 
-    def reserve_execution_components(self, session_id: str, *, expected_shape: str) -> bool:
+    def reserve_execution_components(
+        self, session_id: str, *, expected_shape: str, _wait: bool = True,
+    ):
         self._require_execution_session_storage()
         self._session_text(session_id, 'session_id')
 
-        def reserve(connection):
-            session = connection.execute(
-                'SELECT status FROM execution_sessions WHERE session_id=?', (session_id,),
-            ).fetchone()
-            if session is None or session['status'] != 'running':
-                raise RuntimeError('Component reservations require an existing running session: ' + session_id)
-            rows = connection.execute(
-                'SELECT selected.component_key, shape.shape_json '
-                'FROM session_components AS selected '
-                'LEFT JOIN component_definitions AS definition USING(component_key) '
-                'LEFT JOIN graph_shapes AS shape USING(shape_id) '
-                'WHERE selected.session_id=? ORDER BY selected.position', (session_id,),
-            ).fetchall()
-            if not rows or any(row['shape_json'] != expected_shape for row in rows):
-                raise RuntimeError('Session scope does not match registered components in the expected graph shape')
-            selected_nodes = {node for row in rows for node in decode_component_key(row['component_key'])}
-            for node in sorted(selected_nodes):
-                refuse_receiver_mutation(connection, node)
-            reservations = connection.execute(
-                'SELECT component_key, session_id FROM component_reservations ORDER BY component_key',
-            ).fetchall()
-            conflicts = [(decode_component_key(row['component_key']), row['session_id'])
-                         for row in reservations if row['session_id'] != session_id
-                         and selected_nodes.intersection(decode_component_key(row['component_key']))]
-            if conflicts:
-                raise ComponentReservationConflict(conflicts)
-            owned_keys = {row['component_key'] for row in reservations if row['session_id'] == session_id}
-            if owned_keys == {row['component_key'] for row in rows}:
-                return False
-            if owned_keys:
-                raise RuntimeError('Session has a damaged partial reservation: ' + session_id)
-            connection.executemany(
-                'INSERT INTO component_reservations(component_key, session_id) VALUES(?, ?)',
-                [(row['component_key'], session_id) for row in rows],
-            )
-            return True
+        return self.submit_db_mutation(
+            lambda connection: self._reserve_execution_components(connection, session_id, expected_shape),
+            wait=_wait, priority=0,
+        )
 
-        return self.submit_db_mutation(reserve, wait=True, priority=0)
+    def _reserve_execution_components(self, connection, session_id, expected_shape):
+        session = connection.execute(
+            'SELECT status FROM execution_sessions WHERE session_id=?', (session_id,),
+        ).fetchone()
+        if session is None or session['status'] != 'running':
+            raise RuntimeError('Component reservations require an existing running session: ' + session_id)
+        rows = connection.execute(
+            'SELECT selected.component_key, shape.shape_json '
+            'FROM session_components AS selected '
+            'LEFT JOIN component_definitions AS definition USING(component_key) '
+            'LEFT JOIN graph_shapes AS shape USING(shape_id) '
+            'WHERE selected.session_id=? ORDER BY selected.position', (session_id,),
+        ).fetchall()
+        if not rows or any(row['shape_json'] != expected_shape for row in rows):
+            raise RuntimeError('Session scope does not match registered components in the expected graph shape')
+        selected_nodes = {node for row in rows for node in decode_component_key(row['component_key'])}
+        for node in sorted(selected_nodes):
+            refuse_receiver_mutation(connection, node)
+        reservations = connection.execute(
+            'SELECT component_key, session_id FROM component_reservations ORDER BY component_key',
+        ).fetchall()
+        conflicts = [(decode_component_key(row['component_key']), row['session_id'])
+                     for row in reservations if row['session_id'] != session_id
+                     and selected_nodes.intersection(decode_component_key(row['component_key']))]
+        if conflicts:
+            raise ComponentReservationConflict(conflicts)
+        owned_keys = {row['component_key'] for row in reservations if row['session_id'] == session_id}
+        if owned_keys == {row['component_key'] for row in rows}:
+            return False
+        if owned_keys:
+            raise RuntimeError('Session has a damaged partial reservation: ' + session_id)
+        inserted = connection.executemany(
+            'INSERT INTO component_reservations(component_key, session_id) VALUES(?, ?)',
+            [(row['component_key'], session_id) for row in rows],
+        ).rowcount
+        if inserted != len(rows):
+            raise RuntimeError('Component reservation was not recorded completely')
+        return True
 
     def get_component_reservation(self, component) -> dict | None:
         self._require_execution_session_storage()

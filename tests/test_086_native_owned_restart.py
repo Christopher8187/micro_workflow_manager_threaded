@@ -1422,8 +1422,8 @@ NodeExecutionGroup._prepare_replacements = pause_after_absent_successor
         assert session['status'] == 'running'
         assert session['selected_jobs'] == [('A', 1), ('A', 2)]
         if mode == 'sample':
-            assert session['details']['selection']['population_count'] == 2
-            assert session['details']['selection']['selected_job_ids'] == [1, 2]
+            assert session['details']['selection']['members']['A']['population_count'] == 2
+            assert session['details']['selection']['members']['A']['selected_job_ids'] == [1, 2]
         peer_output = storage.output_file('A', 1).read_bytes()
         peer_events = storage.read_job_events('A', 1)
         restart = subprocess.run(
@@ -1436,7 +1436,7 @@ NodeExecutionGroup._prepare_replacements = pause_after_absent_successor
         assert process.returncode == 0, stdout + stderr
         label = 'sample jobs' if mode == 'sample' else 'jobs'
         assert stdout.count(f'Ran {label} for A:') == 1
-        assert stdout.endswith(f'Ran {label} for A:\n  1\n  2\n')
+        assert stdout.endswith(f'Ran {label} for A:\n  A/1\n  A/2\n')
         assert storage.output_file('A', 1).read_bytes() == peer_output
         assert storage.read_job_events('A', 1) == peer_events
         assert [storage.get_job_status('A', n) for n in (1, 2, 3)] == [

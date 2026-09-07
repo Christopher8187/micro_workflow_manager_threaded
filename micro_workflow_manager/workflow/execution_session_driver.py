@@ -8,10 +8,11 @@ from micro_workflow_manager.storage.component_states import ComponentExecutionIn
 class ExecutionSessionDriver:
     """Retain an execution operation until its owning session decides to end."""
 
-    def __init__(self, workflow, finish, is_finished):
+    def __init__(self, workflow, finish, is_finished, *, sample_admission=None):
         self.workflow = workflow
         self.finish = finish
         self._is_finished = is_finished
+        self.sample_admission = sample_admission
         self._root_operation = None
 
     @property

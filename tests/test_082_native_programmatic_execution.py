@@ -619,8 +619,9 @@ def test_task_nested_admission_checks_target_reservation_before_node_status(tmp_
         _close(workflow.storage)
 
 
-def test_selection_builder_records_the_jobs_selected_under_admission(tmp_path):
+def test_sample_request_records_exact_jobs_and_manifest_after_reservation(tmp_path):
     from micro_workflow_manager.workflow.execution_session import execution_session
+    from micro_workflow_manager.workflow.sample_admission import SampleRequest
 
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
@@ -628,19 +629,20 @@ def test_selection_builder_records_the_jobs_selected_under_admission(tmp_path):
     router.task(lambda ctx: 1)
     workflow.include_routers(router)
     workflow.add_jobs(None, 'A', [{}, {}])
-    selected_ids = []
-
-    def select():
-        selected_ids.extend([2, 1])
-        return {'chosen': [2, 1]}
-
+    instances = tuple(('A', job_id, workflow.storage.read_job_instance_id('A', job_id))
+                      for job_id in (1, 2))
     try:
         with execution_session(
             workflow, command='run sample', start_node='A', nodes=['A'],
-            selected_jobs=selected_ids, selection_builder=select,
-        ):
+            sample_request=SampleRequest(('100%',), 'admission'),
+        ) as driver:
             main = workflow.storage.get_live_main_session()
-            assert main['selected_jobs'] == [('A', 2), ('A', 1)]
+            assert main['selected_jobs'] == [('A', 1), ('A', 2)]
+            assert driver.sample_admission.roots == instances
+            assert workflow.storage.get_component_reservation(('A',)) == {
+                'members': ('A',), 'session_id': main['session_id'],
+            }
+            assert main['details']['selection'] == driver.sample_admission.selection
         assert workflow.storage.list_execution_sessions()[0]['outcome'] == 'done'
     finally:
         _close(workflow.storage)

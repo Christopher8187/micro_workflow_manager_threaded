@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from micro_workflow_manager.component_identity import encode_component_key
 from .selected_execution import read_selected_execution_jobs
 
@@ -36,6 +38,23 @@ class SelectedComponentLifecycleStorageMixin:
         if changed != 1:
             raise RuntimeError('Successful component result was not recorded')
 
+    def _match_component_successful_result(
+        self, connection, component, identity, current, *, record_missing=False,
+        require_present=False,
+    ):
+        """Match current success to its exact retained row, optionally recording it."""
+        prior = self._read_component_successful_result(connection, component, identity)
+        if prior is None:
+            if require_present:
+                raise RuntimeError('Component lost its retained successful result')
+            if record_missing:
+                self._record_component_successful_result(connection, component, identity, current)
+                return current
+            return None
+        if prior != current:
+            raise RuntimeError('Current and retained successful component results disagree')
+        return prior
+
     def begin_selected_component_execution(
         self, context, roots, *, expected_identity, expected_state, expected_parent_states, successful_lineage,
     ):
@@ -65,15 +84,15 @@ class SelectedComponentLifecycleStorageMixin:
             for parent, observed in parents.items():
                 if self._read_component_state(connection, parent) != observed:
                     raise RuntimeError('Selected component parent changed before start')
-            prior = self._read_component_successful_result(connection, component, identity)
             if state['lifecycle'] in ('sampled', 'done'):
                 current = tuple(state[name] for name in ('lifecycle', 'stability', 'instability_origin'))
-                if prior is not None and prior != current:
-                    raise RuntimeError('Current and retained successful component results disagree')
-                prior = current
-                self._record_component_successful_result(connection, component, identity, prior)
-            elif state['lifecycle'] == 'queued' and prior is not None:
-                raise RuntimeError('Queued component unexpectedly retains success at its current alignment')
+                prior = self._match_component_successful_result(
+                    connection, component, identity, current, record_missing=True,
+                )
+            else:
+                prior = self._read_component_successful_result(connection, component, identity)
+                if state['lifecycle'] == 'queued' and prior is not None:
+                    raise RuntimeError('Queued component unexpectedly retains success at its current alignment')
             if prior is not None and prior[1:] != successful_lineage:
                 raise RuntimeError('Selected execution cannot combine incompatible successful lineage')
             self._validate_pending_component_row(connection, {
@@ -141,13 +160,33 @@ class SelectedComponentLifecycleStorageMixin:
             raise RuntimeError('Selected execution lost its retained successful result')
         if prior is not None and prior[1:] != (pending['stability'], pending['instability_origin']):
             raise RuntimeError('Selected pending lineage differs from its retained success')
-        full_coverage = all(
-            job['status'] in ('done', 'skipped') and job['active_execution_id'] is None
-            for node in component for job in connection.execute(
-                'SELECT status, active_execution_id FROM jobs WHERE node_name=?', (node,),
+        session = connection.execute(
+            'SELECT command, details_json FROM execution_sessions WHERE session_id=?', (session_id,),
+        ).fetchone()
+        if session is None:
+            raise RuntimeError('Selected execution lost its session')
+        try:
+            details = json.loads(session['details_json'])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError('Selected execution has damaged session details') from error
+        if not isinstance(details, dict):
+            raise RuntimeError('Selected execution has damaged session details')
+        if session['command'] == 'run sample' or 'selection' in details:
+            from .sample_history import read_sample_admission_history, sample_has_no_unprocessed_work
+
+            history = read_sample_admission_history(
+                self, connection, session_id, component=component, expected_shape=pending['shape_json'],
             )
-        )
-        lifecycle = ('done' if full_coverage or (prior is not None and prior[0] == 'done') else 'sampled')
+            full_coverage = sample_has_no_unprocessed_work(self, connection, history)
+            lifecycle = 'done' if full_coverage else 'sampled'
+        else:
+            full_coverage = all(
+                job['status'] in ('done', 'skipped') and job['active_execution_id'] is None
+                for node in component for job in connection.execute(
+                    'SELECT status, active_execution_id FROM jobs WHERE node_name=?', (node,),
+                )
+            )
+            lifecycle = 'done' if full_coverage or (prior is not None and prior[0] == 'done') else 'sampled'
         return ComponentTerminalOutcome(
             component, pending['shape_json'], identity[1], lifecycle if successful else 'failed',
             pending['stability'] if successful else None,

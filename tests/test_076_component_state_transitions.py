@@ -51,6 +51,38 @@ def _component_rows(storage):
     )}
 
 
+def _pending_rows(storage):
+    return [dict(row) for row in storage.db_connection().execute(
+        'SELECT pending.session_id, pending.component_key, shape.shape_json, '
+        'pending.alignment_generation, pending.completion_ready, pending.execution_kind, '
+        'pending.starting_lifecycle, pending.starting_misaligned, pending.stability, '
+        'pending.instability_origin FROM pending_component_executions AS pending '
+        'JOIN graph_shapes AS shape USING(shape_id) ORDER BY pending.session_id, pending.component_key'
+    )]
+
+
+def _begin_sampled(storage, session_id, component, snapshot, generation, lineage):
+    return storage.begin_sampled_component_execution(
+        session_id, component, expected_shape=snapshot.shape_json,
+        expected_alignment_generation=generation, successful_lineage=lineage,
+    )
+
+
+def _expected_pending(session_id, component, snapshot, generation, lineage):
+    return [{
+        'session_id': session_id,
+        'component_key': encode_component_key(component),
+        'shape_json': snapshot.shape_json,
+        'alignment_generation': generation,
+        'completion_ready': 0,
+        'execution_kind': 'resume',
+        'starting_lifecycle': 'sampled',
+        'starting_misaligned': 0,
+        'stability': lineage[0],
+        'instability_origin': lineage[1],
+    }]
+
+
 def test_sampled_resume_preserves_finished_interrupt_lineage_under_new_main_owner(tmp_path):
     component = ('A', 'B')
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B'), ('B', 'C')]), [('A', 'B')]).snapshot()
@@ -87,9 +119,8 @@ def test_sampled_resume_preserves_finished_interrupt_lineage_under_new_main_owne
         expected_rows = _component_rows(storage)
         expected_rows[encode_component_key(component)]['lifecycle'] = 'running'
 
-        assert storage.begin_sampled_component_resume(
-            'main-resume', component, expected_alignment_generation=7,
-        ) is True
+        lineage = ('unstable', 'int-origin')
+        assert _begin_sampled(storage, 'main-resume', component, snapshot, 7, lineage) is True
 
         expected = {**before, 'lifecycle': 'running'}
         assert storage.get_component_state(component) == expected
@@ -101,6 +132,8 @@ def test_sampled_resume_preserves_finished_interrupt_lineage_under_new_main_owne
         assert storage.get_component_state(('C',)) == other_component
         assert _component_rows(storage) == expected_rows
         assert _other_rows(storage) == other_rows
+        expected_pending = _expected_pending('main-resume', component, snapshot, 7, lineage)
+        assert _pending_rows(storage) == expected_pending
         assert output.read_bytes() == b'established output'
     finally:
         _close(storage)
@@ -111,6 +144,7 @@ def test_sampled_resume_preserves_finished_interrupt_lineage_under_new_main_owne
         assert reopened.get_component_state(('C',)) == other_component
         assert _component_rows(reopened) == expected_rows
         assert _other_rows(reopened) == other_rows
+        assert _pending_rows(reopened) == expected_pending
         assert output.read_bytes() == b'established output'
     finally:
         _close(reopened)
@@ -118,7 +152,7 @@ def test_sampled_resume_preserves_finished_interrupt_lineage_under_new_main_owne
 
 @pytest.mark.parametrize('failure,error,message', [
     ('ABORT', sqlite3.IntegrityError, 'injected resume failure'),
-    ('IGNORE', RuntimeError, 'Sampled component changed before resume'),
+    ('IGNORE', RuntimeError, 'Component changed before start'),
 ])
 def test_sampled_resume_rolls_back_suppressed_or_failed_update_and_can_retry(tmp_path, failure, error, message):
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
@@ -142,16 +176,20 @@ def test_sampled_resume_rolls_back_suppressed_or_failed_update_and_can_retry(tmp
         before = _component_rows(storage), _other_rows(storage)
 
         with pytest.raises(error, match=message):
-            storage.begin_sampled_component_resume('main-resume', ('A',), expected_alignment_generation=7)
+            _begin_sampled(storage, 'main-resume', ('A',), snapshot, 7, ('stable', None))
 
         assert (_component_rows(storage), _other_rows(storage)) == before
+        assert _pending_rows(storage) == []
         storage.submit_db_mutation(lambda connection: connection.execute('DROP TRIGGER interrupt_resume'))
-        assert storage.begin_sampled_component_resume(
-            'main-resume', ('A',), expected_alignment_generation=7,
+        assert _begin_sampled(
+            storage, 'main-resume', ('A',), snapshot, 7, ('stable', None),
         ) is True
         expected = before[0]
         expected[key]['lifecycle'] = 'running'
         assert (_component_rows(storage), _other_rows(storage)) == (expected, before[1])
+        assert _pending_rows(storage) == _expected_pending(
+            'main-resume', ('A',), snapshot, 7, ('stable', None),
+        )
     finally:
         _close(storage)
 
@@ -197,9 +235,10 @@ def test_sampled_resume_refuses_invalid_session_ownership_without_mutation(tmp_p
         before = _component_rows(storage), _other_rows(storage)
 
         with pytest.raises(RuntimeError, match=error):
-            storage.begin_sampled_component_resume(actor, ('A',), expected_alignment_generation=7)
+            _begin_sampled(storage, actor, ('A',), snapshot, 7, ('stable', None))
 
         assert (_component_rows(storage), _other_rows(storage)) == before
+        assert _pending_rows(storage) == []
     finally:
         _close(storage)
 
@@ -229,9 +268,10 @@ def test_sampled_resume_requires_current_aligned_sampled_state(
         before = _component_rows(storage), _other_rows(storage)
 
         with pytest.raises(RuntimeError, match='aligned sampled component at the expected generation'):
-            storage.begin_sampled_component_resume('main-resume', ('A',), expected_alignment_generation=7)
+            _begin_sampled(storage, 'main-resume', ('A',), snapshot, 7, ('stable', None))
 
         assert (_component_rows(storage), _other_rows(storage)) == before
+        assert _pending_rows(storage) == []
     finally:
         _close(storage)
 
@@ -256,11 +296,12 @@ def test_sampled_resume_rejects_generation_coercion_before_mutation(
         before = _component_rows(storage), _other_rows(storage)
 
         with pytest.raises(ValueError, match='nonnegative integer'):
-            storage.begin_sampled_component_resume(
-                'main-resume', ('A',), expected_alignment_generation=expected_generation,
+            _begin_sampled(
+                storage, 'main-resume', ('A',), snapshot, expected_generation, ('stable', None),
             )
 
         assert (_component_rows(storage), _other_rows(storage)) == before
+        assert _pending_rows(storage) == []
     finally:
         _close(storage)
 
@@ -326,9 +367,10 @@ def test_sampled_resume_refuses_damaged_persisted_state_without_repair(tmp_path,
         before = _component_rows(storage), _other_rows(storage)
 
         with pytest.raises(RuntimeError, match=error):
-            storage.begin_sampled_component_resume('main-resume', ('A',), expected_alignment_generation=7)
+            _begin_sampled(storage, 'main-resume', ('A',), snapshot, 7, ('unstable', 'int-origin'))
 
         assert (_component_rows(storage), _other_rows(storage)) == before
+        assert _pending_rows(storage) == []
     finally:
         _close(storage)
 
@@ -356,21 +398,23 @@ def test_sampled_resume_preserves_lineage_and_rechecks_repeated_calls(tmp_path, 
         expected, others = _component_rows(storage), _other_rows(storage)
         expected[key]['lifecycle'] = 'running'
 
-        assert storage.begin_sampled_component_resume(
-            'resuming-owner', ('A',), expected_alignment_generation=7,
-        ) is True
+        lineage = (stability, origin)
+        assert _begin_sampled(storage, 'resuming-owner', ('A',), snapshot, 7, lineage) is True
         assert (_component_rows(storage), _other_rows(storage)) == (expected, others)
-        assert storage.begin_sampled_component_resume(
-            'resuming-owner', ('A',), expected_alignment_generation=7,
-        ) is False
-        with pytest.raises(RuntimeError, match='expected generation'):
-            storage.begin_sampled_component_resume('resuming-owner', ('A',), expected_alignment_generation=8)
+        pending = _expected_pending('resuming-owner', ('A',), snapshot, 7, lineage)
+        assert _pending_rows(storage) == pending
+        with pytest.raises(RuntimeError, match='aligned sampled component'):
+            _begin_sampled(storage, 'resuming-owner', ('A',), snapshot, 7, lineage)
+        with pytest.raises(RuntimeError, match='aligned sampled component'):
+            _begin_sampled(storage, 'resuming-owner', ('A',), snapshot, 8, lineage)
         assert (_component_rows(storage), _other_rows(storage)) == (expected, others)
+        assert _pending_rows(storage) == pending
         assert storage.release_execution_components('resuming-owner') == 1
         after_release = _other_rows(storage)
         with pytest.raises(RuntimeError, match='reservation'):
-            storage.begin_sampled_component_resume('resuming-owner', ('A',), expected_alignment_generation=7)
+            _begin_sampled(storage, 'resuming-owner', ('A',), snapshot, 7, lineage)
         assert (_component_rows(storage), _other_rows(storage)) == (expected, after_release)
+        assert _pending_rows(storage) == pending
     finally:
         _close(storage)
 
@@ -405,7 +449,9 @@ def test_sampled_resume_rechecks_after_waiting_for_its_write_transaction(tmp_pat
 
         def attempt_resume():
             try:
-                return storage.begin_sampled_component_resume('old-owner', ('A',), expected_alignment_generation=7)
+                return _begin_sampled(
+                    storage, 'old-owner', ('A',), snapshot, 7, ('stable', None),
+                )
             finally:
                 storage.close_thread_connection()
 
@@ -433,6 +479,7 @@ def test_sampled_resume_rechecks_after_waiting_for_its_write_transaction(tmp_pat
                 attempt.result(timeout=15)
 
         assert (_component_rows(storage), _other_rows(storage)) == expected
+        assert _pending_rows(storage) == []
     finally:
         proceed.set()
         _close(other)
@@ -458,7 +505,12 @@ def test_concurrent_sampled_resumes_change_exactly_one_component_once(tmp_path):
         def attempt_resume():
             try:
                 start.wait(timeout=10)
-                return storage.begin_sampled_component_resume('main-resume', ('A',), expected_alignment_generation=7)
+                try:
+                    return _begin_sampled(
+                        storage, 'main-resume', ('A',), snapshot, 7, ('stable', None),
+                    )
+                except RuntimeError as error:
+                    return error
             finally:
                 storage.close_thread_connection()
 
@@ -466,8 +518,13 @@ def test_concurrent_sampled_resumes_change_exactly_one_component_once(tmp_path):
             attempts = [executor.submit(attempt_resume) for _ in range(6)]
             results = [attempt.result(timeout=15) for attempt in attempts]
         assert sum(result is True for result in results) == 1
-        assert sum(result is False for result in results) == 5
+        refused = [result for result in results if isinstance(result, RuntimeError)]
+        assert len(refused) == 5
+        assert all('aligned sampled component' in str(error) for error in refused)
         assert (_component_rows(storage), _other_rows(storage)) == (expected, others)
+        assert _pending_rows(storage) == _expected_pending(
+            'main-resume', ('A',), snapshot, 7, ('stable', None),
+        )
     finally:
         _close(storage)
 
@@ -482,7 +539,10 @@ def test_sampled_resume_refuses_missing_native_session_without_changing_existing
         before = tuple(storage.db_connection().iterdump())
 
         with pytest.raises(RuntimeError, match='existing running session'):
-            storage.begin_sampled_component_resume('main-resume', ('A',), expected_alignment_generation=7)
+            storage.begin_sampled_component_execution(
+                'main-resume', ('A',), expected_shape='missing-native-shape',
+                expected_alignment_generation=7, successful_lineage=('stable', None),
+            )
 
         assert tuple(storage.db_connection().iterdump()) == before
         assert output.read_bytes() == b'established output'

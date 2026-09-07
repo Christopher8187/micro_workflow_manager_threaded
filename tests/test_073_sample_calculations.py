@@ -65,10 +65,8 @@ def test_incomplete_duplicate_or_mixed_requests_are_refused(tokens):
 
 @pytest.mark.parametrize('token', ['+3', '003', '3'])
 def test_existing_integer_spellings_keep_their_count(token):
-    from micro_workflow_manager.cli.sampling import parse_sample_count
     from micro_workflow_manager.sample_selection import parse_sample_selectors
 
-    assert parse_sample_count([token]) == 3
     assert parse_sample_selectors('X', ('X',), [token]) == {'X': ('count', 3)}
 
 
@@ -113,10 +111,10 @@ def test_a_count_cannot_exceed_the_filtered_population(requested, population):
 
 
 def test_status_filtering_precedes_percentage_count_calculation():
-    from micro_workflow_manager.cli.sampling import SampleCandidate
+    from types import SimpleNamespace
     from micro_workflow_manager.sample_selection import filter_sample_population, sample_count
 
-    population = tuple(SampleCandidate(job_id, 'failed' if job_id <= 4 else 'done', 0, 'fixture')
+    population = tuple(SimpleNamespace(job_id=job_id, status='failed' if job_id <= 4 else 'done')
                        for job_id in range(1, 12))
     all_jobs = filter_sample_population(population)
     failed_jobs = filter_sample_population(population, ('failed',))
@@ -248,10 +246,10 @@ def test_zero_and_full_selection_preserve_population_boundaries(candidates, coun
 
 
 def test_no_matching_status_leaves_no_starting_work():
-    from micro_workflow_manager.cli.sampling import SampleCandidate
+    from types import SimpleNamespace
     from micro_workflow_manager.sample_selection import filter_sample_population, sample_count
 
-    candidates = [SampleCandidate(1, 'done', 0, 'fixture')]
+    candidates = [SimpleNamespace(job_id=1, status='done')]
     assert filter_sample_population(candidates, ('failed',)) == []
     assert sample_count(('percentage', 100), 0) == 0
 

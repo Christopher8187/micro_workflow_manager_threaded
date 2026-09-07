@@ -113,7 +113,7 @@ def test_cli_exact_selection_runs_recursive_same_component_causal_jobs_only(
 
     storage = FileStorage(tmp_path)
     try:
-        assert "Ran jobs for A:" in output and "  7" in output
+        assert "Ran jobs for A:\n  A/7\n" in output
         for node, job_id in (("A", 7), ("A", 8), ("B", 2)):
             assert storage.get_job_status(node, job_id) == "done"
         for job_id in range(1, 7):

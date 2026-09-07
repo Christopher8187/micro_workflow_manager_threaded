@@ -5,6 +5,8 @@ import http.client
 import importlib
 import json
 import threading
+
+import pytest
 from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -19,9 +21,10 @@ from micro_workflow_manager.cli.engine import (
     render_engine_html,
 )
 from micro_workflow_manager.cli.project import load_workflow
-from micro_workflow_manager.cli.sampling import plan_sample
+from micro_workflow_manager.cli.sampling import read_sample_plan
 from micro_workflow_manager.storage import FileStorage
 from tests.state_helpers import seed_job
+from tests.test_090_component_session_settlement import _close, _rows
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -44,16 +47,6 @@ def _job_output(state: FileStorage, node: str, job_id: int) -> dict:
 
 
 def _make_engine_project(root: Path) -> None:
-    _write_json(
-        root / ".mwf" / "project.json",
-        {
-            "version": 4,
-            "schema_version": 4,
-            "graph_path": "src/graph.py",
-            "runner": "threaded",
-            "edges": [["A", "B"], ["B", "C"]],
-        },
-    )
     behavior = root / "src" / "node_behavior"
     behavior.mkdir(parents=True)
     (root / "src" / "graph.py").write_text(
@@ -71,6 +64,18 @@ def run(ctx):
         + "\n",
         encoding="utf-8",
     )
+    for node in ('B', 'C'):
+        (behavior / f'{node}.py').write_text(
+            f"from micro_workflow_manager import NodeRouter\nrouter = NodeRouter({node!r})\n"
+            "@router.task\ndef run(ctx):\n    return None\n", encoding='utf-8',
+        )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.chdir(root)
+        assert cli.main(['init']) == 0
+        assert cli.main(['graph', 'src/graph.py', '--runner', 'direct']) == 0
+        workflow = load_workflow(root, 'direct')
+        workflow.storage.register_component_topology(workflow.topology.snapshot())
+        _close(workflow.storage)
 
 
 def test_engine_snapshot_collapses_hoeflein_component_and_render_is_graph_only(tmp_path):
@@ -176,6 +181,7 @@ def test_engine_root_redirects_to_token_and_http_surface_stays_read_only():
 
 def test_engine_command_prints_and_opens_bare_loopback_root(tmp_path, monkeypatch, capsys):
     _make_engine_project(tmp_path)
+    capsys.readouterr()
     before = _tree_digest(tmp_path)
     observed: dict[str, object] = {}
 
@@ -259,42 +265,51 @@ def test_sample_plan_is_deterministic_and_replay_guard_detects_drift(tmp_path, m
     state = _make_sample_project(tmp_path, monkeypatch)
     capsys.readouterr()
     workflow = load_workflow(tmp_path, "direct")
-    first = plan_sample(workflow, "work", 5, seed="acceptance")
-    second = plan_sample(workflow, "work", 5, seed="acceptance")
-    other = plan_sample(workflow, "work", 5, seed="other")
+    first = read_sample_plan(tmp_path, "work", ("5",), seed="acceptance")
+    second = read_sample_plan(tmp_path, "work", ("5",), seed="acceptance")
+    other = read_sample_plan(tmp_path, "work", ("5",), seed="other")
 
-    assert first.selected_job_ids == second.selected_job_ids
-    assert first.population_digest == second.population_digest
-    assert first.selected_job_ids != other.selected_job_ids
+    assert first.members[0].selected_job_ids == second.members[0].selected_job_ids
+    assert first.combined_digest == second.combined_digest
+    assert first.members[0].selected_job_ids != other.members[0].selected_job_ids
 
     state.set_job_status("work", 1, "failed", error="changed")
     state.db_mutation_barrier()
     assert cli.main(
         [
             "run", "work", "sample", "5", "--seed", "acceptance",
-            "--expect-population", first.population_digest,
+            "--expect-population", first.combined_digest,
             "--runner", "direct",
         ]
     ) == 1
     error = capsys.readouterr().err
-    assert "Sample population changed" in error
+    assert "Sample population or input changed" in error
 
 
-def test_sample_run_bypasses_readiness_and_preserves_unselected_jobs(tmp_path, monkeypatch, capsys):
+def test_sample_run_requires_readiness_and_preserves_unselected_jobs(tmp_path, monkeypatch, capsys):
     state = _make_sample_project(tmp_path, monkeypatch)
     capsys.readouterr()
     workflow = load_workflow(tmp_path, "direct")
-    plan = plan_sample(workflow, "work", 6, seed="partial-node")
-    selected = set(plan.selected_job_ids)
+    plan = read_sample_plan(tmp_path, "work", ("6",), seed="partial-node")
+    selected = set(plan.members[0].selected_job_ids)
     unselected = set(range(1, 21)) - selected
 
-    # gate is still queued, so an ordinary `mwf run work` would be refused.
     assert state.get_node_status("gate") == "queued"
+    before_rows = _rows(state)
+    before_files = _tree_digest(tmp_path / 'node')
+    assert cli.main(
+        ["run", "work", "sample", "6", "--seed", "partial-node", "--runner", "direct"]
+    ) == 1
+    assert 'not ready' in capsys.readouterr().err
+    assert _rows(state) == before_rows
+    assert _tree_digest(tmp_path / 'node') == before_files
+    assert cli.main(['run', 'gate', '--runner', 'direct']) == 0
+    assert state.get_component_state(('gate',))['lifecycle'] == 'done'
+    capsys.readouterr()
     assert cli.main(
         ["run", "work", "sample", "6", "--seed", "partial-node", "--runner", "direct"]
     ) == 0
-    output = capsys.readouterr().out
-    assert "isolated work sample" in output
+    assert "Sample selection for: work" in capsys.readouterr().out
 
     for job_id in selected:
         assert state.get_job_status("work", job_id) == "done"
@@ -305,11 +320,12 @@ def test_sample_run_bypasses_readiness_and_preserves_unselected_jobs(tmp_path, m
         assert state.get_job_status("work", job_id) == "done"
         assert _job_output(state, "work", job_id) == {"marker": job_id}
 
-    run_state = state.get_run_state()
-    assert run_state["command"] == "run sample"
-    assert run_state["selected_jobs"] == sorted(selected)
-    assert run_state["selection"]["algorithm"] == "mwf.sample.v1"
-    assert run_state["selection"]["population_digest"] == plan.population_digest
+    session, = [session for session in state.list_execution_sessions()
+                if session['command'] == 'run sample']
+    assert (session['status'], session['outcome']) == ('terminal', 'done')
+    assert session['selected_jobs'] == [('work', job_id) for job_id in sorted(selected)]
+    assert session['details']['selection']['algorithm'] == 'mwf.sample.v1'
+    assert session['details']['selection']['combined_digest'] == plan.combined_digest
 
 
 def test_sample_status_filter_and_plan_are_read_only(tmp_path, monkeypatch, capsys):

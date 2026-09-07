@@ -398,7 +398,7 @@ class SQLiteSchemaMixin:
                     CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
                 completion_ready INTEGER NOT NULL DEFAULT 0
                     CHECK(typeof(completion_ready)='integer' AND completion_ready IN (0,1)),
-                execution_kind TEXT NOT NULL DEFAULT 'full' CHECK(execution_kind IN ('full','jobs')),
+                execution_kind TEXT NOT NULL DEFAULT 'full' CHECK(execution_kind IN ('full','jobs','resume')),
                 starting_lifecycle TEXT NOT NULL DEFAULT 'queued'
                     CHECK(starting_lifecycle IN ('queued','sampled','done','failed')),
                 starting_misaligned INTEGER NOT NULL DEFAULT 0

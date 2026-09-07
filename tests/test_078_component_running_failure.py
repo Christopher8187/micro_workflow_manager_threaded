@@ -13,6 +13,7 @@ import pytest
 from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.storage.component_states import ComponentTerminalOutcome
 from micro_workflow_manager.topology import ComponentTopology
 
 
@@ -55,18 +56,16 @@ def test_running_component_failure_clears_lineage_and_preserves_ownership_after_
             'int-origin', outcome='done', finished_at='2026-09-05T12:01:00+00:00',
         ) is True
         key = encode_component_key(component)
-        # Public sampling is not active. Seed only its established sampled result.
+        # Seed a retained lineage on the running state to isolate the generic
+        # failure transition from sampled-resume session settlement.
         assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='sampled', stability='unstable', "
+            "UPDATE component_states SET lifecycle='running', stability='unstable', "
             "instability_origin='int-origin', alignment_generation=7 WHERE component_key=?", (key,),
         ).rowcount) == 1
         owner = _session(storage, 'main-failure', 'main', component)
         assert (owner['session_kind'], owner['status']) == ('main', 'running')
         assert storage.reserve_execution_components(
             'main-failure', expected_shape=snapshot.shape_json,
-        ) is True
-        assert storage.begin_sampled_component_resume(
-            'main-failure', component, expected_alignment_generation=7,
         ) is True
 
         storage.create_job(Job(node_name='A', job_id=1, params={'source': 'retained-input'}))
@@ -518,48 +517,98 @@ def test_concurrent_running_component_failures_publish_once_and_refuse_other_att
 def test_completion_and_failure_compete_for_one_terminal_result_without_overwriting(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
-        snapshot = _running_component(storage)
-        _session(storage, 'int-origin', 'interrupt', ('A',))
+        component = ('A',)
+        snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
+        storage.register_component_topology(snapshot)
+        _session(storage, 'int-origin', 'interrupt', component)
+        _session(storage, 'main-failure', 'main', component)
+        assert storage.reserve_execution_components(
+            'main-failure', expected_shape=snapshot.shape_json,
+        ) is True
         key = encode_component_key(('A',))
         assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET stability='unstable', instability_origin='int-origin' "
+            "UPDATE component_states SET lifecycle='sampled', stability='unstable', "
+            "instability_origin='int-origin', "
+            'alignment_generation=7 '
             'WHERE component_key=?', (key,),
         ).rowcount) == 1
+        assert storage.submit_db_mutation(lambda connection: connection.execute(
+            'INSERT INTO component_successful_results '
+            '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
+            "SELECT component_key, shape_id, 7, 'sampled', 'unstable', 'int-origin' "
+            'FROM component_definitions WHERE component_key=?', (key,),
+        ).rowcount) == 1
+        assert storage.begin_sampled_component_execution(
+            'main-failure', component, expected_shape=snapshot.shape_json,
+            expected_alignment_generation=7, successful_lineage=('unstable', 'int-origin'),
+        ) is True
+        output = storage.node_output_dir('A') / 'established.txt'
+        output.write_bytes(b'established output')
+        storage.create_job(Job(node_name='A', job_id=1, params={'source': 'retained-input'}))
+        storage.set_job_status('A', 1, 'done')
         expected = _stored_rows(storage)
         start = Barrier(2)
 
-        def publish(outcome):
+        def publish(lifecycle):
             try:
                 start.wait(timeout=10)
-                method = (storage.finish_sampled_component_resume if outcome == 'done'
-                          else storage.fail_running_component)
                 try:
-                    return outcome, method(
-                        'main-failure', ('A',), expected_shape=snapshot.shape_json,
-                        expected_alignment_generation=7,
+                    result = storage.decide_execution_session_exit(
+                        'main-failure', outcome=lifecycle,
+                        finished_at='2026-09-05T12:02:00+00:00',
+                        component_outcomes=[ComponentTerminalOutcome(
+                            component, snapshot.shape_json, 7, lifecycle,
+                            'unstable' if lifecycle == 'done' else None,
+                            'int-origin' if lifecycle == 'done' else None,
+                        )],
                     )
+                    return lifecycle, result
                 except RuntimeError as error:
-                    return outcome, str(error)
+                    return lifecycle, error
             finally:
                 storage.close_thread_connection()
 
         with ThreadPoolExecutor(max_workers=2) as executor:
-            attempts = [executor.submit(publish, outcome) for outcome in ('done', 'failed')]
+            attempts = [executor.submit(publish, lifecycle) for lifecycle in ('done', 'failed')]
             results = dict(attempt.result(timeout=15) for attempt in attempts)
-        winners = [outcome for outcome, result in results.items() if result is True]
+        winners = [lifecycle for lifecycle, result in results.items() if isinstance(result, dict)]
         assert len(winners) == 1
         winner = winners[0]
         loser = 'failed' if winner == 'done' else 'done'
-        assert results[loser] == {
-            'failed': 'Failure requires an aligned running component at the expected generation',
-            'done': 'Completion requires an aligned running component with retained lineage at the expected generation',
-        }[loser]
-        matching = [row for row in expected['component_states'] if row['component_key'] == key]
-        assert len(matching) == 1
-        matching[0]['lifecycle'] = winner
-        if winner == 'failed':
-            matching[0].update(stability=None, instability_origin=None)
+        assert results[winner] == {'restarts': {}, 'released': 1}
+        assert isinstance(results[loser], RuntimeError)
+        state = storage.get_component_state(component)
+        assert (state['lifecycle'], state['stability'], state['instability_origin']) == (
+            winner, 'unstable' if winner == 'done' else None,
+            'int-origin' if winner == 'done' else None,
+        )
+        settled_session = storage.get_execution_session('main-failure')
+        assert (settled_session['status'], settled_session['outcome']) == ('terminal', winner)
+        assert storage.get_component_reservation(component) is None
+        assert storage.db_connection().execute(
+            'SELECT COUNT(*) FROM pending_component_executions WHERE session_id=?',
+            ('main-failure',),
+        ).fetchone()[0] == 0
+        history = storage.db_connection().execute(
+            'SELECT lifecycle, stability, instability_origin '
+            'FROM component_successful_results WHERE component_key=? AND alignment_generation=7',
+            (key,),
+        ).fetchall()
+        assert [tuple(row) for row in history] == (
+            [('done' if winner == 'done' else 'sampled', 'unstable', 'int-origin')]
+        )
+        changed, = [row for row in expected['component_states'] if row['component_key'] == key]
+        changed.update(lifecycle=winner, stability='unstable' if winner == 'done' else None,
+                       instability_origin='int-origin' if winner == 'done' else None)
+        session_row, = [row for row in expected['execution_sessions'] if row['session_id'] == 'main-failure']
+        session_row.update(status='terminal', outcome=winner, finished_at='2026-09-05T12:02:00+00:00',
+                           failures_json='[]')
+        expected['component_reservations'] = []
+        expected['pending_component_executions'] = []
+        retained, = expected['component_successful_results']
+        retained['lifecycle'] = 'done' if winner == 'done' else 'sampled'
         assert _stored_rows(storage) == expected
+        assert output.read_bytes() == b'established output'
     finally:
         _close(storage)
 

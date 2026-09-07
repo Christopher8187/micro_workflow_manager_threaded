@@ -6,6 +6,7 @@ from heapq import nsmallest
 from typing import Literal
 
 
+SAMPLE_ALGORITHM = 'mwf.sample.v1'
 SampleSelector = tuple[Literal['count', 'percentage'], int]
 
 
@@ -79,7 +80,7 @@ def select_sample_ids(
         raise ValueError('Sample node must be nonempty and contain no NUL characters')
     if len(set(candidates.values())) != len(candidates):
         raise ValueError('Each sample candidate must have distinct identity bytes')
-    prefix = b'mwf.sample.v1\0' + seed.encode('utf-8') + b'\0' + node.encode('utf-8') + b'\0'
+    prefix = SAMPLE_ALGORITHM.encode('ascii') + b'\0' + seed.encode('utf-8') + b'\0' + node.encode('utf-8') + b'\0'
     selected = nsmallest(count, candidates,
                         key=lambda job_id: (sha256(prefix + candidates[job_id]).digest(), job_id))
     return tuple(sorted(selected))

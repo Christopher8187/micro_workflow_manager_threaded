@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 import networkx as nx
@@ -11,7 +10,7 @@ from micro_workflow_manager.project_format import (
     is_link_or_reparse_point, read_native_project_config,
 )
 from micro_workflow_manager.topology import ComponentTopology
-from micro_workflow_manager.storage.sqlite.schema import SQLiteSchemaMixin
+from micro_workflow_manager.storage.sqlite.preview_snapshot import open_preview_snapshot
 
 from .autostart_scan import scan_autostarts
 from .engine import _stored_edges
@@ -28,16 +27,7 @@ class PreviewStorage:
         database = state_database_file(root)
         if is_link_or_reparse_point(database) or not database.is_file():
             raise RuntimeError("Native MWF project state is missing or is not an ordinary file")
-        connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA query_only=ON")
-            connection.execute("BEGIN")
-            SQLiteSchemaMixin.validate_native_database(connection)
-        except BaseException:
-            connection.close()
-            raise
-        self.connection = connection
+        self.connection = open_preview_snapshot(database)
 
     def close(self) -> None:
         if self.connection is not None:

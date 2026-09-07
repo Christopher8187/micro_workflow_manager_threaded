@@ -6,14 +6,16 @@ import sys
 import time
 from contextlib import contextmanager
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from micro_workflow_manager import __version__
 from micro_workflow_manager.errors import safe_exception_repr
 from micro_workflow_manager.monitor import InlineMonitorReporter, InlineStatsReporter, now_iso
 from micro_workflow_manager.processes import process_identity
+from .admission_wait import resolve_admission_future
 from .execution_session_driver import ExecutionSessionDriver
+from .sample_admission import SampleRequest, admit_sample_execution_session
 if TYPE_CHECKING:
     from micro_workflow_manager.system import MicroWorkflow
 
@@ -87,7 +89,7 @@ def _execution_session(
     start_node: str,
     nodes: list[str],
     selected_jobs: list[int] | None = None,
-    selection_builder: Callable[[], dict] | None = None,
+    sample_request: SampleRequest | None = None,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
     stats: bool = False,
@@ -104,6 +106,13 @@ def _execution_session(
     ownership = MappingProxyType({node: component for component in selected_components for node in component})
     if start_node not in ownership:
         raise ValueError('The starting node must belong to a selected component')
+    if sample_request is not None:
+        if not isinstance(sample_request, SampleRequest):
+            raise TypeError('sample_request must be a SampleRequest')
+        if selected_jobs is not None:
+            raise ValueError('Sample admission cannot also specify selected jobs')
+        if selected_components != [components_by_node[start_node]]:
+            raise ValueError('Sample admission requires exactly its starting component')
     run_id = f"{int(time.time())}-{os.getpid()}-{uuid4().hex[:8]}"
     api_startup_strategy = os.environ.get("MWF_API_STARTUP_STRATEGY", "adaptive").strip().lower()
     if api_startup_strategy in {"single", "event", "latency", "serial", "legacy"}:
@@ -149,6 +158,7 @@ def _execution_session(
     driver = None
     stats_reporter = None
     monitor_reporter = None
+    sample_admission = None
 
     def stop_local_reporting():
         cleanup_error = None
@@ -238,22 +248,63 @@ def _execution_session(
     try:
         with workflow.storage.interprocess_lock("active-run-state"):
             refuse_competing_run(workflow)
-            selection = selection_builder() if selection_builder is not None else None
-            selected_jobs = validate_selected_jobs(workflow, start_node, selected_jobs)
-            if selection is not None:
-                data['selection'] = selection
+            if sample_request is None:
+                # Preserve exact-job refusal before topology registration.
+                selected_jobs = validate_selected_jobs(workflow, start_node, selected_jobs)
             workflow.storage.register_component_topology(snapshot)
-            workflow.storage.create_execution_session(
-                run_id, session_kind='main', command=command,
-                start_component=components_by_node[start_node],
-                selected_components=selected_components,
-                selected_jobs=[(start_node, job_id) for job_id in (selected_jobs or [])],
-                started_at=now_iso(), hostname=socket.gethostname(), pid=os.getpid(),
-                process_identity=process_identity(os.getpid()), details=data,
-            )
-            created = True
-            workflow.storage.reserve_execution_components(run_id, expected_shape=snapshot.shape_json)
-            reserved = True
+            started_at = now_iso()
+            hostname = socket.gethostname()
+            pid = os.getpid()
+            identity = process_identity(pid)
+            if sample_request is None:
+                pending_creation = workflow.storage.create_execution_session(
+                    run_id, session_kind='main', command=command,
+                    start_component=components_by_node[start_node],
+                    selected_components=selected_components,
+                    selected_jobs=[(start_node, job_id) for job_id in (selected_jobs or [])],
+                    started_at=started_at, hostname=hostname, pid=pid,
+                    process_identity=identity, details=data, _wait=False,
+                )
+                admission_arguments = dict(
+                    session_kind='main', command=command,
+                    start_component=components_by_node[start_node],
+                    selected_components=selected_components,
+                    selected_jobs=[(start_node, job_id) for job_id in (selected_jobs or [])],
+                    started_at=started_at, hostname=hostname, pid=pid,
+                    process_identity=identity, details=data,
+                )
+                creation = resolve_admission_future(
+                    pending_creation,
+                    lambda: workflow.storage._read_execution_session_admission(
+                        run_id, **admission_arguments, reserved=False,
+                    ),
+                )
+                created = True
+                if creation.interruption is not None:
+                    raise creation.interruption
+                pending_reservation = workflow.storage.reserve_execution_components(
+                    run_id, expected_shape=snapshot.shape_json, _wait=False,
+                )
+                reservation = resolve_admission_future(
+                    pending_reservation,
+                    lambda: workflow.storage._read_execution_session_admission(
+                        run_id, **admission_arguments, reserved=True,
+                    ),
+                )
+                reserved = True
+                if reservation.interruption is not None:
+                    raise reservation.interruption
+            else:
+                sample_admission = admit_sample_execution_session(
+                    workflow, session_id=run_id, command=command, start_node=start_node,
+                    snapshot=snapshot, selected_components=selected_components,
+                    started_at=started_at, hostname=hostname, pid=pid,
+                    process_identity=identity, details=data, request=sample_request,
+                )
+                # Session, reservation, roots, and selection committed together.
+                created = reserved = True
+                if sample_admission.interruption is not None:
+                    raise sample_admission.interruption
             workflow.storage.bind_thread_overrides_to_run(run_id)
             admitted_context = (run_id, ownership, snapshot.shape_json)
             workflow.execution_session_context = admitted_context
@@ -266,7 +317,9 @@ def _execution_session(
         monitor_reporter = InlineMonitorReporter(
             workflow, nodes=nodes, enabled=monitor, interval=monitor_interval,
         ).start()
-        driver = ExecutionSessionDriver(workflow, finish, lambda: finished)
+        driver = ExecutionSessionDriver(
+            workflow, finish, lambda: finished, sample_admission=sample_admission,
+        )
         yield driver
     except BaseException as error:
         body_error = error
