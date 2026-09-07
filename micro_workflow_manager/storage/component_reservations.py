@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
+from .preparation_guards import refuse_receiver_mutation
 
 
 class ComponentReservationConflict(RuntimeError):
@@ -33,6 +34,8 @@ class ComponentReservationStorageMixin:
             if not rows or any(row['shape_json'] != expected_shape for row in rows):
                 raise RuntimeError('Session scope does not match registered components in the expected graph shape')
             selected_nodes = {node for row in rows for node in decode_component_key(row['component_key'])}
+            for node in sorted(selected_nodes):
+                refuse_receiver_mutation(connection, node)
             reservations = connection.execute(
                 'SELECT component_key, session_id FROM component_reservations ORDER BY component_key',
             ).fetchall()

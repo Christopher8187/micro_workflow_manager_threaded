@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING
 
 from ..component_readiness import calculate_component_readiness
 from ..errors import InvalidGraphError
-from ..storage.job_preparation import apply_job_preparation, read_job_preparation
-from ..storage.preparation_files import stage_preparation_files
+from ..storage.preparation_execution import prepare_component_unit
+from ..storage.preparation_footprint import read_preparation_footprint
+from ..storage.preparation_guards import hold_preparation_guards
 
 if TYPE_CHECKING:
     from ..system import MicroWorkflow
@@ -64,6 +65,7 @@ def prepare_fresh_components(
     components: list[set[str]],
     *,
     keep_trace: bool = False,
+    operation: str = 'run',
 ) -> dict[str, int]:
     """Prepare a full CLI or independent programmatic component selection.
 
@@ -94,46 +96,19 @@ def prepare_fresh_components(
                     context[0], component, expected_shape=context[2],
                 ) for component in selected
             }
-        return _prepare_observed_components(root, workflow, selected, observations, context, keep_trace=keep_trace)
+        return _prepare_observed_components(root, workflow, selected, observations, context,
+                                             keep_trace=keep_trace, operation=operation)
 
 
-def _prepare_observed_components(root, workflow, components, observations, context, *, keep_trace):
-    selected = set(components)
-    preparations = {
-        component: read_job_preparation(
-            workflow.storage, component, selected, reset_retained=True, preserve_external=position > 0,
-        ) for position, component in enumerate(components)
-    }
-    selected_nodes = {node for component in components for node in component}
-    outside = read_job_preparation(
-        workflow.storage, sorted(set(workflow.graph_obj) - selected_nodes), selected,
-        reset_retained=False, preserve_external=True,
-    )
+def _prepare_observed_components(root, workflow, components, observations, context, *, keep_trace, operation):
+    storage = workflow.storage
+    footprint = read_preparation_footprint(storage, components, keep_trace=keep_trace)
+    session_id = None if context is None else context[0]
     removed = {}
-    for component in components:
-        plans = preparations[component]
-        with stage_preparation_files(root, plans):
-            if context is None:
-                workflow.storage.complete_component_reset_preparation(
-                    component, expected_state=observations[component], job_preparation=plans, keep_trace=keep_trace,
-                )
-            else:
-                workflow.storage.complete_component_fresh_preparation(
-                    context[0], component, expected_state=observations[component],
-                    job_preparation=plans, keep_trace=keep_trace,
-                )
-        for plan in plans:
-            if plan.delete_ids:
-                removed[plan.node] = len(plan.delete_ids)
-        workflow.storage.notify_queue_changes(component)
-    for plan in outside:
-        if not plan.delete_ids and (keep_trace or not plan.orphan_ids):
-            continue
-        with stage_preparation_files(root, [plan]):
-            workflow.storage.submit_db_mutation(
-                lambda connection: apply_job_preparation(connection, [plan], keep_trace=keep_trace),
-            )
-        if plan.delete_ids:
-            removed[plan.node] = len(plan.delete_ids)
-        workflow.storage.notify_queue_change(plan.node)
+    with hold_preparation_guards(storage, footprint, session_id, observations) as guard_id:
+        for unit in footprint.units:
+            changed = prepare_component_unit(storage, root, unit, observations[unit.component], session_id,
+                                             guard_id, operation, keep_trace=keep_trace)
+            for node, count in changed.items():
+                removed[node] = removed.get(node, 0) + count
     return removed

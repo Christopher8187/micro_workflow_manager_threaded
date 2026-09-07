@@ -13,6 +13,7 @@ from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import preparation_files
 from micro_workflow_manager.storage.job_preparation import NodeJobPreparation, PreparationJob, read_job_preparation
 from tests.test_036_hoeflein_scheduling import make_project
+from tests.test_076_component_state_transitions import _session
 from tests.test_090_component_session_settlement import _close, _rows
 from tests.test_094_native_fresh_preparation import _fresh_owner
 
@@ -209,9 +210,22 @@ def test_preparation_restoration_preserves_a_new_file_at_the_original_path(tmp_p
 def test_component_preparation_rechecks_job_instances_and_orphan_identity(tmp_path, change):
     storage, snapshot = _fresh_owner(tmp_path)
     try:
+        _session(storage, 'creator-interrupt', 'interrupt', ('B',))
+        storage.reserve_execution_components('creator-interrupt', expected_shape=snapshot.shape_json)
+        storage.create_job(Job(node_name='B', job_id=1, params={}))
+        _, producer_execution = storage.claim_job_execution(
+            'B', 1, started_at='2026-09-06T12:00:00+00:00',
+            session_id='creator-interrupt', component=('B',),
+        )
         storage.create_job(Job(node_name='A', job_id=1, params={'original': True},
-                               parent={'from_node': 'B', 'from_job': 1}, producer_component=('B',), job_kind='dag'))
+                               parent={'from_node': 'B', 'from_job': 1}, producer_component=('B',),
+                               job_kind='dag'), producer_execution_id=producer_execution)
         if change == 'orphan-created-event':
+            generation, execution = storage.claim_job_execution(
+                'A', 1, started_at='2026-09-06T12:00:01+00:00',
+                session_id='fresh-main', component=('A',),
+            )
+            storage.finalize_job_execution('A', 1, generation, execution, 'done')
             storage.delete_job('A', 1, preserve_events=True)
         expected = storage.read_component_fresh_preparation('fresh-main', ('A',), expected_shape=snapshot.shape_json)
         plan = read_job_preparation(storage, ['A'], {('B',)}, reset_retained=True, preserve_external=False)

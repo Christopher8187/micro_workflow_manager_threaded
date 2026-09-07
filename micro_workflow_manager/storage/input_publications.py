@@ -10,6 +10,7 @@ from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.file_helpers import _relative_file_parts
 from .input_publication_files import StagedInputFiles, checked_input_path, input_relative_path
 from .events import JobEventAppend
+from .preparation_guards import refuse_receiver_mutation, refuse_unfinished_preparation
 
 
 class InputPublicationStorageMixin:
@@ -27,6 +28,7 @@ class InputPublicationStorageMixin:
         connection = self._new_db_connection()
         try:
             connection.execute('BEGIN')
+            refuse_unfinished_preparation(connection, receiver)
             self._require_settled_input_publications(connection, receiver)
             ownership = self._read_input_ownership(connection, receiver, relative)
             if ownership is None:
@@ -134,6 +136,7 @@ class InputPublicationStorageMixin:
         arrival_identity = None
 
         def validate(connection):
+            refuse_receiver_mutation(connection, receiver)
             owner = self._validate_input_producer(connection, node, job_id, generation, execution_id, receiver)
             first_changed_path = None
             for entry in files.entries:

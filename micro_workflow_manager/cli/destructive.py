@@ -236,6 +236,7 @@ def execute_destructive_command(
             workflow,
             [set(component) for component in selection.components],
             keep_trace=keep_trace,
+            operation=command,
         )
     _print_completion(workflow, selection)
     print(f"Completed mwf {command} for: " + ", ".join(selection.nodes))

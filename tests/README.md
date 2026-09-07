@@ -78,6 +78,12 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_101_programmatic_fresh_preparation.py` | Repeated independent full preparation, retained root inputs, queue-only and selected-job preservation, preparation failure restoration, parent preflight, and admission selection checks. |
 | `test_102_component_input_arrivals.py` | Managed-input receiver misalignment, first causes, generation repair, rollback, process contention, local result caching, and damaged-history refusal. |
 | `test_103_component_job_arrivals.py` | Managed-job receiver causes, creator identity, shape refusal, publication rollback, directory ownership, process and grouped races, damaged history, and interrupted waits. |
+| `test_104_producer_footprint_preparation.py` | Producer-owned cleanup across excluded receivers, durable ancestry, retained results, preservation of other producers and their orphan traces, and notification failure after commit. |
+| `test_105_preparation_receiver_guards.py` | Complete preparation preflight, excluded receiver ownership and guards, publication refusal, and preservation after a later component fails. |
+| `test_106_preparation_receipt_failures.py` | Ambiguous input refusal, SQL rollback, repeated interrupted waits, retained recovery material, and original errors after committed preparation. |
+| `test_108_native_resume_preparation.py` | Whole-selection misalignment and parent refusal before mutation; atomic failed-job requeue and component transition with file restoration. |
+| `test_109_native_resume_recovery.py` | Exact output recovery, execution lock order, timing and restart history, real terminal output identity, complete active metadata, incompatible prior owners, and retained failures from older alignments. |
+| `test_110_native_resume_guidance.py` | Command-specific repair guidance, separate misaligned branches, and refusal of missing failed-job ownership. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and replacement-runtime isolation after the old checkpoint deadline and stale-write attempt. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished work, missing expected rounds, and repeated-API slowdown beyond the fixed allowance; successful completion and exact allowance equality. |

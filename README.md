@@ -314,10 +314,11 @@ large data into every `input.json`. The sender must still route the exact path
 the receiver expects; node output is not transported automatically.
 
 Returning a `Path`, `{"file": ...}`, or `{"files": ...}` is ordinary return
-data. MWF does not copy the referenced file. On success, `output.json` records
-status and a concise `result_type` and `result_repr`, plus the execution
-generation when supervised. On failure, it records status, the terminal error,
-and generation when applicable. Historical `jobs/<id>/files/` trees are left
+data. MWF does not copy the referenced file.
+On success, `output.json` records status, concise `result_type` and `result_repr`,
+and the exact execution generation and ID. On failure, it records status, the
+terminal error, and the same execution identity. Historical `jobs/<id>/files/`
+trees are left
 untouched during upgrade but no new per-job file tree is created.
 
 ## Retries, fallbacks, validation, and failure lineage

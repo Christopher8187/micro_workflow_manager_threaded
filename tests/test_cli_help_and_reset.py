@@ -565,24 +565,29 @@ def test_reset_component_applies_job_preparation_atomically(tmp_path, monkeypatc
     monkeypatch.setattr(FileStorage, "set_job_status", reject_per_job_status)
     storage = FileStorage(tmp_path)
     try:
-        complete = FileStorage.complete_component_reset_preparation
+        rename = Path.rename
+        injected = False
 
-        def inject_second_node_failure(self, *args, **kwargs):
-            self.submit_db_mutation(lambda connection: connection.execute(
-                'CREATE TRIGGER reject_second_node_reset BEFORE UPDATE OF status ON jobs '
-                "WHEN NEW.node_name='C' BEGIN SELECT RAISE(ABORT, 'second node preparation failed'); END",
-            ))
-            try:
-                return complete(self, *args, **kwargs)
-            finally:
-                self.submit_db_mutation(lambda connection: connection.execute('DROP TRIGGER reject_second_node_reset'))
+        def inject_second_node_failure(path, target):
+            nonlocal injected
+            if not injected and Path(target).parent.parent.name == 'preparation-trash':
+                storage.submit_db_mutation(lambda connection: connection.execute(
+                    'CREATE TRIGGER reject_second_node_reset BEFORE UPDATE OF status ON jobs '
+                    "WHEN NEW.node_name='C' BEGIN SELECT RAISE(ABORT, 'second node preparation failed'); END",
+                ))
+                injected = True
+            return rename(path, target)
 
         before = _rows(storage)
         before_files = {path.relative_to(tmp_path): path.read_bytes()
                         for path in (tmp_path / 'node').rglob('*') if path.is_file()}
-        with monkeypatch.context() as fault:
-            fault.setattr(FileStorage, 'complete_component_reset_preparation', inject_second_node_failure)
-            assert cli.main(["reset", "B", "--yes"]) == 1
+        try:
+            with monkeypatch.context() as fault:
+                fault.setattr(Path, 'rename', inject_second_node_failure)
+                assert cli.main(["reset", "B", "--yes"]) == 1
+        finally:
+            storage.submit_db_mutation(lambda connection: connection.execute('DROP TRIGGER IF EXISTS reject_second_node_reset'))
+        assert injected
         assert 'second node preparation failed' in capsys.readouterr().err
         after = _rows(storage)
         for table in ('jobs', 'job_instances', 'job_events', 'nodes'):

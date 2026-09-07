@@ -177,6 +177,7 @@ class JobLifecycleMixin:
                                 "result_type": type(result).__name__,
                                 "result_repr": repr(result),
                                 "generation": generation,
+                                "execution_id": execution_id,
                             },
                         )
                     self.storage.finalize_job_execution(
@@ -204,6 +205,7 @@ class JobLifecycleMixin:
                                 "status": FAILED,
                                 "error": safe_exception_repr(error),
                                 "generation": generation,
+                                "execution_id": execution_id,
                             },
                         )
                     self.storage.finalize_job_execution(

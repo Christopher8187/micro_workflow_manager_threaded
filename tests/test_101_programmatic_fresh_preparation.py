@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from contextlib import contextmanager
+from pathlib import Path
 
 from micro_workflow_manager import MicroWorkflow
 from micro_workflow_manager.errors import InvalidGraphError
@@ -98,13 +99,18 @@ def test_failed_independent_preparation_restores_files_and_releases_session(tmp_
     old = tmp_path / 'node' / 'A' / 'output' / 'retained.txt'
     old.write_text('retained', encoding='utf-8')
     primary = RuntimeError('preparation injection')
+    mkdir = Path.mkdir
 
-    def fail_preparation(*args, **kwargs):
-        assert storage.get_live_main_session() is not None
-        assert storage.get_component_reservation(('A',)) is not None
-        raise primary
+    def fail_output_recreation(path, *args, **kwargs):
+        if path == old.parent and not path.exists():
+            assert storage.get_live_main_session() is not None
+            assert storage.get_component_reservation(('A',)) is not None
+            saved, = (tmp_path / '.mwf' / 'preparation-trash').glob('*/*/retained.txt')
+            assert saved.read_text(encoding='utf-8') == 'retained'
+            raise primary
+        return mkdir(path, *args, **kwargs)
 
-    monkeypatch.setattr(storage, 'complete_component_fresh_preparation', fail_preparation)
+    monkeypatch.setattr(Path, 'mkdir', fail_output_recreation)
     try:
         with pytest.raises(RuntimeError) as raised:
             workflow.run_node('A')

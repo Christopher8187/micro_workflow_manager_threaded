@@ -21,13 +21,6 @@ class PreparationJob:
     active_started_at: str | None = None
     created_by_execution_id: str | None = None
 
-    @property
-    def producer(self):
-        parent = json.loads(self.parent_json) if self.parent_json else None
-        members = parent.get('_mwf_from_component') if isinstance(parent, dict) else None
-        return tuple(members) if isinstance(members, list) and members else None
-
-
 @dataclass(frozen=True)
 class NodeJobPreparation:
     node: str
@@ -71,23 +64,36 @@ def read_job_preparation(storage, nodes, producers, *, reset_retained: bool, pre
             node = storage.validate_node_name(node)
             jobs = _read_jobs(connection, node)
             orphans = _read_orphan_creations(connection, node)
+            creators = {}
             for job in jobs:
                 if (type(job.instance_id) is not str or len(job.instance_id) != 32
                         or any(character not in '0123456789abcdef' for character in job.instance_id)):
                     raise RuntimeError(f'Preparation requires an exact job instance: {node}/{job.job_id}')
                 if job.last_execution_id is not None or job.created_by_execution_id is not None:
                     storage._read_job_owner_observation(connection, node, job.job_id)
-            delete_ids = tuple(job.job_id for job in jobs if job.producer in producers)
+                creator = None
+                if job.created_by_execution_id is not None:
+                    creator = storage._read_execution_owner(connection, job.created_by_execution_id)
+                    if creator is None:
+                        raise RuntimeError(f'Preparation requires the recorded job creator: {node}/{job.job_id}')
+                creators[job.job_id] = creator
+            delete_ids = tuple(job.job_id for job in jobs
+                               if creators[job.job_id] is not None
+                               and creators[job.job_id]['component'] in producers)
             deleted = set(delete_ids)
             retained = [job for job in jobs if job.job_id not in deleted]
             reset_ids = tuple(job.job_id for job in retained
-                              if reset_retained and (not preserve_external or job.producer is None))
+                              if reset_retained and (not preserve_external or creators[job.job_id] is None))
             reset = set(reset_ids)
             orphan_ids = []
-            for _, job_id, data_json in orphans:
-                data = storage._decode_event_data(data_json)
-                producer = None if data is None else data.get('producer_component')
-                if isinstance(producer, list) and tuple(producer) in producers:
+            for _, job_id, _ in orphans:
+                histories = connection.execute(
+                    'SELECT created_by_execution_id FROM job_execution_owners WHERE node_name=? AND job_id=?',
+                    (node, job_id),
+                ).fetchall()
+                owners = [storage._read_execution_owner(connection, row['created_by_execution_id'])
+                          if row['created_by_execution_id'] is not None else None for row in histories]
+                if owners and all(owner is not None and owner['component'] in producers for owner in owners):
                     orphan_ids.append(job_id)
             result.append(NodeJobPreparation(
                 node, jobs, orphans, delete_ids, reset_ids, tuple(orphan_ids),
@@ -98,16 +104,31 @@ def read_job_preparation(storage, nodes, producers, *, reset_retained: bool, pre
         connection.execute('RELEASE SAVEPOINT mwf_job_preparation')
 
 
-def apply_job_preparation(connection, preparations, *, keep_trace: bool):
-    """Recheck captured identities and apply all job changes without committing."""
+def validate_job_preparation(connection, preparations):
+    """Recheck exact identities without changing their state."""
     for plan in preparations:
-        if _read_jobs(connection, plan.node) != plan.jobs or _read_orphan_creations(connection, plan.node) != plan.orphan_creations:
-            raise RuntimeError('Jobs changed during full preparation: ' + plan.node)
         affected = set(plan.delete_ids) | set(plan.reset_ids)
+        current_jobs = _read_jobs(connection, plan.node)
+        current_orphans = _read_orphan_creations(connection, plan.node)
+        expected_jobs, expected_orphans = plan.jobs, plan.orphan_creations
+        if not plan.mark_queued:
+            # Each selected producer has its own commit unit in an excluded
+            # receiver. Earlier units may already have removed other jobs.
+            current_jobs = tuple(job for job in current_jobs if job.job_id in affected)
+            expected_jobs = tuple(job for job in expected_jobs if job.job_id in affected)
+            current_orphans = tuple(row for row in current_orphans if row[1] in plan.orphan_ids)
+            expected_orphans = tuple(row for row in expected_orphans if row[1] in plan.orphan_ids)
+        if current_jobs != expected_jobs or current_orphans != expected_orphans:
+            raise RuntimeError('Jobs changed during full preparation: ' + plan.node)
         if any(job.active_execution_id is not None or job.status == 'running' or job.active_pid is not None
                or job.active_thread_id is not None or job.active_started_at is not None
                for job in plan.jobs if job.job_id in affected):
             raise RuntimeError('Preparation cannot change active jobs: ' + plan.node)
+
+
+def apply_job_preparation(connection, preparations, *, keep_trace: bool):
+    """Recheck captured identities and apply all job changes without committing."""
+    validate_job_preparation(connection, preparations)
     now = datetime.now().isoformat(timespec='milliseconds')
     for plan in preparations:
         if not keep_trace:

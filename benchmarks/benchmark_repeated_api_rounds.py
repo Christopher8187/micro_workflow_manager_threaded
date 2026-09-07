@@ -1,4 +1,4 @@
-"""Measure repeated API execution with fixed workload and growth allowance."""
+"""Measure repeated fresh API execution with declared workload growth."""
 from __future__ import annotations
 
 import argparse
@@ -24,7 +24,7 @@ if not __debug__:
     raise RuntimeError("Repeated API measurement requires unoptimized Python")
 
 
-EVENTS = ("created", "started", "task_started", "output_written", "done")
+EVENTS = ("queued", "started", "task_started", "output_written", "done")
 
 
 def evaluate_growth(rounds: list[list[float]]) -> dict:
@@ -125,8 +125,10 @@ def measure_project(source: Path, directory: Path) -> int:
 
         cumulative_events = Counter()
         cumulative_checked = 0
+        previous_executions = {}
         for round_number in range(5):
             first = round_number * 96 + 1
+            executed_jobs = first + 95
             runtime_futures.clear()
             for job_id in range(first, first + 96):
                 workflow.start("merge", job_id=job_id, autostart=False, round_number=round_number)
@@ -139,36 +141,43 @@ def measure_project(source: Path, directory: Path) -> int:
             assert writer["pending_mutations"] == writer["queued"] == writer["durability_backlog"] == 0, writer
             pruned = workflow.storage.prune_dead_thread_connections()
             assert pruned == 0, pruned
-            assert len(runtime_futures) == 384, len(runtime_futures)
+            assert len(runtime_futures) == 4 * executed_jobs, len(runtime_futures)
             assert all(value.done() for value in runtime_futures)
             errors = [repr(value.exception()) for value in runtime_futures if value.exception() is not None]
             assert not errors, errors
             counts = workflow.storage.job_status_counts("merge")
             assert counts == dict(cancelled=0, done=first + 95, failed=0, queued=0, running=0, skipped=0), counts
             events = Counter()
-            for job_id in range(first, first + 96):
+            for job_id in range(1, executed_jobs + 1):
+                created_round = (job_id - 1) // 96
                 command = workflow.storage.output_path("merge", "jobs", str(job_id), "command.txt").read_text(encoding="utf-8")
-                assert command == f"{round_number}:{job_id}", (job_id, command)
+                assert command == f"{created_round}:{job_id}", (job_id, command)
                 output = json.loads(workflow.storage.output_file("merge", job_id).read_text(encoding="utf-8"))
-                assert output == dict(status="done", result_type="int", result_repr=str(job_id), generation=0), output
+                owner = workflow.storage.read_job_current_owner("merge", job_id)
+                assert owner is not None and owner["generation"] == 0, owner
+                assert owner["execution_id"] != previous_executions.get(job_id), owner
+                previous_executions[job_id] = owner["execution_id"]
+                assert output == dict(status="done", result_type="int", result_repr=str(job_id), generation=0,
+                                      execution_id=owner["execution_id"]), output
                 runtime = workflow.storage.read_job_runtime("merge", job_id)
                 assert runtime["checkpoint_name"] == "writing", runtime
                 assert runtime["state"] == "running" and runtime["generation"] == 0, runtime
                 assert runtime["node"] == runtime["task"] == "merge" and runtime["job_id"] == job_id, runtime
                 assert isinstance(runtime["watch_id"], str) and runtime["watch_id"], runtime
-                assert isinstance(runtime["execution_id"], str) and runtime["execution_id"], runtime
+                assert runtime["execution_id"] == owner["execution_id"], runtime
                 job_events = Counter(item["event"] for item in workflow.storage.read_job_events("merge", job_id))
                 assert job_events == {name: 1 for name in EVENTS}, (job_id, job_events)
                 events.update(job_events)
             cumulative_events.update(events)
-            cumulative_checked += 96
+            cumulative_checked += executed_jobs
             integrity = workflow.storage.db_connection().execute("PRAGMA quick_check").fetchone()[0]
             assert integrity == "ok", integrity
             result["rounds"].append(dict(
-                round=round_number, warmup=round_number == 0, jobs=96,
+                round=round_number, warmup=round_number == 0, jobs=executed_jobs, new_jobs=96,
                 run_seconds=returned - started, drain_seconds=drained - returned,
                 counts=counts, writer=writer, pruned=pruned, asynchronous_errors=errors,
-                runtime_future_observations=len(runtime_futures), outputs_checked=96, runtimes_checked=96,
+                runtime_future_observations=len(runtime_futures), outputs_checked=executed_jobs,
+                runtimes_checked=executed_jobs,
                 event_counts=dict(events), cumulative_outputs_checked=cumulative_checked,
                 cumulative_events=dict(cumulative_events), integrity=integrity))
             print(json.dumps(dict(round=round_number, run_seconds=returned - started, correctness="passed")), flush=True)
@@ -210,17 +219,19 @@ def validate_sample(data: dict, plan: dict, command: list[str], overrides: dict)
     assert len(data["rounds"]) == 5
     for position, row in enumerate(data["rounds"]):
         total = (position + 1) * 96
-        assert row["round"] == position and row["warmup"] == (position == 0) and row["jobs"] == 96
+        cumulative = 96 * (position + 1) * (position + 2) // 2
+        assert row["round"] == position and row["warmup"] == (position == 0)
+        assert row["jobs"] == total and row["new_jobs"] == 96
         assert math.isfinite(row["run_seconds"]) and row["run_seconds"] > 0
         assert math.isfinite(row["drain_seconds"]) and row["drain_seconds"] >= 0
         assert row["counts"] == dict(cancelled=0, done=total, failed=0, queued=0, running=0, skipped=0)
         assert row["writer"]["pending_mutations"] == row["writer"]["queued"] == row["writer"]["durability_backlog"] == 0
         assert row["pruned"] == 0 and row["asynchronous_errors"] == []
-        assert row["runtime_future_observations"] == 384
-        assert row["outputs_checked"] == row["runtimes_checked"] == 96
-        assert row["event_counts"] == {name: 96 for name in EVENTS}
-        assert row["cumulative_outputs_checked"] == total and row["integrity"] == "ok"
-        assert row["cumulative_events"] == {name: total for name in EVENTS}
+        assert row["runtime_future_observations"] == 4 * total
+        assert row["outputs_checked"] == row["runtimes_checked"] == total
+        assert row["event_counts"] == {name: total for name in EVENTS}
+        assert row["cumulative_outputs_checked"] == cumulative and row["integrity"] == "ok"
+        assert row["cumulative_events"] == {name: cumulative for name in EVENTS}
     return [row["run_seconds"] for row in data["rounds"][1:]]
 
 
@@ -274,7 +285,8 @@ def main(argv=None) -> int:
     plan = dict(source=str(source), source_commit=args.source_commit, source_state=args.source_state,
                 source_sha256=source_snapshot(source), environment=environment_metadata(source),
                 worker_sha256=digest(Path(__file__)), fresh_processes=3, warmup_rounds=1,
-                measured_rounds=4, jobs_per_round=96,
+                measured_rounds=4, new_jobs_per_round=96,
+                executed_jobs_per_round=[96, 192, 288, 384, 480],
                 measured_boundary="run_node only; creation, barrier, validation and cleanup excluded",
                 growth_rule="aggregate late median <= early median * 3 + 1 second",
                 per_project_growth="recorded separately for review; not hidden by aggregate result")

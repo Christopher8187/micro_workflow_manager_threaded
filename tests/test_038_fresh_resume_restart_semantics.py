@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import textwrap
 from pathlib import Path
 
@@ -34,6 +33,22 @@ def _write_project(
 
 def _count(path: Path) -> int:
     return int(path.read_text(encoding="utf-8"))
+
+
+def _terminal_session(storage, command, start_component, selected_components, outcome):
+    matches = [
+        session for session in storage.list_execution_sessions()
+        if session["command"] == command and session["start_component"] == start_component
+    ]
+    assert len(matches) == 1
+    session = matches[0]
+    assert session["session_kind"] == "main"
+    assert session["parent_session_id"] is None
+    assert session["status"] == "terminal"
+    assert session["outcome"] == outcome
+    assert session["selected_components"] == selected_components
+    assert session["selected_jobs"] == []
+    return session
 
 
 def test_run_resets_parent_created_jobs_before_running_with_monitor(
@@ -76,8 +91,17 @@ def test_run_resets_parent_created_jobs_before_running_with_monitor(
     assert cli.main(["run", "B", "--monitor", "--monitor-interval", "0.01"]) == 0
     captured = capsys.readouterr()
     assert _count(tmp_path / "b-count.txt") == 2
-    assert "active run: run B" in captured.err
-    assert "last run: run B | status=done" in captured.err
+    storage = FileStorage(tmp_path)
+    _terminal_session(storage, "runfrom", ("A",), [("A",), ("B",)], "done")
+    session = _terminal_session(storage, "run", ("B",), [("B",)], "done")
+    assert (
+        f"session={session['session_id']} kind=main command=run status=running "
+        "parent=- components=[B]"
+    ) in captured.err
+    assert (
+        f"session={session['session_id']} kind=main command=run status=terminal "
+        "parent=- components=[B] outcome=done"
+    ) in captured.err
     assert "No queued jobs for B" not in captured.out
 
 
@@ -138,9 +162,11 @@ def test_runfrom_freshens_start_component_and_preserves_other_merge_branch(
     )
     capsys.readouterr()
 
-    assert cli.main(["runfrom", "P"]) == 0
+    # Establish Q through a real native component execution. C remains outside
+    # this selection but retains the Q-produced job for the later merge.
+    assert cli.main(["run", "Q"]) == 0
     capsys.readouterr()
-    assert cli.main(["runfrom", "Q"]) == 0
+    assert cli.main(["runfrom", "P"]) == 0
     capsys.readouterr()
     assert _count(tmp_path / "a-count.txt") == 1
     assert _count(tmp_path / "c-A-count.txt") == 1
@@ -151,10 +177,18 @@ def test_runfrom_freshens_start_component_and_preserves_other_merge_branch(
     assert _count(tmp_path / "a-count.txt") == 2
     assert _count(tmp_path / "c-A-count.txt") == 2
     assert _count(tmp_path / "c-Q-count.txt") == 1
-    assert "active run: runfrom A" in captured.err
-    assert "last run: runfrom A | status=done" in captured.err
-
     storage = FileStorage(tmp_path)
+    _terminal_session(storage, "run", ("Q",), [("Q",)], "done")
+    _terminal_session(storage, "runfrom", ("P",), [("P",), ("A",), ("C",)], "done")
+    session = _terminal_session(storage, "runfrom", ("A",), [("A",), ("C",)], "done")
+    assert (
+        f"session={session['session_id']} kind=main command=runfrom status=running "
+        "parent=- components=[A; C]"
+    ) in captured.err
+    assert (
+        f"session={session['session_id']} kind=main command=runfrom status=terminal "
+        "parent=- components=[A; C] outcome=done"
+    ) in captured.err
     c_jobs = [storage.load_job("C", job_id) for job_id in storage.list_job_ids("C")]
     assert sorted(job.params["label"] for job in c_jobs) == ["A", "Q"]
     assert all(storage.get_job_status("C", job.job_id) == "done" for job in c_jobs)
@@ -203,8 +237,18 @@ def test_resumefrom_requeues_failed_descendant_without_prior_restart_and_monitor
 
     assert cli.main(["runfrom", "A", "--monitor", "--monitor-interval", "0.01"]) == 1
     first = capsys.readouterr()
-    assert "last run: runfrom A | status=failed" in first.err
     storage = FileStorage(tmp_path)
+    failed_session = _terminal_session(
+        storage, "runfrom", ("A",), [("A",), ("B",)], "failed"
+    )
+    assert (
+        f"session={failed_session['session_id']} kind=main command=runfrom status=terminal "
+        "parent=- components=[A; B] outcome=failed"
+    ) in first.err
+    assert any(
+        "Job B/2 failed" in failure["error"]
+        for failure in failed_session["failures"]
+    )
     failed_id = next(
         job_id
         for job_id in storage.list_job_ids("B")
@@ -223,8 +267,17 @@ def test_resumefrom_requeues_failed_descendant_without_prior_restart_and_monitor
     assert _count(tmp_path / "b-2-attempts.txt") == 2
     assert storage.current_job_generation("B", failed_id) == generation_before + 1
     assert storage.get_job_status("B", failed_id) == "done"
-    assert "active run: resumefrom A" in resumed.err
-    assert "last run: resumefrom A | status=done" in resumed.err
+    resumed_session = _terminal_session(
+        storage, "resumefrom", ("A",), [("A",), ("B",)], "done"
+    )
+    assert (
+        f"session={resumed_session['session_id']} kind=main command=resumefrom status=running "
+        "parent=- components=[A; B]"
+    ) in resumed.err
+    assert (
+        f"session={resumed_session['session_id']} kind=main command=resumefrom status=terminal "
+        "parent=- components=[A; B] outcome=done"
+    ) in resumed.err
 
 
 def test_restart_is_active_run_only_and_resume_is_post_failure_path(
@@ -236,12 +289,16 @@ def test_restart_is_active_run_only_and_resume_is_post_failure_path(
         edges="EDGES = [('A', 'B')]",
         behaviors={
             "A": """
+                from pathlib import Path
                 from micro_workflow_manager import NodeRouter
                 router = NodeRouter("A")
                 router.create_job(number=1)
                 @router.task
                 def run(ctx):
-                    raise RuntimeError("boom")
+                    root = Path(ctx.system.storage.project_dir)
+                    if not (root / "allow-retry.flag").exists():
+                        raise RuntimeError("boom")
+                    return "recovered"
             """,
             "B": """
                 from micro_workflow_manager import NodeRouter
@@ -258,24 +315,19 @@ def test_restart_is_active_run_only_and_resume_is_post_failure_path(
 
     storage = FileStorage(tmp_path)
     assert storage.get_job_status("A", 1) == "failed"
+    owner = storage.read_job_current_owner("A", 1)
+    failed_session = _terminal_session(storage, "run", ("A",), [("A",)], "failed")
+    assert owner["session_id"] == failed_session["session_id"]
+    generation_before = storage.current_job_generation("A", 1)
     assert cli.main(["restart", "A", "job", "1"]) == 1
     error = capsys.readouterr().err
-    assert "second terminal" in error
-    assert "resumefrom" in error
+    assert f"belongs to session {failed_session['session_id']}" in error
+    assert "cannot accept restart: no running sequence is recorded" in error
     assert storage.get_job_status("A", 1) == "failed"
 
-    storage.write_run_state(
-        {
-            "run_id": "live-test-run",
-            "status": "running",
-            "command": "runfrom",
-            "start_node": "A",
-            "nodes": ["A", "B"],
-            "pid": os.getpid(),
-        }
-    )
-    assert cli.main(["restart", "A", "job", "1"]) == 0
-    output = capsys.readouterr().out
-    assert "failed-job retry" in output
-    assert "existing run remains in control" in output
-    assert storage.get_job_status("A", 1) == "queued"
+    (tmp_path / "allow-retry.flag").write_text("yes", encoding="utf-8")
+    assert cli.main(["resume", "A"]) == 0
+    capsys.readouterr()
+    assert storage.get_job_status("A", 1) == "done"
+    assert storage.current_job_generation("A", 1) == generation_before + 1
+    _terminal_session(storage, "resume", ("A",), [("A",)], "done")

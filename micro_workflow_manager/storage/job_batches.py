@@ -12,6 +12,7 @@ from typing import Any, Iterable
 from uuid import uuid4
 
 from micro_workflow_manager.models import Job, QUEUED
+from .preparation_guards import refuse_receiver_mutation
 
 
 class JobBatchStorageMixin:
@@ -169,6 +170,7 @@ class JobBatchStorageMixin:
         with self.db_transaction() as connection:
             for job in jobs:
                 self._validate_job_producer(connection, job, producer_execution_id)
+            refuse_receiver_mutation(connection, node_name)
             connection.executemany(
                 "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
                 "VALUES(?, ?, ?, ?, ?, '{}')",
@@ -313,6 +315,7 @@ class JobBatchStorageMixin:
                     ))
 
             if job_rows:
+                refuse_receiver_mutation(connection, node_name)
                 connection.executemany(
                     "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
                     "VALUES(?, ?, ?, ?, ?, '{}')",

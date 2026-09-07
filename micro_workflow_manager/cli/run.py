@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from .run_commands import (
     _component_notice,
-    _prepare_node_for_resume,
     _refuse_start_component_inputs,
     resume_from,
     resume_node,

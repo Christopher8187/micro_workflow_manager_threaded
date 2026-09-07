@@ -816,18 +816,34 @@ def test_node_router_timeout_is_written_to_schema(tmp_path):
 
 
 def test_active_run_state_contains_ownership_and_heartbeat(tmp_path, monkeypatch, capsys):
+    from micro_workflow_manager import __version__
+
     write_project(tmp_path, monkeypatch)
     capsys.readouterr()
     assert cli.main(["run", "A"]) == 0
-    state = json.loads((tmp_path / ".mwf" / "run.json").read_text(encoding="utf-8"))
+    storage = FileStorage(tmp_path)
+    sessions = storage.list_execution_sessions()
+    assert len(sessions) == 1
+    state = sessions[0]
     assert state["hostname"]
-    assert state["pid"] > 0
-    assert state["heartbeat_at"]
-    assert state["mwf_version"] == "0.6.1"
-    assert state["status"] == "done"
+    assert state["pid"] == os.getpid()
+    assert datetime.fromisoformat(state["started_at"]) <= datetime.fromisoformat(state["heartbeat_at"])
+    assert datetime.fromisoformat(state["heartbeat_at"]) <= datetime.fromisoformat(state["finished_at"])
+    assert state["details"]["mwf_version"] == __version__
+    assert state["session_kind"] == "main"
+    assert state["start_component"] == ("A",)
+    assert state["selected_components"] == [("A",)]
+    assert state["status"] == "terminal"
+    assert state["outcome"] == "done"
+    assert state["failures"] == []
+    owner = storage.read_job_current_owner("A", 1)
+    assert owner is not None and owner["session_id"] == state["session_id"]
+    assert storage.get_live_main_session() is None
+    assert storage.get_component_reservation(("A",)) is None
+    assert not (tmp_path / ".mwf" / "run.json").exists()
 
 
-def test_migrate_versions_only_framework_metadata(tmp_path, monkeypatch, capsys):
+def test_unsupported_project_refusal_preserves_user_data(tmp_path, monkeypatch, capsys):
     write_project(tmp_path, monkeypatch)
     capsys.readouterr()
     config_path = tmp_path / ".mwf" / "project.json"
@@ -840,37 +856,52 @@ def test_migrate_versions_only_framework_metadata(tmp_path, monkeypatch, capsys)
     output_path.write_text('{"custom": true}', encoding="utf-8")
     input_before = input_path.read_bytes()
     output_before = output_path.read_bytes()
-    storage = FileStorage(tmp_path)
-    status_before = storage.read_job_status_data("A", 1)
+    before = {
+        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
+        for path in tmp_path.rglob("*")
+    }
 
-    assert cli.main(["migrate", "--dry-run"]) == 0
-    assert "Would migrate" in capsys.readouterr().out
+    with pytest.raises(RuntimeError, match="Unsupported MWF project format.*migration.md"):
+        FileStorage(tmp_path)
+    assert cli.main(["run", "A"]) == 1
+    assert "Unsupported MWF project format" in capsys.readouterr().err
+    assert {
+        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
+        for path in tmp_path.rglob("*")
+    } == before
     assert "schema_version" not in json.loads(config_path.read_text(encoding="utf-8"))
-    assert storage.read_job_status_data("A", 1) == status_before
-
-    assert cli.main(["migrate"]) == 0
-    capsys.readouterr()
-    assert json.loads(config_path.read_text(encoding="utf-8"))["schema_version"] == 2
-    assert storage.database_integrity_check() == "ok"
     assert input_path.read_bytes() == input_before
     assert output_path.read_bytes() == output_before
 
 def test_runfrom_plan_is_read_only(tmp_path, monkeypatch, capsys):
-    write_project(tmp_path, monkeypatch)
+    behavior = write_project(tmp_path, monkeypatch)
     capsys.readouterr()
+    for path in [tmp_path / "src" / "graph.py", *behavior.glob("*.py")]:
+        path.write_text(
+            "raise AssertionError('A run plan must not import user code')\n" + path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     storage = FileStorage(tmp_path)
     config_path = tmp_path / ".mwf" / "project.json"
     config_before = config_path.read_bytes()
     jobs_before = storage.list_job_ids("A")
     status_before = storage.read_job_status_data("A", 1)
     tree_before = sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node").rglob("*"))
+    files_before = {
+        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
+        for path in tmp_path.rglob("*")
+    }
 
     assert cli.main(["runfrom", "A", "--plan"]) == 0
     out = capsys.readouterr().out
     assert "Plan for: mwf runfrom A" in out
     assert "planned runfrom was not applied" in out
-    assert "bootstrap and router mounting may already have updated framework state" in out
-    assert "no state, jobs, inputs, outputs, or node folders were changed" not in out
+    assert "user code was not loaded" in out
+    assert "no project state was changed" in out
+    assert {
+        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
+        for path in tmp_path.rglob("*")
+    } == files_before
     assert config_path.read_bytes() == config_before
     assert storage.list_job_ids("A") == jobs_before
     assert storage.read_job_status_data("A", 1) == status_before
@@ -883,14 +914,20 @@ def test_graph_update_dry_run_does_not_add_or_delete_nodes(tmp_path, monkeypatch
     capsys.readouterr()
     config_before = (tmp_path / ".mwf" / "project.json").read_bytes()
     (tmp_path / "src" / "graph.py").write_text("EDGES = [('A', 'C')]\n", encoding="utf-8")
+    files_before = {
+        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
+        for path in tmp_path.rglob("*")
+    }
 
     assert cli.main(["graph", "--update", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "nodes to add: C" in out
     assert "nodes to delete: B" in out
     assert "graph synchronization was not applied" in out
-    assert "normal CLI bootstrap may already have migrated framework state" in out
-    assert "no configuration or node folders were changed" not in out
+    assert {
+        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
+        for path in tmp_path.rglob("*")
+    } == files_before
     assert (tmp_path / ".mwf" / "project.json").read_bytes() == config_before
     assert (tmp_path / "node" / "B").is_dir()
     assert not (tmp_path / "node" / "C").exists()
@@ -1180,7 +1217,12 @@ def test_scheduler_uses_one_central_watchdog_for_multiple_attempts(tmp_path, mon
         assert counts.get("done") == 4 and sum(counts.values()) == 4
         for job in jobs:
             output = json.loads(workflow.storage.output_file("A", job.job_id).read_text(encoding="utf-8"))
-            assert output == {"status": "done", "result_type": "int", "result_repr": str(job.job_id)}
+            owner = workflow.storage.read_job_current_owner("A", job.job_id)
+            assert owner is not None
+            assert output == {
+                "status": "done", "result_type": "int", "result_repr": str(job.job_id),
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
     finally:
         release.set()
         runner.join(timeout=10)
@@ -1192,17 +1234,23 @@ def test_scheduler_uses_one_central_watchdog_for_multiple_attempts(tmp_path, mon
         workflow.storage.close_thread_connection()
 
 
-def test_untimed_task_without_checkpoints_keeps_original_direct_fast_path(tmp_path):
-    from threading import get_ident
-
+def test_untimed_owned_task_keeps_deadlines_and_runtime_unset(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
     workflow.graph([("A", "B")])
-    caller = get_ident()
-    observed: list[int] = []
+    observed: list[str] = []
 
     @workflow.task("A")
     def a(ctx):
-        observed.append(get_ident())
+        with workflow.scheduler_supervisor._condition:
+            watches = [watch for watch in workflow.scheduler_supervisor._watches.values()
+                       if watch.execution_id == ctx.execution_id]
+            assert len(watches) == 1
+            watch = watches[0]
+            assert not watch.supervised
+            assert watch.total_deadline is None
+            assert watch.checkpoint_deadline is None
+            assert watch.external_wait_deadline is None
+        observed.append(ctx.execution_id)
         return "ok"
 
     @workflow.task("B")
@@ -1210,11 +1258,13 @@ def test_untimed_task_without_checkpoints_keeps_original_direct_fast_path(tmp_pa
         return None
 
     assert workflow.run_one("A") == "ok"
-    assert observed == [caller]
+    owner = workflow.storage.read_job_current_owner("A", 1)
+    assert owner is not None
+    assert observed == [owner["execution_id"]]
     assert workflow.storage.read_job_runtime("A", 1) == {}
     assert not (workflow.storage.job_base_dir("A", 1) / "runtime.json").exists()
-    thread = workflow.scheduler_supervisor._thread
-    assert thread is None or not thread.is_alive()
+    assert workflow.scheduler_supervisor._watches == {}
+    assert workflow.storage.get_live_main_session() is None
 
 
 def test_dynamic_checkpoint_timeout_requires_supervised_handler(tmp_path):

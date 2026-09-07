@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .input_schema import INPUT_TABLES, create_input_tables
 from .misalignment_schema import MISALIGNMENT_TABLES, create_misalignment_tables
+from .preparation_schema import PREPARATION_TABLES, create_preparation_tables
 
 
 DATABASE_SCHEMA_VERSION = 5
@@ -19,7 +20,7 @@ CORE_TABLES = frozenset({
     "metadata", "nodes", "jobs", "job_events", "idempotency",
     "default_job_specs", "advisory_locks", "job_sequences", "network_state",
 })
-NATIVE_TABLES = CORE_TABLES | SESSION_TABLES | INPUT_TABLES | MISALIGNMENT_TABLES
+NATIVE_TABLES = CORE_TABLES | SESSION_TABLES | INPUT_TABLES | MISALIGNMENT_TABLES | PREPARATION_TABLES
 
 
 class SQLiteSchemaMixin:
@@ -435,6 +436,7 @@ class SQLiteSchemaMixin:
         """)
 
         create_input_tables(connection)
+        create_preparation_tables(connection)
         create_misalignment_tables(connection)
 
     def database_integrity_check(self) -> str:

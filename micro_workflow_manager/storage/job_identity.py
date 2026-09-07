@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from micro_workflow_manager.models import Job, QUEUED
 from .job_producers import JobProducerStorageMixin
+from .preparation_guards import refuse_receiver_mutation
 
 
 class JobIdentityStorageMixin(JobProducerStorageMixin):
@@ -114,6 +115,7 @@ class JobIdentityStorageMixin(JobProducerStorageMixin):
         node_name = self.validate_node_name(node_name)
 
         def reserve(connection):
+            refuse_receiver_mutation(connection, node_name)
             row = connection.execute(
                 "SELECT next_job_id FROM job_sequences WHERE node_name=?",
                 (node_name,),

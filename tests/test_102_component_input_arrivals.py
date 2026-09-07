@@ -43,7 +43,8 @@ def test_late_managed_input_marks_completed_receiver_without_rerunning_it(tmp_pa
         owner = storage.read_job_current_owner('B', 1)
         output = storage.output_file('B', 1).read_bytes()
 
-        workflow.run_node('A')
+        workflow.start('A', job_id=2)
+        workflow.run_job('A', 2, ignore_readiness=True)
 
         assert calls == ['A', 'B', 'A']
         assert [path.name for path in published] == ['value.txt', 'value_2.txt']
@@ -82,18 +83,20 @@ def test_receiver_keeps_first_actual_batch_path_after_later_arrivals_and_reopen(
         workflow.run()
         before = storage.get_component_state(('B',))
         downstream_before = storage.get_component_state(('C',))
-        workflow.run_node('A')
+        workflow.start('A', job_id=2)
+        workflow.run_job('A', 2, ignore_readiness=True)
         expected = [{
             'receiver_node': 'B', 'alignment_generation': before['alignment_generation'],
-            'producer_node': 'A', 'producer_job_id': 1,
+            'producer_node': 'A', 'producer_job_id': 2,
             'arrival_kind': 'managed-input', 'path': 'A/first_2.txt',
         }]
         assert storage.read_component_misalignment_causes(('B',)) == expected
         assert storage.get_component_state(('C',)) == downstream_before
-        workflow.run_node('A')
+        workflow.start('A', job_id=3)
+        workflow.run_job('A', 3, ignore_readiness=True)
         assert [path.name for path in rounds[-1]] == ['first_3.txt', 'second_3.txt']
         assert storage.read_component_misalignment_causes(('B',)) == expected
-        storage.clear_job_events('A', [1])
+        storage.clear_job_events('A', [2])
         assert storage.read_component_misalignment_causes(('B',)) == expected
     finally:
         _close(storage)
@@ -140,12 +143,13 @@ def test_terminal_receiver_keeps_lifecycle_and_gets_a_new_cause_after_full_repai
         before = storage.get_component_state(('B',))
         assert before['lifecycle'] == lifecycle
         assert storage.read_component_misalignment_causes(('B',)) == []
-        workflow.run_node('A')
+        workflow.start('A', job_id=2)
+        workflow.run_job('A', 2, ignore_readiness=True)
         assert storage.get_component_state(('B',)) == dict(before, misaligned=True)
         first = storage.read_component_misalignment_causes(('B',))
         assert first == [{
             'receiver_node': 'B', 'alignment_generation': before['alignment_generation'],
-            'producer_node': 'A', 'producer_job_id': 1,
+            'producer_node': 'A', 'producer_job_id': 2,
             'arrival_kind': 'managed-input', 'path': 'A/data_2.txt',
         }]
         fail_receiver = False
@@ -154,10 +158,12 @@ def test_terminal_receiver_keeps_lifecycle_and_gets_a_new_cause_after_full_repai
         assert repaired['lifecycle'] == 'done' and repaired['misaligned'] is False
         assert repaired['alignment_generation'] == before['alignment_generation'] + 1
         assert storage.read_component_misalignment_causes(('B',)) == []
-        workflow.run_node('A')
+        workflow.start('A', job_id=3)
+        workflow.run_job('A', 3, ignore_readiness=True)
         assert storage.get_component_state(('B',)) == dict(repaired, misaligned=True)
         assert storage.read_component_misalignment_causes(('B',)) == [dict(
-            first[0], alignment_generation=repaired['alignment_generation'], path='A/data_3.txt',
+            first[0], alignment_generation=repaired['alignment_generation'],
+            producer_job_id=3, path='A/data_3.txt',
         )]
     finally:
         _close(storage)
@@ -177,10 +183,10 @@ def test_failed_arrival_decision_restores_files_owners_events_and_receiver(tmp_p
         if not reject:
             ctx.node('B').write_input('keep.txt', 'original')
             return
-        events = storage.read_job_events('A', 1)
+        events = storage.read_job_events('A', ctx.job_id)
         with pytest.raises(sqlite3.IntegrityError, match='injected arrival failure'):
             ctx.node('B').write_inputs([('keep.txt', 'replacement'), ('new.txt', 'new')], overwrite=True)
-        assert storage.read_job_events('A', 1) == events
+        assert storage.read_job_events('A', ctx.job_id) == events
         assert (receiver / 'keep.txt').read_bytes() == b'original'
         assert not (receiver / 'new.txt').exists()
         assert storage.read_node_input_owner('B', 'A/keep.txt') == before['owner']
@@ -201,6 +207,7 @@ def test_failed_arrival_decision_restores_files_owners_events_and_receiver(tmp_p
         workflow.run()
         before = {'state': storage.get_component_state(('B',)),
                   'owner': storage.read_node_input_owner('B', 'A/keep.txt')}
+        workflow.start('A', job_id=2)
         target = {
             'state': "UPDATE OF misaligned ON component_states WHEN NEW.misaligned=1",
             'cause': 'INSERT ON component_misalignment_causes',
@@ -212,7 +219,7 @@ def test_failed_arrival_decision_restores_files_owners_events_and_receiver(tmp_p
             " BEGIN SELECT RAISE(ABORT, 'injected arrival failure'); END"
         ))
         reject = True
-        workflow.run_node('A')
+        workflow.run_job('A', 2, ignore_readiness=True)
     finally:
         storage.submit_db_mutation(lambda connection: connection.execute('DROP TRIGGER IF EXISTS refuse_arrival'))
         _close(storage)
@@ -223,14 +230,19 @@ def test_two_receivers_in_one_component_keep_their_causes_after_concurrent_publi
     workflow.graph([('A', 'X'), ('X', 'A'), ('A', 'B'), ('X', 'C'), ('B', 'C'), ('C', 'B')])
     storage = workflow.storage
     publish_together = Barrier(2)
+    publish_later = False
 
     @workflow.task('A')
     def first(ctx):
+        if not publish_later:
+            return
         publish_together.wait(timeout=10)
         ctx.node('B').write_input('first.txt', 'A')
 
     @workflow.task('X')
     def second(ctx):
+        if not publish_later:
+            return
         publish_together.wait(timeout=10)
         ctx.node('C').write_input('second.txt', 'X')
 
@@ -248,13 +260,14 @@ def test_two_receivers_in_one_component_keep_their_causes_after_concurrent_publi
         workflow.run()
         before = storage.get_component_state(('B', 'C'))
         assert before['misaligned'] is False
+        publish_later = True
         workflow.run_component(('A', 'X'))
         assert storage.get_component_state(('B', 'C')) == dict(before, misaligned=True)
         assert storage.read_component_misalignment_causes(('C', 'B')) == [
             {'receiver_node': 'B', 'alignment_generation': before['alignment_generation'],
-             'producer_node': 'A', 'producer_job_id': 1, 'arrival_kind': 'managed-input', 'path': 'A/first_2.txt'},
+             'producer_node': 'A', 'producer_job_id': 1, 'arrival_kind': 'managed-input', 'path': 'A/first.txt'},
             {'receiver_node': 'C', 'alignment_generation': before['alignment_generation'],
-             'producer_node': 'X', 'producer_job_id': 1, 'arrival_kind': 'managed-input', 'path': 'X/second_2.txt'},
+             'producer_node': 'X', 'producer_job_id': 1, 'arrival_kind': 'managed-input', 'path': 'X/second.txt'},
         ]
     finally:
         _close(storage)
@@ -363,15 +376,19 @@ def test_reopened_cause_reader_refuses_damaged_current_history(tmp_path, damage)
     try:
         workflow.run()
         receiver_owner = storage.read_job_current_owner('B', 1)
-        workflow.run_node('A')
+        workflow.start('A', job_id=2)
+        workflow.run_job('A', 2, ignore_readiness=True)
         assert len(storage.read_component_misalignment_causes(('B',))) == 1
         def corrupt(connection):
             if damage == 'missing':
-                connection.execute('DELETE FROM component_misalignment_causes')
+                connection.execute(
+                    "DELETE FROM component_misalignment_causes WHERE receiver_node='B'"
+                )
             elif damage == 'flag':
                 connection.execute("UPDATE component_states SET misaligned=0 WHERE component_key='[\"B\"]'")
             elif damage == 'producer':
-                connection.execute('UPDATE component_misalignment_causes SET producer_execution_id=?',
+                connection.execute("UPDATE component_misalignment_causes "
+                                   "SET producer_execution_id=? WHERE receiver_node='B'",
                                    (receiver_owner['execution_id'],))
             else:
                 column, value = {
@@ -380,7 +397,10 @@ def test_reopened_cause_reader_refuses_damaged_current_history(tmp_path, damage)
                     'generation': ('alignment_generation', 0),
                     'path': ('relative_path', '../outside.txt'),
                 }[damage]
-                connection.execute('UPDATE component_misalignment_causes SET ' + column + '=?', (value,))
+                connection.execute(
+                    'UPDATE component_misalignment_causes SET ' + column +
+                    "=? WHERE receiver_node='B'", (value,)
+                )
         storage.submit_db_mutation(corrupt)
     finally:
         _close(storage)
@@ -644,12 +664,13 @@ def test_managed_delete_marks_receiver_when_it_removes_bytes_or_remaining_owners
             path.unlink()
         assert storage.get_component_state(('B',)) == before
         later = True
-        workflow.run_node('A')
+        workflow.start('A', job_id=2)
+        workflow.run_job('A', 2, ignore_readiness=True)
         assert not path.exists()
         assert storage.get_component_state(('B',)) == dict(before, misaligned=True)
         assert storage.read_component_misalignment_causes(('B',)) == [{
             'receiver_node': 'B', 'alignment_generation': before['alignment_generation'],
-            'producer_node': 'A', 'producer_job_id': 1,
+            'producer_node': 'A', 'producer_job_id': 2,
             'arrival_kind': 'managed-input', 'path': 'A/keep.txt',
         }]
     finally:

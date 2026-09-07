@@ -86,10 +86,18 @@ queued or running. Repeated arrivals retain the first cause; manual filesystem
 edits trigger no detection. Full fresh preparation
 advances the generation and removes old causes from the current view. Idempotent
 job reuse creates no arrival. Job causes retain the receiving instance even after
-trace clearing, deletion, or numeric ID reuse. Preparation-driven causes and public
-trace integration remain under implementation. See
+trace clearing, deletion, or numeric ID reuse. See
 [receiver input progress](../plans/0.6.2/receiver-input-misalignment-progress.md) and
 [managed job progress](../plans/0.6.2/managed-job-arrivals-progress.md).
+
+Full component preparation removes the selected producers' managed jobs and input
+files at excluded receivers, preserves other producers' material, and records a
+preparation-removal cause for an established receiver result. It checks the whole
+mutation footprint and holds short-lived receiver guards before moving files.
+Durable receipts keep filesystem restoration consistent with the SQLite decision,
+including failures reported after commit. Selected-job preparation, interval
+commands, and automatic recovery remain under
+implementation. See [producer preparation progress](../plans/0.6.2/producer-footprint-preparation-progress.md).
 
 An overwritten or appended path can retain several producing executions.
 Overwriting an existing unowned file also preserves that predecessor in the

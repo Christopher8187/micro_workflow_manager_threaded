@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from micro_workflow_manager.models import Job, QUEUED
+from .preparation_guards import refuse_receiver_mutation
 
 
 @dataclass(slots=True)
@@ -226,8 +227,14 @@ class AutoJobCreationStorageMixin:
                         outcomes[index] = (True, (False, job_id))
                         continue
 
+                try:
+                    refuse_receiver_mutation(connection, node_name)
+                except Exception as error:
+                    outcomes[index] = (False, error)
+                    continue
                 job_id = next_job_id
                 next_job_id += 1
+                next_ids[node_name] = next_job_id
                 pending.append((item, job_id))
                 outcomes[index] = (True, (True, job_id))
                 if item.key_hash is not None:
@@ -235,8 +242,6 @@ class AutoJobCreationStorageMixin:
                         str(item.idempotency_key),
                         job_id,
                     )
-            next_ids[node_name] = next_job_id
-
         published: list[AutoJobPublish] = []
         try:
             for item, job_id in pending:

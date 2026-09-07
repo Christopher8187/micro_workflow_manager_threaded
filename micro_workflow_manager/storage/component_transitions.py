@@ -86,7 +86,8 @@ class ComponentTransitionStorageMixin:
     ) -> int:
         return self._complete_component_preparation(None, component, expected_state, job_preparation, keep_trace)
 
-    def _complete_component_preparation(self, session_id, component, expected_state, job_preparation, keep_trace):
+    def _complete_component_preparation(self, session_id, component, expected_state, job_preparation, keep_trace,
+                                        *, connection=None):
         self._require_execution_session_storage()
         members = self._session_component(component)
         expected = dict(expected_state)
@@ -119,7 +120,7 @@ class ComponentTransitionStorageMixin:
                 raise RuntimeError('Component changed during full preparation: ' + key)
             return expected['alignment_generation'] + 1
 
-        return self.submit_db_mutation(complete, wait=True, priority=0)
+        return complete(connection) if connection is not None else self.submit_db_mutation(complete, wait=True, priority=0)
 
     def begin_sampled_component_resume(
         self, session_id: str, component, *, expected_alignment_generation: int,

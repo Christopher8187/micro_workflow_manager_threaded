@@ -8,6 +8,7 @@ from typing import Any
 
 from micro_workflow_manager.models import Job, QUEUED
 from .auto_job_creation import AutoJobCreationStorageMixin
+from .preparation_guards import refuse_receiver_mutation
 
 
 class JobCreationStorageMixin(AutoJobCreationStorageMixin):
@@ -119,6 +120,7 @@ class JobCreationStorageMixin(AutoJobCreationStorageMixin):
             if collision is not None:
                 raise ValueError(f"Job {job.node_name}/{job_id} already exists")
 
+            refuse_receiver_mutation(connection, job.node_name)
             if input_text is not None:
                 input_directory = self.job_base_dir(job.node_name, job_id)
                 input_directory.mkdir(exist_ok=False)

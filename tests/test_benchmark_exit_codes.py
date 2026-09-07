@@ -104,7 +104,7 @@ def test_repeated_api_worker_rejects_unfinished_jobs(tmp_path, monkeypatch):
         storage.close_thread_connection()
 
 
-@pytest.mark.parametrize("damage", [None, "source_path", "source_hash"])
+@pytest.mark.parametrize("damage", [None, "source_path", "source_hash", "executed_jobs", "historical_outputs"])
 def test_repeated_api_parent_binds_results_to_the_measured_source(tmp_path, monkeypatch, damage):
     from benchmarks import benchmark_repeated_api_rounds as benchmark
 
@@ -115,14 +115,15 @@ def test_repeated_api_parent_binds_results_to_the_measured_source(tmp_path, monk
         rows = []
         for position in range(5):
             total = (position + 1) * 96
+            cumulative = 96 * (position + 1) * (position + 2) // 2
             rows.append(dict(
-                round=position, warmup=position == 0, jobs=96, run_seconds=1, drain_seconds=0,
+                round=position, warmup=position == 0, jobs=total, new_jobs=96, run_seconds=1, drain_seconds=0,
                 counts=dict(cancelled=0, done=total, failed=0, queued=0, running=0, skipped=0),
                 writer=dict(pending_mutations=0, queued=0, durability_backlog=0), pruned=0,
-                asynchronous_errors=[], runtime_future_observations=384, outputs_checked=96,
-                runtimes_checked=96, cumulative_outputs_checked=total, integrity="ok",
-                event_counts={name: 96 for name in ("created", "started", "task_started", "output_written", "done")},
-                cumulative_events={name: total for name in ("created", "started", "task_started", "output_written", "done")},
+                asynchronous_errors=[], runtime_future_observations=4 * total, outputs_checked=total,
+                runtimes_checked=total, cumulative_outputs_checked=cumulative, integrity="ok",
+                event_counts={name: total for name in ("queued", "started", "task_started", "output_written", "done")},
+                cumulative_events={name: cumulative for name in ("queued", "started", "task_started", "output_written", "done")},
             ))
         data = dict(exit_code=0, correctness="passed", cleanup="passed", cleanup_seconds=0,
                     source=plan["source"], source_sha256=plan["source_sha256"],
@@ -133,6 +134,10 @@ def test_repeated_api_parent_binds_results_to_the_measured_source(tmp_path, monk
             data["source"] = "a different source copy"
         elif damage == "source_hash":
             data["source_sha256"] = {}
+        elif damage == "executed_jobs":
+            data["rounds"][-1]["jobs"] = 96
+        elif damage == "historical_outputs":
+            data["rounds"][-1]["outputs_checked"] = 96
         (directory / "result.json").write_text(json.dumps(data), encoding="utf-8")
         return SimpleNamespace(returncode=0)
 

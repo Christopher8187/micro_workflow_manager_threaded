@@ -100,19 +100,33 @@ circulation. The active run record retains the selection manifest and digest.
 
 ## Resume
 
-`mwf resume NODE` continues NODE's selected component without resetting `done`
-or `skipped` jobs. `mwf resumefrom START` applies that behavior through the
-selected descendant region. Existing queued work remains available, and failed,
-cancelled, or abandoned-running work is fenced and requeued.
+`mwf resume NODE` continues one component while preserving successful jobs and
+output. `mwf resumefrom START` continues through its quotient descendants.
+Queued jobs retain their generations. Repairable failed or cancelled jobs
+receive a new job generation. Resume preserves the component's alignment generation.
 
-Before selection, resume reconciles terminal `output.json` records for jobs
-still recorded as running and waits for those state updates to become durable.
+Both commands preflight the whole selection before changing jobs, files, or
+traces. Misalignment and incomplete or incompatible external parents block
+resume. Misaligned `resume C` recommends `mwf run C`. Misaligned C inside
+`resumefrom B` recommends `mwf resetfrom C`, then retrying `mwf resumefrom B`.
+Separate affected branches receive separate repair commands.
+
+Preparation requires exact session reservations, job instances, and execution
+owners. Failed or cancelled attempts must retain their producing component
+membership but may belong to an older shape or alignment. Execution locks precede
+receiver locks. Requeue, component state, restart events, trace clearing, and
+output recovery commit together. Failed SQL restores staged files.
+
+Terminal-output recovery requires an abandoned running attempt in a terminal
+session, with the current producing component, shape, and alignment. Output must
+match its generation and execution ID. Recovery retains its start time and the
+output file's finish time. Native running components and crashed sessions still
+need the separate recovery work in the
+[implementation progress](plans/0.6.2/producer-footprint-preparation-progress.md).
+
 The start component's trace is retained. Default `resumefrom` clears descendant
-trace journals; `--keeptrace` retains them.
-
-`resumefrom` supports the same `refuse` and `refuseafter` admission boundaries
-as `runfrom`, but it does not perform fresh producer cleanup.
-
+traces after preflight; `--keeptrace` retains them. It supports the same `refuse`
+and `refuseafter` admission boundaries as `runfrom` without fresh producer cleanup.
 ## Restart during a live sequence
 
 Keep the original execution terminal running and use another terminal:

@@ -427,28 +427,26 @@ def test_fresh_component_cleanup_uses_bulk_producer_snapshot(tmp_path, monkeypat
 
     @workflow.task("preexplode")
     def preexplode(ctx):
-        return None
+        ctx.node("explode").add_many([{"value": value} for value in range(100)])
 
     @workflow.task("explode")
     def explode(ctx, value):
+        ctx.node("handler").add_many([{"value": item} for item in range(200)])
         return value
 
     @workflow.task("handler")
     def handler(ctx, value):
         return value
 
-    workflow.add_jobs(
-        "preexplode",
-        "explode",
-        [{"value": value} for value in range(100)],
-        _parent_job_id=1,
-    )
-    workflow.add_jobs(
-        "explode",
-        "handler",
-        [{"value": value} for value in range(200)],
-        _parent_job_id=1,
-    )
+    workflow.start("preexplode", job_id=1)
+    workflow.run_node("preexplode")
+    workflow.run_job("explode", 1)
+    for producer, receiver in (("preexplode", "explode"), ("explode", "handler")):
+        owner = workflow.storage.read_job_current_owner(producer, 1)
+        creators = workflow.storage.db_connection().execute(
+            'SELECT DISTINCT created_by_execution_id FROM job_instances WHERE node_name=?', (receiver,),
+        ).fetchall()
+        assert [row['created_by_execution_id'] for row in creators] == [owner['execution_id']]
 
     monkeypatch.setattr(
         workflow.storage,

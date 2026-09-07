@@ -415,14 +415,62 @@ def test_resumefrom_preserves_start_trace_and_clears_descendant_trace_by_default
     assert cli.main(["runfrom", "A"]) == 1
     capsys.readouterr()
     storage = FileStorage(tmp_path)
+    assert storage.list_job_ids("A") == [1]
+    assert storage.list_job_ids("B") == [1]
+    assert storage.get_job_status("A", 1) == "done"
+    assert storage.get_job_status("B", 1) == "failed"
+    a_state_before = storage.get_component_state(("A",))
+    b_state_before = storage.get_component_state(("B",))
+    assert a_state_before is not None and a_state_before["lifecycle"] == "done"
+    assert b_state_before is not None and b_state_before["lifecycle"] == "failed"
+    assert not a_state_before["misaligned"]
+    assert not b_state_before["misaligned"]
+    a_alignment_generation = a_state_before["alignment_generation"]
+    b_alignment_generation = b_state_before["alignment_generation"]
+    a_job_generation = storage.current_job_generation("A", 1)
+    b_job_generation = storage.current_job_generation("B", 1)
+    failed_session, = [
+        session
+        for session in storage.list_execution_sessions()
+        if session["command"] == "runfrom"
+        and session["start_component"] == ("A",)
+    ]
+    assert failed_session["status"] == "terminal"
+    assert failed_session["outcome"] == "failed"
+    assert failed_session["selected_components"] == [("A",), ("B",)]
+    assert storage.get_component_reservation(("A",)) is None
+    assert storage.get_component_reservation(("B",)) is None
     assert [event["content"] for event in _trace_events(storage, "A", 1)] == ["original"]
     assert [event["content"] for event in _trace_events(storage, "B", 1)] == [1]
 
     (tmp_path / "allow.flag").write_text("yes", encoding="utf-8")
     assert cli.main(["resumefrom", "A"]) == 0
     capsys.readouterr()
+    assert storage.get_job_status("A", 1) == "done"
+    assert storage.get_job_status("B", 1) == "done"
+    assert storage.current_job_generation("A", 1) == a_job_generation
+    assert storage.current_job_generation("B", 1) == b_job_generation + 1
+    a_state_after = storage.get_component_state(("A",))
+    b_state_after = storage.get_component_state(("B",))
+    assert a_state_after is not None and a_state_after["lifecycle"] == "done"
+    assert b_state_after is not None and b_state_after["lifecycle"] == "done"
+    assert a_state_after["alignment_generation"] == a_alignment_generation
+    assert b_state_after["alignment_generation"] == b_alignment_generation
+    assert not a_state_after["misaligned"]
+    assert not b_state_after["misaligned"]
     assert [event["content"] for event in _trace_events(storage, "A", 1)] == ["original"]
     assert [event["content"] for event in _trace_events(storage, "B", 1)] == [2]
+    resumed_session, = [
+        session
+        for session in storage.list_execution_sessions()
+        if session["command"] == "resumefrom"
+        and session["start_component"] == ("A",)
+    ]
+    assert resumed_session["status"] == "terminal"
+    assert resumed_session["outcome"] == "done"
+    assert resumed_session["selected_components"] == [("A",), ("B",)]
+    assert storage.get_component_reservation(("A",)) is None
+    assert storage.get_component_reservation(("B",)) is None
 
 
 def test_deleted_job_and_copy_paste_preserve_trace_journals(

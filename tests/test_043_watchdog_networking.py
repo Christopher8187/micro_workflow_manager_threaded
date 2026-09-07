@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import socket
 import threading
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
@@ -17,6 +19,7 @@ import micro_workflow_manager.workflow.supervisor_persistence as supervisor_pers
 from micro_workflow_manager import MicroWorkflow
 from micro_workflow_manager.context import JobContext
 from micro_workflow_manager.errors import JobFailedError
+from micro_workflow_manager.models import Job
 from micro_workflow_manager.networking import (
     close_shared_http_transport,
     configure_shared_http_transport,
@@ -27,6 +30,33 @@ from micro_workflow_manager.network.transport import (
     network_attempt_context,
 )
 from micro_workflow_manager.runners.api import ApiRunner
+from micro_workflow_manager.session_liveness import process_identity
+
+
+def _claimed_runtime_storage(tmp_path):
+    workflow = MicroWorkflow(tmp_path, persist_graph=False)
+    workflow.graph([("A", "A")])
+    storage = workflow.storage
+    session_id = "runtime-observation-owner"
+    snapshot = workflow.topology.snapshot()
+    storage.register_component_topology(snapshot)
+    storage.create_execution_session(
+        session_id,
+        session_kind="main",
+        command="runtime observation",
+        start_component=("A",),
+        selected_components=[("A",)],
+        started_at="2026-01-01T00:00:00",
+        hostname=socket.gethostname(),
+        pid=os.getpid(),
+        process_identity=process_identity(os.getpid()),
+    )
+    storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
+    storage.create_job(Job(node_name="A", job_id=1, params={}))
+    generation, execution_id = storage.claim_job_execution(
+        "A", 1, started_at="2026-01-01", session_id=session_id, component=("A",),
+    )
+    return storage, generation, execution_id
 
 
 def test_cooperative_future_result_preserves_periodic_timeout_semantics():
@@ -348,11 +378,16 @@ def test_initial_task_deadline_starts_after_framework_condition_delay(
         release_handler.set()
         assert run_finished.wait(10), "The API run did not finish"
         output = json.loads(workflow.storage.output_file("A", 1).read_text(encoding="utf-8"))
+        owner = workflow.storage.read_job_current_owner("A", 1)
+        assert owner is not None
         if phase == "framework":
             assert not errors, errors
             assert handler_entered.is_set()
             assert workflow.storage.job_status_counts("A").get("done") == 1
-            assert output == {"status": "done", "result_type": "dict", "result_repr": "{'started': True}"}
+            assert output == {
+                "status": "done", "result_type": "dict", "result_repr": "{'started': True}",
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
         else:
             assert len(errors) == 1 and isinstance(errors[0], JobFailedError)
             assert workflow.storage.job_status_counts("A").get("failed") == 1
@@ -542,10 +577,15 @@ def test_physical_replay_entry_preserves_lease_boundaries(tmp_path, monkeypatch,
         worker.join(timeout=10)
         assert not worker.is_alive(), "The replay run did not finish"
         output = json.loads(workflow.storage.output_file("A", 1).read_text(encoding="utf-8"))
+        owner = workflow.storage.read_job_current_owner("A", 1)
+        assert owner is not None
         if expected is None:
             assert not errors, errors
             assert workflow.storage.job_status_counts("A").get("done") == 1
-            assert output == {"status": "done", "result_type": "dict", "result_repr": "{'received': True}"}
+            assert output == {
+                "status": "done", "result_type": "dict", "result_repr": "{'received': True}",
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
             assert not timeout_events()
         else:
             assert len(errors) == 1 and isinstance(errors[0], JobFailedError)
@@ -649,8 +689,11 @@ def test_delayed_timeout_preserves_a_later_attempt_runtime(tmp_path, monkeypatch
         assert before["attempt"] == (2 if recovery == "retry" else 1)
         assert before["checkpoint_name"] == "later attempt result" and before["progress"] == 0.75
         output = json.loads(workflow.storage.output_file("A", 1).read_text(encoding="utf-8"))
+        owner = workflow.storage.read_job_current_owner("A", 1)
+        assert owner is not None and owner["generation"] == 0
         assert output == {"status": "done", "result_type": "dict",
-                          "result_repr": "{'recovered': '" + recovery + "'}", "generation": 0}
+                          "result_repr": "{'recovered': '" + recovery + "'}", "generation": 0,
+                          "execution_id": owner["execution_id"]}
         release_publication.set()
         assert publication_finished.wait(10), "The earlier timeout publisher did not finish"
         events = [event for event in workflow.storage.read_job_events("A", 1)
@@ -676,13 +719,9 @@ def test_delayed_timeout_preserves_a_later_attempt_runtime(tmp_path, monkeypatch
 
 @pytest.mark.parametrize("ordering", ["queued", "grouped", "priority"])
 def test_later_runtime_survives_queued_earlier_observations(tmp_path, monkeypatch, ordering):
-    from micro_workflow_manager.models import Job
-    from micro_workflow_manager.storage import FileStorage
     from micro_workflow_manager.storage.runtime_observations import RuntimeObservationSequence
 
-    storage = FileStorage(tmp_path)
-    storage.create_job(Job(node_name="A", job_id=1, params={}))
-    generation, execution_id = storage.claim_job_execution("A", 1, started_at="2026-01-01")
+    storage, generation, execution_id = _claimed_runtime_storage(tmp_path)
     sequence = RuntimeObservationSequence()
     orders = {name: sequence.register(name) for name in ("first", "middle", "last")}
     rows = {name: dict(state="running", watch_id=name, generation=generation,
@@ -750,13 +789,9 @@ def test_later_runtime_survives_queued_earlier_observations(tmp_path, monkeypatc
 @pytest.mark.parametrize("failure", ["serialization", "writer"])
 def test_failed_runtime_successor_preserves_the_saved_attempt(tmp_path, failure):
     import sqlite3
-    from micro_workflow_manager.models import Job
-    from micro_workflow_manager.storage import FileStorage
     from micro_workflow_manager.storage.runtime_observations import RuntimeObservationSequence
 
-    storage = FileStorage(tmp_path)
-    storage.create_job(Job(node_name="A", job_id=1, params={}))
-    generation, execution_id = storage.claim_job_execution("A", 1, started_at="2026-01-01")
+    storage, generation, execution_id = _claimed_runtime_storage(tmp_path)
     sequence = RuntimeObservationSequence()
     orders = {name: sequence.register(name) for name in ("first", "middle", "last")}
     rows = {name: dict(state="running", watch_id=name, generation=generation,
@@ -877,8 +912,12 @@ def test_timeout_event_rejects_an_execution_replaced_during_publication(tmp_path
             assert not old_thread.is_alive(), "The stale handler did not retire"
         assert workflow.storage.job_status_counts("A").get("done") == 1
         output = json.loads(workflow.storage.output_file("A", 1).read_text(encoding="utf-8"))
+        owner = workflow.storage.read_job_current_owner("A", 1)
+        assert owner is not None and owner["generation"] == 1
+        assert owner["execution_id"] != old_owner["active_execution_id"]
         assert output == {"status": "done", "result_type": "dict",
-                          "result_repr": "{'generation': 1}", "generation": 1}
+                          "result_repr": "{'generation': 1}", "generation": 1,
+                          "execution_id": owner["execution_id"]}
         assert (tmp_path / "node/A/output/fresh.txt").read_text(encoding="utf-8") == "fresh"
         assert not (tmp_path / "node/A/output/stale.txt").exists()
         runtime = workflow.storage.read_job_runtime("A", 1)
@@ -1198,6 +1237,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
     is_network = operation == "network_end" or is_renewal
     expected_physical_attempts = 2 if operation == "network_replay" else 1
     release_handler = Event()
+    allow_a = Event()
     arming_thread = []
     entered_jobs = set()
     entered_lock = threading.Lock()
@@ -1344,20 +1384,18 @@ def test_task_intervals_exclude_framework_heap_maintenance(
     for job_id in range(1, 41):
         workflow.start("B", job_id=job_id)
 
-    def run(node):
+    def run():
         try:
-            workflow.run_node(node, ignore_readiness=True)
+            workflow.run_concurrently(
+                ["A", "B"],
+                ready_check=lambda node: node != "A" or operation != "initial" or allow_a.is_set(),
+            )
         except BaseException as error:
             errors.append(error)
 
-    def start(node):
-        worker = threading.Thread(target=run, args=(node,), daemon=True)
-        workers.append(worker)
-        worker.start()
-        return worker
-
-    active = start("A") if operation != "initial" else None
-    other_worker = start("B")
+    active = threading.Thread(target=run, daemon=True)
+    workers.append(active)
+    active.start()
     try:
         if operation == "checkpoint":
             assert handler_entered.wait(10), "User work did not start"
@@ -1377,17 +1415,24 @@ def test_task_intervals_exclude_framework_heap_maintenance(
             # so only its post-submission rearm takes the rebuild branch.
             start_checkpoint.set()
             assert checkpoint_submission.wait(10), "Checkpoint did not reach runtime submission"
+        if operation == "initial":
+            allow_a.set()
         other_handlers_gate.set_result(None)
-        other_worker.join(timeout=10)
-        assert not other_worker.is_alive(), "Concurrent tasks did not finish"
+        completed_deadline = time.perf_counter() + 10
+        while workflow.storage.job_status_counts("B").get("done") != 40:
+            assert time.perf_counter() < completed_deadline, "Concurrent tasks did not finish"
+            time.sleep(0.01)
         assert not errors, errors
         assert workflow.storage.job_status_counts("B").get("done") == 40
         for job_id in range(1, 41):
             output = json.loads(workflow.storage.output_file("B", job_id).read_text(encoding="utf-8"))
-            assert output == {"status": "done", "result_type": "dict", "result_repr": str({"job": job_id})}
-        if operation == "initial":
-            active = start("A")
-        elif operation == "checkpoint":
+            owner = workflow.storage.read_job_current_owner("B", job_id)
+            assert owner is not None
+            assert output == {
+                "status": "done", "result_type": "dict", "result_repr": str({"job": job_id}),
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
+        if operation == "checkpoint":
             release_checkpoint_submission.set()
         elif operation == "network_end":
             release_response.set()
@@ -1438,11 +1483,16 @@ def test_task_intervals_exclude_framework_heap_maintenance(
         active.join(timeout=10)
         assert not active.is_alive(), "The API run did not finish"
         output = json.loads(workflow.storage.output_file("A", 1).read_text(encoding="utf-8"))
+        owner = workflow.storage.read_job_current_owner("A", 1)
+        assert owner is not None
         if expected_kind is None:
             assert not errors, errors
             assert handler_entered.is_set()
             assert workflow.storage.job_status_counts("A").get("done") == 1
-            assert output == {"status": "done", "result_type": "dict", "result_repr": "{'started': True}"}
+            assert output == {
+                "status": "done", "result_type": "dict", "result_repr": "{'started': True}",
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
         else:
             assert len(errors) == 1 and isinstance(errors[0], JobFailedError)
             assert workflow.storage.job_status_counts("A").get("failed") == 1
@@ -1466,6 +1516,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
         release_heap.set()
         release_supervisor.set()
         release_handler.set()
+        allow_a.set()
         start_checkpoint.set()
         release_checkpoint_submission.set()
         release_response.set()
@@ -1496,6 +1547,7 @@ def test_initial_runtime_persistence_cannot_expose_deadlines_to_concurrent_compa
     release_supervisor = Event()
     heap_rebuilt = Event()
     checkpoints_finished = Event()
+    release_other_reports = Event()
     release_other_handler = Event()
     first_handler_entered = Event()
     observe_supervisor = Event()
@@ -1564,6 +1616,7 @@ def test_initial_runtime_persistence_cannot_expose_deadlines_to_concurrent_compa
     def b(ctx):
         # Accumulate real obsolete checkpoint revisions while the watchdog is
         # paused, crossing the ordinary compaction threshold without changing it.
+        assert release_other_reports.wait(10), "Other reports were not released"
         for value in range(300):
             ctx.checkpoint(f"other task report {value}", timeout=100)
         checkpoints_finished.set()
@@ -1577,18 +1630,15 @@ def test_initial_runtime_persistence_cannot_expose_deadlines_to_concurrent_compa
     workflow.start("A", job_id=1)
     workflow.start("B", job_id=1)
 
-    def run(node):
+    def run():
         try:
-            workflow.run_node(node, ignore_readiness=True)
+            workflow.run_concurrently(["A", "B"])
         except BaseException as error:
             errors.append(error)
 
-    def start(node):
-        worker = threading.Thread(target=run, args=(node,), daemon=True)
-        workers.append(worker)
-        worker.start()
-
-    start("A")
+    worker = threading.Thread(target=run, daemon=True)
+    workers.append(worker)
+    worker.start()
     try:
         assert initial_write_blocked.wait(10), "Initial runtime was not submitted"
         assert len(initial_payload) == 1
@@ -1603,7 +1653,7 @@ def test_initial_runtime_persistence_cannot_expose_deadlines_to_concurrent_compa
         assert supervisor_paused.wait(10), "Supervisor did not pause before compaction"
         with condition:
             clock[0] += 1.0
-        start("B")
+        release_other_reports.set()
         assert checkpoints_finished.wait(10), "Concurrent checkpoint reports did not finish"
         assert heap_rebuilt.is_set(), "Concurrent reports did not exercise real heap compaction"
         assert not first_handler_entered.is_set()
@@ -1631,12 +1681,18 @@ def test_initial_runtime_persistence_cannot_expose_deadlines_to_concurrent_compa
         for node, expected in (("A", "{'started': True}"), ("B", "{'reports': 300}")):
             assert workflow.storage.job_status_counts(node).get("done") == 1
             output = json.loads(workflow.storage.output_file(node, 1).read_text(encoding="utf-8"))
-            assert output == {"status": "done", "result_type": "dict", "result_repr": expected}
+            owner = workflow.storage.read_job_current_owner(node, 1)
+            assert owner is not None
+            assert output == {
+                "status": "done", "result_type": "dict", "result_repr": expected,
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
             assert not [event for event in workflow.storage.read_job_events(node, 1)
                         if event.get("event") == "timeout"]
     finally:
         release_initial_write.set()
         release_supervisor.set()
+        release_other_reports.set()
         release_other_handler.set()
         for worker in workers:
             worker.join(timeout=10)
@@ -1912,6 +1968,8 @@ def test_api_checkpoint_stops_after_handler_exit_before_framework_completion(
         )
         assert workflow.storage.read_job_runtime("A", 1)["checkpoint_name"] == checkpoint_name
         output = json.loads(workflow.storage.output_file("A", 1).read_text(encoding="utf-8"))
+        owner = workflow.storage.read_job_current_owner("A", 1)
+        assert owner is not None
         if timeout_kind is not None:
             assert len(errors) == 1 and isinstance(errors[0], JobFailedError)
             assert workflow.storage.job_status_counts("A").get("failed") == 1
@@ -1923,11 +1981,17 @@ def test_api_checkpoint_stops_after_handler_exit_before_framework_completion(
             assert isinstance(errors[0].__cause__, ValueError)
             assert str(errors[0].__cause__) == "model conversion failed"
             assert workflow.storage.job_status_counts("A").get("failed") == 1
-            assert output == {"status": "failed", "error": "ValueError('model conversion failed')"}
+            assert output == {
+                "status": "failed", "error": "ValueError('model conversion failed')",
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
         else:
             assert not errors, errors
             assert workflow.storage.job_status_counts("A").get("done") == 1
-            assert output == {"status": "done", "result_type": "dict", "result_repr": "{'ok': True}"}
+            assert output == {
+                "status": "done", "result_type": "dict", "result_repr": "{'ok': True}",
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
     finally:
         release_caller.set()
         release_completion.set()
@@ -2060,11 +2124,16 @@ def test_framework_network_entry_distinguishes_admission_from_caller_time(
         release_entry.set()
         assert run_finished.wait(10), "The API run did not finish"
         output = json.loads(workflow.storage.output_file("A", 1).read_text(encoding="utf-8"))
+        owner = workflow.storage.read_job_current_owner("A", 1)
+        assert owner is not None
         if timeout_kind is None:
             assert not errors, errors
             assert physical_dispatch.is_set()
             assert workflow.storage.job_status_counts("A").get("done") == 1
-            assert output == {"status": "done", "result_type": "dict", "result_repr": "{'ok': True}"}
+            assert output == {
+                "status": "done", "result_type": "dict", "result_repr": "{'ok': True}",
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
         else:
             assert len(errors) == 1 and isinstance(errors[0], JobFailedError)
             assert not physical_dispatch.is_set()
@@ -2409,9 +2478,12 @@ def test_many_framework_network_waits_do_not_cascade_checkpoint_cancellations(tm
         assert counts.get("done") == 100 and sum(counts.values()) == 100
         for job_id in range(1, 101):
             output = json.loads(workflow.storage.output_file("A", job_id).read_text(encoding="utf-8"))
+            owner = workflow.storage.read_job_current_owner("A", job_id)
+            assert owner is not None
             assert output == {
                 "status": "done", "result_type": "dict",
                 "result_repr": "{'ok': True, 'job': " + str(job_id) + "}",
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
             }
     finally:
         release_responses.set()

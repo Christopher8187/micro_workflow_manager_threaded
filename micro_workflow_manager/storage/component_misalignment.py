@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 
 from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
 from micro_workflow_manager.file_helpers import _relative_file_parts
@@ -43,9 +44,13 @@ class ComponentMisalignmentStorageMixin:
                 or row['receiver_node'] not in state['members']
                 or type(row['alignment_generation']) is not int
                 or row['alignment_generation'] != state['alignment_generation']
-                or shape is None or shape['shape_json'] != state['shape_json']
-                or row['arrival_kind'] not in ('managed-input', 'managed-job')):
+                or shape is None or shape['shape_json'] != state['shape_json']):
             raise RuntimeError('Damaged component misalignment cause')
+        if row['preparation_kind'] is not None:
+            return self._decode_component_preparation_cause(connection, row, state)
+        if (row['arrival_kind'] not in ('managed-input', 'managed-job')
+                or any(row[key] is not None for key in ('operation', 'action', 'affected_kind', 'preparation_id'))):
+            raise RuntimeError('Damaged component misalignment arrival')
         if row['arrival_kind'] == 'managed-job':
             return self._decode_component_job_cause(connection, row)
         owner = self._read_execution_owner(connection, row['producer_execution_id'])
@@ -88,6 +93,63 @@ class ComponentMisalignmentStorageMixin:
             'producer_job_id': None if owner is None else owner['job_id'],
             'arrival_kind': 'managed-job', 'job_id': row['receiver_job_id'],
         }
+
+    def _decode_component_preparation_cause(self, connection, row, state):
+        owner = self._read_execution_owner(connection, row['producer_execution_id'])
+        receipt = connection.execute('SELECT * FROM preparation_receipts WHERE operation_id=?',
+                                     (row['preparation_id'],)).fetchone()
+        if (row['arrival_kind'] is not None or row['preparation_kind'] != 'preparation-removal'
+                or row['action'] != 'delete' or row['affected_kind'] not in ('managed-input', 'managed-job')
+                or owner is None or receipt is None or receipt['state'] != 'committed'
+                or receipt['operation'] != row['operation']
+                or receipt['component_key'] != encode_component_key(owner['component'])):
+            raise RuntimeError('Damaged component preparation cause')
+        effect = {'receiver': row['receiver_node'], 'kind': row['affected_kind'],
+                  'producer_execution_id': row['producer_execution_id']}
+        result = {
+            'component': state['members'], 'receiver_node': row['receiver_node'],
+            'alignment_generation': row['alignment_generation'],
+            'producer_node': owner['node_name'], 'producer_job_id': owner['job_id'],
+            'preparation_kind': row['preparation_kind'], 'operation': row['operation'],
+            'action': row['action'], 'affected_kind': row['affected_kind'],
+        }
+        if row['affected_kind'] == 'managed-input':
+            try:
+                parts = _relative_file_parts(row['relative_path'])
+            except (TypeError, ValueError) as error:
+                raise RuntimeError('Damaged preparation input path') from error
+            if (len(parts) < 2 or parts[0] != owner['node_name'] or '/'.join(parts) != row['relative_path']
+                    or row['receiver_job_id'] is not None or row['receiver_job_instance_id'] is not None):
+                raise RuntimeError('Damaged preparation input producer or path')
+            self._validate_input_edge(connection, owner, row['receiver_node'])
+            effect['path'] = result['path'] = row['relative_path']
+        else:
+            instance = row['receiver_job_instance_id']
+            if (row['relative_path'] is not None or type(row['receiver_job_id']) is not int
+                    or row['receiver_job_id'] < 1 or type(instance) is not str or len(instance) != 32
+                    or any(character not in '0123456789abcdef' for character in instance)):
+                raise RuntimeError('Damaged preparation receiving job')
+            effect['job_id'] = result['job_id'] = row['receiver_job_id']
+            effect['job_instance_id'] = result['job_instance_id'] = instance
+        try:
+            effects = json.loads(receipt['manifest_json'])['effects']
+        except (ValueError, TypeError, KeyError) as error:
+            raise RuntimeError('Damaged preparation receipt effects') from error
+        if not isinstance(effects, list) or effect not in effects:
+            raise RuntimeError('Preparation cause disagrees with its recorded mutation')
+        return result
+
+    def _mark_component_preparation_change(self, connection, effect, receipt):
+        receiver = effect['receiver']
+        observed = self._read_job_receiver_state(connection, receiver, None)
+        if observed is None:
+            return None
+        shape_id, state = observed
+        return self._mark_component_arrival(
+            connection, receiver, shape_id, state, effect['producer_execution_id'], None,
+            relative=effect.get('path'), job_id=effect.get('job_id'), job_instance_id=effect.get('job_instance_id'),
+            preparation=('preparation-removal', receipt.operation, 'delete', effect['kind'], receipt.operation_id),
+        )
 
     def validate_job_receiver_shape(self, receiver, *, expected_shape=None):
         receiver = self.validate_node_name(receiver)
@@ -161,7 +223,7 @@ class ComponentMisalignmentStorageMixin:
         )
 
     def _mark_component_arrival(self, connection, receiver, shape_id, state, creator, kind,
-                                *, relative=None, job_id=None, job_instance_id=None):
+                                *, relative=None, job_id=None, job_instance_id=None, preparation=None):
         members = state['members']
         identity = (os.getpid(), shape_id, members, state['alignment_generation'])
         if state['misaligned'] and self._component_arrival_latches.get(receiver) == identity:
@@ -181,10 +243,10 @@ class ComponentMisalignmentStorageMixin:
             if changed != 1:
                 raise RuntimeError('Managed arrival receiver changed before publication')
         connection.execute(
-            'INSERT INTO component_misalignment_causes VALUES(?,?,?,?,?,?,?,?,?) '
+            'INSERT INTO component_misalignment_causes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) '
             'ON CONFLICT(receiver_node,alignment_generation) DO NOTHING',
             (receiver, state['alignment_generation'], encode_component_key(members), shape_id,
-             creator, kind, relative, job_id, job_instance_id),
+             creator, kind, relative, job_id, job_instance_id, *(preparation or (None,) * 5)),
         )
         recorded = connection.execute(
             'SELECT * FROM component_misalignment_causes WHERE receiver_node=? AND alignment_generation=?',

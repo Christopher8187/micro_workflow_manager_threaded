@@ -253,14 +253,24 @@ def test_repeated_api_rounds_release_worker_connections_and_preserve_outputs(tmp
                 command = workflow.storage.output_path("merge", "jobs", str(job_id), "command.txt")
                 assert command.read_text(encoding="utf-8") == f"{round_number}:{job_id}"
                 output = json.loads(workflow.storage.output_file("merge", job_id).read_text(encoding="utf-8"))
-                assert output == {"status": "done", "result_type": "int", "result_repr": str(job_id), "generation": 0}
+                owner = workflow.storage.read_job_current_owner("merge", job_id)
+                assert owner is not None and owner["generation"] == 0
+                assert output == {
+                    "status": "done", "result_type": "int", "result_repr": str(job_id),
+                    "generation": 0, "execution_id": owner["execution_id"],
+                }
             assert workflow.storage.db_connection().execute("PRAGMA quick_check").fetchone()[0] == "ok"
         for job_id in range(1, 289):
             round_number = (job_id - 1) // 96 + 1
             command = workflow.storage.output_path("merge", "jobs", str(job_id), "command.txt")
             assert command.read_text(encoding="utf-8") == f"{round_number}:{job_id}"
             output = json.loads(workflow.storage.output_file("merge", job_id).read_text(encoding="utf-8"))
-            assert output == {"status": "done", "result_type": "int", "result_repr": str(job_id), "generation": 0}
+            owner = workflow.storage.read_job_current_owner("merge", job_id)
+            assert owner is not None and owner["generation"] == 0
+            assert output == {
+                "status": "done", "result_type": "int", "result_repr": str(job_id),
+                "generation": 0, "execution_id": owner["execution_id"],
+            }
     finally:
         workflow.storage.db_mutation_barrier()
         cleanup_deadline = time.perf_counter() + 10

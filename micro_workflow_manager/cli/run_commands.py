@@ -3,12 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from micro_workflow_manager.component_readiness import calculate_component_readiness
-from micro_workflow_manager.models import CANCELLED, FAILED, QUEUED, RUNNING
 from micro_workflow_manager.system import MicroWorkflow
+from micro_workflow_manager.workflow.resume_preparation import observe_resume_selection, prepare_admitted_resume
 
 from .active_run import refuse_competing_run
 from .cleanup import prepare_fresh_components
-from .graph_utils import direct_incomplete_inputs
 from .run_orchestration import run_nodes
 
 
@@ -122,6 +121,7 @@ def run_from(
             workflow,
             components,
             keep_trace=keep_trace,
+            operation='runfrom',
         )
         if removed:
             summary = ", ".join(f"{name}={count}" for name, count in sorted(removed.items()))
@@ -136,37 +136,6 @@ def run_from(
         refuse_before_node=refuse_before_node,
     )
 
-def _recover_finished_before_resume(
-    workflow: MicroWorkflow,
-    nodes: list[str],
-) -> int:
-    """Publish output-backed terminal jobs before deciding what to restart."""
-    workflow.storage.db_mutation_barrier()
-    recovered = workflow.storage.reconcile_terminal_outputs(nodes)
-    workflow.storage.db_mutation_barrier()
-    if recovered:
-        print(f"Registered {recovered} finished job(s) before resume.")
-    return recovered
-
-
-def _prepare_node_for_resume(workflow: MicroWorkflow, node: str) -> int:
-    """Requeue only unsuccessful work, preserving done/skipped jobs and output."""
-    changed = 0
-    for job_id in workflow.storage.list_job_ids(node):
-        status = workflow.storage.get_job_status(node, job_id)
-        if status in {FAILED, CANCELLED, RUNNING}:
-            workflow.storage.request_job_restart(
-                node,
-                job_id,
-                reason="resume unsuccessful job",
-            )
-            changed += 1
-    if workflow.storage.has_queued_jobs(node):
-        workflow.storage.set_node_status(node, QUEUED)
-    else:
-        workflow.refresh_node_status(node, allow_complete=True)
-    return changed
-
 def resume_node(
     root: Path,
     workflow: MicroWorkflow,
@@ -180,15 +149,10 @@ def resume_node(
 ) -> int:
     refuse_competing_run(workflow)
     nodes = list(workflow.component_key(workflow.component_for(node)))
-    _recover_finished_before_resume(workflow, nodes)
-
-    blockers = direct_incomplete_inputs(workflow, set(nodes))
-    if blockers:
-        print("Resuming with incomplete external inputs:", ", ".join(sorted(blockers)))
+    selection = observe_resume_selection(workflow, nodes, command='resume', start_node=node)
 
     def prepare():
-        for item in nodes:
-            _prepare_node_for_resume(workflow, item)
+        prepare_admitted_resume(workflow, nodes, selection)
 
     return run_nodes(
         workflow,
@@ -230,20 +194,12 @@ def resume_from(
                 f"{refusal_mode} node {refusal_node!r} is not in the resumefrom "
                 f"selection starting at {node!r}"
             )
-    _recover_finished_before_resume(workflow, nodes)
-    if not keep_trace:
-        start_nodes = set(workflow.component_key(start_component))
-        workflow.storage.clear_job_events_for_nodes(
-            [name for name in nodes if name not in start_nodes]
-        )
-
-    blockers = direct_incomplete_inputs(workflow, set(nodes))
-    if blockers:
-        print("Resuming with incomplete external inputs:", ", ".join(sorted(blockers)))
+    selection = observe_resume_selection(workflow, nodes, command='resumefrom', start_node=node)
+    start_nodes = set(workflow.component_key(start_component))
+    clear_trace_nodes = () if keep_trace else tuple(name for name in nodes if name not in start_nodes)
 
     def prepare():
-        for item in nodes:
-            _prepare_node_for_resume(workflow, item)
+        prepare_admitted_resume(workflow, nodes, selection, clear_trace_nodes=clear_trace_nodes)
 
     return run_nodes(
         workflow,

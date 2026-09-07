@@ -90,7 +90,10 @@ present. The related historical observation is
 ### `benchmark_repeated_api_rounds.py`
 
 Measures repeated API execution in three fresh processes. Each process uses one
-project for an excluded warmup and four measured rounds of 96 new jobs. The
+project for a warmup and four measured rounds, adding 96 new jobs each time. A
+full fresh run executes every retained job, so the five workloads contain 96,
+192, 288, 384, and 480 jobs. Each round validates all rerun outputs, native
+execution identities, and queue events. The
 clock covers `run_node`; creation, mutation draining, validation, and final
 cleanup are recorded or performed outside that interval.
 
@@ -109,7 +112,8 @@ cleanup, and SQLite integrity. Any failure returns a nonzero process status.
 The timing gate compares the median of the final two measured rounds across
 all processes with the median of the first two. It requires
 `late <= early * 3 + 1 second`. Inspect the recorded per-project comparisons
-as well as the aggregate result. This fixed allowance does not promise that
+as well as the aggregate result. The allowance applies to raw durations with this declared workload growth.
+It does not promise that
 every individual later round is faster or reject every increasing sequence.
 
 ### `compare_job_loading_models.py`

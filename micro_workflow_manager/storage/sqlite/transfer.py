@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from micro_workflow_manager.project_format import is_link_or_reparse_point
+from ..preparation_guards import refuse_receiver_mutation
 
 from micro_workflow_manager.models import (
     QUEUED,
@@ -23,6 +24,7 @@ class SQLiteStateTransferMixin:
 
     @staticmethod
     def _delete_node_state(connection, node_name):
+        refuse_receiver_mutation(connection, node_name)
         connection.execute("DELETE FROM idempotency WHERE node_name=?", (node_name,))
         connection.execute("DELETE FROM default_job_specs WHERE node_name=?", (node_name,))
         connection.execute("DELETE FROM job_events WHERE node_name=?", (node_name,))
