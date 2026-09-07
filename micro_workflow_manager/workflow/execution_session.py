@@ -88,6 +88,7 @@ def _execution_session(
     command: str,
     start_node: str,
     nodes: list[str],
+    ordered_components: tuple[tuple[str, ...], ...] | None = None,
     selected_jobs: list[int] | None = None,
     sample_request: SampleRequest | None = None,
     refuse_after_node: str | None = None,
@@ -100,6 +101,17 @@ def _execution_session(
     with workflow.lock:
         snapshot = workflow.topology.snapshot()
         selected_components = workflow.topology.execution_components(nodes)
+        if ordered_components is not None:
+            ordered = tuple(ordered_components)
+            if (len(ordered) != len(set(ordered)) or set(ordered) != set(selected_components)
+                    or tuple(node for component in ordered for node in component) != tuple(nodes)):
+                raise ValueError('Ordered execution components differ from the current selection')
+            positions = {component: position for position, component in enumerate(ordered)}
+            dag = workflow.topology.component_dag()
+            if any(positions[parent] >= positions[child] for parent, child in dag.edges
+                   if parent in positions and child in positions):
+                raise ValueError('Execution components are not in quotient-DAG order')
+            selected_components = list(ordered)
     components_by_node = {node: component for component in snapshot.components for node in component}
     if start_node not in components_by_node or any(node not in components_by_node for node in nodes):
         raise ValueError('Execution selection contains a node outside the captured graph')

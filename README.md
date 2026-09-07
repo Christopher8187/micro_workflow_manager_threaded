@@ -214,6 +214,15 @@ before the boundary component starts. `refuseafter BOUNDARY` lets it terminate,
 then stops later admission. Already-running parallel components are joined and
 later queued work can be continued with `resumefrom`.
 
+`runbetween START END`, `resumebetween START END`, and `resetbetween START END`
+select every directed quotient path between the endpoints, including START's
+component and excluding END's component. END must be a strict directed
+descendant. Use `--plan` for run and resume, or `--dry-run` for reset. Previews
+show the expanded raw nodes, excluded end component, crossing edges, native
+prerequisites, job counts, and preparation effects. Selected producers may
+publish to excluded receivers without executing them. Reset refuses before
+project loading while any main or interrupt session remains running.
+
 In Python, each independent `run()`, `run_concurrently()`, `run_node()`, or
 `run_component()` performs full fresh preparation of its selected components.
 Repeating the call requeues retained root jobs and clears selected output before
@@ -400,10 +409,10 @@ project data. Execution commands can mount routers and create their declared job
 | --- | --- | --- |
 | Create and synchronize | `init`, `graph` | `init` creates framework state and sidecars. Only `graph` synchronizes edges and node folders. |
 | Check and observe | `doctor`, `engine`, `inspect`, `trace`, `filter`, `monitor`, `top` | Read current graph or state without running jobs. `engine` is graph-only and loopback. |
-| Execute fresh work | `run`, `runfrom` | Reset the selected component or selected descendant region before execution. |
-| Continue work | `resume`, `resumefrom` | Preserve done and skipped jobs and continue queued, failed, cancelled, or abandoned work. |
+| Execute fresh work | `run`, `runfrom`, `runbetween` | Freshly prepare one component, its descendants, or a half-open quotient interval before execution. |
+| Continue work | `resume`, `resumefrom`, `resumebetween` | Preserve successful jobs and continue the selected component, descendants, or interval after native preflight. |
 | Control a live sequence | `restart`, `threads` | Fence selected active jobs or change run-scoped concurrency without starting another scheduler. |
-| Prepare a rerun | `reset`, `resetfrom` | Fresh preparation without task execution, with component-aware scope. |
+| Prepare a rerun | `reset`, `resetfrom`, `resetbetween` | Apply the same full fresh preparation without task execution; inspect it with `--dry-run`. |
 | Preserve node state | `copy`, `paste` | Save or restore a node tree with its SQLite node snapshot. |
 | Maintain state and deployment | `recover`, `deploy` | Recover a dead owner or build and transfer a filtered archive. |
 

@@ -167,10 +167,14 @@ def test_native_previews_use_persisted_state_without_imports_or_sidecars(
     if sampling:
         assert 'A: selected' in output
         assert 'eligible jobs' in output
-    elif arguments[0] in {'reset', 'resetfrom'}:
-        assert 'A: would preserve jobs/input; queued=1;' in output
+    elif 'job' in arguments:
+        if arguments[0] == 'reset':
+            assert 'A: would preserve jobs/input; queued=1;' in output
+        else:
+            assert 'A: node_status=queued, queued=1' in output
     else:
-        assert 'A: node_status=queued, queued=1' in output
+        assert '{A}: queued' in output
+        assert 'A: queued=1' in output
     if not sampling:
         assert 'synchronized raw edges' in output
     assert 'user code was not loaded' in output
@@ -216,7 +220,8 @@ def test_live_native_preview_reads_committed_wal_state_and_preserves_project(
     try:
         assert cli.main(['run', 'A', '--plan']) == 0
         output = capsys.readouterr().out
-        assert 'A: node_status=done, done=1' in output
+        assert '{A}: done, stable' in output
+        assert 'A: done=1' in output
         assert 'user code was not loaded' in output
         assert _snapshot(tmp_path, mutable_existing_shm=True) == before
         assert database.read_bytes() == main_before
@@ -254,11 +259,13 @@ def test_preview_uses_synchronized_edges_and_static_autostart_without_imports(
     assert cli.main(['run', 'B', '--plan']) == 0
 
     output = capsys.readouterr().out
-    assert 'A: node_status=queued, no jobs' in output
-    assert 'B: node_status=queued, no jobs' in output
-    assert 'After: node_status=' not in output
-    assert 'same Hoeflein component: A' in output
-    assert 'incomplete start-component inputs: Before' in output
+    assert '{A, B}: queued' in output
+    assert 'A: no jobs' in output
+    assert 'B: no jobs' in output
+    assert 'After: no jobs' not in output
+    assert 'selected nodes: A, B' in output
+    assert 'Before: queued' in output
+    assert 'would refuse' in output
     assert 'synchronized raw edges' in output
     assert 'AST-read autostart declarations' in output
     assert _snapshot(tmp_path) == before
@@ -339,7 +346,8 @@ def test_native_preview_reports_abandoned_session_and_owned_job_without_mutation
         assert 'a/1' in output
         assert 'recover' in output
         if arguments[0] == 'run':
-            assert 'a: node_status=queued, running=1' in output
+            assert '{a}: running' in output
+            assert 'a: running=1' in output
         assert _snapshot(tmp_path, mutable_existing_shm=True) == before
         assert database.read_bytes() == main_before
         assert wal.read_bytes() == wal_before

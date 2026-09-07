@@ -101,9 +101,16 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_124_admission_interruption.py` | Interrupted admission delivery and in-flight writes, session or reservation rollback, exact retained roots, and cleanup after notification failure following COMMIT. |
 | `test_125_sampled_resume.py` | Resume remaining sampled work, promote completed samples, retain running lineage, refuse incompatible inputs, and settle failures through native sessions. |
 | `test_126_sampling_lifecycle_writer_paths.py` | Filtered completion after excluded work changes, repair of failed or cancelled sampled jobs, and retained unstable origins. |
+| `test_127_between_command_previews.py` | Half-open interval previews, component expansion, excluded endpoints, crossing edges, invalid directed endpoints, and unchanged project files without user imports. |
 | `test_128_sample_plan_filtered_acquisition.py` | Fresh read-only sampling observations accept excluded-status changes while retaining the later complete job baseline. |
 | `test_129_sampled_resume_history.py` | Refuse conflicting history before admission, preserve sampled lineage after failed repair, and check selected parent lineage before preparation. |
 | `test_130_sampled_resume_history_writers.py` | Retained history at resume start and settlement, rollback after failed writes, and file restoration after history changes during preparation. |
+| `test_131_native_command_planning.py` | All nine previews use native prerequisite state despite raw-status disagreement and include retained publication receivers outside graph edges. |
+| `test_132_between_command_execution.py` | Fresh and resumed interval execution, excluded operator work, producer cleanup, native alignment, and publication without receiver execution. |
+| `test_133_readonly_reset_live_refusal.py` | Applied reset forms refuse a live interrupt before imports or mutation, preserving all database rows and project bytes. |
+| `test_134_between_external_prerequisites.py` | Wide interval preparation with a blocked interior merge across all four runners, preserving excluded component state, jobs, and node trees. |
+| `test_135_graph_preview_busy_boundaries.py` | Valid reservations, holds, and pending work render as busy; damaged links fail; excluded receiver guards and active jobs appear without mutation. |
+| `test_136_nine_command_wiring_regressions.py` | Stale-session reset refusal, parent drift after reservation, consistent interval order, unknown refusal-boundary validation, and exact interval repair guidance. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and replacement-runtime isolation after the old checkpoint deadline and stale-write attempt. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished work, missing expected rounds, and repeated-API slowdown beyond the fixed allowance; successful completion and exact allowance equality. |

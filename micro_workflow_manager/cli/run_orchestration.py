@@ -51,6 +51,7 @@ def run_nodes(
     start_node: str,
     *,
     command: str = "run",
+    components: tuple[tuple[str, ...], ...] | None = None,
     stats: bool = False,
     stats_interval: float = 5.0,
     monitor: bool = False,
@@ -74,7 +75,7 @@ def run_nodes(
         raise ValueError("refuse and refuseafter are mutually exclusive")
     wait_deadlock_resolver = (
         _WaitDeadlockResolver()
-        if command in {"run", "runfrom", "resume", "resumefrom"}
+        if command in {"run", "runfrom", "runbetween", "resume", "resumefrom", "resumebetween"}
         else None
     )
 
@@ -84,6 +85,7 @@ def run_nodes(
         command=command,
         start_node=start_node,
         nodes=nodes,
+        ordered_components=components,
         refuse_after_node=refuse_after_node,
         refuse_before_node=refuse_before_node,
         stats=stats,
@@ -100,6 +102,7 @@ def run_nodes(
             _session_driver=finish_run,
             _sequential=workflow.runner not in {'threaded', 'api', 'process'},
             nodes=nodes,
+            _components=components,
             refuse_after_component=refuse_after_component,
             refuse_before_component=refuse_before_component,
             refusal_event=refusal_event,

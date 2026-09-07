@@ -13,6 +13,7 @@ from micro_workflow_manager.topology import ComponentTopology
 from micro_workflow_manager.storage.sqlite.preview_snapshot import open_preview_snapshot
 
 from .autostart_scan import scan_autostarts
+from .static_publication_scan import scan_static_node_targets
 from .engine import _stored_edges
 from .project import resolve_stored_graph_path
 
@@ -66,6 +67,7 @@ class PreviewWorkflow:
         config = read_native_project_config(root)
         self.graph_obj = nx.DiGraph(_stored_edges(config))
         self.autostart_edges: set[tuple[str, str]] = set()
+        self.static_node_targets: dict[str, frozenset[str]] = {}
         graph_path = config.get("graph_path")
         if graph_path:
             directory = resolve_stored_graph_path(root, graph_path).parent / "node_behavior"
@@ -75,6 +77,7 @@ class PreviewWorkflow:
                 for end in targets
                 if self.graph_obj.has_edge(start, end)
             }
+            self.static_node_targets = scan_static_node_targets(directory)
         self.topology = ComponentTopology(self.graph_obj, self.autostart_edges)
         self.storage = PreviewStorage(root)
 

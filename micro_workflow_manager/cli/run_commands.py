@@ -6,7 +6,8 @@ from micro_workflow_manager.component_readiness import calculate_component_readi
 from micro_workflow_manager.system import MicroWorkflow
 from micro_workflow_manager.workflow.resume_preparation import observe_resume_selection, prepare_admitted_resume
 
-from .active_run import refuse_competing_run
+from micro_workflow_manager.workflow.execution_session import refuse_competing_run
+from micro_workflow_manager.workflow.graph_command_selection import select_graph_command
 from .cleanup import prepare_fresh_components
 from .run_orchestration import run_nodes
 
@@ -20,12 +21,23 @@ def _component_notice(workflow: MicroWorkflow, node: str) -> list[str]:
         )
     return component
 
-def _refuse_start_component_inputs(workflow: MicroWorkflow, node: str, command: str) -> bool:
+def _read_start_component_inputs(workflow: MicroWorkflow, node: str):
     with workflow.lock:
         component = workflow.component_for(node)
         parents = sorted(workflow.component_predecessor_components(component))
-        expected_shape = workflow.topology.graph_shape()
-    observed = workflow.storage.read_component_states(parents, expected_shape=expected_shape, allow_missing=True)
+        shape = workflow.topology.graph_shape()
+    return workflow.storage.read_component_states(parents, expected_shape=shape, allow_missing=True)
+
+
+def _parent_result_observations(states):
+    fields = ('lifecycle', 'stability', 'instability_origin', 'alignment_generation')
+    return {component: None if state is None else tuple(state[field] for field in fields)
+            for component, state in states.items()}
+
+
+def _refuse_start_component_inputs(workflow: MicroWorkflow, node: str, command: str, *, observed=None) -> bool:
+    observed = _read_start_component_inputs(workflow, node) if observed is None else observed
+    parents = sorted(observed)
     blockers = [parent for parent, state in observed.items()
                 if state is None or state['lifecycle'] != 'done']
     reason = 'incomplete predecessor components'
@@ -48,6 +60,73 @@ def _refuse_start_component_inputs(workflow: MicroWorkflow, node: str, command: 
         print(f"  {labels[parent]}: {status}")
     return True
 
+def execute_graph_command(
+    root: Path, workflow: MicroWorkflow, node: str, *, command: str,
+    end_node: str | None = None, stats: bool = False, stats_interval: float = 5.0,
+    monitor: bool = False, monitor_interval: float = 2.0, keep_trace: bool = False,
+    refuse_after_node: str | None = None, refuse_before_node: str | None = None,
+) -> int:
+    refuse_competing_run(workflow)
+    with workflow.lock:
+        selection = select_graph_command(workflow.topology, command, node, end_node)
+        shape = workflow.topology.graph_shape()
+    if selection.operation not in ('run', 'resume'):
+        raise ValueError('Execution requires a run or resume selection')
+    nodes = list(selection.nodes)
+    if refuse_before_node is not None and refuse_after_node is not None:
+        raise ValueError('refuse and refuseafter are mutually exclusive')
+    refusal_node = refuse_before_node or refuse_after_node
+    if refusal_node is not None:
+        mode = 'refuse' if refuse_before_node is not None else 'refuseafter'
+        if workflow.component_id(refusal_node) not in selection.components:
+            raise RuntimeError(
+                f'{mode} node {refusal_node!r} is not in the {command} selection starting at {node!r}'
+            )
+    resumed = None
+    parent_results = None
+    if selection.operation == 'run':
+        _component_notice(workflow, node)
+        parents = _read_start_component_inputs(workflow, node)
+        if _refuse_start_component_inputs(workflow, node, f'{command} {node}', observed=parents):
+            return 1
+        parent_results = _parent_result_observations(parents)
+    else:
+        options = {} if end_node is None else {'end_node': end_node}
+        resumed = observe_resume_selection(workflow, nodes, command=command, start_node=node, **options)
+    clear_trace = () if keep_trace or selection.scope == 'one' else tuple(
+        name for name in nodes if name not in selection.start_component
+    )
+
+    def prepare():
+        context = workflow.execution_session_context
+        with workflow.lock:
+            current = select_graph_command(workflow.topology, command, node, end_node)
+        if (current != selection or context is None or context[2] != shape
+                or tuple(dict.fromkeys(context[1].values())) != selection.components):
+            raise RuntimeError('Graph command selection changed during admission')
+        if resumed is not None:
+            prepare_admitted_resume(workflow, nodes, resumed, clear_trace_nodes=clear_trace)
+            return
+        current_parents = _read_start_component_inputs(workflow, node)
+        if _parent_result_observations(current_parents) != parent_results:
+            raise RuntimeError('Start-component parent results changed during admission')
+        removed = prepare_fresh_components(
+            root, workflow, [set(component) for component in selection.components],
+            keep_trace=keep_trace, operation=command,
+        )
+        if removed:
+            summary = ', '.join(f'{name}={count}' for name, count in sorted(removed.items()))
+            selected = '; '.join('{' + ', '.join(component) + '}' for component in selection.components)
+            print(f'Removed jobs produced by selected Hoeflein components {selected}: {summary}')
+
+    return run_nodes(
+        workflow, nodes, node, command=command, components=selection.components,
+        stats=stats, stats_interval=stats_interval,
+        monitor=monitor, monitor_interval=monitor_interval, prepare=prepare,
+        refuse_after_node=refuse_after_node, refuse_before_node=refuse_before_node,
+    )
+
+
 def run_node(
     root: Path,
     workflow: MicroWorkflow,
@@ -59,29 +138,15 @@ def run_node(
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
 ) -> int:
-    refuse_competing_run(workflow)
-    nodes = _component_notice(workflow, node)
-    if _refuse_start_component_inputs(workflow, node, f"run {node}"):
-        return 1
-
-    component = set(nodes)
-
-    def prepare():
-        removed = prepare_fresh_components(
-            root,
-            workflow,
-            [component],
-            keep_trace=keep_trace,
-        )
-        if removed:
-            summary = ", ".join(f"{name}={count}" for name, count in sorted(removed.items()))
-            print(f"Removed jobs produced by Hoeflein component {{{', '.join(nodes)}}}: {summary}")
-
-    return run_nodes(
-        workflow, nodes, node, command="run",
-        stats=stats, stats_interval=stats_interval, monitor=monitor,
-        monitor_interval=monitor_interval, prepare=prepare,
+    return execute_graph_command(
+        root, workflow, node, command='run',
+        stats=stats,
+        stats_interval=stats_interval,
+        monitor=monitor,
+        monitor_interval=monitor_interval,
+        keep_trace=keep_trace,
     )
+
 
 def run_from(
     root: Path,
@@ -96,45 +161,17 @@ def run_from(
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
 ) -> int:
-    refuse_competing_run(workflow)
-    start_component = workflow.component_for(node)
-    start_nodes = _component_notice(workflow, node)
-    components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
-    nodes = [name for component in components for name in workflow.component_key(component)]
-    refusal_node = refuse_before_node or refuse_after_node
-    if refusal_node is not None:
-        refusal_mode = "refuse" if refuse_before_node is not None else "refuseafter"
-        refuse_component = workflow.component_for(refusal_node)
-        if workflow.component_id(refuse_component) not in {
-            workflow.component_id(component) for component in components
-        }:
-            raise RuntimeError(
-                f"{refusal_mode} node {refusal_node!r} is not in the runfrom "
-                f"selection starting at {node!r}"
-            )
-    if _refuse_start_component_inputs(workflow, node, f"runfrom {node}"):
-        return 1
-
-    def prepare():
-        removed = prepare_fresh_components(
-            root,
-            workflow,
-            components,
-            keep_trace=keep_trace,
-            operation='runfrom',
-        )
-        if removed:
-            summary = ", ".join(f"{name}={count}" for name, count in sorted(removed.items()))
-            selected = "; ".join("{" + ", ".join(workflow.component_key(c)) + "}" for c in components)
-            print(f"Removed jobs produced by selected Hoeflein components {selected}: {summary}")
-
-    return run_nodes(
-        workflow, nodes, node, command="runfrom",
-        stats=stats, stats_interval=stats_interval, monitor=monitor,
-        monitor_interval=monitor_interval, prepare=prepare,
+    return execute_graph_command(
+        root, workflow, node, command='runfrom',
+        stats=stats,
+        stats_interval=stats_interval,
+        monitor=monitor,
+        monitor_interval=monitor_interval,
+        keep_trace=keep_trace,
         refuse_after_node=refuse_after_node,
         refuse_before_node=refuse_before_node,
     )
+
 
 def resume_node(
     root: Path,
@@ -147,24 +184,15 @@ def resume_node(
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
 ) -> int:
-    refuse_competing_run(workflow)
-    nodes = list(workflow.component_key(workflow.component_for(node)))
-    selection = observe_resume_selection(workflow, nodes, command='resume', start_node=node)
-
-    def prepare():
-        prepare_admitted_resume(workflow, nodes, selection)
-
-    return run_nodes(
-        workflow,
-        nodes,
-        node,
-        command="resume",
+    return execute_graph_command(
+        root, workflow, node, command='resume',
         stats=stats,
         stats_interval=stats_interval,
         monitor=monitor,
         monitor_interval=monitor_interval,
-        prepare=prepare,
+        keep_trace=keep_trace,
     )
+
 
 def resume_from(
     root: Path,
@@ -179,38 +207,21 @@ def resume_from(
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
 ) -> int:
-    refuse_competing_run(workflow)
-    start_component = workflow.component_for(node)
-    components = [start_component, *[set(item) for item in workflow.component_descendants(start_component)]]
-    nodes = [name for component in components for name in workflow.component_key(component)]
-    refusal_node = refuse_before_node or refuse_after_node
-    if refusal_node is not None:
-        refusal_mode = "refuse" if refuse_before_node is not None else "refuseafter"
-        refuse_component = workflow.component_for(refusal_node)
-        if workflow.component_id(refuse_component) not in {
-            workflow.component_id(component) for component in components
-        }:
-            raise RuntimeError(
-                f"{refusal_mode} node {refusal_node!r} is not in the resumefrom "
-                f"selection starting at {node!r}"
-            )
-    selection = observe_resume_selection(workflow, nodes, command='resumefrom', start_node=node)
-    start_nodes = set(workflow.component_key(start_component))
-    clear_trace_nodes = () if keep_trace else tuple(name for name in nodes if name not in start_nodes)
-
-    def prepare():
-        prepare_admitted_resume(workflow, nodes, selection, clear_trace_nodes=clear_trace_nodes)
-
-    return run_nodes(
-        workflow,
-        nodes,
-        node,
-        command="resumefrom",
+    return execute_graph_command(
+        root, workflow, node, command='resumefrom',
         stats=stats,
         stats_interval=stats_interval,
         monitor=monitor,
         monitor_interval=monitor_interval,
-        prepare=prepare,
+        keep_trace=keep_trace,
         refuse_after_node=refuse_after_node,
         refuse_before_node=refuse_before_node,
     )
+
+
+def run_between(root: Path, workflow: MicroWorkflow, node: str, end_node: str, **options) -> int:
+    return execute_graph_command(root, workflow, node, command='runbetween', end_node=end_node, **options)
+
+
+def resume_between(root: Path, workflow: MicroWorkflow, node: str, end_node: str, **options) -> int:
+    return execute_graph_command(root, workflow, node, command='resumebetween', end_node=end_node, **options)

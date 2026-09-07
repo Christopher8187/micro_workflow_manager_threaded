@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from micro_workflow_manager.component_identity import encode_component_key
 from .input_publication_files import checked_input_path
@@ -53,12 +54,117 @@ def _selected_owners(storage, connection, components):
     return tuple(result)
 
 
+class _SnapshotPreparationStorage:
+    """Only the validated readers required by preparation observation."""
+
+    def __init__(self, connection, project_root):
+        self._connection = connection
+        self.project_dir = Path(project_root)
+
+    def db_connection(self):
+        return self._connection
+
+    @staticmethod
+    def validate_node_name(node_name):
+        from .base import FileStorageBase
+
+        return FileStorageBase.validate_node_name(node_name)
+
+    @staticmethod
+    def _read_execution_owner(connection, execution_id):
+        from .execution_ownership import JobExecutionOwnerStorageMixin
+
+        return JobExecutionOwnerStorageMixin._read_execution_owner(connection, execution_id)
+
+    @staticmethod
+    def _read_job_owner_observation(connection, node_name, job_id):
+        from .execution_ownership import JobExecutionOwnerStorageMixin
+
+        return JobExecutionOwnerStorageMixin._read_job_owner_observation(
+            connection, node_name, job_id,
+        )
+
+    @staticmethod
+    def _require_settled_input_publications(connection, receiver):
+        from .input_publications import InputPublicationStorageMixin
+
+        return InputPublicationStorageMixin._require_settled_input_publications(
+            connection, receiver,
+        )
+
+    @staticmethod
+    def _validate_input_edge(connection, owner, receiver):
+        from .input_publications import InputPublicationStorageMixin
+
+        return InputPublicationStorageMixin._validate_input_edge(
+            connection, owner, receiver,
+        )
+
+    def _read_input_ownership(self, connection, receiver, relative):
+        from .input_publications import InputPublicationStorageMixin
+
+        return InputPublicationStorageMixin._read_input_ownership(
+            self, connection, receiver, relative,
+        )
+
+    def _validate_pending_component_row(self, connection, row):
+        from .component_settlement import ComponentSettlementStorageMixin
+
+        return ComponentSettlementStorageMixin._validate_pending_component_row(
+            self, connection, row,
+        )
+
+
 def read_preparation_footprint(storage, components, *, keep_trace=False):
+    """Observe a live store through the same connection/root snapshot reader."""
+    return _read_preparation_footprint(
+        storage, storage.db_connection(), components, keep_trace=keep_trace,
+    )
+
+
+def read_preparation_footprint_snapshot(
+    connection, project_root, components, *, keep_trace=False,
+):
+    """Observe full fresh-preparation effects from a query-only snapshot."""
+    components = tuple(components)
+    storage = _SnapshotPreparationStorage(connection, project_root)
+    footprint = _read_preparation_footprint(
+        storage, connection, components, keep_trace=keep_trace,
+    )
+    from .preparation_guards import refuse_unfinished_preparation
+
+    for component in components:
+        key = encode_component_key(component)
+        if connection.execute(
+            "SELECT 1 FROM preparation_receipts WHERE component_key=? AND state='prepared' LIMIT 1",
+            (key,),
+        ).fetchone():
+            raise RuntimeError('Fresh planning requires recovery of unfinished component preparation: ' + key)
+    selected_executions = tuple(owner['execution_id'] for owner in footprint.owners)
+    if selected_executions:
+        placeholders = ','.join('?' for _ in selected_executions)
+        if connection.execute(
+            "SELECT 1 FROM input_publications WHERE state='prepared' "
+            f"AND execution_id IN ({placeholders}) LIMIT 1",
+            selected_executions,
+        ).fetchone():
+            raise RuntimeError('Fresh planning requires recovery of a selected producer publication')
+    receivers = {
+        plan.node for unit in footprint.units for plan in unit.jobs
+    } | {
+        item.receiver for unit in footprint.units for item in unit.inputs
+    }
+    for receiver in sorted(receivers):
+        refuse_unfinished_preparation(connection, receiver)
+        storage._require_settled_input_publications(connection, receiver)
+    return footprint
+
+
+def _read_preparation_footprint(storage, connection, components, *, keep_trace):
     """Assign selected receiver changes to that receiver's own commit unit."""
     components = tuple(components)
     selected = set(components)
     selected_nodes = {node: component for component in components for node in component}
-    connection = storage.db_connection()
     connection.execute('SAVEPOINT mwf_preparation_footprint')
     try:
         owners = _selected_owners(storage, connection, components)

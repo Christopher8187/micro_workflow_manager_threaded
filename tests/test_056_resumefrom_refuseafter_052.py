@@ -7,6 +7,8 @@ from micro_workflow_manager import cli
 from micro_workflow_manager.cli.parser import build_parser
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
+from tests.test_090_component_session_settlement import _rows
+from tests.test_093_native_cli_readiness import _node_files
 
 
 def _write_project(tmp_path: Path, monkeypatch, *, edges: str, behaviors: dict[str, str], runner: str = "threaded") -> None:
@@ -180,6 +182,16 @@ def test_resumefrom_refuseafter_uses_whole_hoeflein_boundary_component(tmp_path,
     (tmp_path / "c-ran.txt").unlink()
     storage = FileStorage(tmp_path)
     storage.create_job(Job(node_name="A", job_id=2, params={}))
+    assert storage.get_component_state(("A",))["misaligned"] is True
+    before_rows, before_files = _rows(storage), _node_files(tmp_path)
+    assert cli.main(["resumefrom", "A", "refuseafter", "B"]) == 1
+    assert "mwf resetfrom A" in capsys.readouterr().err
+    assert _rows(storage) == before_rows
+    assert _node_files(tmp_path) == before_files
+    assert cli.main(["resetfrom", "A", "--yes"]) == 0
+    capsys.readouterr()
+    assert storage.get_component_state(("A",))["misaligned"] is False
+    assert storage.list_job_ids("A") == [1, 2]
 
     assert cli.main(["resumefrom", "A", "refuseafter", "B"]) == 0
     output = capsys.readouterr().out

@@ -53,7 +53,7 @@ def _validate_recovery_component(connection, session_id, component):
         'SELECT command FROM execution_sessions WHERE session_id=?', (session_id,),
     ).fetchone()
     expected_kind = 'jobs' if roots else 'full'
-    if (not roots and session is not None and session['command'] in ('resume', 'resumefrom')
+    if (not roots and session is not None and session['command'] in ('resume', 'resumefrom', 'resumebetween')
             and pending['starting_lifecycle'] == 'sampled'):
         expected_kind = 'resume'
     if pending['execution_kind'] != expected_kind:

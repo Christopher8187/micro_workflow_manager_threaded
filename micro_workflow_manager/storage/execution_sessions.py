@@ -13,6 +13,101 @@ class ExecutionSessionHasActiveJobs(RuntimeError):
     """Joined work still has unsettled active claims in its owned scope."""
 
 
+def _session_text_snapshot(value, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f'{field} must be nonempty text')
+    return value
+
+
+def _session_time_snapshot(value, field: str) -> str:
+    _session_text_snapshot(value, field)
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f'{field} must be an ISO timestamp') from error
+    return value
+
+
+def execution_session_from_row_snapshot(connection, row) -> dict:
+    session_id = row['session_id']
+    result = dict(row)
+    try:
+        result['start_component'] = SessionSelectionStorageMixin._stored_session_component(
+            result['start_component']
+        )
+        result['failures'] = json.loads(result.pop('failures_json'))
+        result['details'] = json.loads(result.pop('details_json'))
+        result['selected_components'] = SessionSelectionStorageMixin._read_session_components(
+            connection, session_id,
+        )
+        result['selected_jobs'] = [
+            (node, job_id) for node, job_id, _ in
+            SessionSelectionStorageMixin._read_session_job_roots(
+                connection, session_id, components=result['selected_components'],
+            )
+        ]
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
+        raise RuntimeError('Damaged execution session: ' + str(session_id)) from error
+    return result
+
+
+def validate_execution_session_snapshot(session: dict) -> None:
+    try:
+        session_id = _session_text_snapshot(session['session_id'], 'session_id')
+        _session_text_snapshot(session['command'], 'command')
+        _session_text_snapshot(session['hostname'], 'hostname')
+        _session_time_snapshot(session['started_at'], 'started_at')
+        _session_time_snapshot(session['heartbeat_at'], 'heartbeat_at')
+        if session['session_kind'] not in ('main', 'interrupt'):
+            raise ValueError('Invalid session kind')
+        parent = session['parent_session_id']
+        if parent is not None:
+            _session_text_snapshot(parent, 'parent_session_id')
+            if session['session_kind'] != 'interrupt' or parent == session_id:
+                raise ValueError('Invalid parent session')
+        if session['selection_kind'] not in ('components', 'jobs'):
+            raise ValueError('Invalid session selection kind')
+        if session['status'] not in ('running', 'terminal'):
+            raise ValueError('Invalid session status')
+        if type(session['pid']) is not int or session['pid'] < 1:
+            raise ValueError('Session PID must be a positive integer')
+        if session['process_identity'] is not None:
+            _session_text_snapshot(session['process_identity'], 'process_identity')
+        if not isinstance(session['failures'], list):
+            raise ValueError('Session failures must be an ordered list')
+        if not isinstance(session['details'], dict):
+            raise ValueError('Session details must be an object')
+        if session['status'] == 'running':
+            if session['finished_at'] is not None or session['outcome'] is not None or session['failures']:
+                raise ValueError('Running session has terminal fields')
+        else:
+            _session_time_snapshot(session['finished_at'], 'finished_at')
+            _session_text_snapshot(session['outcome'], 'outcome')
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError('Damaged execution session: ' + str(session.get('session_id'))) from error
+
+
+def read_execution_sessions_snapshot(connection, *, running_only: bool = False) -> tuple[dict, ...]:
+    where = " WHERE status='running'" if running_only else ''
+    connection.execute('SAVEPOINT mwf_execution_session_observation')
+    try:
+        sessions = []
+        for row in connection.execute('SELECT * FROM execution_sessions' + where + ' ORDER BY session_id'):
+            session = execution_session_from_row_snapshot(connection, row)
+            validate_execution_session_snapshot(session)
+            sessions.append(session)
+        return tuple(sessions)
+    finally:
+        connection.execute('RELEASE SAVEPOINT mwf_execution_session_observation')
+
+
+def read_live_execution_sessions_snapshot(connection) -> tuple[dict, ...]:
+    return tuple(
+        session for session in read_execution_sessions_snapshot(connection, running_only=True)
+        if execution_session_liveness(session)['live']
+    )
+
+
 class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissionStorageMixin):
     """Persist exact execution-session records in SQLite."""
 
@@ -22,18 +117,11 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
 
     @staticmethod
     def _session_text(value, field: str) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{field} must be nonempty text")
-        return value
+        return _session_text_snapshot(value, field)
 
     @classmethod
     def _session_time(cls, value, field: str) -> str:
-        cls._session_text(value, field)
-        try:
-            datetime.fromisoformat(value)
-        except ValueError as error:
-            raise ValueError(f"{field} must be an ISO timestamp") from error
-        return value
+        return _session_time_snapshot(value, field)
 
     def _session_component(self, component) -> tuple[str, ...]:
         if not isinstance(component, (tuple, list, set, frozenset)) or not component:
@@ -372,8 +460,8 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
         return [self._execution_session_from_row(connection, row) for row in rows]
 
     def list_live_execution_sessions(self) -> list[dict]:
-        return [session for session in self.list_execution_sessions()
-                if execution_session_liveness(session)["live"]]
+        self._require_execution_session_storage()
+        return list(read_live_execution_sessions_snapshot(self.db_connection()))
 
     def get_live_main_session(self) -> dict | None:
         return next((session for session in self.list_live_execution_sessions()
@@ -392,18 +480,4 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
 
     @staticmethod
     def _execution_session_from_row(connection, row) -> dict:
-        # Selected scope is immutable session history. Read every mutable
-        # session field together, then attach its immutable scope rows.
-        session_id = row["session_id"]
-        result = dict(row)
-        result["start_component"] = SessionSelectionStorageMixin._stored_session_component(result["start_component"])
-        result["failures"] = json.loads(result.pop("failures_json"))
-        result["details"] = json.loads(result.pop("details_json"))
-        result["selected_components"] = SessionSelectionStorageMixin._read_session_components(connection, session_id)
-        result["selected_jobs"] = [
-            (node, job_id) for node, job_id, _ in
-            ExecutionSessionStorageMixin._read_session_job_roots(
-                connection, session_id, components=result["selected_components"],
-            )
-        ]
-        return result
+        return execution_session_from_row_snapshot(connection, row)

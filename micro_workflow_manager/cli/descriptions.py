@@ -43,7 +43,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "recover": "Fence and requeue jobs left in running state by a dead CLI process. Done and failed jobs are not reset.",
     "reset": "Perform the same fresh preparation as mwf run, including selected-job mode, but do not execute task code.",
     "resetfrom": "Perform the same producer-aware fresh descendant preparation as mwf runfrom, but do not execute task code.",
-    "run": "Reset and run the ready Hoeflein component selected by one node, or selected jobs in a singleton node; --monitor prints the full timestamped dashboard in the same terminal.",
+    "run": "Reset and run the ready Hoeflein component selected by one node, or selected roots and their same-component causal work; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control that restarts running and failed/cancelled jobs in the selected active Hoeflein component; it never starts another scheduler.",
     "threads": "View or change run-scoped per-node max_threads overrides and the deprecated aggregate API admission budget; active threaded and API nodes scale live.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
@@ -246,8 +246,11 @@ unless `--keeptrace` is supplied.
 
 Sample mode provides deterministic SHA-256 ranking of existing jobs and preservation
 of unselected jobs. Use `--status` to narrow candidates and `--expect-population`
-to detect drift. Current tests do not yet establish descendant or component-circulation isolation. `--plan` does not apply the sample run, but normal CLI
-bootstrap and router mounting may still update framework state.
+to refuse changed eligible work or inputs. A count or percentage applies after
+status filtering. Named assignments select raw members of the same component.
+The selected roots and their new same-component causal work run; unrelated
+existing jobs and quotient descendants do not execute. `--plan` is read-only
+and does not import user code or create an execution session.
 """,
     "restart": """
 Restart is a second-terminal control for the workflow sequence that is currently
@@ -426,3 +429,37 @@ checkpoint, retry, or fallback history of one specific node or job.
 """,
 
 }
+
+
+COMMAND_HELP_DESCRIPTIONS.update({
+    'runbetween': 'Freshly prepare and run the half-open quotient interval from the start component to the excluded end component.',
+    'resumebetween': 'Preserve successful work and resume the half-open quotient interval before the excluded end component.',
+    'resetbetween': 'Apply runbetween preparation without executing tasks; preview with --dry-run.',
+})
+
+COMMAND_DESCRIPTIONS.update({
+    'runbetween': """
+`mwf runbetween A B` prepares and executes every component on a directed quotient
+path from A to B, including A's component and excluding B's whole component.
+The end must be a strict directed descendant of the start. Other branches stay
+unselected. Published jobs or input can reach an excluded receiver, but that
+receiver does not execute. The start component's incoming input is preserved.
+Use `--plan` to inspect selected components, crossing edges, prerequisites, and
+preparation effects without importing user code or changing durable state.
+""",
+    'resumebetween': """
+`mwf resumebetween A B` uses the same half-open selection as runbetween. It
+preserves done and skipped jobs and repairs eligible unsuccessful work. Aligned
+sampled results retain compatible lineage while the remaining work runs. The
+end component and unrelated branches do not execute. Use `--plan` for a
+read-only preview and `--keeptrace` to preserve descendant traces.
+""",
+    'resetbetween': """
+`mwf resetbetween A B` performs runbetween's fresh preparation without task
+execution. The included start and excluded end select the same half-open
+quotient interval. Preparation can remove selected producers' prior material
+from excluded receivers and mark those receivers misaligned. Any live execution
+session prevents reset. Use `--dry-run` to inspect the effects; apply with a
+typed resetbetween confirmation or `--yes`.
+""",
+})

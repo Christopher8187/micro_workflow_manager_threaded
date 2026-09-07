@@ -5,7 +5,8 @@ from pathlib import Path
 
 from micro_workflow_manager.system import MicroWorkflow
 
-from .active_run import refuse_competing_run
+from micro_workflow_manager.workflow.execution_session import refuse_competing_run
+from micro_workflow_manager.workflow.graph_command_selection import GraphCommandSelection, select_graph_command
 from .cleanup import prepare_fresh_components
 from micro_workflow_manager.workflow.selected_preparation import prepare_selected_jobs
 from .jobs import selected_job_ids_from_args
@@ -18,28 +19,14 @@ class DestructiveSelection:
     nodes: tuple[str, ...]
     selected_jobs: tuple[int, ...] | None = None
     refuse_after_node: str | None = None
+    graph_selection: GraphCommandSelection | None = None
 
 
 def _all_components(workflow: MicroWorkflow) -> list[set[str]]:
     return [set(component) for component in workflow.execution_components()]
 
 
-def _components_from(
-    workflow: MicroWorkflow,
-    node: str,
-    *,
-    descendants: bool,
-) -> list[set[str]]:
-    if node == "*":
-        return _all_components(workflow)
-    require_node(workflow, node)
-    start = workflow.component_for(node)
-    if not descendants:
-        return [set(start)]
-    return [
-        set(start),
-        *[set(component) for component in workflow.component_descendants(start)],
-    ]
+
 
 
 def _selection(
@@ -47,11 +34,11 @@ def _selection(
     *,
     command: str,
     node: str,
+    end_node: str | None = None,
     job_mode: str | None = None,
     job_specs: list[str] | None = None,
     refuse_after_node: str | None = None,
 ) -> DestructiveSelection:
-    descendants = command.endswith("from")
     if job_mode is not None or job_specs:
         if command != "reset":
             raise RuntimeError("Explicit job selection is available only for mwf reset.")
@@ -66,12 +53,9 @@ def _selection(
             selected_jobs=tuple(selected),
         )
 
-    components = _components_from(workflow, node, descendants=descendants)
-    nodes = tuple(
-        name
-        for component in components
-        for name in workflow.component_key(component)
-    )
+    graph_selection = select_graph_command(workflow.topology, command, node, end_node)
+    components = graph_selection.components
+    nodes = graph_selection.nodes
     if refuse_after_node is not None:
         if command != "resetfrom":
             raise RuntimeError("refuseafter is available only for mwf resetfrom.")
@@ -88,6 +72,7 @@ def _selection(
         components=tuple(frozenset(component) for component in components),
         nodes=nodes,
         refuse_after_node=refuse_after_node,
+        graph_selection=graph_selection,
     )
 
 
@@ -193,7 +178,7 @@ def execute_destructive_command(
     args,
 ) -> int:
     command = str(args.command)
-    if command not in {"reset", "resetfrom"}:
+    if command not in {"reset", "resetfrom", "resetbetween"}:
         raise RuntimeError(f"Unknown reset command: {command}")
     node = getattr(args, "node", None)
     if node is None:
@@ -203,6 +188,7 @@ def execute_destructive_command(
         workflow,
         command=command,
         node=node,
+        end_node=getattr(args, "end_node", None),
         job_mode=getattr(args, "job_mode", None),
         job_specs=getattr(args, "job_specs", None),
         refuse_after_node=refuse_node,
@@ -221,6 +207,11 @@ def execute_destructive_command(
     if not _confirm(command, selection, assume_yes=bool(getattr(args, "yes", False))):
         return 1
 
+    if selection.graph_selection is not None:
+        with workflow.lock:
+            current = select_graph_command(workflow.topology, command, node, getattr(args, "end_node", None))
+            if current != selection.graph_selection:
+                raise RuntimeError("Reset selection changed before fresh preparation")
     keep_trace = bool(getattr(args, "keeptrace", False))
     if command == "reset" and selection.selected_jobs is not None:
         prepare_selected_jobs(root, workflow, selection.nodes[0], selection.selected_jobs,

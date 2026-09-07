@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+from .parser_options import add_destructive_arguments, add_keeptrace_argument, add_stats_arguments, positive_float
+from .graph_command_parser import add_between_commands
+
 import argparse
 import textwrap
 
 from .constants import RUNNER_CHOICES
 from .descriptions import COMMAND_HELP_DESCRIPTIONS, HELP_EPILOG
 
-def add_destructive_arguments(command) -> None:
-    command.add_argument("--dry-run", action="store_true", help="Describe the requested operation without applying it; normal CLI bootstrap and router mounting may still update framework state.")
-    command.add_argument("--yes", action="store_true", help="Acknowledge the danger and skip the interactive typed confirmation.")
-    add_keeptrace_argument(command)
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -168,13 +168,13 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     resetfrom_cmd.add_argument("node", help="Start node for fresh descendant preparation, or '*' for all nodes.")
-    resetfrom_cmd.add_argument("refuse_mode", nargs="?", choices=("refuseafter",), metavar="refuseafter", help="Optional compatibility boundary; reset scope remains the full descendant set.")
+    resetfrom_cmd.add_argument("refuse_mode", nargs="?", choices=("refuseafter",), metavar="refuseafter", help="Optional boundary label; reset scope remains the full descendant set.")
     resetfrom_cmd.add_argument("refuse_node", nargs="?", metavar="node", help="Boundary node to validate against the selection.")
     add_destructive_arguments(resetfrom_cmd)
 
     run_cmd = commands.add_parser(
         "run",
-        help="Run the ready Hoeflein component selected by one node, or selected jobs in a singleton node.",
+        help="Run the ready Hoeflein component selected by one node, or selected roots and their same-component causal work.",
         description=COMMAND_HELP_DESCRIPTIONS["run"].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -198,7 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_cmd.add_argument(
         "--seed",
-        help="Deterministic seed for `mwf run NODE sample COUNT`.",
+        help="Deterministic seed for a count, percentage, or named-member sample.",
     )
     run_cmd.add_argument(
         "--status",
@@ -220,7 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_cmd.add_argument("node", help="Node selecting the Hoeflein component to resume.")
     resume_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
     add_keeptrace_argument(resume_cmd)
-    resume_cmd.add_argument("--plan", action="store_true", help="Show the resume selection without applying it or running tasks; normal CLI bootstrap and router mounting may still update framework state.")
+    resume_cmd.add_argument("--plan", action="store_true", help="Show the resume selection without applying it or running tasks.")
     add_stats_arguments(resume_cmd)
 
 
@@ -352,9 +352,9 @@ def build_parser() -> argparse.ArgumentParser:
     resumefrom_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
     add_keeptrace_argument(resumefrom_cmd)
 
-    run_cmd.add_argument("--plan", action="store_true", help="Show run selection and reset effects without applying them or running tasks; normal CLI bootstrap and router mounting may still update framework state.")
-    runfrom_cmd.add_argument("--plan", action="store_true", help="Show descendant run selection without applying it or running tasks; normal CLI bootstrap and router mounting may still update framework state.")
-    resumefrom_cmd.add_argument("--plan", action="store_true", help="Show resumed descendant selection without applying it or running tasks; normal CLI bootstrap and router mounting may still update framework state.")
+    run_cmd.add_argument("--plan", action="store_true", help="Show run selection and reset effects without applying them or running tasks.")
+    runfrom_cmd.add_argument("--plan", action="store_true", help="Show descendant run selection without applying it or running tasks.")
+    resumefrom_cmd.add_argument("--plan", action="store_true", help="Show resumed descendant selection without applying it or running tasks.")
     add_stats_arguments(run_cmd)
     add_stats_arguments(runfrom_cmd)
     add_stats_arguments(resumefrom_cmd)
@@ -411,47 +411,5 @@ def build_parser() -> argparse.ArgumentParser:
     top_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     top_cmd.add_argument("--no-clear", action="store_true", help="Do not clear the terminal between redraws.")
 
+    add_between_commands(commands)
     return parser
-
-def positive_float(text: str) -> float:
-    try:
-        value = float(text)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(f"expected a positive number, got {text!r}") from error
-
-    if value <= 0:
-        raise argparse.ArgumentTypeError("value must be positive")
-
-    return value
-
-def add_stats_arguments(command: argparse.ArgumentParser):
-    command.add_argument(
-        "--stats",
-        action="store_true",
-        help="Print compact timestamped statistics while this command runs.",
-    )
-    command.add_argument(
-        "--stats-interval",
-        type=positive_float,
-        default=5.0,
-        help="Seconds between --stats lines. Default: 5.",
-    )
-    command.add_argument(
-        "--monitor",
-        action="store_true",
-        help="Print the full timestamped monitor dashboard in this terminal while the command runs.",
-    )
-    command.add_argument(
-        "--monitor-interval",
-        type=positive_float,
-        default=2.0,
-        help="Seconds between inline --monitor snapshots. Default: 2.",
-    )
-
-
-def add_keeptrace_argument(command: argparse.ArgumentParser) -> None:
-    command.add_argument(
-        "--keeptrace",
-        action="store_true",
-        help="Preserve existing job trace journals that this command would otherwise clear.",
-    )

@@ -6,6 +6,7 @@ from shlex import join
 from ..component_readiness import calculate_component_readiness, calculate_sampled_resume_lineage
 from ..errors import InvalidGraphError
 from ..storage.resume_preparation import prepare_resume_components, validate_resume_job_owners
+from .graph_command_selection import select_graph_command
 
 
 @dataclass(frozen=True)
@@ -17,9 +18,10 @@ class ResumeSelection:
     successful_results: dict
     command: str
     start_node: str
+    end_node: str | None = None
 
 
-def _predict_resume_lineages(components, all_parents, observations, successful_results):
+def predict_resume_lineages(components, all_parents, observations, successful_results):
     predicted = {}
     for component in components:
         state = observations[component]
@@ -65,11 +67,16 @@ def _predict_resume_lineages(components, all_parents, observations, successful_r
     return predicted
 
 
-def observe_resume_selection(workflow, nodes, *, command='resume', start_node=None):
+def observe_resume_selection(
+    workflow, nodes, *, command='resume', start_node=None, end_node=None,
+):
     start_node = nodes[0] if start_node is None else start_node
     with workflow.lock:
         shape = workflow.topology.graph_shape()
-        components = tuple(workflow.execution_components(nodes))
+        selection = select_graph_command(workflow.topology, command, start_node, end_node)
+        if tuple(nodes) != selection.nodes:
+            raise RuntimeError('Resume nodes differ from the graph-command selection')
+        components = selection.components
         selected = set(components)
         all_parents = {
             component: workflow.component_predecessor_components(set(component))
@@ -92,8 +99,14 @@ def observe_resume_selection(workflow, nodes, *, command='resume', start_node=No
         else:
             roots = [component for component in misaligned
                      if not any(component in descendants[parent] for parent in misaligned)]
-            guidance = '\n'.join('Run ' + join(['mwf', 'resetfrom', component[0]]) for component in roots)
-            guidance += '\nThen retry ' + join(['mwf', command, start_node])
+            repairs = (['mwf', 'resetbetween', component[0], end_node]
+                       if command == 'resumebetween' else ['mwf', 'resetfrom', component[0]]
+                       for component in roots)
+            guidance = '\n'.join('Run ' + join(repair) for repair in repairs)
+            retry = ['mwf', command, start_node]
+            if end_node is not None:
+                retry.append(end_node)
+            guidance += '\nThen retry ' + join(retry)
         raise RuntimeError(f'Cannot {command}: misaligned components {misaligned}.\n{guidance}')
     for component in components:
         state = observations[component]
@@ -101,18 +114,19 @@ def observe_resume_selection(workflow, nodes, *, command='resume', start_node=No
             raise RuntimeError(f'Resume requires recovery of running component {component}')
     states = {key: observations[key] for key in components}
     successful_results = validate_resume_job_owners(workflow.storage, states)
-    _predict_resume_lineages(components, all_parents, observations, successful_results)
+    predict_resume_lineages(components, all_parents, observations, successful_results)
     return ResumeSelection(shape, components, states,
                            {key: observations[key] for key in external}, successful_results,
-                           command, start_node)
+                           command, start_node, end_node)
 
 
 def prepare_admitted_resume(workflow, nodes, selection, *, clear_trace_nodes=()):
     context = workflow.execution_session_context
     if (context is None or context[2] != selection.shape
-            or set(context[1].values()) != set(selection.components)
+            or tuple(dict.fromkeys(context[1].values())) != selection.components
             or observe_resume_selection(workflow, nodes, command=selection.command,
-                                        start_node=selection.start_node) != selection):
+                                        start_node=selection.start_node,
+                                        end_node=selection.end_node) != selection):
         raise RuntimeError('Resume selection changed during admission')
     return prepare_resume_components(
         workflow.storage, context[0], selection.states,

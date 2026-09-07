@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
+from micro_workflow_manager.component_identity import component_key, decode_component_key, encode_component_key
+from .base import FileStorageBase
 from .component_transitions import ComponentTransitionStorageMixin
 from .component_settlement import ComponentSettlementStorageMixin
 from .selected_component_lifecycle import SelectedComponentLifecycleStorageMixin
@@ -32,6 +33,84 @@ class ComponentTaskParent:
 
 class ComponentExecutionIncomplete(RuntimeError):
     """Successful tasks left unfinished work in their begun component."""
+
+
+def _observation_component(component) -> tuple[str, ...]:
+    if not isinstance(component, (tuple, list, set, frozenset)) or not component:
+        raise ValueError('A selected component needs member node names')
+    return component_key(FileStorageBase.validate_node_name(node) for node in component)
+
+
+def validate_component_state_snapshot(row) -> None:
+    lifecycle = row['lifecycle']
+    stability = row['stability']
+    origin = row['instability_origin']
+    misaligned = row['misaligned']
+    generation = row['alignment_generation']
+    no_lineage = stability is None and origin is None
+    result_lineage = (
+        (stability == 'stable' and origin is None)
+        or (stability == 'unstable' and isinstance(origin, str) and bool(origin.strip())
+            and row['origin_kind'] == 'interrupt')
+    )
+    valid_lifecycle = (
+        (lifecycle == 'queued' and no_lineage and misaligned == 0)
+        or (lifecycle == 'running' and (no_lineage or result_lineage))
+        or (lifecycle in ('sampled', 'done') and result_lineage)
+        or (lifecycle == 'failed' and no_lineage)
+    )
+    if not (
+        valid_lifecycle
+        and type(misaligned) is int and misaligned in (0, 1)
+        and type(generation) is int and generation >= 0
+    ):
+        raise RuntimeError('Invalid component state for ' + row['component_key'])
+
+
+def read_component_state_snapshot(connection, component) -> dict | None:
+    members = _observation_component(component)
+    row = connection.execute(
+        "SELECT d.component_key, g.shape_json, s.component_key AS state_key, "
+        "s.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, "
+        "origin.session_kind AS origin_kind "
+        "FROM component_definitions d "
+        "LEFT JOIN graph_shapes g USING(shape_id) "
+        "LEFT JOIN component_states s USING(component_key) "
+        "LEFT JOIN execution_sessions origin ON origin.session_id=s.instability_origin "
+        "WHERE d.component_key=?",
+        (encode_component_key(members),),
+    ).fetchone()
+    if row is None:
+        return None
+    if row['state_key'] is None or row['shape_json'] is None:
+        raise RuntimeError('Incomplete component state or producing graph shape')
+    validate_component_state_snapshot(row)
+    return {
+        'members': decode_component_key(row['component_key']),
+        'shape_json': row['shape_json'],
+        'lifecycle': row['lifecycle'],
+        'stability': row['stability'],
+        'instability_origin': row['instability_origin'],
+        'misaligned': bool(row['misaligned']),
+        'alignment_generation': row['alignment_generation'],
+    }
+
+
+def read_component_states_snapshot(
+    connection, components, *, expected_shape: str, allow_missing: bool = False,
+) -> dict[tuple[str, ...], dict | None]:
+    if not isinstance(expected_shape, str) or not expected_shape.strip():
+        raise ValueError('expected_shape must be nonempty text')
+    members = tuple(_observation_component(component) for component in components)
+    connection.execute('SAVEPOINT mwf_component_observation')
+    try:
+        observed = {component: read_component_state_snapshot(connection, component) for component in members}
+        if any((not allow_missing if state is None else state['shape_json'] != expected_shape)
+               for state in observed.values()):
+            raise RuntimeError('Component observations require the expected producing shape')
+        return observed
+    finally:
+        connection.execute('RELEASE SAVEPOINT mwf_component_observation')
 
 
 class ComponentStateStorageMixin(
@@ -230,7 +309,7 @@ class ComponentStateStorageMixin(
             if owner['selected_key'] is None:
                 raise RuntimeError('Component is outside the session selected scope: ' + key)
             if (starting_lifecycle == 'sampled'
-                    and owner['command'] not in ('resume', 'resumefrom')):
+                    and owner['command'] not in ('resume', 'resumefrom', 'resumebetween')):
                 raise RuntimeError('Sampled component execution requires a resume session')
             state = connection.execute(
                 'SELECT d.component_key, d.shape_id, g.shape_json, s.component_key AS state_key, '
@@ -318,73 +397,18 @@ class ComponentStateStorageMixin(
     def read_component_states(self, components, *, expected_shape: str, allow_missing: bool = False) -> dict:
         """Read one ordered snapshot, optionally retaining absent definitions as None."""
         self._require_execution_session_storage()
-        self._session_text(expected_shape, 'expected_shape')
-        members = tuple(self._session_component(component) for component in components)
-        connection = self.db_connection()
-        connection.execute('SAVEPOINT mwf_component_observation')
-        try:
-            observed = {component: self._read_component_state(connection, component) for component in members}
-            if any((not allow_missing if state is None else state['shape_json'] != expected_shape)
-                   for state in observed.values()):
-                raise RuntimeError('Component observations require the expected producing shape')
-            return observed
-        finally:
-            connection.execute('RELEASE SAVEPOINT mwf_component_observation')
+        return read_component_states_snapshot(
+            self.db_connection(), components,
+            expected_shape=expected_shape, allow_missing=allow_missing,
+        )
 
     def get_component_state(self, component) -> dict | None:
         self._require_execution_session_storage()
-        members = self._session_component(component)
-        return self._read_component_state(self.db_connection(), members)
+        return read_component_state_snapshot(self.db_connection(), component)
 
     def _read_component_state(self, connection, members):
-        row = connection.execute(
-            "SELECT d.component_key, g.shape_json, s.component_key AS state_key, "
-            "s.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, "
-            "origin.session_kind AS origin_kind "
-            "FROM component_definitions d "
-            "LEFT JOIN graph_shapes g USING(shape_id) "
-            "LEFT JOIN component_states s USING(component_key) "
-            "LEFT JOIN execution_sessions origin ON origin.session_id=s.instability_origin "
-            "WHERE d.component_key=?",
-            (encode_component_key(members),),
-        ).fetchone()
-        if row is None:
-            return None
-        if row['state_key'] is None or row['shape_json'] is None:
-            raise RuntimeError('Incomplete component state or producing graph shape')
-        self._validate_component_state_row(row)
-        return {
-            'members': decode_component_key(row['component_key']),
-            'shape_json': row['shape_json'],
-            'lifecycle': row['lifecycle'],
-            'stability': row['stability'],
-            'instability_origin': row['instability_origin'],
-            'misaligned': bool(row['misaligned']),
-            'alignment_generation': row['alignment_generation'],
-        }
+        return read_component_state_snapshot(connection, members)
 
     @staticmethod
     def _validate_component_state_row(row) -> None:
-        lifecycle = row['lifecycle']
-        stability = row['stability']
-        origin = row['instability_origin']
-        misaligned = row['misaligned']
-        generation = row['alignment_generation']
-        no_lineage = stability is None and origin is None
-        result_lineage = (
-            (stability == 'stable' and origin is None)
-            or (stability == 'unstable' and isinstance(origin, str) and bool(origin.strip())
-                and row['origin_kind'] == 'interrupt')
-        )
-        valid_lifecycle = (
-            (lifecycle == 'queued' and no_lineage and misaligned == 0)
-            or (lifecycle == 'running' and (no_lineage or result_lineage))
-            or (lifecycle in ('sampled', 'done') and result_lineage)
-            or (lifecycle == 'failed' and no_lineage)
-        )
-        if not (
-            valid_lifecycle
-            and type(misaligned) is int and misaligned in (0, 1)
-            and type(generation) is int and generation >= 0
-        ):
-            raise RuntimeError('Invalid component state for ' + row['component_key'])
+        validate_component_state_snapshot(row)

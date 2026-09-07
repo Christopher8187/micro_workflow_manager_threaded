@@ -6,6 +6,6 @@ RUNNER_CHOICES = ["threaded", "api", "process", "direct", "thread", "io", "netwo
 
 COMMAND_NAMES = [
     "init", "copy", "paste", "graph", "engine", "doctor", "inspect", "trace", "filter", "recover",
-    "reset", "resetfrom", "run", "restart",
-    "threads", "deploy", "resume", "runfrom", "resumefrom", "monitor", "top",
+    "reset", "resetfrom", "resetbetween", "run", "runbetween", "restart",
+    "threads", "deploy", "resume", "runfrom", "resumefrom", "resumebetween", "monitor", "top",
 ]

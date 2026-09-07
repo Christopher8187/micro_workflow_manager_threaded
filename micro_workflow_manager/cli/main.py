@@ -22,12 +22,13 @@ from .monitoring import monitor_command
 from .top import top_command
 from .planning import print_run_plan
 from .preview import load_preview
+from .graph_command_dispatch import graph_preview_requested, print_graph_preview, refuse_reset_running_sessions
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
 from .restart import restart_active_jobs, restart_active_scope
 from .threads import threads_command, update_declared_threads
 from .deploy import deploy_command
-from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs
+from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs, run_between, resume_between
 from .sampling import sample_command
 from .validation import require_node
 from .node_clipboard import copy_node_to_clipboard, paste_node_from_clipboard
@@ -47,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.print_help()
             return 0
 
-        if args.command in {"run", "runfrom", "resume", "resumefrom"} and not getattr(args, "plan", False):
+        if args.command in {"run", "runfrom", "runbetween", "resume", "resumefrom", "resumebetween"} and not getattr(args, "plan", False):
             raise_open_file_limit()
 
         if args.command == "init":
@@ -61,12 +62,16 @@ def main(argv: list[str] | None = None) -> int:
             return engine_command(root)
         if args.command == "run" and args.job_mode == "sample":
             return sample_command(root, args)
+        if args.command == "run" and any(value is not None for value in (args.seed, args.sample_status, args.expect_population)):
+            raise RuntimeError("--seed, --status, and --expect-population require: mwf run <node> sample <count>")
         read_only_plan = (
-            args.command in {"run", "runfrom", "resume", "resumefrom"}
+            args.command in {"run", "runfrom", "runbetween", "resume", "resumefrom", "resumebetween"}
             and args.plan
         ) or (
-            args.command in {"reset", "resetfrom", "recover"} and args.dry_run
+            args.command in {"reset", "resetfrom", "resetbetween", "recover"} and args.dry_run
         )
+        if args.command in {"reset", "resetfrom", "resetbetween"} and not read_only_plan:
+            refuse_reset_running_sessions(root)
         if not read_only_plan:
             ensure_runtime_layout(root)
 
@@ -119,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
             recovery_result = print_recovery_preview(workflow, quiet_if_empty=args.command != "recover")
             if args.command == "recover":
                 return recovery_result
+            if graph_preview_requested(args):
+                return print_graph_preview(root, workflow, args)
 
         if args.command == "recover":
             return recover_command(root, workflow, dry_run=args.dry_run)
@@ -187,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
                 recent_events=args.events,
             )
 
-        if args.command in {"reset", "resetfrom"}:
+        if args.command in {"reset", "resetfrom", "resetbetween"}:
             if args.command == "resetfrom" and (
                 (args.refuse_mode is None) != (args.refuse_node is None)
             ):
@@ -199,9 +206,16 @@ def main(argv: list[str] | None = None) -> int:
         node = safe_node_name(args.node)
         require_node(workflow, node)
 
+        if args.command in {"runbetween", "resumebetween"}:
+            end_node = safe_node_name(args.end_node)
+            handler = run_between if args.command == "runbetween" else resume_between
+            return handler(
+                root, workflow, node, end_node, stats=args.stats,
+                stats_interval=args.stats_interval, monitor=args.monitor,
+                monitor_interval=args.monitor_interval, keep_trace=args.keeptrace,
+            )
+
         if args.command == "run":
-            if args.seed is not None or args.sample_status is not None or args.expect_population is not None:
-                raise RuntimeError("--seed, --status, and --expect-population require: mwf run <node> sample <count>")
             job_ids = selected_job_ids_from_args(args.job_mode, args.job_specs)
             if args.plan:
                 return print_run_plan(
@@ -236,14 +250,6 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.command == "resume":
-            if args.plan:
-                return print_run_plan(
-                    root,
-                    workflow,
-                    command="resume",
-                    node=node,
-                    keep_trace=args.keeptrace,
-                )
             return resume_node(
                 root,
                 workflow,
@@ -269,16 +275,6 @@ def main(argv: list[str] | None = None) -> int:
                     refuse_before_node = refusal_node
                 else:
                     refuse_after_node = refusal_node
-            if args.plan:
-                return print_run_plan(
-                    root,
-                    workflow,
-                    command="runfrom",
-                    node=node,
-                    keep_trace=args.keeptrace,
-                    refuse_after_node=refuse_after_node,
-                    refuse_before_node=refuse_before_node,
-                )
             return run_from(
                 root,
                 workflow,
@@ -306,16 +302,6 @@ def main(argv: list[str] | None = None) -> int:
                     refuse_before_node = refusal_node
                 else:
                     refuse_after_node = refusal_node
-            if args.plan:
-                return print_run_plan(
-                    root,
-                    workflow,
-                    command="resumefrom",
-                    node=node,
-                    keep_trace=args.keeptrace,
-                    refuse_after_node=refuse_after_node,
-                    refuse_before_node=refuse_before_node,
-                )
             return resume_from(
                 root,
                 workflow,

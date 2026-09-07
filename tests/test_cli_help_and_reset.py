@@ -303,7 +303,7 @@ def test_run_job_selection_runs_individual_jobs_and_ranges_only(tmp_path, monkey
 
     assert "Ran jobs for work:" in out
     for job_id in [1, 3, 8, 9, 10]:
-        assert f"  {job_id}" in out
+        assert f"  work/{job_id}" in out
         assert (tmp_path / "node" / "work" / "output" / "jobs" / str(job_id) / "job.txt").read_text(encoding="utf-8") == f"job {job_id}"
 
     for job_id in [2, 4, 5, 6, 7]:
@@ -525,10 +525,13 @@ def test_cleanup_component_dry_run_lists_expanded_component(tmp_path, monkeypatc
     assert cli.main(["reset", "C", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "selected Hoeflein components: {B, C}" in out
-    assert "  B: would preserve jobs/input" in out
-    assert "  C: would preserve jobs/input" in out
-    assert "  A:" not in out
-    assert "  D:" not in out
+    assert "selected nodes: B, C" in out
+    for node in ("B", "C"):
+        assert f"{node}: no jobs" in out
+        assert f"{node}: generated output would be cleared" in out
+    for node in ("A", "D"):
+        assert f"{node}: generated output would be cleared" not in out
+        assert f"{node}: no jobs" not in out
 
 
 def test_reset_dag_node_does_not_reset_other_quotient_nodes(tmp_path, monkeypatch, capsys):

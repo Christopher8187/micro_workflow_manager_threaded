@@ -1,5 +1,6 @@
 import json
 import textwrap
+from datetime import datetime
 
 import pytest
 from pathlib import Path
@@ -8,6 +9,7 @@ from micro_workflow_manager import cli
 from micro_workflow_manager import monitor as monitor_module
 from micro_workflow_manager.monitor import InlineMonitorReporter
 from micro_workflow_manager.models import Job
+from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.storage import FileStorage
 
 
@@ -82,6 +84,69 @@ def make_monitor_project(tmp_path: Path, monkeypatch):
     assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
 
 
+def _sessions(root: Path) -> list[dict]:
+    storage = FileStorage(root)
+    try:
+        return storage.list_execution_sessions()
+    finally:
+        storage.close_database_connections()
+
+
+def _new_session(root: Path, previous_ids: set[str]) -> dict:
+    added = [
+        session for session in _sessions(root)
+        if session["session_id"] not in previous_ids
+    ]
+    assert len(added) == 1
+    return added[0]
+
+
+def _assert_terminal_main_session(
+    session: dict,
+    *,
+    command: str,
+    start_component: tuple[str, ...],
+    selected_components: list[tuple[str, ...]],
+) -> None:
+    assert session["session_kind"] == "main"
+    assert session["command"] == command
+    assert session["start_component"] == start_component
+    assert session["selected_components"] == selected_components
+    assert session["selection_kind"] == "components"
+    assert session["selected_jobs"] == []
+    assert session["parent_session_id"] is None
+    assert session["status"] == "terminal"
+    assert session["outcome"] == "done"
+    assert session["failures"] == []
+    assert session["details"]["start_node"] == start_component[0]
+    started = datetime.fromisoformat(session["started_at"])
+    heartbeat = datetime.fromisoformat(session["heartbeat_at"])
+    finished = datetime.fromisoformat(session["finished_at"])
+    assert started <= heartbeat <= finished
+    assert type(session["pid"]) is int and session["pid"] > 0
+    assert isinstance(session["hostname"], str) and session["hostname"].strip()
+    assert session["process_identity"] == process_identity(session["pid"])
+
+
+def _rendered_session_prefix(session: dict, status: str) -> str:
+    components = "; ".join(",".join(value) for value in session["selected_components"])
+    return (
+        f"session={session['session_id']} kind=main command={session['command']} "
+        f"status={status} parent=- components=[{components}]"
+    )
+
+
+def _assert_inline_session_timeline(text: str, session: dict) -> None:
+    assert _rendered_session_prefix(session, "running") in text
+    terminal = _rendered_session_prefix(session, "terminal")
+    assert (
+        f"{terminal} outcome=done finished={session['finished_at']}"
+        in text
+    )
+    assert "active run:" not in text
+    assert "last run:" not in text
+
+
 def test_monitor_once_prints_workflow_counts(tmp_path, monkeypatch, capsys):
     make_monitor_project(tmp_path, monkeypatch)
     capsys.readouterr()
@@ -100,6 +165,7 @@ def test_monitor_once_prints_workflow_counts(tmp_path, monkeypatch, capsys):
 def test_run_stats_and_monitor_json_include_timing_metadata(tmp_path, monkeypatch, capsys):
     make_monitor_project(tmp_path, monkeypatch)
     capsys.readouterr()
+    before_ids = {session["session_id"] for session in _sessions(tmp_path)}
 
     assert cli.main(["run", "A", "--runner", "direct", "--stats", "--stats-interval", "0.1"]) == 0
     captured = capsys.readouterr()
@@ -113,11 +179,20 @@ def test_run_stats_and_monitor_json_include_timing_metadata(tmp_path, monkeypatc
     assert "finished_at" in status
     assert isinstance(status["duration_seconds"], int | float)
 
+    session = _new_session(tmp_path, before_ids)
+    _assert_terminal_main_session(
+        session,
+        command="run",
+        start_component=("A",),
+        selected_components=[("A",)],
+    )
+
     assert cli.main(["monitor", "--once", "--json"]) == 0
     data = json.loads(capsys.readouterr().out)
 
-    assert data["run_state"]["command"] == "run"
-    assert data["run_state"]["status"] == "done"
+    assert data["sessions"] == json.loads(json.dumps([session]))
+    assert "run_state" not in data
+    assert "active_run" not in data
     assert data["totals"]["jobs"] >= 2
 
 
@@ -171,27 +246,41 @@ def make_slow_monitor_project(tmp_path: Path, monkeypatch):
 def test_run_monitor_prints_timeline_and_terminal_active_none(tmp_path, monkeypatch, capsys):
     make_slow_monitor_project(tmp_path, monkeypatch)
     capsys.readouterr()
+    before_ids = {session["session_id"] for session in _sessions(tmp_path)}
 
     assert cli.main(
         ["run", "A", "--runner", "direct", "--monitor", "--monitor-interval", "0.02"]
     ) == 0
     captured = capsys.readouterr()
+    session = _new_session(tmp_path, before_ids)
+    _assert_terminal_main_session(
+        session,
+        command="run",
+        start_component=("A",),
+        selected_components=[("A",)],
+    )
 
     assert "--- mwf monitor snapshot ---" in captured.err
     assert "micro-workflow monitor |" in captured.err
-    assert "active run: run A" in captured.err
+    _assert_inline_session_timeline(captured.err, session)
     assert "--- mwf final monitor snapshot ---" in captured.err
     final = captured.err.rsplit("--- mwf final monitor snapshot ---", 1)[1]
-    assert "active run: none" in final
-    assert "last run: run A | status=done" in final
+    assert _rendered_session_prefix(session, "running") not in final
+    assert (
+        f"{_rendered_session_prefix(session, 'terminal')} "
+        f"outcome=done finished={session['finished_at']}"
+        in final
+    )
     assert "running jobs" in captured.err
 
 
 def test_runfrom_monitor_observes_descendants_and_can_be_reused(tmp_path, monkeypatch, capsys):
     make_slow_monitor_project(tmp_path, monkeypatch)
     capsys.readouterr()
+    seen_ids: set[str] = set()
 
     for _ in range(2):
+        before_ids = {session["session_id"] for session in _sessions(tmp_path)}
         assert cli.main(
             [
                 "runfrom",
@@ -204,21 +293,43 @@ def test_runfrom_monitor_observes_descendants_and_can_be_reused(tmp_path, monkey
             ]
         ) == 0
         captured = capsys.readouterr()
-        assert "active run: runfrom A" in captured.err
-        assert "last run: runfrom A | status=done" in captured.err
+        session = _new_session(tmp_path, before_ids)
+        _assert_terminal_main_session(
+            session,
+            command="runfrom",
+            start_component=("A",),
+            selected_components=[("A",), ("B",)],
+        )
+        assert session["session_id"] not in seen_ids
+        _assert_inline_session_timeline(captured.err, session)
+        for previous_id in seen_ids:
+            assert f"session={previous_id}" in captured.err
+        seen_ids.add(session["session_id"])
+        assert "Ran:\n  A\n  B\n" in captured.out
         assert "A" in captured.err
         assert "B" in captured.err
         assert FileStorage(tmp_path).get_node_status("A") == "done"
         assert FileStorage(tmp_path).get_node_status("B") == "done"
 
     # A different execution command after repeated runfrom use must not inherit
-    # a stale reporter or active-run label.
+    # a stale reporter or previous native session identity.
+    before_ids = {session["session_id"] for session in _sessions(tmp_path)}
     assert cli.main(
         ["run", "B", "--runner", "direct", "--monitor", "--monitor-interval", "0.02"]
     ) == 0
     captured = capsys.readouterr()
-    assert "active run: run B" in captured.err
-    assert "last run: run B | status=done" in captured.err
+    session = _new_session(tmp_path, before_ids)
+    _assert_terminal_main_session(
+        session,
+        command="run",
+        start_component=("B",),
+        selected_components=[("B",)],
+    )
+    assert session["session_id"] not in seen_ids
+    _assert_inline_session_timeline(captured.err, session)
+    for previous_id in seen_ids:
+        assert f"session={previous_id}" in captured.err
+    assert "Ran:\n  B\n" in captured.out
 
     import threading
 
@@ -231,21 +342,36 @@ def test_runfrom_monitor_observes_descendants_and_can_be_reused(tmp_path, monkey
 def test_standalone_monitor_calls_completed_sequence_last_not_active(tmp_path, monkeypatch, capsys):
     make_slow_monitor_project(tmp_path, monkeypatch)
     capsys.readouterr()
+    before_ids = {session["session_id"] for session in _sessions(tmp_path)}
 
     assert cli.main(["run", "A", "--runner", "direct"]) == 0
+    session = _new_session(tmp_path, before_ids)
+    _assert_terminal_main_session(
+        session,
+        command="run",
+        start_component=("A",),
+        selected_components=[("A",)],
+    )
     capsys.readouterr()
     assert cli.main(["monitor", "--once"]) == 0
     output = capsys.readouterr().out
 
-    assert "active run: none" in output
-    assert "last run: run A | status=done" in output
-    assert "active run: run A" not in output
+    assert "Execution sessions:" in output
+    assert (
+        f"{_rendered_session_prefix(session, 'terminal')} "
+        f"outcome=done finished={session['finished_at']}"
+        in output
+    )
+    assert _rendered_session_prefix(session, "running") not in output
+    assert "active run:" not in output
+    assert "last run:" not in output
 
 
 
 def test_stats_and_full_monitor_can_run_together(tmp_path, monkeypatch, capsys):
     make_slow_monitor_project(tmp_path, monkeypatch)
     capsys.readouterr()
+    before_ids = {session["session_id"] for session in _sessions(tmp_path)}
 
     assert cli.main([
         "run", "A", "--runner", "direct",
@@ -253,13 +379,27 @@ def test_stats_and_full_monitor_can_run_together(tmp_path, monkeypatch, capsys):
         "--monitor", "--monitor-interval", "0.02",
     ]) == 0
     captured = capsys.readouterr()
+    session = _new_session(tmp_path, before_ids)
+    _assert_terminal_main_session(
+        session,
+        command="run",
+        start_component=("A",),
+        selected_components=[("A",)],
+    )
     assert "[stats]" in captured.err
     assert "[final stats]" in captured.err
     assert "--- mwf monitor snapshot ---" in captured.err
     assert "--- mwf final monitor snapshot ---" in captured.err
-    assert "active run: none" in captured.err.rsplit(
+    _assert_inline_session_timeline(captured.err, session)
+    final = captured.err.rsplit(
         "--- mwf final monitor snapshot ---", 1
     )[1]
+    assert _rendered_session_prefix(session, "running") not in final
+    assert (
+        f"{_rendered_session_prefix(session, 'terminal')} "
+        f"outcome=done finished={session['finished_at']}"
+        in final
+    )
 
 
 def test_inline_monitor_failure_is_diagnostic_not_a_run_failure(monkeypatch, capsys):

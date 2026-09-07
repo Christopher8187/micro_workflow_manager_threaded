@@ -12,6 +12,7 @@ from .execution_terminal import TerminalUpdate
 from .preparation_files import stage_preparation_files
 from .preparation_guards import refuse_receiver_mutation
 from .preparation_receipts import PreparationReceipt, submit_preparation_decision
+from .preparation_footprint import _SnapshotPreparationStorage
 
 
 def _read_resume_successful_result(storage, connection, component, state):
@@ -67,6 +68,84 @@ def validate_resume_job_owners(storage, states):
         return successful_results
     finally:
         connection.execute('RELEASE SAVEPOINT mwf_resume_owner_observation')
+
+
+class _SnapshotResumeStorage(_SnapshotPreparationStorage):
+    """Extend preparation observation with component-history readers."""
+
+    def _read_component_state(self, connection, component):
+        from .component_states import read_component_state_snapshot
+
+        return read_component_state_snapshot(connection, component)
+
+    def _read_component_producing_identity(self, connection, component):
+        from .component_definitions import ComponentDefinitionStorageMixin
+
+        return ComponentDefinitionStorageMixin._read_component_producing_identity(
+            self, connection, component,
+        )
+
+    def _read_component_successful_result(self, connection, component, identity):
+        from .selected_component_lifecycle import SelectedComponentLifecycleStorageMixin
+
+        return SelectedComponentLifecycleStorageMixin._read_component_successful_result(
+            self, connection, component, identity,
+        )
+
+    def _match_component_successful_result(
+        self, connection, component, identity, current, **options,
+    ):
+        from .selected_component_lifecycle import SelectedComponentLifecycleStorageMixin
+
+        return SelectedComponentLifecycleStorageMixin._match_component_successful_result(
+            self, connection, component, identity, current, **options,
+        )
+
+
+def read_resume_plan_snapshot(
+    connection, project_root, components, states, *, expected_shape,
+):
+    """Validate and summarize resume work without recovering or requeueing it."""
+    from .component_states import read_component_states_snapshot
+    from .planning_observation import ResumeJobEffect, ResumePlanEffects
+    from .preparation_guards import refuse_receiver_mutation
+
+    components = tuple(tuple(component) for component in components)
+    expected = {tuple(component): dict(state) for component, state in states.items()}
+    if set(expected) != set(components):
+        raise ValueError('Resume plan states must match its selected components')
+    observed = read_component_states_snapshot(
+        connection, components, expected_shape=expected_shape,
+    )
+    if observed != expected:
+        raise RuntimeError('Component changed during resume observation')
+    storage = _SnapshotResumeStorage(connection, project_root)
+    connection.execute('SAVEPOINT mwf_resume_plan')
+    try:
+        successful_results = validate_resume_job_owners(storage, expected)
+        jobs = []
+        for component in components:
+            key = encode_component_key(component)
+            if connection.execute(
+                'SELECT 1 FROM pending_component_executions WHERE component_key=? UNION ALL '
+                'SELECT 1 FROM component_holds WHERE component_key=? LIMIT 1',
+                (key, key),
+            ).fetchone():
+                raise RuntimeError('Resume requires recovery of a held or pending component: ' + key)
+            for node in component:
+                refuse_receiver_mutation(connection, node)
+                storage._require_settled_input_publications(connection, node)
+                for job in _read_jobs(connection, node):
+                    if job.status in ('queued', 'failed', 'cancelled', 'running'):
+                        jobs.append(ResumeJobEffect(
+                            node, job.job_id, job.status, job.generation,
+                        ))
+        return ResumePlanEffects(
+            tuple(jobs),
+            tuple((component, successful_results[component]) for component in components),
+        )
+    finally:
+        connection.execute('RELEASE SAVEPOINT mwf_resume_plan')
 
 
 def _read_finished_outputs(storage, captured):

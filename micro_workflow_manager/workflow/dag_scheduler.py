@@ -54,6 +54,7 @@ class DagSchedulerMixin(NodeSchedulerMixin):
         execution_context,
         _session_driver=None,
         _operation=None,
+        _components=None,
         _task_parent=None,
         _sequential=False,
         refuse_after_component: tuple[str, ...] | None = None,
@@ -69,7 +70,12 @@ class DagSchedulerMixin(NodeSchedulerMixin):
         A -> B -> A from starting competing schedulers that fight over the same
         queue/status files or recursively wait on child jobs.
         """
-        units = self.execution_components(nodes) if _operation is None else _operation.units
+        if _components is not None:
+            admitted = tuple(dict.fromkeys(execution_context[1].values()))
+            if tuple(_components) != admitted:
+                raise RuntimeError('Scheduled components differ from the admitted order')
+        units = (_operation.units if _operation is not None else
+                 tuple(_components) if _components is not None else self.execution_components(nodes))
         if not units:
             return []
         for unit in units:

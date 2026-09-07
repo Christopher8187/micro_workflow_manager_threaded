@@ -12,6 +12,7 @@ from micro_workflow_manager.cli.project import load_workflow
 from micro_workflow_manager.models import Job
 from tests.test_036_hoeflein_scheduling import make_project
 from tests.test_086_native_owned_restart import _close
+from tests.test_064_read_only_previews import _wait_restart_listener_retired
 
 
 def _files(root, *, allow_existing_shm=False):
@@ -41,11 +42,25 @@ def _native_project(tmp_path, monkeypatch):
             ''',
         },
     )
-    workflow = load_workflow(tmp_path)
+    workflow = load_workflow(tmp_path, 'direct')
     workflow.storage.register_component_topology(workflow.topology.snapshot())
     if not workflow.storage.job_exists('A', 1):
         workflow.storage.create_job(Job(node_name='A', job_id=1, params={}))
     return workflow
+
+
+
+def _complete_native_result(workflow):
+    storage = workflow.storage
+    assert storage.get_component_state(('A',))['lifecycle'] == 'queued'
+    workflow.run_node('A')
+    assert storage.get_job_status('A', 1) == 'done'
+    state = storage.get_component_state(('A',))
+    assert (state['lifecycle'], state['stability'], state['instability_origin']) == ('done', 'stable', None)
+    _wait_restart_listener_retired(storage)
+    # Keep the obsolete raw-node row different so it cannot satisfy the plan assertion.
+    storage.set_node_status('A', 'queued')
+    storage.db_mutation_barrier()
 
 
 def _install_import_sentinels(tmp_path):
@@ -69,7 +84,7 @@ def test_closed_native_wal_preview_creates_no_sidecars_or_project_changes(
 ):
     workflow = _native_project(tmp_path, monkeypatch)
     storage = workflow.storage
-    storage.set_node_status('A', 'done')
+    _complete_native_result(workflow)
     storage.db_mutation_barrier()
     storage.db_connection().execute('PRAGMA wal_checkpoint(TRUNCATE)')
     _close(storage)
@@ -82,7 +97,7 @@ def test_closed_native_wal_preview_creates_no_sidecars_or_project_changes(
 
     assert cli.main(['run', 'A', '--plan']) == 0
 
-    assert 'A: node_status=done' in capsys.readouterr().out
+    assert '{A}: done, stable' in capsys.readouterr().out
     assert _files(tmp_path) == before
     assert not wal.exists()
     assert not shm.exists()
@@ -100,7 +115,7 @@ def test_live_preview_reads_committed_wal_frame_without_changing_main_or_wal(
     storage.db_mutation_barrier()
     storage.db_connection().execute('PRAGMA wal_checkpoint(TRUNCATE)')
     main_before_update = database.read_bytes()
-    storage.set_node_status('A', 'done')
+    _complete_native_result(workflow)
     storage.db_mutation_barrier()
     assert database.read_bytes() == main_before_update
     assert wal.is_file() and wal.stat().st_size > 0
@@ -111,7 +126,7 @@ def test_live_preview_reads_committed_wal_frame_without_changing_main_or_wal(
     wal_before = wal.read_bytes()
     try:
         assert cli.main(['run', 'A', '--plan']) == 0
-        assert 'A: node_status=done' in capsys.readouterr().out
+        assert '{A}: done, stable' in capsys.readouterr().out
         assert _files(tmp_path, allow_existing_shm=True) == before
         assert database.read_bytes() == main_before
         assert wal.read_bytes() == wal_before
@@ -195,7 +210,7 @@ def test_live_preview_pins_existing_sidecars_before_opening_original_sqlite(
     database = tmp_path / '.mwf' / 'state.sqlite3'
     wal = Path(f'{database}-wal')
     shm = Path(f'{database}-shm')
-    storage.set_node_status('A', 'done')
+    _complete_native_result(workflow)
     storage.db_mutation_barrier()
     assert wal.is_file() and shm.is_file()
     external = _install_import_sentinels(tmp_path)
@@ -225,7 +240,7 @@ def test_live_preview_pins_existing_sidecars_before_opening_original_sqlite(
             assert attempted, 'The pinned original SQLite open was not reached'
         else:
             assert not attempted, 'The original database must use a private copy on this platform'
-        assert 'A: node_status=done' in capsys.readouterr().out
+        assert '{A}: done, stable' in capsys.readouterr().out
         assert _files(tmp_path, allow_existing_shm=True) == before
         assert database.read_bytes() == main_before
         assert wal.read_bytes() == wal_before
@@ -245,7 +260,7 @@ def test_live_sidecars_use_private_copy_when_path_deletion_cannot_be_prevented(
     database = tmp_path / '.mwf' / 'state.sqlite3'
     wal = Path(f'{database}-wal')
     shm = Path(f'{database}-shm')
-    storage.set_node_status('A', 'done')
+    _complete_native_result(workflow)
     storage.db_mutation_barrier()
     assert wal.is_file() and shm.is_file()
     external = _install_import_sentinels(tmp_path)
@@ -266,7 +281,7 @@ def test_live_sidecars_use_private_copy_when_path_deletion_cannot_be_prevented(
         monkeypatch.setattr(preview_snapshot, '_open_live_snapshot', refuse_live)
         monkeypatch.setattr(preview_snapshot.sqlite3, 'connect', connect)
         assert cli.main(['run', 'A', '--plan']) == 0
-        assert 'A: node_status=done' in capsys.readouterr().out
+        assert '{A}: done, stable' in capsys.readouterr().out
         assert _files(tmp_path, allow_existing_shm=True) == before
         assert not external.exists()
     finally:

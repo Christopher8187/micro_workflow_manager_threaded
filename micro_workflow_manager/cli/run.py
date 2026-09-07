@@ -3,8 +3,10 @@ from __future__ import annotations
 from .run_commands import (
     _component_notice,
     _refuse_start_component_inputs,
+    resume_between,
     resume_from,
     resume_node,
+    run_between,
     run_from,
     run_node,
 )
@@ -14,8 +16,10 @@ from .run_session import active_workflow_run
 
 __all__ = [
     "active_workflow_run",
+    "resume_between",
     "resume_from",
     "resume_node",
+    "run_between",
     "run_from",
     "run_node",
     "run_nodes",

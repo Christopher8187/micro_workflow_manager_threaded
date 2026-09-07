@@ -7,12 +7,15 @@ changing workflow design. Use `mwf <command> --help` for exact syntax and
 
 ## Bootstrap effects of observation and previews
 
-Before most commands, MWF may migrate an older runtime layout. Commands that
-mount routers may also refresh schemas or create declared starter jobs. Only
-`mwf engine` and `mwf migrate --dry-run` bypass those bootstrap paths. A command
-described as observational or a preview still avoids executing jobs or applying
-its advertised mutation; it does not guarantee a byte-for-byte unchanged
-framework state directory.
+Graph execution plans, sample plans, reset and recovery dry runs, and `mwf
+engine` bypass mutable runtime initialization. Graph command previews read
+synchronized edges, literal autostart declarations, and persisted native state
+without importing project graph or task code. They do not create starter jobs,
+reserve sessions, prepare components, or change project files. When observing
+an open WAL database, SQLite may update its existing shared-memory file.
+
+Commands that mount routers can refresh runtime records and create declared
+starter jobs. Graph synchronization and `doctor` still use that startup path.
 
 ## Initialization and graph synchronization
 
@@ -34,7 +37,7 @@ mwf graph --update
 ```
 
 The preview does not apply the proposed graph metadata change or node-folder
-addition/removal. The shared bootstrap caveat above still applies. The applied
+addition/removal. The router-startup effects above still apply. The applied
 form synchronizes stored edges and node folders, and can remove a node directory
 when the graph no longer names it. Preserve needed node data first.
 
@@ -51,21 +54,26 @@ loads no external assets.
 
 ## Fresh execution
 
-`mwf run NODE` selects NODE's complete Hoeflein component. It performs fresh
-preparation and then schedules the component if its external predecessors are
-complete. For a singleton node, `job`, `jobs`, and `sample` modes can select a
-subset.
+`mwf run NODE` selects NODE's complete Hoeflein component. It checks the start
+component's external predecessor results before fresh preparation and execution.
+The `job`, `jobs`, and `sample` modes select exact starting jobs and their newly
+produced causal work within that component.
 
 `mwf runfrom START` selects START's component and quotient-DAG descendants. It
 freshens the complete selected region, removes descendant work attributable to
 selected producer components, preserves merge work from unselected branches,
 then schedules in dependency order.
 
-Both commands support `--plan`, and both can show an inline dashboard with
-`--monitor`. A plan validates and displays the selection and reset effects
-without creating a run record, applying the planned reset, or executing task
-code. Loading and mounting routers may still perform the bootstrap effects
-described above.
+`mwf runbetween START END` selects the union of directed quotient paths from
+START's component to END's component, excluding END's component. END must be a
+strict directed descendant. A selected producer may publish to an excluded
+receiver, but this command does not execute that receiver.
+
+All three fresh commands support `--plan` and `--monitor`. Their full-component
+plans show selected components and raw nodes, native prerequisite results, job counts, crossing
+edges, publication receivers, and exact cleanup effects. Interval plans also
+show the excluded end component. Busy state appears as a refusal reason;
+damaged stored state makes the preview fail.
 
 Fresh execution clears affected trace journals unless `--keeptrace` is used.
 It also clears node output for whole-component preparation. A selected-job run
@@ -93,23 +101,28 @@ mwf run classify sample 100 --seed release-check --status failed `
   --expect-population <sha256>
 ```
 
-Sampling is designed to isolate selected jobs. Tests establish deterministic
-selection, preservation of unselected work, and planning that does not apply the
-sample run. They do not yet exercise routed descendants or Hoeflein-component
-circulation. The active run record retains the selection manifest and digest.
+Sampling includes named component members and percentage counts. It preserves
+unselected jobs and runs newly produced causal work within the selected
+component. Admission stores the exact sample and population digest with its
+session. Successful partial coverage leaves the component sampled; full
+eligible coverage with no newer unprocessed work can complete it.
 
 ## Resume
 
 `mwf resume NODE` continues one component while preserving successful jobs and
 output. `mwf resumefrom START` continues through its quotient descendants.
+`mwf resumebetween START END` continues the same half-open interval as
+`runbetween`.
 Queued jobs retain their generations. Repairable failed or cancelled jobs
 receive a new job generation. Resume preserves the component's alignment generation.
 
-Both commands preflight the whole selection before changing jobs, files, or
+All three commands preflight the whole selection before changing jobs, files, or
 traces. Misalignment and incomplete or incompatible external parents block
 resume. Misaligned `resume C` recommends `mwf run C`. Misaligned C inside
 `resumefrom B` recommends `mwf resetfrom C`, then retrying `mwf resumefrom B`.
-Separate affected branches receive separate repair commands.
+Misaligned C inside `resumebetween B E` recommends `mwf resetbetween C E`, then
+retrying `mwf resumebetween B E`. Separate affected branches receive separate
+repair commands.
 
 Preparation requires exact session reservations, job instances, and execution
 owners. Failed or cancelled attempts must retain their producing component
@@ -218,11 +231,17 @@ confirmation unless `--yes` is supplied.
 
 | Command | Jobs | Node output | Node input | Executes tasks |
 | --- | --- | --- | --- | --- |
-| `reset` | keep identities and parameters; requeue selected work | clear for whole-component scope | keep | no |
+| `reset` | requeue retained jobs; remove selected-producer work | clear for whole-component scope | preserve outside input; remove selected-producer publications | no |
 
-The `resetfrom` command applies through quotient-DAG descendants. It uses the same
-producer-aware freshening as `runfrom`. Naming any member expands to its whole
-Hoeflein component, and `*` selects every graph node.
+`resetfrom` prepares quotient-DAG descendants. `resetbetween START END` prepares
+the same half-open interval as `runbetween`. Naming any member selects its whole
+Hoeflein component. `reset '*'` and `resetfrom '*'` select every graph node.
+
+Preparation can remove selected-producer files or jobs at excluded receivers
+and mark their retained results misaligned. It preserves material from
+unselected producers. Applied reset commands refuse before loading project
+code while any main or interrupt session remains running, including an
+abandoned session that needs recovery.
 
 ## Node clipboard
 
@@ -235,39 +254,6 @@ same node.
 reconciles payload jobs and stale running leases. Clipboard copies predating the
 SQLite snapshot are restored as payload-only copies. Clipboard operations do
 not copy graph edges or Python behavior.
-
-## Migration
-
-`mwf migrate --dry-run` reports changes to MWF-owned metadata without changing
-it. `mwf migrate` updates low-churn JSON and SQLite schemas and can import older
-framework-owned status, queue, event, execution, idempotency, default-job, and
-node-summary records.
-
-Applied migration checks both `.mwf_run.json` and `.mwf/run.json` before changing
-layout, locks, JSON, or SQLite state. It refuses while either legacy run is
-observed alive, or when both records exist, preserving both even if their bytes
-match. Automatic conversion of an older runtime layout uses the same check.
-Initialization checks before extracting a deployment archive and again after
-extraction, before further initialization writes. Each present run entry must
-contain a readable UTF-8 JSON object in a regular file and cannot itself be a
-link. Structural errors report every affected path before any migration changes.
-Wait for the recorded run to finish or become stale before migrating; a fresh
-heartbeat from another host also counts as live.
-
-Direct storage and workflow construction also validate both raw records before
-SQLite access. If the database path does not resolve to a file, an observed live
-owner prevents creation. Graph loading, graph setup, process-worker imports,
-and node copy/paste perform this check before their user-code or filesystem
-effects. Established projects with a database and one valid current live record
-remain usable. The guard does not inspect an existing database's completeness;
-handling an interrupted initialization there awaits the
-[SQLite coordination decision](plans/0.6.2/architectural-questions.md#aq1-sqlite-coordination-during-read-only-previews).
-This preflight does not prevent an older process from starting after the check.
-Concurrent-start exclusion and safe session import remain unfinished.
-
-Migration does not rewrite `input.json`, `output.json`, node input, node output,
-or old per-job file trees. It refuses to downgrade state created by a newer,
-incompatible schema.
 
 ## Deployment
 
