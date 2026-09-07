@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import time
@@ -147,6 +148,7 @@ def test_recreated_numeric_job_id_never_inherits_deleted_jobs_owner(workflow, de
     elif delete == 'node':
         storage.delete_node_jobs('A', preserve_events=True)
     else:
+        shutil.rmtree(storage.node_dir('A'))
         storage.delete_node_state('A')
     assert storage.read_job_current_owner('A', 1) is None
     storage.create_job(Job(node_name='A', job_id=1, params={'value': 'new'}))

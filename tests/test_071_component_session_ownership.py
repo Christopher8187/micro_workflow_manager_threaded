@@ -272,10 +272,11 @@ def test_registration_rejects_malformed_or_inconsistent_graph_shapes(tmp_path, s
     storage.close_database_connections()
 
 
-def test_component_operations_do_not_upgrade_ordinary_version_four_storage(tmp_path):
+def test_component_operations_refuse_a_damaged_native_schema_marker_without_mutation(tmp_path):
     storage = FileStorage(tmp_path)
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     connection = storage.db_connection()
+    connection.execute("UPDATE metadata SET value='invalid' WHERE key='database_schema_version'")
     before = [tuple(row) for row in connection.execute('SELECT * FROM metadata ORDER BY key')]
 
     with pytest.raises(RuntimeError, match='session-capable database'):
@@ -294,9 +295,11 @@ def test_component_operations_do_not_upgrade_ordinary_version_four_storage(tmp_p
             operation()
 
     assert [tuple(row) for row in connection.execute('SELECT * FROM metadata ORDER BY key')] == before
-    assert connection.execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '4'
+    assert connection.execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == 'invalid'
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {'graph_shapes', 'component_definitions', 'component_reservations', 'component_holds'}.isdisjoint(tables)
+    assert {'graph_shapes', 'component_definitions', 'component_reservations', 'component_holds'} <= tables
+    for table in ('graph_shapes', 'component_definitions', 'component_reservations', 'component_holds'):
+        assert connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] == 0
     assert not (tmp_path / '.mwf' / 'run.json').exists()
     assert not (tmp_path / '.mwf_run.json').exists()
     storage.close_database_connections()
@@ -775,7 +778,7 @@ def test_noncanonical_spelling_of_an_equivalent_shape_refuses_without_inserting(
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), [('A', 'B')]).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
 
-    with pytest.raises(ValueError, match='canonical graph shape'):
+    with pytest.raises(ValueError, match='Invalid producing graph shape'):
         storage.register_component_topology(replace(snapshot, shape_json=shape_json))
 
     assert _definition_rows(storage) == {'shapes': [], 'components': []}

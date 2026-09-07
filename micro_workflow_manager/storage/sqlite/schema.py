@@ -13,7 +13,7 @@ SESSION_TABLES = frozenset({
     "execution_sessions", "session_components", "session_jobs",
     "graph_shapes", "component_definitions", "component_reservations", "component_holds",
     "job_execution_owners", "component_states", "job_instances",
-    "pending_component_executions",
+    "pending_component_executions", "component_successful_results",
 })
 SESSION_TRIGGERS = frozenset({"create_job_instance"})
 CORE_TABLES = frozenset({
@@ -379,7 +379,7 @@ class SQLiteSchemaMixin:
                                 AND length(instability_origin)>0)
                         ))
                     )
-                    AND (lifecycle NOT IN ('queued','running') OR misaligned=0)
+                    AND (lifecycle<>'queued' OR misaligned=0)
                 ) IS 1)
             )
         """)
@@ -398,6 +398,11 @@ class SQLiteSchemaMixin:
                     CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
                 completion_ready INTEGER NOT NULL DEFAULT 0
                     CHECK(typeof(completion_ready)='integer' AND completion_ready IN (0,1)),
+                execution_kind TEXT NOT NULL DEFAULT 'full' CHECK(execution_kind IN ('full','jobs')),
+                starting_lifecycle TEXT NOT NULL DEFAULT 'queued'
+                    CHECK(starting_lifecycle IN ('queued','sampled','done','failed')),
+                starting_misaligned INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(starting_misaligned)='integer' AND starting_misaligned IN (0,1)),
                 stability TEXT NOT NULL CHECK(stability IN ('stable','unstable')),
                 instability_origin TEXT REFERENCES execution_sessions(session_id),
                 PRIMARY KEY(session_id, component_key),
@@ -406,6 +411,21 @@ class SQLiteSchemaMixin:
                     (stability='stable' AND instability_origin IS NULL)
                     OR (stability='unstable' AND instability_origin IS NOT NULL AND length(instability_origin)>0)
                 ) IS 1)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE component_successful_results (
+                component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
+                shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id),
+                alignment_generation INTEGER NOT NULL
+                    CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
+                lifecycle TEXT NOT NULL CHECK(lifecycle IN ('sampled','done')),
+                stability TEXT NOT NULL CHECK(stability IN ('stable','unstable')),
+                instability_origin TEXT REFERENCES execution_sessions(session_id),
+                PRIMARY KEY(component_key, shape_id, alignment_generation),
+                CHECK(((stability='stable' AND instability_origin IS NULL)
+                    OR (stability='unstable' AND instability_origin IS NOT NULL
+                        AND length(instability_origin)>0)) IS 1)
             )
         """)
         connection.execute("""

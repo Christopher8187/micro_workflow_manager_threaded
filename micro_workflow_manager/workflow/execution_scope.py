@@ -5,12 +5,13 @@ from contextlib import contextmanager
 from ..storage.component_states import ComponentTaskParent
 from .execution_session import execution_session, validate_selected_jobs
 from .preparation import observe_programmatic_fresh_preparation, prepare_admitted_programmatic_components
+from .selected_preparation import prepare_selected_jobs
 
 
 @contextmanager
 def programmatic_execution(
     workflow, *, command, start_node, nodes, selected_jobs=None, include_driver=False, include_parent=False,
-    fresh=False,
+    fresh=False, selected_preparation=False,
 ):
     """Admit an independent call, or reuse the exact owner of a current task."""
     execution_id = getattr(workflow._job_context, 'execution_id', None)
@@ -42,12 +43,16 @@ def programmatic_execution(
         )
         yield (context, None, parent) if include_parent else (context, None) if include_driver else context
         return
-    preparation = observe_programmatic_fresh_preparation(workflow, nodes) if fresh else None
+    preparation = observe_programmatic_fresh_preparation(workflow, nodes) if fresh or selected_preparation else None
     with execution_session(
         workflow, command=command, start_node=start_node,
         nodes=nodes, selected_jobs=selected_jobs,
     ) as driver:
         if preparation is not None:
-            prepare_admitted_programmatic_components(workflow, nodes, preparation)
+            if selected_preparation:
+                prepare_selected_jobs(workflow.storage.project_dir, workflow, start_node, selected_jobs,
+                                      selection=preparation)
+            else:
+                prepare_admitted_programmatic_components(workflow, nodes, preparation)
         context = workflow.execution_session_context
         yield (context, driver, None) if include_parent else (context, driver) if include_driver else context

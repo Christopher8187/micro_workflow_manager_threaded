@@ -3,11 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from micro_workflow_manager.models import RUNNING
 from micro_workflow_manager.system import MicroWorkflow
+from micro_workflow_manager.workflow.preparation import observe_programmatic_fresh_preparation
+from micro_workflow_manager.workflow.selected_preparation import prepare_selected_jobs
 
 from .active_run import refuse_competing_run
-from .cleanup import reset_job_for_run
 from .run_session import active_workflow_run
 from .sampling import plan_sample, print_sample_plan
 from .validation import is_ready, print_not_ready
@@ -31,7 +31,6 @@ def run_selected_jobs(
         node,
         list(job_ids),
         command="run jobs",
-        check_readiness=True,
         stats=stats,
         stats_interval=stats_interval,
         monitor=monitor,
@@ -86,7 +85,6 @@ def run_sampled_jobs(
         node,
         selected_job_ids,
         command="run sample",
-        check_readiness=False,
         selection_builder=build_selection,
         stats=stats,
         stats_interval=stats_interval,
@@ -103,7 +101,6 @@ def _run_selected_jobs(
     job_ids: list[int],
     *,
     command: str,
-    check_readiness: bool,
     selection_builder: Callable[[], dict] | None = None,
     stats: bool = False,
     stats_interval: float = 5.0,
@@ -113,9 +110,10 @@ def _run_selected_jobs(
 ) -> int:
     refuse_competing_run(workflow)
 
-    if check_readiness and not is_ready(workflow, node):
+    if not is_ready(workflow, node):
         print_not_ready(workflow, node)
         return 1
+    preparation = observe_programmatic_fresh_preparation(workflow, [node])
 
     # Preserve the established explicit-ID behavior: reject a typo before
     # publishing an active-run receipt. Sample IDs do not exist until their
@@ -131,7 +129,7 @@ def _run_selected_jobs(
         queue_autostarts=True,
         command=command,
         start_node=node,
-        nodes=[node],
+        nodes=list(workflow.component_key(workflow.component_for(node))),
         selected_jobs=job_ids,
         selection_builder=selection_builder,
         stats=stats,
@@ -147,16 +145,7 @@ def _run_selected_jobs(
         for job_id in job_ids:
             if not workflow.storage.job_exists(node, job_id):
                 raise RuntimeError(f"Job does not exist: {node}/{job_id}")
-        workflow.storage.set_node_status(node, RUNNING)
-        for job_id in job_ids:
-            reset_job_for_run(
-                root,
-                workflow,
-                node,
-                job_id,
-                mark_queued=False,
-                keep_trace=keep_trace,
-            )
+        prepare_selected_jobs(root, workflow, node, job_ids, selection=preparation, keep_trace=keep_trace)
 
         jobs = [workflow.storage.load_job(node, job_id) for job_id in job_ids]
         workflow._run_node_jobs(

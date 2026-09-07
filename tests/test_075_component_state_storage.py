@@ -229,7 +229,7 @@ def test_reregistration_refuses_extra_definition_outside_producing_partition(tmp
     ('queued', None, None, 1, 0, False),
     ('running', 'stable', 'int-live', 0, 0, False),
     ('running', 'unstable', None, 0, 0, False),
-    ('running', None, None, 1, 0, False),
+    ('running', None, None, 1, 0, True),
     ('running', None, 'int-live', 0, 0, False),
     ('sampled', None, None, 0, 0, False),
     ('done', None, None, 0, 0, False),
@@ -331,13 +331,21 @@ def test_component_state_schema_refuses_impossible_result_combinations(
             hostname='worker.example', pid=123, process_identity='instance-1',
         )
         before = storage.get_component_state(('A',))
-        with pytest.raises(sqlite3.IntegrityError):
+        selected_running = (lifecycle, stability, origin, misaligned) == ('running', None, None, 1)
+        if selected_running:
             storage.submit_db_mutation(lambda connection: connection.execute(
-                'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=?, '
-                'misaligned=? WHERE component_key=?',
-                (lifecycle, stability, origin, misaligned, '["A"]'),
+                "UPDATE component_states SET lifecycle='running', misaligned=1 WHERE component_key=?",
+                ('["A"]',),
             ))
-        assert storage.get_component_state(('A',)) == before
+            assert storage.get_component_state(('A',)) == {**before, 'lifecycle': 'running', 'misaligned': True}
+        else:
+            with pytest.raises(sqlite3.IntegrityError):
+                storage.submit_db_mutation(lambda connection: connection.execute(
+                    'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=?, '
+                    'misaligned=? WHERE component_key=?',
+                    (lifecycle, stability, origin, misaligned, '["A"]'),
+                ))
+            assert storage.get_component_state(('A',)) == before
         assert storage.database_integrity_check() == 'ok'
     finally:
         _close(storage)

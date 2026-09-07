@@ -346,13 +346,25 @@ def test_public_job_creation_inherits_actual_task_creator_independently_of_trace
     def child(ctx):
         return 'child'
 
+    @workflow.task('C')
+    def prerequisite(ctx):
+        return 'ready'
+
     workflow.start('A', job_id=1)
+    workflow.start('C', job_id=1)
     try:
+        workflow.run_node('C')
+        parent_state = storage.get_component_state(('C',))
+        parent_owner = storage.read_job_current_owner('C', 1)
+        assert parent_state['lifecycle'] == 'done' and parent_state['stability'] == 'stable'
         child_id = workflow.run_job('A', 1, ignore_readiness=True)
         root_owner = storage.read_job_current_owner('A', 1)
         child_owner = storage.read_job_current_owner('B', child_id)
         assert child_owner['created_by_execution_id'] == root_owner['execution_id']
         assert child_owner['session_id'] == root_owner['session_id']
+        assert storage.get_component_state(('C',)) == parent_state
+        assert storage.read_job_current_owner('C', 1) == parent_owner
+        assert parent_owner['session_id'] != root_owner['session_id']
     finally:
         _close(storage)
 

@@ -8,6 +8,7 @@ from .admission_sources import ClaimedJob, ClaimedQueuedJobSource, StoppingJobSo
 from .live_start import wait_for_live_component_release
 from .execution_scope import programmatic_execution
 from .node_execution_group import NodeExecutionGroup
+from .selected_execution_operation import run_selected_execution
 from ..runners.direct import DirectRunner
 from ..runners.threaded import ThreadedRunner
 from ..runners.process import ProcessPoolRunner
@@ -111,9 +112,11 @@ class NodeSchedulerMixin:
         self.storage.set_node_status(node_name, RUNNING)
         job_source = None
         try:
-            runner = self.make_runner(
+            runner = (self.make_runner(
                 node, execution_context=execution_context, api_startup_lanes=_api_startup_lanes,
-            )
+            ) if _component_operation is None else _component_operation.make_runner(
+                node, api_startup_lanes=_api_startup_lanes,
+            ))
 
             refreshable = bool(
                 getattr(runner, "supports_refreshable_job_source", False)
@@ -131,7 +134,10 @@ class NodeSchedulerMixin:
             preloaded = bool(getattr(runner, "prefers_preloaded_jobs", False))
             if _restart_job_ids is not None:
                 refreshable = False
-                job_source = [self.storage.load_job(node_name, job_id) if preloaded else job_id
+                load_job = (self.storage.load_job if _component_operation is None
+                            else _component_operation.load_source_job)
+                selected_preloaded = _component_operation is not None and _component_operation.preloaded_selection
+                job_source = [load_job(node_name, job_id) if preloaded or selected_preloaded else job_id
                               for job_id in _restart_job_ids]
             elif preloaded:
                 job_source = self.storage.queued_job_object_source(
@@ -344,6 +350,7 @@ class NodeSchedulerMixin:
         with programmatic_execution(
             self, command='run_node_jobs', start_node=node_name, nodes=[node_name],
             selected_jobs=[job.job_id for job in jobs], include_driver=True,
+            selected_preparation=True,
         ) as (context, driver):
             return self._run_node_jobs(
                 node_name, jobs, ignore_readiness, execution_context=context, _session_driver=driver,
@@ -358,15 +365,18 @@ class NodeSchedulerMixin:
     ):
         """Run a specific list of jobs from one node.
 
-        This is the shared implementation for normal node runs and the CLI's
-        job-selection mode. The supplied jobs are the only jobs executed; other
-        queued jobs on the same node are left untouched.
+        An independent selected call also pumps its new same-component causal
+        descendants. A nested call runs its supplied jobs within the owning
+        operation, which retains responsibility for subsequent causal work.
         """
         self.execution_claim_context(node_name, context=execution_context)
         if any(job.node_name != node_name for job in jobs):
             raise ValueError('All selected jobs must belong to the requested node')
         if not ignore_readiness and not self.node_ready(node_name):
             raise InvalidGraphError(f"Node {node_name} is not ready yet")
+
+        if _session_driver is not None and jobs:
+            return run_selected_execution(self, node_name, jobs, execution_context, _session_driver)
 
         node = self.nodes[node_name]
 
@@ -414,7 +424,7 @@ class NodeSchedulerMixin:
             return []
         with programmatic_execution(
             self, command='run_jobs', start_node=node_name, nodes=[node_name], selected_jobs=job_ids,
-            include_driver=True,
+            include_driver=True, selected_preparation=True,
         ) as (context, driver):
             return self._run_jobs(
                 node_name, job_ids, ignore_readiness, execution_context=context, _session_driver=driver,
@@ -429,8 +439,8 @@ class NodeSchedulerMixin:
     ):
         """Run selected job IDs from one node.
 
-        Unlike run_node(...), this does not gather every queued job. It loads the
-        exact job IDs requested by the caller and runs only those jobs.
+        Load the exact roots in caller order. Independent calls also execute
+        their new same-component causal work through the shared selected pump.
         """
         if not job_ids: return []
         jobs = [self.storage.load_job(node_name, job_id) for job_id in job_ids]

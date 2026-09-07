@@ -426,7 +426,8 @@ def test_restart_rechecks_state_after_cli_preflight(workflow, change, monkeypatc
         if change == 'status':
             storage.finalize_job_execution('A', 1, generation, execution, 'failed')
         elif change == 'generation':
-            storage.request_job_restart('A', 1)
+            restarted, = apply(storage, storage.plan_owned_job_restarts([('A', 1)]))
+            assert restarted['generation'] == generation + 1
             storage.output_file('A', 1).write_bytes(b'new generation output\n')
         elif change == 'owner':
             storage.finalize_job_execution('A', 1, generation, execution, 'failed')
@@ -1580,13 +1581,11 @@ def test_restart_admission_refuses_target_changes_after_payload_reload(tmp_path,
 @pytest.mark.parametrize('runner', ['direct', 'threaded'])
 @pytest.mark.parametrize('entry', ['run_jobs', 'run_node_jobs', 'run_node', 'run_queued_node_jobs'])
 def test_restart_and_session_exit_have_one_durable_decision(tmp_path, monkeypatch, order, runner, entry):
-    from micro_workflow_manager.workflow.node_execution_group import NodeExecutionGroup
-
     monkeypatch.chdir(tmp_path)
     workflow = MicroWorkflow(tmp_path, runner=runner, persist_graph=False)
     workflow.graph([('A', 'B')])
     router = NodeRouter('A', runner=runner, max_threads=2)
-    ready, group_checked, release_group = Barrier(2), Event(), Event()
+    ready, decision_ready, release_decision = Barrier(2), Event(), Event()
     job_count = 130 if (entry, runner, order) == ('run_node', 'threaded', 'restart_first') else 3
     values = {job_id: object() for job_id in range(1, job_count + 1)}
     completed_value, replacement_value = values[1], values[2]
@@ -1611,7 +1610,7 @@ def test_restart_and_session_exit_have_one_durable_decision(tmp_path, monkeypatc
     for _ in range(job_count):
         workflow.add_job(None, 'A')
     storage = workflow.storage
-    prepare = NodeExecutionGroup._prepare_replacements
+    decide = storage.decide_execution_session_exit
     load_job = storage.load_job
     superseded = []
 
@@ -1631,14 +1630,13 @@ def test_restart_and_session_exit_have_one_durable_decision(tmp_path, monkeypatc
 
     monkeypatch.setattr(storage, 'load_job', load_then_replace_again)
 
-    def pause_after_absent_successor(group):
-        found = prepare(group)
-        if group.storage is storage and not found and not group_checked.is_set():
-            group_checked.set()
-            assert release_group.wait(30)
-        return found
+    def pause_before_failed_decision(*args, **kwargs):
+        if kwargs.get('outcome') == 'failed' and not decision_ready.is_set():
+            decision_ready.set()
+            assert release_decision.wait(30)
+        return decide(*args, **kwargs)
 
-    monkeypatch.setattr(NodeExecutionGroup, '_prepare_replacements', pause_after_absent_successor)
+    monkeypatch.setattr(storage, 'decide_execution_session_exit', pause_before_failed_decision)
 
     def run():
         try:
@@ -1656,14 +1654,14 @@ def test_restart_and_session_exit_have_one_durable_decision(tmp_path, monkeypatc
     thread = Thread(target=run, name='native-session-exit-restart', daemon=True)
     thread.start()
     try:
-        assert group_checked.wait(20), result
+        assert decision_ready.wait(20), result
         owner = storage.read_job_current_owner('A', 2)
         assert storage.get_execution_session(owner['session_id'])['status'] == 'running'
         assert storage.get_component_reservation(('A',))['session_id'] == owner['session_id']
         assert storage.get_job_status('A', 1) == 'done'
         original_starts = list(starts)
         if order == 'terminal_first':
-            release_group.set()
+            release_decision.set()
             thread.join(timeout=20)
             assert not thread.is_alive(), result
             assert storage.get_execution_session(owner['session_id'])['status'] == 'terminal'
@@ -1682,7 +1680,7 @@ def test_restart_and_session_exit_have_one_durable_decision(tmp_path, monkeypatc
         assert command.returncode == 0, command.stdout + command.stderr
         assert storage.get_execution_session(owner['session_id'])['status'] == 'running'
         assert storage.get_component_reservation(('A',))['session_id'] == owner['session_id']
-        release_group.set()
+        release_decision.set()
         thread.join(timeout=20)
         assert not thread.is_alive(), result
         assert 'error' not in result, result
@@ -1700,7 +1698,7 @@ def test_restart_and_session_exit_have_one_durable_decision(tmp_path, monkeypatc
         assert sessions[0]['outcome'] == 'done'
         assert storage.get_component_reservation(('A',)) is None
     finally:
-        release_group.set()
+        release_decision.set()
         thread.join(timeout=20)
         assert not thread.is_alive(), result
         _close(storage)

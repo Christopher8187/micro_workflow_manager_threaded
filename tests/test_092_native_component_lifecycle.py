@@ -574,7 +574,7 @@ def test_selected_job_nested_full_call_defers_completion_until_its_parent_finish
                 workflow.run_job('A', 1)
         else:
             assert workflow.run_job('A', 1) == 1
-        assert observations == [('selected', 'queued'), ('nested', 'running'), ('returned', 'running')]
+        assert observations == [('selected', 'running'), ('nested', 'running'), ('returned', 'running')]
         state = storage.get_component_state(('A',))
         assert (state['lifecycle'], state['stability'], state['instability_origin']) == (
             ('failed', None, None) if parent_fails else ('done', 'stable', None)
@@ -723,7 +723,7 @@ def work(ctx):
 
 @pytest.mark.parametrize('entry', ['run_jobs', 'run_node_jobs'])
 @pytest.mark.parametrize('runner', ['direct', 'threaded'])
-def test_finite_selected_jobs_leave_other_work_and_full_component_lifecycle_queued(tmp_path, entry, runner):
+def test_finite_selected_jobs_leave_other_work_untouched_and_component_sampled(tmp_path, entry, runner):
     workflow = MicroWorkflow(tmp_path, runner=runner, persist_graph=False)
     workflow.graph([('A', 'B')])
     storage = workflow.storage
@@ -733,7 +733,7 @@ def test_finite_selected_jobs_leave_other_work_and_full_component_lifecycle_queu
     @router.task
     def work(ctx):
         calls.append(ctx.job_id)
-        assert storage.get_component_state(('A',))['lifecycle'] == 'queued'
+        assert storage.get_component_state(('A',))['lifecycle'] == 'running'
         return {'selected': ctx.job_id}
 
     workflow.include_routers(router)
@@ -749,7 +749,7 @@ def test_finite_selected_jobs_leave_other_work_and_full_component_lifecycle_queu
         assert storage.read_job_events('A', 2) == untouched_events
         assert not storage.output_file('A', 2).exists()
         state = storage.get_component_state(('A',))
-        assert (state['lifecycle'], state['stability'], state['instability_origin']) == ('queued', None, None)
+        assert (state['lifecycle'], state['stability'], state['instability_origin']) == ('sampled', 'stable', None)
         session, = storage.list_execution_sessions()
         assert session['selected_jobs'] == [('A', 1)]
         assert (session['status'], session['outcome']) == ('terminal', 'done')
@@ -1414,7 +1414,7 @@ def test_selected_parent_retains_its_python_value_when_nested_same_component_wor
     decide = storage.decide_execution_session_exit
 
     def pause_clean_exit(*args, **kwargs):
-        if kwargs['outcome'] == 'done' and not at_decision.is_set():
+        if not at_decision.is_set():
             at_decision.set()
             assert proceed.wait(20)
         return decide(*args, **kwargs)

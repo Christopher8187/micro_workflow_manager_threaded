@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 
-from .job_preparation import apply_job_preparation, validate_job_preparation
+from .job_preparation import apply_job_preparation, validate_job_preparation, queue_prepared_nodes
 from .preparation_files import stage_preparation_files
-from .preparation_footprint import validate_prepared_inputs
+from .preparation_footprint import validate_prepared_inputs, validate_preparation_footprint
 from .preparation_guards import validate_held_guards, refuse_unfinished_preparation
 from .preparation_receipts import PreparationReceipt, submit_preparation_decision
 
@@ -25,17 +25,25 @@ def _effects(unit):
     return effects
 
 
-def prepare_component_unit(storage, root, unit, expected, session_id, guard_id, operation, *, keep_trace):
+def prepare_component_unit(storage, root, unit, expected, session_id, guard_id, operation, *, keep_trace,
+                           selected_footprint=None):
+    roots = None if selected_footprint is None else selected_footprint.roots
+    if selected_footprint is not None and (not roots or selected_footprint.units != (unit,)):
+        raise ValueError('Selected preparation requires one complete exact footprint')
     effects = _effects(unit)
     receivers = sorted({plan.node for plan in unit.jobs} | {item.receiver for item in unit.inputs})
 
     def validate(connection):
         validate_held_guards(connection, unit.excluded_nodes, guard_id)
-        observed = storage._read_component_preparation(connection, session_id, unit.component, expected['shape_json'])
+        observed = storage._read_component_preparation(
+            connection, session_id, unit.component, expected['shape_json'], selected_roots=roots,
+        )
         if observed != expected:
             raise RuntimeError('Component changed during full preparation: ' + repr(unit.component))
         validate_job_preparation(connection, unit.jobs)
         validate_prepared_inputs(storage, connection, unit.inputs)
+        if selected_footprint is not None:
+            validate_preparation_footprint(storage, connection, selected_footprint)
 
     def validate_initial(connection):
         for receiver in receivers:
@@ -49,9 +57,14 @@ def prepare_component_unit(storage, root, unit, expected, session_id, guard_id, 
         validate(connection)
         selected = tuple(plan for plan in unit.jobs if plan.node in unit.component)
         outside = tuple(plan for plan in unit.jobs if plan.node not in unit.component)
-        storage._complete_component_preparation(session_id, unit.component, expected, selected, keep_trace,
-                                                connection=connection)
+        if selected_footprint is None:
+            storage._complete_component_preparation(session_id, unit.component, expected, selected, keep_trace,
+                                                    connection=connection)
+        else:
+            apply_job_preparation(connection, selected, keep_trace=keep_trace)
         apply_job_preparation(connection, outside, keep_trace=keep_trace)
+        if roots is not None and session_id is None and operation == 'reset':
+            queue_prepared_nodes(connection, sorted({node for node, _, _ in roots}))
         for item in unit.inputs:
             changed = connection.execute('DELETE FROM managed_input_files WHERE receiver_node=? AND relative_path=?',
                                          (item.receiver, item.relative)).rowcount

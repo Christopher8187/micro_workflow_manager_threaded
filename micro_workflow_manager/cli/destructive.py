@@ -6,7 +6,8 @@ from pathlib import Path
 from micro_workflow_manager.system import MicroWorkflow
 
 from .active_run import refuse_competing_run
-from .cleanup import prepare_fresh_components, reset_job_for_run
+from .cleanup import prepare_fresh_components
+from micro_workflow_manager.workflow.selected_preparation import prepare_selected_jobs
 from .jobs import selected_job_ids_from_args
 from .validation import require_node
 
@@ -60,7 +61,7 @@ def _selection(
         selected = selected_job_ids_from_args(job_mode, job_specs or [])
         assert selected is not None
         return DestructiveSelection(
-            components=(frozenset({node}),),
+            components=(frozenset(workflow.component_id(node)),),
             nodes=(node,),
             selected_jobs=tuple(selected),
         )
@@ -222,14 +223,8 @@ def execute_destructive_command(
 
     keep_trace = bool(getattr(args, "keeptrace", False))
     if command == "reset" and selection.selected_jobs is not None:
-        for job_id in selection.selected_jobs:
-            reset_job_for_run(
-                root,
-                workflow,
-                selection.nodes[0],
-                job_id,
-                keep_trace=keep_trace,
-            )
+        prepare_selected_jobs(root, workflow, selection.nodes[0], selection.selected_jobs,
+                              keep_trace=keep_trace, operation=command)
     else:
         prepare_fresh_components(
             root,

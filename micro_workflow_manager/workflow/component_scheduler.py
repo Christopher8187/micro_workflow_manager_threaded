@@ -202,7 +202,8 @@ class ComponentSchedulerMixin(ComponentFailureCleanupMixin):
             return choice if choice in queued else None
 
         while True:
-            queued_nodes = self._component_queued_nodes(component_nodes)
+            observed = _operation.observe_jobs()
+            queued_nodes = [node for node in component_nodes if node in observed[QUEUED]]
             if _operation is not None:
                 queued_nodes = _operation.selected_queued_nodes(queued_nodes)
             if not queued_nodes:
@@ -211,7 +212,7 @@ class ComponentSchedulerMixin(ComponentFailureCleanupMixin):
                 return ran
 
             if self.runner == "direct":
-                blocking_nodes = self._component_wait_blockers(component_nodes)
+                blocking_nodes = set().union(*observed.values())
                 startable = self._waiting_startable_nodes(
                     component_nodes,
                     queued_nodes=set(queued_nodes),
@@ -269,6 +270,7 @@ class ComponentSchedulerMixin(ComponentFailureCleanupMixin):
                 and not self.nodes[node_name].waiting
                 and (self.nodes[node_name].runner_override or self.runner)
                 in {"threaded", "api"}
+                and _operation.live_admission
                 and (_operation is None or not (_operation.stop_admission or _operation.replacement_epoch))
             }
             live_ready_events = {
@@ -366,9 +368,7 @@ class ComponentSchedulerMixin(ComponentFailureCleanupMixin):
                     # Publication and producer completion can occur between
                     # separate reads. One snapshot prevents false quiescence
                     # or deadlock from combining incompatible observations.
-                    observed = self.storage.nodes_by_job_status(
-                        component_nodes, WAIT_BLOCKING_JOB_STATUSES
-                    )
+                    observed = _operation.observe_jobs()
                     queued_set = observed[QUEUED]
                     if _operation is not None:
                         queued_set = set(_operation.selected_queued_nodes(queued_set))

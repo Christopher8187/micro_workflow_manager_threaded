@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -420,6 +421,7 @@ def test_supported_deletion_paths_remove_only_deleted_job_identities(tmp_path, p
             elif path == 'node-jobs':
                 storage.delete_node_jobs('A')
             else:
+                shutil.rmtree(storage.node_dir('A'))
                 storage.delete_node_state('A')
             expected = {('B', 1): before[('B', 1)]}
         assert _identity_rows(storage) == expected

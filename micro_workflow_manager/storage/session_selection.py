@@ -65,3 +65,23 @@ class SessionSelectionStorageMixin:
                 raise RuntimeError('Damaged selected job identity')
             roots.append((row['node_name'], row['job_id'], instance))
         return roots
+
+    def _require_selected_preparation_roots(self, connection, session_id, component, roots):
+        if not roots or len(roots) != len(set(roots)):
+            raise ValueError('Selected preparation requires distinct exact job roots')
+        if session_id is not None:
+            if self._read_session_components(connection, session_id) != [component]:
+                raise RuntimeError('Selected preparation requires one exact component')
+            if tuple(self._read_session_job_roots(connection, session_id)) != roots:
+                raise RuntimeError('Selected preparation roots changed after admission')
+        for node, job_id, instance in roots:
+            self.validate_node_name(node)
+            self.validate_job_id(job_id)
+            row = connection.execute(
+                'SELECT instance_id FROM jobs JOIN job_instances USING(node_name, job_id) '
+                'WHERE node_name=? AND job_id=?', (node, job_id),
+            ).fetchone()
+            if (node not in component or row is None or row['instance_id'] != instance
+                    or type(instance) is not str or len(instance) != 32
+                    or any(character not in '0123456789abcdef' for character in instance)):
+                raise RuntimeError(f'Selected preparation job instance changed: {node}/{job_id}')

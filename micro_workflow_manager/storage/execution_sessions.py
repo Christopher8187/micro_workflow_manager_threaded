@@ -311,7 +311,8 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin):
 
             for pending_row in connection.execute(
                 'SELECT pending.component_key, shape.shape_json, pending.alignment_generation, '
-                'pending.completion_ready, pending.stability, pending.instability_origin '
+                'pending.completion_ready, pending.stability, pending.instability_origin, '
+                'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned '
                 'FROM pending_component_executions AS pending JOIN graph_shapes AS shape USING(shape_id) '
                 'JOIN component_reservations AS reservation USING(component_key) '
                 'WHERE pending.session_id=? AND reservation.session_id=?', (session_id, session_id),
@@ -359,7 +360,8 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin):
 
             pending = connection.execute(
                 'SELECT pending.component_key, shape.shape_json, pending.alignment_generation, '
-                'pending.completion_ready, pending.stability, pending.instability_origin '
+                'pending.completion_ready, pending.stability, pending.instability_origin, pending.shape_id, '
+                'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned '
                 'FROM pending_component_executions AS pending '
                 'JOIN graph_shapes AS shape USING(shape_id) '
                 'JOIN component_reservations AS reservation USING(component_key) '
@@ -372,6 +374,18 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin):
                 ready = row['completion_ready'] == 1
                 if component not in settled and outcome != 'failed' and not ready:
                     raise RuntimeError('Session completion omitted a running component')
+                if row['execution_kind'] == 'jobs':
+                    recorded = self._selected_component_result(
+                        connection, session_id, row, successful=ready,
+                    )
+                    supplied = settled.get(component)
+                    if supplied is not None and (
+                        supplied.expected_shape != recorded.expected_shape
+                        or supplied.expected_alignment_generation != recorded.expected_alignment_generation
+                    ):
+                        raise RuntimeError('Selected outcome differs from its recorded start')
+                    settled[component] = recorded
+                    continue
                 successful = ready and all(
                     job['status'] in ('done', 'skipped') and job['active_execution_id'] is None
                     for node in component for job in connection.execute(

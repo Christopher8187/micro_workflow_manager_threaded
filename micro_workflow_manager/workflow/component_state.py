@@ -81,6 +81,28 @@ class ComponentStateMixin:
                 normalized.add((start, end))
         self.autostart_edges = normalized
 
+    def begin_selected_component_execution(self, component, roots, *, execution_context, expected_identity):
+        component = self.component_key(component)
+        expected_shape = execution_context[2]
+        with self.lock:
+            if self.topology.graph_shape() != expected_shape:
+                raise RuntimeError('Selected execution graph changed after session admission')
+            parents = sorted(self.component_predecessor_components(set(component)))
+        observations = self.storage.read_component_states(parents, expected_shape=expected_shape)
+        if set(observations) != set(parents):
+            raise RuntimeError('Selected execution requires every direct parent observation')
+        readiness = calculate_component_readiness(
+            (state['lifecycle'], state['stability'], state['instability_origin'])
+            for state in observations.values()
+        )
+        if readiness is None:
+            raise InvalidGraphError(f'Hoeflein component {list(component)} is not ready yet')
+        return self.storage.begin_selected_component_execution(
+            execution_context, roots, expected_identity=expected_identity,
+            expected_state=self.storage.get_component_state(component),
+            expected_parent_states=observations, successful_lineage=(readiness[0], readiness[1]),
+        )
+
     def register_autostart_edge(self, start: str, end: str) -> None:
         if not self.graph_obj.has_edge(start, end):
             return

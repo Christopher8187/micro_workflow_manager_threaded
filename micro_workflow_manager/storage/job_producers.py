@@ -77,6 +77,32 @@ class JobProducerStorageMixin:
             creator = owner['created_by_execution_id']
         return False
 
+    def _read_selected_preparation_owners(self, connection, component, roots):
+        """Walk historical descendants forward, stopping at component boundaries."""
+        owners = {}
+        for node, job_id, instance in roots:
+            for row in connection.execute(
+                'SELECT execution_id FROM job_execution_owners '
+                'WHERE node_name=? AND job_id=? AND job_instance_id=? ORDER BY execution_id',
+                (node, job_id, instance),
+            ):
+                owner = self._read_execution_owner(connection, row['execution_id'])
+                if owner['component'] == component:
+                    owners[owner['execution_id']] = owner
+        pending = list(owners)
+        while pending:
+            producer = pending.pop()
+            for row in connection.execute(
+                'SELECT execution_id FROM job_execution_owners '
+                'WHERE created_by_execution_id=? AND component_key=? ORDER BY execution_id',
+                (producer, encode_component_key(component)),
+            ):
+                execution_id = row['execution_id']
+                if execution_id not in owners:
+                    owners[execution_id] = self._read_execution_owner(connection, execution_id)
+                    pending.append(execution_id)
+        return tuple(owners[key] for key in sorted(owners))
+
     def _selected_job_claim_error(self, connection, batch, node_rows, producing_identity, checked):
         try:
             if batch.session_id not in checked:

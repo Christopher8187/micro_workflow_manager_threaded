@@ -285,7 +285,8 @@ def test_idempotent_reuse_does_not_attach_old_work_to_a_new_selected_invocation(
         workflow.start('A', job_id=1)
         workflow.run_job('A', 1, ignore_readiness=True)
         owner = storage.read_job_current_owner('B', children[0])
-        workflow.run_job('A', 1, ignore_readiness=True)
+        workflow.start('A', job_id=2)
+        workflow.run_job('A', 2, ignore_readiness=True)
         assert storage.list_job_ids('B') == children
         assert storage.read_job_current_owner('B', children[0]) == owner
         assert storage.db_connection().execute(

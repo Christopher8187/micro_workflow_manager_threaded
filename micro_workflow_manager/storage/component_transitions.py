@@ -33,7 +33,9 @@ class ComponentTransitionStorageMixin:
         finally:
             connection.execute('RELEASE SAVEPOINT mwf_component_preparation')
 
-    def _read_component_preparation(self, connection, session_id, members, expected_shape):
+    def _read_component_preparation(self, connection, session_id, members, expected_shape, *, selected_roots=None):
+        if selected_roots is not None:
+            self._require_selected_preparation_roots(connection, session_id, members, selected_roots)
         key = encode_component_key(members)
         reservation = connection.execute(
             'SELECT session_id FROM component_reservations WHERE component_key=?', (key,),
@@ -53,7 +55,7 @@ class ComponentTransitionStorageMixin:
                 raise RuntimeError('Full preparation requires a running selected component owner: ' + key)
             if reservation is None or reservation['session_id'] != session_id:
                 raise RuntimeError('Full preparation requires the exact component reservation: ' + key)
-            if self._read_session_job_roots(connection, session_id):
+            if selected_roots is None and self._read_session_job_roots(connection, session_id):
                 raise RuntimeError('Selected-job preparation cannot realign a full component')
         if connection.execute(
             'SELECT 1 FROM component_holds WHERE component_key=? LIMIT 1', (key,),

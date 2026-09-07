@@ -170,8 +170,13 @@ def apply_job_preparation(connection, preparations, *, keep_trace: bool):
                 'ON CONFLICT(node_name) DO UPDATE SET next_job_id=excluded.next_job_id', (plan.node, plan.node),
             )
         if plan.mark_queued:
-            connection.execute(
-                "INSERT INTO nodes(node_name, status) VALUES(?, 'queued') "
-                'ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, '
-                'updated_at=CURRENT_TIMESTAMP WHERE nodes.status IS NOT excluded.status', (plan.node,),
-            )
+            queue_prepared_nodes(connection, (plan.node,))
+
+
+def queue_prepared_nodes(connection, nodes):
+    connection.executemany(
+        "INSERT INTO nodes(node_name, status) VALUES(?, 'queued') "
+        'ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, '
+        'updated_at=CURRENT_TIMESTAMP WHERE nodes.status IS NOT excluded.status',
+        [(node,) for node in nodes],
+    )

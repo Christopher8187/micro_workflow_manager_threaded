@@ -515,8 +515,7 @@ def test_refused_cli_call_preserves_live_programmatic_controls(tmp_path, monkeyp
     try:
         if entry == 'selected':
             second = pool.submit(
-                run_selected._run_selected_jobs, tmp_path, workflow, 'B', [1],
-                command='run jobs', check_readiness=False,
+                run_selected.run_selected_jobs, tmp_path, workflow, 'B', [1],
             )
             assert prechecked.wait(10)
         first = pool.submit(workflow.run_job, 'A', 1)
@@ -722,5 +721,85 @@ def test_private_dispatch_refuses_invalid_token_before_node_status(tmp_path, ent
             assert workflow.storage.get_node_status('A') == status
             assert workflow.storage.get_job_status('A', 1) == 'queued'
             assert ran == []
+    finally:
+        _close(workflow.storage)
+
+
+def test_manual_restart_refuses_newly_active_native_attempt_without_mutation(tmp_path, monkeypatch):
+    from micro_workflow_manager.models import Job
+    from tests.test_084_native_current_job_owner import _claim, _session
+
+    workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
+    workflow.graph([('A', 'B'), ('B', 'A')])
+    storage = workflow.storage
+    storage.register_component_topology(workflow.topology.snapshot())
+    storage.create_job(Job(node_name='A', job_id=1, params={'value': 'root'}))
+    _session(workflow, 'restart-dispatch-race')
+
+    before_fence = Event()
+    release_request = Event()
+    real_lock = storage.filesystem_interprocess_lock
+    execution_lock = storage.job_execution_lock_name('A', 1)
+    delayed = False
+
+    @contextmanager
+    def delay_request_fence(namespace, name):
+        nonlocal delayed
+        if (
+            not delayed
+            and current_thread().name.startswith('manual-restart')
+            and namespace == 'execution-fences'
+            and name == execution_lock
+        ):
+            delayed = True
+            before_fence.set()
+            assert release_request.wait(10), 'Manual restart request was not released'
+        with real_lock(namespace, name):
+            yield
+
+    monkeypatch.setattr(storage, 'filesystem_interprocess_lock', delay_request_fence)
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='manual-restart')
+    future = pool.submit(
+        storage.request_job_restart,
+        'A',
+        1,
+        reason='manual restart dispatch race',
+    )
+    try:
+        assert before_fence.wait(10), 'Manual restart did not reach its execution fence'
+        generation, execution_id = _claim(storage, 'restart-dispatch-race')
+        assert generation == 0
+        owner = storage.get_job_execution_owner(execution_id)
+        output = storage.output_file('A', 1)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b'active attempt output')
+        storage.db_mutation_barrier()
+        before_database = list(storage.db_connection().iterdump())
+        before_control = storage.read_job_control('A', 1)
+        before_events = storage.read_job_events('A', 1)
+
+        release_request.set()
+        with pytest.raises(RuntimeError, match='running|state changed'):
+            future.result(timeout=10)
+
+        storage.db_mutation_barrier()
+        assert list(storage.db_connection().iterdump()) == before_database
+        assert storage.read_job_control('A', 1) == before_control
+        assert storage.read_job_events('A', 1) == before_events
+        assert storage.read_job_current_owner('A', 1) == owner
+        assert storage.get_job_status('A', 1) == 'running'
+        assert output.read_bytes() == b'active attempt output'
+    finally:
+        release_request.set()
+        pool.shutdown(wait=True)
+        _close(storage)
+
+
+def test_active_restart_preserves_missing_job_file_not_found_error(tmp_path):
+    workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
+    workflow.graph([('A', 'A')])
+    try:
+        with pytest.raises(FileNotFoundError, match='Job does not exist: A/1'):
+            workflow.storage.request_active_job_restart('A', 1)
     finally:
         _close(workflow.storage)

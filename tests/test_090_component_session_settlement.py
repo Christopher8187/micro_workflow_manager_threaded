@@ -192,6 +192,10 @@ def test_component_publication_preserves_another_sessions_pending_record(running
     expected['pending_component_executions'] = [
         row for row in expected['pending_component_executions'] if row['session_id'] == 'retained-owner'
     ]
+    expected['component_successful_results'] = [{
+        'component_key': json.dumps(['A', 'B']), 'shape_id': 1, 'alignment_generation': 0,
+        'lifecycle': 'done', 'stability': 'stable', 'instability_origin': None,
+    }]
     assert _rows(storage) == expected
 
 
@@ -269,6 +273,10 @@ def test_successful_component_can_finish_while_its_session_remains_live(running_
     component_row = next(row for row in expected['component_states'] if row['component_key'] == json.dumps(['A', 'B']))
     component_row.update(lifecycle='done', stability='stable')
     expected['pending_component_executions'] = []
+    expected['component_successful_results'] = [{
+        'component_key': json.dumps(['A', 'B']), 'shape_id': 1, 'alignment_generation': 0,
+        'lifecycle': 'done', 'stability': 'stable', 'instability_origin': None,
+    }]
     assert _rows(storage) == expected
     observed = storage.read_component_states([('A', 'B'), ('C',)], expected_shape=topology.shape_json)
     assert observed[('A', 'B')]['lifecycle'] == 'done'
@@ -617,7 +625,7 @@ def test_component_settlement_rejects_invalid_calculated_results(running_compone
         'negative-generation': {'expected_alignment_generation': -1},
         'boolean-generation': {'expected_alignment_generation': True},
         'incomplete-lineage': {'stability': 'unstable'},
-        'unknown-lifecycle': {'lifecycle': 'sampled'},
+        'unknown-lifecycle': {'lifecycle': 'waiting'},
         'failed-session-mismatch': {'lifecycle': 'failed', 'stability': None},
     }
     outcomes = [outcome, outcome] if damage == 'duplicate' else [replace(outcome, **changes[damage])]
@@ -654,3 +662,26 @@ def test_ordinary_claim_waits_until_an_accepted_component_repair_finishes(runnin
     else:
         storage.claim_job_execution('A', 2, **claim)
         assert storage.get_job_status('A', 2) == 'running'
+
+
+def test_full_component_pending_execution_refuses_sampled_result_without_mutation(running_component):
+    storage, topology, generation, execution_id = running_component
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
+    before = _rows(storage)
+    with pytest.raises(ValueError, match='successful result'):
+        storage.finish_successful_component_execution(
+            'ordinary-result', replace(_outcome(topology), lifecycle='sampled'),
+        )
+    assert _rows(storage) == before
+
+
+def test_full_component_session_exit_refuses_sampled_result_without_mutation(running_component):
+    storage, topology, generation, execution_id = running_component
+    storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
+    before = _rows(storage)
+    with pytest.raises(RuntimeError, match='Only selected execution may settle as sampled'):
+        storage.decide_execution_session_exit(
+            'ordinary-result', outcome='done', finished_at=now(),
+            component_outcomes=[replace(_outcome(topology), lifecycle='sampled')],
+        )
+    assert _rows(storage) == before

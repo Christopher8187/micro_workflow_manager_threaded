@@ -10,6 +10,7 @@ from threading import Event, Thread, current_thread
 import pytest
 
 from micro_workflow_manager import MicroWorkflow, cli
+from micro_workflow_manager.errors import JobRestartedError
 from micro_workflow_manager.cli.run_commands import resume_node
 from micro_workflow_manager.storage.input_publication_files import InputFileChange
 from micro_workflow_manager.models import CANCELLED, DONE, FAILED, Job, now
@@ -347,25 +348,31 @@ def test_real_job_output_records_execution_and_is_recovered_after_terminal_write
 
     workflow.start("A", job_id=1)
     original_finalize = storage.finalize_job_execution
+    original_reconcile = storage.reconcile_terminal_outputs
     terminal_error = OSError("terminal database publication interrupted")
-    failed_once = False
+    terminal_attempts = []
 
-    def interrupt_first_terminal(
+    def interrupt_terminal(
         node, job_id, expected_generation, expected_execution_id, status, *args, **kwargs
     ):
-        nonlocal failed_once
-        if node == "A" and job_id == 1 and expected_generation == 0 and not failed_once:
-            failed_once = True
+        if node == "A" and job_id == 1 and expected_generation == 0:
+            terminal_attempts.append(status)
             raise terminal_error
         return original_finalize(
             node, job_id, expected_generation, expected_execution_id, status, *args, **kwargs
         )
 
-    monkeypatch.setattr(storage, "finalize_job_execution", interrupt_first_terminal)
+    def interrupt_reconciliation(*args, **kwargs):
+        raise terminal_error
+
+    monkeypatch.setattr(storage, "reconcile_terminal_outputs", interrupt_reconciliation)
+    monkeypatch.setattr(storage, "finalize_job_execution", interrupt_terminal)
     with pytest.raises(OSError) as caught:
         workflow.run_job("A", 1)
     assert caught.value is terminal_error
-    assert failed_once
+    assert terminal_attempts
+    monkeypatch.setattr(storage, "reconcile_terminal_outputs", original_reconcile)
+    monkeypatch.setattr(storage, "finalize_job_execution", original_finalize)
 
     observation = storage.read_job_owner_observation("A", 1)
     owner = observation["owner"]
@@ -383,12 +390,23 @@ def test_real_job_output_records_execution_and_is_recovered_after_terminal_write
 
     # The active-job exit guard retained the owner. Convert it to the terminal
     # abandoned-owner state that public resume accepts without changing output.
+    component = storage.get_component_state(("A",))
+    assert storage.fail_running_component(
+        owner["session_id"], ("A",), expected_shape=component["shape_json"],
+        expected_alignment_generation=owner["alignment_generation"],
+    )
+    assert storage.submit_db_mutation(lambda connection: connection.execute(
+        "DELETE FROM pending_component_executions WHERE session_id=?",
+        (owner["session_id"],),
+    ).rowcount) == 1
     storage.release_execution_components(owner["session_id"])
     storage.finish_execution_session(
         owner["session_id"], outcome=FAILED, finished_at=now()
     )
     storage.set_node_status("A", FAILED)
     monkeypatch.setattr(storage, "finalize_job_execution", original_finalize)
+    assert storage.read_json(storage.output_file("A", 1)) == output
+    assert storage.read_job_current_owner("A", 1) == owner
     before = storage.latest_job_event_id()
 
     assert resume_node(tmp_path, workflow, "A") == 0
@@ -573,3 +591,75 @@ def test_resume_refuses_abandoned_running_job_with_missing_activity_metadata(
     assert _node_files(tmp_path) == before_files
     assert storage.list_execution_sessions() == before_sessions
     assert storage.get_component_reservation(("A",)) is None
+
+
+def test_manual_restart_requeues_exact_native_abandoned_attempt_and_fences_old_owner(
+    tmp_path, request,
+):
+    _, storage, _, _, generation, execution_id = _abandoned_job(tmp_path, request)
+    owner = storage.get_job_execution_owner(execution_id)
+    assert owner == storage.read_job_current_owner('A', 1)
+    assert storage.get_job_status('A', 1) == 'running'
+    assert storage.read_job_control('A', 1)['active_execution_id'] == execution_id
+    assert storage.list_execution_sessions()[0]['status'] == 'terminal'
+    assert storage.get_component_reservation(('A',)) is None
+    output = storage.output_file('A', 1)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b'abandoned attempt output')
+
+    restarted = storage.request_job_restart('A', 1, reason='recover native abandoned attempt')
+
+    assert restarted['previous_generation'] == generation
+    assert restarted['generation'] == generation + 1
+    assert storage.get_job_status('A', 1) == 'queued'
+    control = storage.read_job_control('A', 1)
+    assert control['generation'] == generation + 1
+    assert control['active_execution_id'] is None
+    assert storage.read_job_current_owner('A', 1) == owner
+    assert storage.get_job_execution_owner(execution_id) == owner
+    assert not output.exists()
+    with pytest.raises(JobRestartedError):
+        storage.run_guarded_job_side_effect(
+            'A', 1, generation, execution_id,
+            lambda: pytest.fail('Abandoned execution retained its publication fence'),
+        )
+    restart = [
+        event for event in storage.read_job_events('A', 1)
+        if event['event'] == 'restart_requested'
+    ][-1]
+    assert restart['previous_generation'] == generation
+    assert restart['generation'] == generation + 1
+    assert restart['reason'] == 'recover native abandoned attempt'
+
+
+
+def test_manual_restart_refuses_damaged_native_abandoned_owner_without_mutation(
+    tmp_path, request,
+):
+    _, storage, _, _, generation, execution_id = _abandoned_job(tmp_path, request)
+    output = storage.output_file('A', 1)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b'preserve damaged owner output')
+    connection = storage.db_connection()
+    connection.execute('PRAGMA foreign_keys=OFF')
+    try:
+        assert connection.execute(
+            'DELETE FROM job_execution_owners WHERE execution_id=?', (execution_id,),
+        ).rowcount == 1
+    finally:
+        connection.execute('PRAGMA foreign_keys=ON')
+    storage.db_mutation_barrier()
+    before_database = list(connection.iterdump())
+    before_events = storage.read_job_events('A', 1)
+    before_control = storage.read_job_control('A', 1)
+
+    with pytest.raises(RuntimeError, match='owner|ownership'):
+        storage.request_job_restart('A', 1, reason='must refuse damaged owner')
+
+    storage.db_mutation_barrier()
+    assert list(connection.iterdump()) == before_database
+    assert storage.read_job_events('A', 1) == before_events
+    assert storage.read_job_control('A', 1) == before_control
+    assert storage.get_job_status('A', 1) == 'running'
+    assert storage.read_job_control('A', 1)['generation'] == generation
+    assert output.read_bytes() == b'preserve damaged owner output'

@@ -361,19 +361,23 @@ class JobRestartStorageMixin:
         *,
         requested_by_pid: int | None,
         reason: str,
-        require_running_execution: bool,
     ) -> dict[str, Any]:
-        control = self.read_job_control(node_name, job_id)
-        previous_status = self.get_job_status(node_name, job_id) or QUEUED
-        if require_running_execution:
-            if previous_status != RUNNING or not control.get("active_execution_id"):
-                raise RuntimeError(
-                    f"Job {node_name}/{job_id} is not currently running. Only a live "
-                    "running attempt can be restarted inside an existing run/runfrom sequence."
-                )
+        observed = self._read_job_owner_observation(self.db_connection(), node_name, job_id)
+        if observed is None:
+            raise FileNotFoundError(f'Job does not exist: {node_name}/{job_id}')
+        previous_status = observed['status']
+        owner_live = observed['session'] is not None and execution_session_liveness(observed['session'])['live']
+        if owner_live and previous_status in (RUNNING, FAILED, CANCELLED):
+            raise RuntimeError(f'Job {node_name}/{job_id} owning-session restart state changed')
+        if previous_status == RUNNING:
+            owner = observed['owner']
+            if owner is None or observed['active_execution_id'] != owner['execution_id']:
+                raise RuntimeError(f'Job {node_name}/{job_id} has damaged abandoned execution ownership')
+        elif observed['active_execution_id'] is not None:
+            raise RuntimeError(f'Job {node_name}/{job_id} has inconsistent active execution ownership')
 
         requested_at = datetime.now().isoformat(timespec="seconds")
-        previous_generation = int(control["generation"])
+        previous_generation = observed["generation"]
         generation = previous_generation + 1
         runtime = self.read_job_runtime(node_name, job_id)
         if runtime:
@@ -387,11 +391,13 @@ class JobRestartStorageMixin:
             }
         status_extra: dict[str, Any] = {}
         with self.db_transaction() as connection:
-            connection.execute(
+            changed = connection.execute(
                 "UPDATE jobs SET generation=?, active_execution_id=NULL, active_pid=NULL, "
                 "active_thread_id=NULL, active_started_at=NULL, restart_requested_at=?, "
                 "restart_requested_by_pid=?, restart_reason=?, status=?, status_json=?, runtime_json=? "
-                "WHERE node_name=? AND job_id=?",
+                "WHERE node_name=? AND job_id=? AND generation=? AND status=? AND active_execution_id IS ? "
+                "AND EXISTS (SELECT 1 FROM job_instances AS i WHERE i.node_name=jobs.node_name "
+                "AND i.job_id=jobs.job_id AND i.instance_id=? AND i.last_execution_id IS ?)",
                 (
                     generation,
                     requested_at,
@@ -401,9 +407,13 @@ class JobRestartStorageMixin:
                     json.dumps(status_extra),
                     json.dumps(runtime, ensure_ascii=False, separators=(",", ":")) if runtime else None,
                     node_name,
-                    job_id,
+                    job_id, previous_generation, previous_status, observed['active_execution_id'],
+                    observed['job_instance_id'],
+                    None if observed['owner'] is None else observed['owner']['execution_id'],
                 ),
-            )
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(f'Job {node_name}/{job_id} restart state changed')
             self._increment_job_restart_revision(connection)
         self.append_job_event(
             node_name,
@@ -440,8 +450,17 @@ class JobRestartStorageMixin:
         requested_by_pid: int | None = None,
         reason: str = "manual restart",
     ) -> dict[str, Any]:
-        if not self.job_exists(node_name, job_id):
+        self._require_execution_session_storage()
+        node_name, job_id = self.validate_node_name(node_name), self.validate_job_id(job_id)
+        observed = self._read_job_owner_observation(self.db_connection(), node_name, job_id)
+        if observed is None:
             raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
+        owner_live = observed['session'] is not None and execution_session_liveness(observed['session'])['live']
+        if owner_live and observed['status'] in (RUNNING, FAILED, CANCELLED):
+            target = self._read_owned_restart_target(self.db_connection(), node_name, job_id)
+            return self.request_owned_job_restarts(
+                [target], requested_by_pid=requested_by_pid, reason=reason,
+            )[0]
         with self.filesystem_interprocess_lock(
             "execution-fences",
             self.job_execution_lock_name(node_name, job_id),
@@ -451,7 +470,6 @@ class JobRestartStorageMixin:
                 job_id,
                 requested_by_pid=requested_by_pid,
                 reason=reason,
-                require_running_execution=False,
             )
 
     def request_active_job_restart(
@@ -462,16 +480,14 @@ class JobRestartStorageMixin:
         requested_by_pid: int | None = None,
         reason: str = "second-terminal active-job restart",
     ) -> dict[str, Any]:
+        self._require_execution_session_storage()
+        node_name = self.validate_node_name(node_name)
+        job_id = self.validate_job_id(job_id)
         if not self.job_exists(node_name, job_id):
-            raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
-        with self.filesystem_interprocess_lock(
-            "execution-fences",
-            self.job_execution_lock_name(node_name, job_id),
-        ):
-            return self._request_job_restart_locked(
-                node_name,
-                job_id,
-                requested_by_pid=requested_by_pid,
-                reason=reason,
-                require_running_execution=True,
-            )
+            raise FileNotFoundError(f'Job does not exist: {node_name}/{job_id}')
+        target = self._read_owned_restart_target(self.db_connection(), node_name, job_id)
+        if target['mode'] != 'running':
+            raise RuntimeError(f'Job {node_name}/{job_id} is not currently running')
+        return self.request_owned_job_restarts(
+            [target], requested_by_pid=requested_by_pid, reason=reason,
+        )[0]

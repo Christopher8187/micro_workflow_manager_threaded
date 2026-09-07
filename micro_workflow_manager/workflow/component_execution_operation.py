@@ -11,6 +11,9 @@ from ..storage.execution_claims import RestartClaimChanged
 class ComponentExecutionOperation:
     """Retain one component across joined pump epochs and owner decisions."""
 
+    live_admission = True
+    preloaded_selection = False
+
     def __init__(self, workflow, component, execution_context, wait_deadlock_resolver, api_pump_allocations, *, task_parent=None):
         self.workflow = workflow
         self.component = tuple(sorted(component))
@@ -132,6 +135,23 @@ class ComponentExecutionOperation:
             return [job_id for (member, job_id) in self.expectations
                     if member == node and (member, job_id) not in self.errors]
 
+    def observe_jobs(self):
+        return self.workflow.storage.nodes_by_job_status(self.component, {'queued', 'running', 'failed'})
+
+    def begin_epoch(self):
+        pass
+
+    def has_more_work(self):
+        return False
+
+    def make_runner(self, node, *, api_startup_lanes=None):
+        return self.workflow.make_runner(
+            node, execution_context=self.execution_context, api_startup_lanes=api_startup_lanes,
+        )
+
+    def load_source_job(self, node, job_id):
+        return self.workflow.storage.load_job(node, job_id)
+
     def selected_queued_nodes(self, queued):
         if not self.stop_admission and not self.replacement_epoch:
             return queued
@@ -190,6 +210,7 @@ class ComponentExecutionOperation:
             # ordinary queues. Cancellation cannot make another queued job the
             # first item of the replacement epoch.
             self.replacement_epoch = bool(self.expectations)
+            self.begin_epoch()
             try:
                 self.workflow._run_component(
                     set(self.component), True, self.wait_deadlock_resolver, self.api_pump_allocations,
@@ -210,16 +231,21 @@ class ComponentExecutionOperation:
                 self.completed = True
                 return self.ran
             if not self.replacement_epoch:
+                if self.has_more_work():
+                    continue
                 break
+        self.finish_execution()
+        return self.ran
+
+    def finish_execution(self):
         self.workflow.refresh_component_status(set(self.component), allow_complete=True)
         if self.stop_admission and self.workflow.component_has_queued_jobs(set(self.component)):
             # A different failed unit can stop this component after its exact
             # replacement finishes. Leave its unfinished lifecycle for the
             # session decision without replacing that original failure.
-            return self.ran
+            return
         if self.completion is not None:
             self.workflow.storage.finish_successful_component_execution(
                 self.execution_context[0], self.completion, task_parent=self.task_parent,
             )
         self.completed = True
-        return self.ran

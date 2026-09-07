@@ -61,6 +61,7 @@ def test_ordinary_component_start_records_its_lifecycle_and_pending_execution_an
         'session_id': 'ordinary-start', 'component_key': json.dumps(['A', 'B']),
         'shape_id': 1, 'alignment_generation': 0,
         'completion_ready': 0, 'stability': 'stable', 'instability_origin': None,
+        'execution_kind': 'full', 'starting_lifecycle': 'queued', 'starting_misaligned': 0,
     }]
 
     assert storage.begin_queued_component_execution(

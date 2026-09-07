@@ -81,9 +81,16 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_104_producer_footprint_preparation.py` | Producer-owned cleanup across excluded receivers, durable ancestry, retained results, preservation of other producers and their orphan traces, and notification failure after commit. |
 | `test_105_preparation_receiver_guards.py` | Complete preparation preflight, excluded receiver ownership and guards, publication refusal, and preservation after a later component fails. |
 | `test_106_preparation_receipt_failures.py` | Ambiguous input refusal, SQL rollback, repeated interrupted waits, retained recovery material, and original errors after committed preparation. |
+| `test_107_selected_producer_preparation.py` | Exact selected-root ancestry, historical generations, prior descendant cleanup, excluded receiver causes, and preservation of unrelated work and user files. |
 | `test_108_native_resume_preparation.py` | Whole-selection misalignment and parent refusal before mutation; atomic failed-job requeue and component transition with file restoration. |
 | `test_109_native_resume_recovery.py` | Exact output recovery, execution lock order, timing and restart history, real terminal output identity, complete active metadata, incompatible prior owners, and retained failures from older alignments. |
 | `test_110_native_resume_guidance.py` | Command-specific repair guidance, separate misaligned branches, and refusal of missing failed-job ownership. |
+| `test_111_selected_preparation_readiness.py` | Mandatory parent readiness for independent selected calls, exact admitted roots, and refusal before fresh preparation. |
+| `test_112_selected_causal_execution.py` | Recursive same-component children, causal failures, retained root values, and unrelated-work preservation. |
+| `test_113_selected_causal_runners.py` | CLI, direct, threaded, API, and process execution; waiting, supplied payloads, child restarts, and alignment drift. |
+| `test_114_selected_component_lifecycle.py` | Running, sampled, done, and failed transitions; cumulative coverage, retained lineage, misalignment, repair, and zero-work behavior. |
+| `test_115_selected_adopted_restart_continuation.py` | Repeated child repairs and new causal work after a retained nested component repair, preserving the original root result. |
+| `test_116_selected_ready_session_failure.py` | Ready results after caller failure, transactional rollback, damaged pending history, and producing-identity drift before the first claim. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and replacement-runtime isolation after the old checkpoint deadline and stale-write attempt. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished work, missing expected rounds, and repeated-API slowdown beyond the fixed allowance; successful completion and exact allowance equality. |

@@ -91,6 +91,13 @@ def test_forwarded_file_deletion_preserves_other_owners(tmp_path, missing_ok):
 def test_receiving_input_refuses_recursive_discovery(tmp_path, operation):
     workflow = MicroWorkflow(project_dir=tmp_path, runner='direct')
     workflow.graph([('A', 'B'), ('B', 'C')])
+
+    @workflow.task('A')
+    def parent(ctx):
+        return 'parent complete'
+
+    workflow.start('A')
+    assert workflow.run_job('A', 1) == 'parent complete'
     path = tmp_path / 'node' / 'B' / 'input' / 'A' / 'nested' / 'value.json'
     path.parent.mkdir(parents=True)
     path.write_text('{"value": 7}', encoding='utf-8')
@@ -138,6 +145,13 @@ def test_receiving_input_refuses_recursive_discovery(tmp_path, operation):
 def test_input_reads_have_fixed_depth_and_output_reads_keep_recursion(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path, runner='direct')
     workflow.graph([('A', 'B')])
+
+    @workflow.task('A')
+    def parent(ctx):
+        return 'parent complete'
+
+    workflow.start('A')
+    assert workflow.run_job('A', 1) == 'parent complete'
     for scope in ('input', 'output'):
         root = tmp_path / 'node' / 'B' / scope / 'A'
         (root / 'nested').mkdir(parents=True)

@@ -631,26 +631,34 @@ def test_live_task_handle_can_publish_from_its_helper_thread(tmp_path):
         _close(storage)
 
 
-def test_restarted_generation_preserves_prior_file_owner_and_records_shared_path_ambiguity(tmp_path):
+@pytest.mark.parametrize('restart', ['active', 'manual'])
+def test_restarted_generation_preserves_prior_file_owner_and_records_shared_path_ambiguity(tmp_path, restart):
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
     storage = workflow.storage
     owners = []
+    restarted = []
 
     @workflow.task('A')
     def produce(ctx):
         handle = ctx.node('B')
         handle.write_input('shared.txt', 'current generation', overwrite=True)
         owners.append(storage.read_job_current_owner('A', 1))
-        if len(owners) == 1:
+        if ctx.execution_generation == 0:
             handle.write_input('first-only.txt', 'old generation')
+            request_restart = (storage.request_active_job_restart if restart == 'active'
+                               else storage.request_job_restart)
+            restarted.append(request_restart('A', 1))
+        return ctx.execution_generation
 
     workflow.start('A')
     try:
-        workflow.run_job('A', 1, ignore_readiness=True)
-        storage.request_job_restart('A', 1)
-        workflow.run_job('A', 1, ignore_readiness=True)
-        assert owners[1]['generation'] > owners[0]['generation']
+        assert workflow.run_job('A', 1) == 1
+        assert len(restarted) == 1
+        assert restarted[0]['generation'] == 1
+        assert [owner['generation'] for owner in owners] == [0, 1]
+        assert owners[1]['execution_id'] != owners[0]['execution_id']
+        assert owners[1]['session_id'] == owners[0]['session_id']
         storage.clear_job_events('A', [1])
         assert storage.read_node_input_owner('B', 'A/first-only.txt') == owners[0]
         with pytest.raises(RuntimeError, match='[Aa]mbiguous'):

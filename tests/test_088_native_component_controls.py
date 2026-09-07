@@ -54,7 +54,7 @@ def test_skipped_job_remains_successful_without_being_executed(tmp_path):
     workflow.storage.set_job_status('A', skipped.job_id, 'skipped')
     skipped_events = workflow.storage.read_job_events('A', skipped.job_id)
     try:
-        workflow.run_node('A')
+        workflow.run_queued_node_jobs('A')
         assert executed == [queued.job_id]
         assert workflow.storage.get_job_status('A', skipped.job_id) == 'skipped'
         assert workflow.storage.get_job_status('A', queued.job_id) == 'done'

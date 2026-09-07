@@ -276,7 +276,7 @@ def test_two_receivers_in_one_component_keep_their_causes_after_concurrent_publi
 
 def test_running_receiver_noop_does_not_hide_an_arrival_at_the_same_completed_generation(tmp_path):
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
-    workflow.graph([('A', 'B'), ('B', 'A')])
+    workflow.graph([('A', 'B'), ('B', 'A'), ('X', 'B')])
     storage = workflow.storage
     states = []
 
@@ -290,6 +290,12 @@ def test_running_receiver_noop_does_not_hide_an_arrival_at_the_same_completed_ge
             assert storage.get_component_state(('A', 'B')) == state
             assert storage.read_component_misalignment_causes(('A', 'B')) == []
 
+    @workflow.task('X')
+    def later_producer(ctx):
+        states.append(storage.get_component_state(('A', 'B')))
+        assert storage.read_component_misalignment_causes(('A', 'B')) == []
+        ctx.node('B').write_input('data.txt', 'later arrival')
+
     @workflow.task('B')
     def consume(ctx):
         return 'received'
@@ -298,14 +304,15 @@ def test_running_receiver_noop_does_not_hide_an_arrival_at_the_same_completed_ge
     workflow.start('B')
     try:
         workflow.run()
-        workflow.run_job('A', 1, ignore_readiness=True)
+        workflow.start('X')
+        workflow.run_job('X', 1)
         assert [state['lifecycle'] for state in states] == ['running', 'done']
         assert states[0]['alignment_generation'] == states[1]['alignment_generation']
         assert storage.get_component_state(('A', 'B')) == dict(states[1], misaligned=True)
         assert storage.read_component_misalignment_causes(('A', 'B')) == [{
             'receiver_node': 'B', 'alignment_generation': states[1]['alignment_generation'],
-            'producer_node': 'A', 'producer_job_id': 1,
-            'arrival_kind': 'managed-input', 'path': 'A/data_2.txt',
+            'producer_node': 'X', 'producer_job_id': 1,
+            'arrival_kind': 'managed-input', 'path': 'X/data.txt',
         }]
     finally:
         _close(storage)

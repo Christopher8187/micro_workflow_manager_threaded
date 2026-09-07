@@ -18,6 +18,7 @@ from ..fibers import cancellation_scope, in_fiber_runtime
 from ..networking import network_attempt_context
 from ..storage.priorities import ADMISSION_PRIORITY
 from .execution_scope import programmatic_execution
+from .selected_execution_operation import run_selected_execution
 
 
 T = TypeVar("T")
@@ -69,7 +70,12 @@ class JobLifecycleMixin:
         with programmatic_execution(
             self, command='run_job', start_node=node_name,
             nodes=[node_name], selected_jobs=[job_id],
-        ) as context:
+            selected_preparation=True, include_driver=True,
+        ) as (context, driver):
+            if driver is not None:
+                return run_selected_execution(
+                    self, node_name, [self.storage.load_job(node_name, job_id)], context, driver, scalar=True,
+                )
             return self._run_job(node_name, job_id, ignore_readiness, execution_context=context)
 
     def _run_job(

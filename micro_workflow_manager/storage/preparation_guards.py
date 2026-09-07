@@ -48,6 +48,7 @@ def hold_preparation_guards(storage, footprint, session_id, observations):
             expected = observations[unit.component]
             observed = storage._read_component_preparation(
                 connection, session_id, unit.component, expected['shape_json'],
+                selected_roots=footprint.roots or None,
             )
             if observed != expected:
                 raise RuntimeError('Component changed during complete preparation preflight: ' + repr(unit.component))
