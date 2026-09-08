@@ -8,14 +8,27 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import networkx as nx
 import pytest
 
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.processes import process_identity
+from micro_workflow_manager.topology import ComponentTopology
 
 
-def _session(storage, session_id="main-1", *, kind="main", **overrides):
+def _single_snapshot():
+    graph = nx.DiGraph()
+    graph.add_node('A')
+    return ComponentTopology(graph, []).snapshot()
+
+
+def _session(
+    storage, session_id="main-1", *, kind="main", register_topology=True, **overrides,
+):
+    snapshot = _single_snapshot()
+    if register_topology:
+        storage.register_component_topology(snapshot)
     fields = {
         "session_kind": kind,
         "command": "run" if kind == "main" else "interrupt",
@@ -25,6 +38,7 @@ def _session(storage, session_id="main-1", *, kind="main", **overrides):
         "hostname": "worker.example",
         "pid": 123,
         "process_identity": "process-instance-1",
+        "expected_shape": snapshot.shape_json,
     }
     fields.update(overrides)
     return storage.create_execution_session(session_id, **fields)
@@ -45,7 +59,7 @@ def test_ordinary_reopen_keeps_native_schema_and_payloads(tmp_path):
     with sqlite3.connect(tmp_path / '.mwf' / 'state.sqlite3') as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone() == ('5',)
+        ).fetchone() == ('6',)
         assert connection.execute('SELECT COUNT(*) FROM execution_sessions').fetchone() == (0,)
     reopened.close_database_connections()
 
@@ -85,6 +99,8 @@ def test_terminal_session_keeps_exact_outcome_when_old_heartbeat_or_finish_arriv
 
 def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
+    snapshot = ComponentTopology(nx.DiGraph([('A', 'B'), ('B', 'A'), ('B', 'C')]), []).snapshot()
+    storage.register_component_topology(snapshot)
     for node, job_id in [("B", 9), ("A", 3)]:
         storage.create_job(Job(node_name=node, job_id=job_id, params={}))
     records = {}
@@ -106,6 +122,7 @@ def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_
             pid=123,
             process_identity="process-instance-1",
             details={"boundary": ["C"], "settings": {"sample": 0.5}},
+            expected_shape=snapshot.shape_json,
         )
     storage.close_database_connections()
 
@@ -135,6 +152,8 @@ def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_
             "outcome": None,
             "failures": [],
             "details": {"boundary": ["C"], "settings": {"sample": 0.5}},
+            "admitted_shape_id": 1,
+            "partition_revision": 0,
         }
         assert records[session_id] == expected
         assert reopened.get_execution_session(session_id) == expected
@@ -145,6 +164,8 @@ def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_
 
 def test_separate_processes_cannot_create_two_running_main_sessions(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
+    snapshot = _single_snapshot()
+    storage.register_component_topology(snapshot)
     storage.create_job(Job(node_name="A", job_id=1, params={}))
     script = """
 import sqlite3, sys, time
@@ -163,7 +184,7 @@ try:
         session_id, session_kind='main', command='run', start_component=('A',),
         selected_components=[('A',)], selected_jobs=[('A', 1)],
         started_at='2026-09-05T12:00:00+00:00', hostname='worker.example',
-        pid=123, process_identity='old-process',
+        pid=123, process_identity='old-process', expected_shape=sys.argv[3],
     )
 except sqlite3.IntegrityError:
     print('refused', flush=True)
@@ -173,7 +194,7 @@ finally:
     storage.close_database_connections()
 """
     processes = [subprocess.Popen(
-        [sys.executable, "-c", script, str(tmp_path), session_id],
+        [sys.executable, "-c", script, str(tmp_path), session_id, snapshot.shape_json],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     ) for session_id in ("main-1", "main-2")]
     try:
@@ -302,6 +323,7 @@ def test_session_creation_rejects_invalid_identity_or_scope_without_partial_rows
 def test_session_mutations_share_the_writer_and_rollback_partial_children(tmp_path, monkeypatch):
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.create_job(Job(node_name="A", job_id=1, params={}))
+    storage.register_component_topology(_single_snapshot())
     original = storage.submit_db_mutation
     mutations = []
 
@@ -311,12 +333,12 @@ def test_session_mutations_share_the_writer_and_rollback_partial_children(tmp_pa
 
     monkeypatch.setattr(storage, "submit_db_mutation", submit)
     with pytest.raises(sqlite3.IntegrityError):
-        _session(storage, selected_jobs=[("A", 1), ("A", 1)])
+        _session(storage, register_topology=False, selected_jobs=[("A", 1), ("A", 1)])
     assert storage.get_execution_session("main-1") is None
     with sqlite3.connect(tmp_path / ".mwf" / "state.sqlite3") as connection:
         assert connection.execute("SELECT COUNT(*) FROM session_components").fetchone() == (0,)
         assert connection.execute("SELECT COUNT(*) FROM session_jobs").fetchone() == (0,)
-    _session(storage, selected_jobs=[("A", 1)])
+    _session(storage, register_topology=False, selected_jobs=[("A", 1)])
     storage.heartbeat_execution_session("main-1", "2026-09-05T12:01:00+00:00")
     storage.finish_execution_session("main-1", outcome="done", finished_at="2026-09-05T12:02:00+00:00")
     assert mutations == [(True, 0)] * 4
@@ -354,7 +376,7 @@ def test_failed_schema_creation_does_not_publish_a_partial_version(tmp_path, mon
     with sqlite3.connect(tmp_path / ".mwf" / "state.sqlite3") as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone() == ("5",)
+        ).fetchone() == ("6",)
     _session(storage)
     assert storage.get_execution_session("main-1")["status"] == "running"
     assert storage.database_integrity_check() == "ok"
@@ -371,7 +393,9 @@ def test_session_operations_refuse_changed_schema_without_mutation(tmp_path):
         ))
         before = _rows(storage)
         for operation in (
-            lambda: _session(storage),
+            lambda: _session(
+                storage, expected_shape=_single_snapshot().shape_json, register_topology=False,
+            ),
             lambda: storage.get_execution_session('main-1'),
             storage.list_execution_sessions,
             lambda: storage.heartbeat_execution_session('main-1', '2026-09-05T12:01:00+00:00'),
@@ -555,7 +579,7 @@ def test_fresh_creator_preserves_a_native_store_that_initialized_first(tmp_path,
         assert storage.database_integrity_check() == 'ok'
         assert storage.db_connection().execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'",
-        ).fetchone()[0] == '5'
+        ).fetchone()[0] == '6'
     finally:
         storage.close_database_connections()
 

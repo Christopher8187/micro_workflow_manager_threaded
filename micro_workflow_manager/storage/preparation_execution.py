@@ -26,7 +26,7 @@ def _effects(unit):
 
 
 def prepare_component_unit(storage, root, unit, expected, session_id, guard_id, operation, *, keep_trace,
-                           selected_footprint=None):
+                           selected_footprint=None, membership_preparation=None, target_shape=None):
     roots = None if selected_footprint is None else selected_footprint.roots
     if selected_footprint is not None and (not roots or selected_footprint.units != (unit,)):
         raise ValueError('Selected preparation requires one complete exact footprint')
@@ -35,11 +35,14 @@ def prepare_component_unit(storage, root, unit, expected, session_id, guard_id, 
 
     def validate(connection):
         validate_held_guards(connection, unit.excluded_nodes, guard_id)
-        observed = storage._read_component_preparation(
-            connection, session_id, unit.component, expected['shape_json'], selected_roots=roots,
-        )
-        if observed != expected:
-            raise RuntimeError('Component changed during full preparation: ' + repr(unit.component))
+        if membership_preparation is not None:
+            membership_preparation.validate_unit(connection, unit, guard_id)
+        else:
+            observed = storage._read_component_preparation(
+                connection, session_id, unit.component, expected['shape_json'], selected_roots=roots,
+            )
+            if observed != expected:
+                raise RuntimeError('Component changed during full preparation: ' + repr(unit.component))
         validate_job_preparation(connection, unit.jobs)
         validate_prepared_inputs(storage, connection, unit.inputs)
         if selected_footprint is not None:
@@ -50,16 +53,22 @@ def prepare_component_unit(storage, root, unit, expected, session_id, guard_id, 
             refuse_unfinished_preparation(connection, receiver)
         validate(connection)
 
-    receipt = PreparationReceipt(storage, guard_id, operation, unit.component, session_id, validate_initial, effects)
+    receipt = PreparationReceipt(
+        storage, guard_id, operation, unit.component, session_id, validate_initial, effects,
+        membership=None if membership_preparation is None else membership_preparation.receipt_metadata(unit),
+    )
     identities = {}
 
     def commit(connection):
         validate(connection)
         selected = tuple(plan for plan in unit.jobs if plan.node in unit.component)
         outside = tuple(plan for plan in unit.jobs if plan.node not in unit.component)
-        if selected_footprint is None:
+        if membership_preparation is not None:
+            apply_job_preparation(connection, selected, keep_trace=keep_trace)
+            membership_preparation.complete_unit(connection, unit)
+        elif selected_footprint is None:
             storage._complete_component_preparation(session_id, unit.component, expected, selected, keep_trace,
-                                                    connection=connection)
+                                                    connection=connection, target_shape=target_shape)
         else:
             apply_job_preparation(connection, selected, keep_trace=keep_trace)
         apply_job_preparation(connection, outside, keep_trace=keep_trace)

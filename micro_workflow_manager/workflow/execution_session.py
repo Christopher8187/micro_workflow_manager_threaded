@@ -91,6 +91,7 @@ def _execution_session(
     ordered_components: tuple[tuple[str, ...], ...] | None = None,
     selected_jobs: list[int] | None = None,
     sample_request: SampleRequest | None = None,
+    fresh_preparation: bool = False,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
     stats: bool = False,
@@ -263,6 +264,23 @@ def _execution_session(
             if sample_request is None:
                 # Preserve exact-job refusal before topology registration.
                 selected_jobs = validate_selected_jobs(workflow, start_node, selected_jobs)
+            from ..storage.membership_observation import (
+                read_membership_change, require_reusable_membership_match, membership_repair_lines,
+            )
+            membership = read_membership_change(workflow.storage.db_connection(), snapshot, selected_components)
+            if fresh_preparation:
+                if selected_jobs or sample_request is not None:
+                    raise ValueError('Full membership preparation cannot select individual jobs')
+                for line in membership_repair_lines(membership):
+                    print(line)
+            else:
+                require_reusable_membership_match(membership)
+            if membership is not None and membership.changes_active_membership:
+                from ..storage.membership_activity import require_idle_membership_region
+                require_idle_membership_region(
+                    workflow.storage.db_connection(),
+                    (*membership.source_components, *membership.target_components),
+                )
             workflow.storage.register_component_topology(snapshot)
             started_at = now_iso()
             hostname = socket.gethostname()
@@ -275,7 +293,7 @@ def _execution_session(
                     selected_components=selected_components,
                     selected_jobs=[(start_node, job_id) for job_id in (selected_jobs or [])],
                     started_at=started_at, hostname=hostname, pid=pid,
-                    process_identity=identity, details=data, _wait=False,
+                    process_identity=identity, details=data, expected_shape=snapshot.shape_json, _wait=False,
                 )
                 admission_arguments = dict(
                     session_kind='main', command=command,
@@ -283,7 +301,7 @@ def _execution_session(
                     selected_components=selected_components,
                     selected_jobs=[(start_node, job_id) for job_id in (selected_jobs or [])],
                     started_at=started_at, hostname=hostname, pid=pid,
-                    process_identity=identity, details=data,
+                    process_identity=identity, details=data, expected_shape=snapshot.shape_json,
                 )
                 creation = resolve_admission_future(
                     pending_creation,

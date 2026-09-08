@@ -4,29 +4,26 @@ import json
 
 from micro_workflow_manager.component_identity import encode_component_key
 from .selected_execution import read_selected_execution_jobs
+from .component_result_identity import (
+    ComponentGenerationIdentity,
+    read_admitted_component_shape,
+    read_component_state_record,
+    observe_current_success,
+    read_retained_successful_result,
+    read_successful_result,
+)
 
 
 class SelectedComponentLifecycleStorageMixin:
     """Begin selected attempts and retain successful results across failed repairs."""
 
     def _read_component_successful_result(self, connection, component, identity):
-        row = connection.execute(
-            'SELECT result.*, origin.session_kind AS origin_kind FROM component_successful_results AS result '
-            'LEFT JOIN execution_sessions AS origin ON origin.session_id=result.instability_origin '
-            'WHERE component_key=? AND shape_id=? AND alignment_generation=?',
-            (encode_component_key(component), *identity),
-        ).fetchone()
-        if row is None:
-            return None
-        if (row['lifecycle'] not in ('sampled', 'done')
-                or not ((row['stability'] == 'stable' and row['instability_origin'] is None)
-                        or (row['stability'] == 'unstable' and isinstance(row['instability_origin'], str)
-                            and bool(row['instability_origin'].strip())
-                            and row['origin_kind'] == 'interrupt'))):
-            raise RuntimeError('Invalid retained successful component result')
-        return tuple(row[name] for name in ('lifecycle', 'stability', 'instability_origin'))
+        result = read_successful_result(connection, component, identity)
+        return None if result is None else result.result
 
     def _record_component_successful_result(self, connection, component, identity, result):
+        if isinstance(identity, ComponentGenerationIdentity):
+            identity = identity.values
         changed = connection.execute(
             'INSERT INTO component_successful_results '
             '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
@@ -72,10 +69,12 @@ class SelectedComponentLifecycleStorageMixin:
         )])
 
         def begin(connection):
-            identity = self._read_component_producing_identity(connection, component)
+            observed_identity = ComponentGenerationIdentity(*expected_identity)
+            admitted = read_admitted_component_shape(connection, session_id, component, shape)
             read_selected_execution_jobs(self, context, roots, expected_identity, connection=connection)
-            state = self._read_component_state(connection, component)
-            if state != expected or state['lifecycle'] == 'running':
+            state_record = read_component_state_record(connection, component)
+            if (state_record is None or state_record.snapshot != expected
+                    or state_record.identity != observed_identity or state_record.lifecycle == 'running'):
                 raise RuntimeError('Selected component changed before its captured start')
             if connection.execute(
                 'SELECT 1 FROM pending_component_executions WHERE component_key=?', (key,),
@@ -84,39 +83,52 @@ class SelectedComponentLifecycleStorageMixin:
             for parent, observed in parents.items():
                 if self._read_component_state(connection, parent) != observed:
                     raise RuntimeError('Selected component parent changed before start')
-            if state['lifecycle'] in ('sampled', 'done'):
-                current = tuple(state[name] for name in ('lifecycle', 'stability', 'instability_origin'))
-                prior = self._match_component_successful_result(
-                    connection, component, identity, current, record_missing=True,
-                )
-            else:
-                prior = self._read_component_successful_result(connection, component, identity)
-                if state['lifecycle'] == 'queued' and prior is not None:
-                    raise RuntimeError('Queued component unexpectedly retains success at its current alignment')
-            if prior is not None and prior[1:] != successful_lineage:
+            prior = observe_current_success(connection, state_record)
+            if state_record.lifecycle == 'queued' and prior is not None:
+                raise RuntimeError('Queued component unexpectedly retains successful history')
+            if prior is not None and prior.lineage != successful_lineage:
                 raise RuntimeError('Selected execution cannot combine incompatible successful lineage')
             self._validate_pending_component_row(connection, {
                 'completion_ready': 0, 'stability': proposal.stability,
                 'instability_origin': proposal.instability_origin, 'execution_kind': 'jobs',
-                'starting_lifecycle': state['lifecycle'], 'starting_misaligned': int(state['misaligned']),
+                'starting_lifecycle': state_record.lifecycle,
+                'starting_misaligned': int(state_record.misaligned),
+                'shape_id': admitted.shape_id,
+                'starting_shape_id': state_record.identity.shape_id,
+                'component_key': key,
             })
-            retained_lineage = (None, None) if prior is None else prior[1:]
+            retained_lineage = (None, None) if prior is None else prior.lineage
+            pointer = state_record.retained_result_identity
             changed = connection.execute(
-                "UPDATE component_states SET lifecycle='running', stability=?, instability_origin=? "
-                'WHERE component_key=? AND lifecycle=? AND misaligned=? AND alignment_generation=?',
-                (*retained_lineage, key, state['lifecycle'], int(state['misaligned']), identity[1]),
+                "UPDATE component_states SET shape_id=?, lifecycle='running', "
+                'stability=?, instability_origin=?, retained_result_shape_id=?, '
+                'retained_result_alignment_generation=? '
+                'WHERE component_key=? AND shape_id=? AND lifecycle=? AND misaligned=? '
+                'AND alignment_generation=? AND retained_result_shape_id IS ? '
+                'AND retained_result_alignment_generation IS ?',
+                (admitted.shape_id, *retained_lineage,
+                 None if pointer is None else pointer.shape_id,
+                 None if pointer is None else pointer.alignment_generation,
+                 key, state_record.identity.shape_id,
+                 state_record.lifecycle, int(state_record.misaligned),
+                 state_record.identity.alignment_generation,
+                 None if pointer is None else pointer.shape_id,
+                 None if pointer is None else pointer.alignment_generation),
             ).rowcount
             if changed != 1:
                 raise RuntimeError('Selected component changed before start')
             recorded = connection.execute(
                 'INSERT INTO pending_component_executions '
-                '(session_id, component_key, shape_id, alignment_generation, stability, instability_origin, '
-                'execution_kind, starting_lifecycle, starting_misaligned) VALUES(?,?,?,?,?,?,?,?,?)',
-                (session_id, key, *identity, *successful_lineage, 'jobs', state['lifecycle'], int(state['misaligned'])),
+                '(session_id, component_key, shape_id, starting_shape_id, alignment_generation, '
+                'stability, instability_origin, execution_kind, starting_lifecycle, starting_misaligned) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?)',
+                (session_id, key, admitted.shape_id, state_record.identity.shape_id,
+                 state_record.identity.alignment_generation, *successful_lineage, 'jobs',
+                 state_record.lifecycle, int(state_record.misaligned)),
             ).rowcount
             if recorded != 1:
                 raise RuntimeError('Selected component start was not recorded')
-            return proposal, identity
+            return proposal, (admitted.shape_id, state_record.identity.alignment_generation)
 
         return self.submit_db_mutation(begin, wait=True, priority=0)
 
@@ -151,14 +163,17 @@ class SelectedComponentLifecycleStorageMixin:
         frontier = read_selected_execution_jobs(self, context, roots, identity, connection=connection)
         if successful and any(status not in ('done', 'skipped') for _, _, status in frontier):
             raise ComponentExecutionIncomplete('Selected completion has unfinished causal work')
-        prior = self._read_component_successful_result(connection, component, identity)
+        state = read_component_state_record(connection, component)
+        if state is None or state.identity != ComponentGenerationIdentity(*identity):
+            raise RuntimeError('Selected execution lost its admitted component identity')
+        prior = read_retained_successful_result(connection, state)
         if pending['starting_lifecycle'] == 'queued' and prior is not None:
             raise RuntimeError('Queued selected execution cannot have a retained successful result')
         if pending['starting_lifecycle'] in ('sampled', 'done') and (
-            prior is None or prior[0] != pending['starting_lifecycle']
+            prior is None or prior.lifecycle != pending['starting_lifecycle']
         ):
             raise RuntimeError('Selected execution lost its retained successful result')
-        if prior is not None and prior[1:] != (pending['stability'], pending['instability_origin']):
+        if prior is not None and prior.lineage != (pending['stability'], pending['instability_origin']):
             raise RuntimeError('Selected pending lineage differs from its retained success')
         session = connection.execute(
             'SELECT command, details_json FROM execution_sessions WHERE session_id=?', (session_id,),
@@ -186,7 +201,7 @@ class SelectedComponentLifecycleStorageMixin:
                     'SELECT status, active_execution_id FROM jobs WHERE node_name=?', (node,),
                 )
             )
-            lifecycle = 'done' if full_coverage or (prior is not None and prior[0] == 'done') else 'sampled'
+            lifecycle = 'done' if full_coverage or (prior is not None and prior.lifecycle == 'done') else 'sampled'
         return ComponentTerminalOutcome(
             component, pending['shape_json'], identity[1], lifecycle if successful else 'failed',
             pending['stability'] if successful else None,

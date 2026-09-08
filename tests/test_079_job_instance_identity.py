@@ -593,6 +593,7 @@ def test_identity_survives_claim_terminal_restart_reset_and_sequence_updates(tmp
             'owner', session_kind='main', command='run', start_component=('A',),
             selected_components=[('A',)], started_at='2026-09-05T12:00:00',
             hostname='worker.example', pid=123, process_identity='owner-process',
+            expected_shape=snapshot.shape_json,
         )
         assert storage.reserve_execution_components('owner', expected_shape=snapshot.shape_json)
         storage.create_job(Job(node_name='A', job_id=1, params={'value': 'retained'}))

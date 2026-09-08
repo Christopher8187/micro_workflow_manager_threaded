@@ -86,6 +86,7 @@ def test_live_component_queue_notification_wakes_before_poll_fallback(tmp_path):
     workflow.component_queue_poll_seconds = 5.0
     workflow.graph([("router", "worker"), ("worker", "router")])
     worker_started = threading.Event()
+    job_published = threading.Event()
     release_router = threading.Event()
 
     router = NodeRouter("router", runner="threaded", max_threads=1)
@@ -94,7 +95,8 @@ def test_live_component_queue_notification_wakes_before_poll_fallback(tmp_path):
     @router.task
     def route(ctx):
         ctx.node("worker").add(value=ctx.job_id)
-        assert release_router.wait(2)
+        job_published.set()
+        assert release_router.wait(5)
 
     worker = NodeRouter("worker", runner="api", max_threads=1)
 
@@ -111,6 +113,7 @@ def test_live_component_queue_notification_wakes_before_poll_fallback(tmp_path):
     )
     run.start()
     try:
+        assert job_published.wait(5), "router did not publish the queued job"
         assert worker_started.wait(0.5), "worker pump slept until the polling fallback"
     finally:
         release_router.set()
@@ -484,10 +487,14 @@ def test_terminal_registration_flushes_while_next_admission_pull_is_blocked(tmp_
 
     storage = FileStorage(tmp_path)
     storage.create_job(Job(node_name="A", job_id=1, params={}))
+    from tests.test_047_event_state_top import _admit_event_owner
+
+    _admit_event_owner(storage)
     generation, execution_id = storage.claim_job_executions_batch(
         "A",
         [1],
         started_at=now(),
+        session_id='event-owner', component=('A',),
     )[0]
 
     second_pull_started = threading.Event()

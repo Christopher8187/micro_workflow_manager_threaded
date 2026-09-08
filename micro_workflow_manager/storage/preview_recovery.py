@@ -83,8 +83,10 @@ def _active_job_owner(connection, node, job_id):
     reservation = connection.execute(
         'SELECT reservation.session_id, definition.shape_id, state.alignment_generation '
         'FROM component_reservations AS reservation '
-        'JOIN component_definitions AS definition USING(component_key) '
-        'JOIN component_states AS state USING(component_key) WHERE component_key=?', (component_key,),
+        'JOIN component_states AS state USING(component_key) '
+        'JOIN component_definitions AS definition '
+        'ON definition.component_key=state.component_key AND definition.shape_id=state.shape_id '
+        'WHERE reservation.component_key=?', (component_key,),
     ).fetchone()
     if (reservation is None or reservation['session_id'] != owner['session_id']
             or reservation['shape_id'] != owner['shape_id']

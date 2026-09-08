@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 
 from micro_workflow_manager.storage.component_definitions import component_snapshot_from_shape
+from .component_result_identity import read_admitted_component_shape
 from .sample_planning import SAMPLE_ALGORITHM, SampleMember, SamplePlan
 
 
@@ -100,6 +101,7 @@ def read_sample_admission_history(storage, connection, session_id, *, component,
     component = tuple(component)
     if components != [component] or storage._stored_session_component(row['start_component']) != component:
         raise RuntimeError('Persisted sample scope differs from its lifecycle component')
+    read_admitted_component_shape(connection, session_id, component, expected_shape)
     try:
         details = json.loads(row['details_json'])
     except (TypeError, json.JSONDecodeError) as error:

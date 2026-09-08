@@ -23,6 +23,7 @@ def _storage(tmp_path, *, selected=True, pending=False):
         start_component=('A', 'B'), selected_components=[('A', 'B')],
         selected_jobs=[('A', 1)] if selected else [], started_at=now(),
         hostname='claim-test', pid=os.getpid(), process_identity='claim-test',
+        expected_shape=topology.shape_json,
     )
     storage.reserve_execution_components('producing-session', expected_shape=topology.shape_json)
     storage.submit_db_mutation(lambda connection: connection.execute(
@@ -100,18 +101,27 @@ def test_claim_captures_identity_that_survives_current_state_changes_and_trace_r
         storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
         storage.clear_job_events('A', [1])
 
-        # Simulate a later accepted definition update, retaining the old shape.
+        storage.decide_execution_session_exit(
+            'producing-session', outcome='failed', finished_at=now(),
+        )
+        later = ComponentTopology(nx.DiGraph([('A', 'B'), ('B', 'A'), ('B', 'D')]), []).snapshot()
+        storage.register_component_topology(later)
+        next_shape = storage.db_connection().execute(
+            'SELECT shape_id FROM graph_shapes WHERE shape_json=?', (later.shape_json,),
+        ).fetchone()['shape_id']
+        # Advance current state while preserving both exact historical definitions.
         # Historical reads must not reconstruct the producer from current state.
-        def advance(connection):
-            connection.execute('DELETE FROM pending_component_executions')
-            next_shape = connection.execute(
-                'INSERT INTO graph_shapes(shape_json) VALUES(?)',
-                (topology.shape_json.replace('"C"', '"D"'),),
-            ).lastrowid
-            connection.execute('UPDATE component_definitions SET shape_id=?', (next_shape,))
-            connection.execute('UPDATE component_states SET alignment_generation=8')
-
-        storage.submit_db_mutation(advance)
+        storage.submit_db_mutation(lambda connection: connection.execute(
+            "UPDATE component_states SET shape_id=?, alignment_generation=8, lifecycle='queued', "
+            'stability=NULL, instability_origin=NULL, misaligned=0, retained_result_shape_id=NULL, '
+            'retained_result_alignment_generation=NULL WHERE component_key=?',
+            (next_shape, '["A", "B"]'),
+        ))
+        assert {row['shape_id'] for row in storage.db_connection().execute(
+            'SELECT shape_id FROM component_definitions WHERE component_key=?', ('["A", "B"]',),
+        )} == {shape_id, next_shape}
+        assert storage.get_component_state(('A', 'B'))['shape_json'] == later.shape_json
+        assert storage.get_component_state(('A', 'B'))['alignment_generation'] == 8
         assert storage.read_job_current_owner('A', 1) == owner
         assert storage.get_job_execution_owner(execution_id) == owner
     finally:
@@ -143,9 +153,7 @@ def test_claim_refuses_damaged_producing_identity_before_mutating_jobs(tmp_path,
     storage, topology = _storage(tmp_path, selected=False, pending=damage.startswith('pending-'))
     try:
         def corrupt(connection):
-            if damage == 'missing-state':
-                connection.execute('DELETE FROM component_states WHERE component_key=?', ('["A", "B"]',))
-            elif damage == 'invalid-generation':
+            if damage == 'invalid-generation':
                 connection.execute('PRAGMA ignore_check_constraints=ON')
                 try:
                     connection.execute('UPDATE component_states SET alignment_generation=-1')
@@ -158,9 +166,24 @@ def test_claim_refuses_damaged_producing_identity_before_mutating_jobs(tmp_path,
                     'INSERT INTO graph_shapes(shape_json) VALUES(?)',
                     (topology.shape_json.replace('"C"', '"D"'),),
                 ).lastrowid
+                connection.executemany(
+                    'INSERT INTO component_definitions(component_key, shape_id) VALUES(?, ?)',
+                    [('["A", "B"]', shape_id), ('["D"]', shape_id)],
+                )
                 connection.execute('UPDATE pending_component_executions SET shape_id=?', (shape_id,))
 
-        storage.submit_db_mutation(corrupt)
+        if damage == 'missing-state':
+            storage.db_mutation_barrier()
+            connection = storage.db_connection()
+            connection.execute('PRAGMA foreign_keys=OFF')
+            try:
+                connection.execute(
+                    'DELETE FROM component_states WHERE component_key=?', ('["A", "B"]',),
+                )
+            finally:
+                connection.execute('PRAGMA foreign_keys=ON')
+        else:
+            storage.submit_db_mutation(corrupt)
         before = _rows(storage)
         with pytest.raises(RuntimeError):
             _claim(storage, batch=True)
@@ -363,7 +386,7 @@ def test_owner_readers_refuse_damaged_producing_identity(tmp_path, damage, reade
             storage.create_execution_session(
                 'other-session', session_kind='interrupt', command='run', start_component=('C',),
                 selected_components=[('C',)], started_at=now(), hostname='claim-test',
-                pid=os.getpid(), process_identity='claim-test',
+                pid=os.getpid(), process_identity='claim-test', expected_shape=topology.shape_json,
             )
         connection = storage.db_connection()
         connection.execute('PRAGMA foreign_keys=OFF')

@@ -111,6 +111,7 @@ def test_ready_component_keeps_its_recorded_successful_lineage(running_component
         start_component=('C',), selected_components=[('C',)],
         started_at=now(), hostname=socket.gethostname(), pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
+        expected_shape=topology.shape_json,
     )
     storage.submit_db_mutation(lambda connection: connection.execute(
         "UPDATE pending_component_executions SET completion_ready=1, stability='stable'",
@@ -151,6 +152,10 @@ def test_component_publication_rechecks_its_pending_start_record(running_compone
                 'INSERT INTO graph_shapes(shape_json) VALUES(?)',
                 (topology.shape_json.replace('"C"', '"D"'),),
             ).lastrowid
+            connection.execute(
+                'INSERT INTO component_definitions(component_key, shape_id) VALUES(?, ?)',
+                (json.dumps(['A', 'B']), shape_id),
+            )
             connection.execute('UPDATE pending_component_executions SET shape_id=?', (shape_id,))
         elif damage == 'generation':
             connection.execute('UPDATE pending_component_executions SET alignment_generation=1')
@@ -169,6 +174,31 @@ def test_component_publication_rechecks_its_pending_start_record(running_compone
     assert _rows(storage) == before
 
 
+def _seed_retained_result(storage, component, *, lifecycle, stability, origin):
+    key = json.dumps(list(component))
+
+    def seed(connection):
+        state = connection.execute(
+            'SELECT shape_id, alignment_generation FROM component_states WHERE component_key=?',
+            (key,),
+        ).fetchone()
+        assert state is not None
+        connection.execute(
+            'INSERT INTO component_successful_results '
+            '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
+            'VALUES(?, ?, ?, ?, ?, ?)',
+            (key, state['shape_id'], state['alignment_generation'], lifecycle, stability, origin),
+        )
+        changed = connection.execute(
+            'UPDATE component_states SET stability=?, instability_origin=?, retained_result_shape_id=?, '
+            'retained_result_alignment_generation=? WHERE component_key=?',
+            (stability, origin, state['shape_id'], state['alignment_generation'], key),
+        ).rowcount
+        assert changed == 1
+
+    storage.submit_db_mutation(seed)
+
+
 def test_component_publication_preserves_another_sessions_pending_record(running_component):
     storage, topology, generation, execution_id = running_component
     storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
@@ -176,11 +206,15 @@ def test_component_publication_preserves_another_sessions_pending_record(running
         'retained-owner', session_kind='interrupt', command='run',
         start_component=('A', 'B'), selected_components=[('A', 'B')],
         started_at=now(), hostname=socket.gethostname(), pid=os.getpid(),
-        process_identity=process_identity(os.getpid()),
+        process_identity=process_identity(os.getpid()), expected_shape=topology.shape_json,
     )
     storage.submit_db_mutation(lambda connection: connection.execute(
-        'INSERT INTO pending_component_executions(session_id, component_key, shape_id, alignment_generation, stability, instability_origin) '
-        'SELECT ?, component_key, shape_id, alignment_generation, stability, instability_origin FROM pending_component_executions WHERE session_id=?',
+        'INSERT INTO pending_component_executions('
+        'session_id, component_key, shape_id, starting_shape_id, alignment_generation, completion_ready, '
+        'execution_kind, starting_lifecycle, starting_misaligned, stability, instability_origin) '
+        'SELECT ?, component_key, shape_id, starting_shape_id, alignment_generation, completion_ready, '
+        'execution_kind, starting_lifecycle, starting_misaligned, stability, instability_origin '
+        'FROM pending_component_executions WHERE session_id=?',
         ('retained-owner', 'ordinary-result'),
     ))
     before = _rows(storage)
@@ -188,7 +222,10 @@ def test_component_publication_preserves_another_sessions_pending_record(running
     expected = deepcopy(before)
     for row in expected['component_states']:
         if row['component_key'] == json.dumps(['A', 'B']):
-            row.update(lifecycle='done', stability='stable')
+            row.update(
+                lifecycle='done', stability='stable', retained_result_shape_id=1,
+                retained_result_alignment_generation=0,
+            )
     expected['pending_component_executions'] = [
         row for row in expected['pending_component_executions'] if row['session_id'] == 'retained-owner'
     ]
@@ -210,6 +247,7 @@ def running_component(tmp_path, request):
         start_component=('A', 'B'), selected_components=getattr(request, 'param', [('A', 'B')]),
         started_at=now(), hostname=socket.gethostname(),
         pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=topology.shape_json,
     )
     storage.reserve_execution_components('ordinary-result', expected_shape=topology.shape_json)
     storage.begin_queued_component_execution(
@@ -271,7 +309,10 @@ def test_successful_component_can_finish_while_its_session_remains_live(running_
 
     expected = deepcopy(before)
     component_row = next(row for row in expected['component_states'] if row['component_key'] == json.dumps(['A', 'B']))
-    component_row.update(lifecycle='done', stability='stable')
+    component_row.update(
+        lifecycle='done', stability='stable', retained_result_shape_id=1,
+        retained_result_alignment_generation=0,
+    )
     expected['pending_component_executions'] = []
     expected['component_successful_results'] = [{
         'component_key': json.dumps(['A', 'B']), 'shape_id': 1, 'alignment_generation': 0,
@@ -537,6 +578,7 @@ def test_component_result_batch_preserves_work_transferred_to_another_session(ru
         'next-owner', session_kind='interrupt', command='run',
         start_component=('C',), selected_components=[('C',)], started_at=now(),
         hostname=socket.gethostname(), pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=topology.shape_json,
     )
     storage.submit_db_mutation(lambda connection: connection.execute(
         'UPDATE component_reservations SET session_id=? WHERE component_key=?',
@@ -573,6 +615,7 @@ def test_component_settlement_preserves_or_clears_successful_lineage(running_com
         start_component=('C',), selected_components=[('C',)],
         started_at=now(), hostname=socket.gethostname(), pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
+        expected_shape=topology.shape_json,
     )
     lifecycle = 'failed' if mode == 'failed' else 'done'
     if mode in ('new-unstable', 'retained-unstable'):
@@ -581,10 +624,9 @@ def test_component_settlement_preserves_or_clears_successful_lineage(running_com
         ))
     storage.finalize_job_execution('A', 1, generation, execution_id, lifecycle)
     if mode != 'new-unstable':
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET stability='unstable', instability_origin='interrupt-origin' "
-            'WHERE component_key=?', (json.dumps(['A', 'B']),),
-        ))
+        _seed_retained_result(
+            storage, ('A', 'B'), lifecycle='done', stability='unstable', origin='interrupt-origin',
+        )
     stability = None if mode == 'failed' else 'stable' if mode == 'replace-retained' else 'unstable'
     origin = 'interrupt-origin' if stability == 'unstable' else None
     before = _rows(storage)

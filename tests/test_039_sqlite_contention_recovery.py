@@ -30,6 +30,7 @@ def native_claim(tmp_path):
         start_component=('merge',), selected_components=[('merge',)],
         started_at='2026-09-06T12:00:00', hostname='worker.example',
         pid=os.getpid(), process_identity='test-process',
+        expected_shape=snapshot.shape_json,
     )
     storage.reserve_execution_components('checkpoint-owner', expected_shape=snapshot.shape_json)
     storage.create_job(Job(job_id=1, node_name='merge', params={}))

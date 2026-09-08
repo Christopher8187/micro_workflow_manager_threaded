@@ -10,6 +10,7 @@ import networkx as nx
 import pytest
 
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.topology import ComponentTopology
 
 
@@ -20,6 +21,38 @@ def _close(storage):
         assert time.perf_counter() < deadline, 'Mutation writer did not retire'
         time.sleep(0.01)
     storage.close_thread_connection()
+
+
+def _seed_valid_state(
+    storage, component, *, lifecycle, stability, origin, misaligned, generation,
+):
+    key = encode_component_key(component)
+
+    def seed(connection):
+        row = connection.execute(
+            'SELECT shape_id FROM component_states WHERE component_key=?', (key,),
+        ).fetchone()
+        assert row is not None
+        retained = lifecycle in ('sampled', 'done') or (lifecycle == 'running' and stability is not None)
+        if retained:
+            result_lifecycle = lifecycle if lifecycle in ('sampled', 'done') else 'sampled'
+            connection.execute(
+                'INSERT INTO component_successful_results '
+                '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
+                'VALUES(?, ?, ?, ?, ?, ?)',
+                (key, row['shape_id'], generation, result_lifecycle, stability, origin),
+            )
+        connection.execute(
+            'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=?, misaligned=?, '
+            'alignment_generation=?, retained_result_shape_id=?, retained_result_alignment_generation=? '
+            'WHERE component_key=?',
+            (
+                lifecycle, stability, origin, misaligned, generation,
+                row['shape_id'] if retained else None, generation if retained else None, key,
+            ),
+        )
+
+    storage.submit_db_mutation(seed)
 
 
 def test_fresh_component_state_preserves_exact_producing_shape_after_reopen(tmp_path):
@@ -95,10 +128,10 @@ def test_reregistration_preserves_results_and_refuses_missing_state(tmp_path, en
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         storage.register_component_topology(snapshot)
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='done', stability='stable', "
-            "misaligned=1, alignment_generation=7 WHERE component_key='[\"A\"]'"
-        ))
+        _seed_valid_state(
+            storage, ('A',), lifecycle='done', stability='stable', origin=None,
+            misaligned=1, generation=7,
+        )
         saved = storage.get_component_state(('A',))
         assert saved['lifecycle'] == 'done' and saved['stability'] == 'stable'
         assert saved['misaligned'] is True and saved['alignment_generation'] == 7
@@ -113,7 +146,7 @@ def test_reregistration_preserves_results_and_refuses_missing_state(tmp_path, en
     try:
         before = reopened.get_component_state(('B',))
         definition = reopened.get_component_definition(('A',))
-        with pytest.raises(RuntimeError, match='[Ii]ncomplete component state'):
+        with pytest.raises(RuntimeError, match='Component definition has no current state'):
             if entrypoint == 'read':
                 reopened.get_component_state(('A',))
             else:
@@ -133,12 +166,17 @@ def test_reregistration_refuses_missing_definition_without_recreating_history(tm
     try:
         storage.register_component_topology(snapshot)
 
-        def lose_component(connection):
-            connection.execute(
-                "UPDATE component_states SET lifecycle='done', stability='stable', "
-                "misaligned=1, alignment_generation=7"
+        for component in (('A',), ('B',)):
+            _seed_valid_state(
+                storage, component, lifecycle='done', stability='stable', origin=None,
+                misaligned=1, generation=7,
             )
+
+        def lose_component(connection):
             connection.execute('DELETE FROM component_states WHERE component_key=?', ('["A"]',))
+            connection.execute(
+                'DELETE FROM component_successful_results WHERE component_key=?', ('["A"]',),
+            )
             connection.execute('DELETE FROM component_definitions WHERE component_key=?', ('["A"]',))
 
         storage.submit_db_mutation(lose_component)
@@ -172,18 +210,24 @@ def test_reregistration_refuses_extra_definition_outside_producing_partition(tmp
     try:
         storage.register_component_topology(snapshot)
 
-        def add_extra_definition(connection):
-            connection.execute(
-                "UPDATE component_states SET lifecycle='done', stability='stable', "
-                "misaligned=1, alignment_generation=7"
+        for component in (('A',), ('B',)):
+            _seed_valid_state(
+                storage, component, lifecycle='done', stability='stable', origin=None,
+                misaligned=1, generation=7,
             )
+
+        def add_extra_definition(connection):
             connection.execute(
                 'INSERT INTO component_definitions(component_key, shape_id) '
                 'SELECT ?, shape_id FROM graph_shapes WHERE shape_json=?',
                 ('["Extra"]', snapshot.shape_json),
             )
             if extra_has_state:
-                connection.execute('INSERT INTO component_states(component_key) VALUES(?)', ('["Extra"]',))
+                connection.execute(
+                    'INSERT INTO component_states(component_key, shape_id) '
+                    'SELECT ?, shape_id FROM graph_shapes WHERE shape_json=?',
+                    ('["Extra"]', snapshot.shape_json),
+                )
 
         storage.submit_db_mutation(add_extra_definition)
         saved = {members: storage.get_component_state(members) for members in [('A',), ('B',)]}
@@ -266,26 +310,31 @@ def test_component_state_reader_preserves_valid_lineage_and_refuses_damage(
                 session_id, session_kind=kind, command='run', start_component=('A',),
                 selected_components=[('A',)], started_at='2026-09-05T12:00:00+00:00',
                 hostname='worker.example', pid=123, process_identity=session_id,
+                expected_shape=snapshot.shape_json,
             )
         storage.finish_execution_session(
             'int-done', outcome='done', finished_at='2026-09-05T12:01:00+00:00',
         )
-        # Seed later states and damage that this read-only slice cannot create.
-        # The disposable connection alone disables CHECK/FK enforcement.
-        with sqlite3.connect(storage.state_database_path()) as connection:
-            connection.execute('PRAGMA foreign_keys=ON')
-            if not valid:
+        # Seed valid native history through the writer. The disposable
+        # connection alone disables CHECK/FK enforcement for named damage.
+        if valid:
+            _seed_valid_state(
+                storage, ('A',), lifecycle=lifecycle, stability=stability, origin=origin,
+                misaligned=misaligned, generation=generation,
+            )
+        else:
+            with sqlite3.connect(storage.state_database_path()) as connection:
                 connection.execute('PRAGMA ignore_check_constraints=ON')
                 connection.execute('PRAGMA foreign_keys=OFF')
                 if origin in (' ', '\t\r\n', '\u2003'):
                     connection.execute(
                         "UPDATE execution_sessions SET session_id=? WHERE session_id='int-live'", (origin,),
                     )
-            connection.execute(
-                'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=?, '
-                'misaligned=?, alignment_generation=? WHERE component_key=?',
-                (lifecycle, stability, origin, misaligned, generation, '["A"]'),
-            )
+                connection.execute(
+                    'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=?, '
+                    'misaligned=?, alignment_generation=? WHERE component_key=?',
+                    (lifecycle, stability, origin, misaligned, generation, '["A"]'),
+                )
         before = tuple(storage.db_connection().execute(
             'SELECT * FROM component_states WHERE component_key=?', ('["A"]',),
         ).fetchone())
@@ -296,7 +345,12 @@ def test_component_state_reader_preserves_valid_lineage_and_refuses_damage(
                 'misaligned': bool(misaligned), 'alignment_generation': generation,
             }
         else:
-            with pytest.raises(RuntimeError, match='[Ii]nvalid component state'):
+            error = (
+                'Invalid component alignment generation'
+                if type(generation) is not int or generation < 0
+                else '[Ii]nvalid component state'
+            )
+            with pytest.raises(RuntimeError, match=error):
                 storage.get_component_state(('A',))
         assert tuple(storage.db_connection().execute(
             'SELECT * FROM component_states WHERE component_key=?', ('["A"]',),
@@ -329,6 +383,7 @@ def test_component_state_schema_refuses_impossible_result_combinations(
             'int-1', session_kind='interrupt', command='run', start_component=('A',),
             selected_components=[('A',)], started_at='2026-09-05T12:00:00+00:00',
             hostname='worker.example', pid=123, process_identity='instance-1',
+            expected_shape=snapshot.shape_json,
         )
         before = storage.get_component_state(('A',))
         selected_running = (lifecycle, stability, origin, misaligned) == ('running', None, None, 1)
@@ -359,21 +414,30 @@ def test_component_state_keeps_producing_shape_and_separate_split_identities(tmp
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         storage.register_component_topology(merged)
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='done', stability='stable'"
-        ))
+        _seed_valid_state(
+            storage, ('A', 'B'), lifecycle='done', stability='stable', origin=None,
+            misaligned=0, generation=0,
+        )
         result = storage.get_component_state(('A', 'B'))
-        with pytest.raises(RuntimeError, match='different graph shape'):
-            storage.register_component_topology(changed)
+        assert storage.register_component_topology(changed) is True
         assert storage.get_component_state(('A', 'B')) == result
-        assert storage.get_component_state(('C',)) is None
+        assert storage.get_component_state(('C',)) == {
+            'members': ('C',), 'shape_json': changed.shape_json,
+            'lifecycle': 'queued', 'stability': None, 'instability_origin': None,
+            'misaligned': False, 'alignment_generation': 0,
+        }
         assert storage.register_component_topology(split) is True
         for members in [('A',), ('B',)]:
+            assert storage.get_component_definition(members) == {
+                'members': members, 'shape_json': split.shape_json,
+            }
             assert storage.get_component_state(members) == {
                 'members': members, 'shape_json': split.shape_json,
                 'lifecycle': 'queued', 'stability': None, 'instability_origin': None,
                 'misaligned': False, 'alignment_generation': 0,
             }
+            with pytest.raises(RuntimeError, match='differs from the active membership'):
+                storage.read_component_states([members], expected_shape=split.shape_json)
         assert storage.register_component_topology(merged) is False
         assert storage.get_component_state(('A', 'B')) == result
     finally:
@@ -435,7 +499,7 @@ def test_private_version5_component_state_declarations_refuse_silent_upgrade(tmp
             assert modified != declaration, 'The requested declaration damage was not applied'
             connection.execute(modified)
         before = connection.execute('SELECT type,name,sql FROM sqlite_master ORDER BY type,name').fetchall()
-    # Old-version state is opened by a new process. Existing live storage
+    # Damaged current-version state is opened by a new process. Existing live storage
     # instances deliberately cache schema initialization for their process.
     script = '''
 import sys
@@ -445,11 +509,11 @@ try:
 except RuntimeError as error:
     assert 'Incomplete SQLite execution-session schema' in str(error), str(error)
 else:
-    raise AssertionError('Incomplete private version-5 state was accepted')
+    raise AssertionError('Incomplete private version-6 state was accepted')
 '''
     result = subprocess.run([sys.executable, '-c', script, str(tmp_path)],
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
     with sqlite3.connect(database) as connection:
         assert connection.execute('SELECT type,name,sql FROM sqlite_master ORDER BY type,name').fetchall() == before
-        assert connection.execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '5'
+        assert connection.execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '6'

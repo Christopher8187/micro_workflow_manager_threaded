@@ -274,11 +274,30 @@ def test_job_event_append_uses_one_groupable_journal_mutation(tmp_path, monkeypa
     assert json.loads(captured["rows"][0][4]) == {"name": "batched"}
 
 
+def _admit_event_owner(storage):
+    import networkx as nx
+    from micro_workflow_manager.topology import ComponentTopology
+
+    graph = nx.DiGraph()
+    graph.add_node('A')
+    snapshot = ComponentTopology(graph, []).snapshot()
+    storage.register_component_topology(snapshot)
+    storage.create_execution_session(
+        'event-owner', session_kind='main', command='run',
+        start_component=('A',), selected_components=[('A',)],
+        started_at='2026-01-01T00:00:00', hostname='worker.example',
+        pid=os.getpid(), process_identity='event-test-process',
+        expected_shape=snapshot.shape_json,
+    )
+    assert storage.reserve_execution_components('event-owner', expected_shape=snapshot.shape_json)
+
+
 def test_api_job_event_append_can_return_a_future_and_flush_in_order(tmp_path):
     storage = FileStorage(tmp_path)
     storage.create_job(Job(node_name="A", job_id=1, params={}))
+    _admit_event_owner(storage)
     generation, execution_id = storage.claim_job_execution(
-        "A", 1, started_at="2026-01-01T00:00:00"
+        "A", 1, started_at="2026-01-01T00:00:00", session_id='event-owner', component=('A',),
     )
 
     first = storage.append_job_event(
@@ -310,8 +329,9 @@ def test_api_job_event_append_rejects_superseded_execution(tmp_path):
 
     storage = FileStorage(tmp_path)
     storage.create_job(Job(node_name="A", job_id=1, params={}))
+    _admit_event_owner(storage)
     generation, execution_id = storage.claim_job_execution(
-        "A", 1, started_at="2026-01-01T00:00:00"
+        "A", 1, started_at="2026-01-01T00:00:00", session_id='event-owner', component=('A',),
     )
     storage.request_job_restart("A", 1, reason="test")
 
@@ -336,8 +356,9 @@ def test_timeout_event_accepts_only_its_recorded_terminal_owner(tmp_path, status
 
     storage = FileStorage(tmp_path)
     storage.create_job(Job(node_name="A", job_id=1, params={}))
+    _admit_event_owner(storage)
     generation, execution_id = storage.claim_job_execution(
-        "A", 1, started_at="2026-01-01T00:00:00"
+        "A", 1, started_at="2026-01-01T00:00:00", session_id='event-owner', component=('A',),
     )
     storage.finalize_job_execution(
         "A", 1, generation, execution_id, status,
@@ -380,7 +401,10 @@ def test_timeout_event_refuses_damaged_terminal_owner_without_changes(tmp_path, 
 
     storage = FileStorage(tmp_path)
     storage.create_job(Job(node_name="A", job_id=1, params={}))
-    generation, execution_id = storage.claim_job_execution("A", 1, started_at="2026-01-01")
+    _admit_event_owner(storage)
+    generation, execution_id = storage.claim_job_execution(
+        "A", 1, started_at="2026-01-01", session_id='event-owner', component=('A',),
+    )
     storage.finalize_job_execution(
         "A", 1, generation, execution_id, "done",
         generation=generation, execution_id=execution_id,

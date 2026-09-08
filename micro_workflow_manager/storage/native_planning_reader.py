@@ -8,13 +8,19 @@ from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.models import JOB_VALID_STATUSES
 
 from .component_definitions import component_snapshot_from_shape
-from .component_states import read_component_state_snapshot, read_component_states_snapshot
+from .component_states import read_component_state_snapshot
+from .unproduced_membership import read_execution_component_states
 from .execution_sessions import (
     read_execution_sessions_snapshot,
     read_live_execution_sessions_snapshot,
 )
 from .planning_observation import LiveSessionPlanState, NodeJobPlanState
-from .preparation_footprint import read_preparation_footprint_snapshot
+from .preparation_footprint import (
+    read_preparation_footprint_snapshot, _SnapshotPreparationStorage, validate_preparation_snapshot,
+)
+from .component_membership import read_active_component_partition
+from .membership_observation import read_membership_change, membership_needs_fresh_preparation
+from .membership_footprint import read_membership_preparation_footprint
 from .resume_preparation import read_resume_plan_snapshot
 
 
@@ -27,6 +33,11 @@ class NativePlanningReader:
     shape_json: str
 
     def _component_for_node(self, node):
+        active = read_active_component_partition(self.connection)
+        if active is not None:
+            component = next((item.members for item in active.components if node in item.members), None)
+            if component is not None:
+                return component
         snapshot = component_snapshot_from_shape(self.shape_json)
         return next(
             (component for component in snapshot.components if node in component),
@@ -34,7 +45,7 @@ class NativePlanningReader:
         )
 
     def read_component_states(self, components, *, allow_missing: bool):
-        return read_component_states_snapshot(
+        return read_execution_component_states(
             self.connection,
             components,
             expected_shape=self.shape_json,
@@ -52,6 +63,12 @@ class NativePlanningReader:
 
     def read_component_activity(self, components):
         """Validate and describe normal reservation, hold, and pending activity."""
+        nodes = {node for component in components for node in component}
+        active = read_active_component_partition(self.connection)
+        if active is not None:
+            components = tuple(dict.fromkeys((*components, *(
+                item.members for item in active.components if nodes.intersection(item.members)
+            ))))
         sessions = {
             session["session_id"]: session
             for session in read_execution_sessions_snapshot(
@@ -205,8 +222,6 @@ class NativePlanningReader:
             state = read_component_state_snapshot(self.connection, component)
             if reservation is not None and state is None:
                 raise RuntimeError("Damaged reserved receiver component: " + key)
-            if state is not None and state["shape_json"] != self.shape_json:
-                raise RuntimeError("Receiver component belongs to a different graph shape: " + key)
             if reservation is not None or (
                 state is not None and state["lifecycle"] == "running"
             ):
@@ -251,6 +266,18 @@ class NativePlanningReader:
         return tuple(activity)
 
     def read_preparation_footprint(self, components, *, keep_trace: bool):
+        change = read_membership_change(
+            self.connection, component_snapshot_from_shape(self.shape_json), components,
+        )
+        if membership_needs_fresh_preparation(change):
+            storage = _SnapshotPreparationStorage(self.connection, self.project_root)
+            footprint = read_membership_preparation_footprint(
+                storage, change, start_component=components[0], keep_trace=keep_trace,
+            )
+            return validate_preparation_snapshot(
+                storage, self.connection,
+                tuple(dict.fromkeys((*change.source_components, *change.preparation_components))), footprint,
+            )
         return read_preparation_footprint_snapshot(
             self.connection,
             self.project_root,

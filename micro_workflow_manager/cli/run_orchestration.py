@@ -57,6 +57,7 @@ def run_nodes(
     monitor: bool = False,
     monitor_interval: float = 2.0,
     prepare: Callable[[], None] | None = None,
+    fresh_preparation: bool = False,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
 ) -> int:
@@ -86,6 +87,7 @@ def run_nodes(
         start_node=start_node,
         nodes=nodes,
         ordered_components=components,
+        fresh_preparation=fresh_preparation,
         refuse_after_node=refuse_after_node,
         refuse_before_node=refuse_before_node,
         stats=stats,

@@ -27,19 +27,25 @@ class ComponentReservationStorageMixin:
 
     def _reserve_execution_components(self, connection, session_id, expected_shape):
         session = connection.execute(
-            'SELECT status FROM execution_sessions WHERE session_id=?', (session_id,),
+            'SELECT status, admitted_shape_id, partition_revision FROM execution_sessions WHERE session_id=?', (session_id,),
         ).fetchone()
         if session is None or session['status'] != 'running':
             raise RuntimeError('Component reservations require an existing running session: ' + session_id)
         rows = connection.execute(
             'SELECT selected.component_key, shape.shape_json '
             'FROM session_components AS selected '
-            'LEFT JOIN component_definitions AS definition USING(component_key) '
-            'LEFT JOIN graph_shapes AS shape USING(shape_id) '
-            'WHERE selected.session_id=? ORDER BY selected.position', (session_id,),
+            'LEFT JOIN component_definitions AS definition '
+            'ON definition.component_key=selected.component_key AND definition.shape_id=? '
+            'LEFT JOIN graph_shapes AS shape ON shape.shape_id=definition.shape_id '
+            'WHERE selected.session_id=? ORDER BY selected.position', (session['admitted_shape_id'], session_id),
         ).fetchall()
         if not rows or any(row['shape_json'] != expected_shape for row in rows):
             raise RuntimeError('Session scope does not match registered components in the expected graph shape')
+        from .component_membership import read_active_component_partition
+
+        active = read_active_component_partition(connection)
+        if active is None or active.revision != session['partition_revision']:
+            raise RuntimeError('Active component membership changed during admission')
         selected_nodes = {node for row in rows for node in decode_component_key(row['component_key'])}
         for node in sorted(selected_nodes):
             refuse_receiver_mutation(connection, node)

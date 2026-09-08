@@ -26,12 +26,45 @@ def _close(storage):
     storage.close_thread_connection()
 
 
-def _session(storage, session_id, kind, component):
+def _session(storage, session_id, kind, component, snapshot):
     return storage.create_execution_session(
         session_id, session_kind=kind, command='resume', start_component=component,
         selected_components=[component], started_at='2026-09-05T12:00:00+00:00',
         hostname='worker.example', pid=os.getpid(), process_identity=session_id,
+        expected_shape=snapshot.shape_json,
     )
+
+
+def _seed_state(
+    storage, component, *, lifecycle, stability, origin, generation, misaligned=0,
+):
+    key = encode_component_key(component)
+
+    def seed(connection):
+        row = connection.execute(
+            'SELECT shape_id FROM component_states WHERE component_key=?', (key,),
+        ).fetchone()
+        assert row is not None
+        retained = lifecycle in ('sampled', 'done') or (lifecycle == 'running' and stability is not None)
+        if retained:
+            result_lifecycle = lifecycle if lifecycle in ('sampled', 'done') else 'sampled'
+            connection.execute(
+                'INSERT INTO component_successful_results '
+                '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
+                'VALUES(?, ?, ?, ?, ?, ?)',
+                (key, row['shape_id'], generation, result_lifecycle, stability, origin),
+            )
+        connection.execute(
+            'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=?, misaligned=?, '
+            'alignment_generation=?, retained_result_shape_id=?, retained_result_alignment_generation=? '
+            'WHERE component_key=?',
+            (
+                lifecycle, stability, origin, misaligned, generation,
+                row['shape_id'] if retained else None, generation if retained else None, key,
+            ),
+        )
+
+    storage.submit_db_mutation(seed)
 
 
 def _stored_rows(storage):
@@ -51,18 +84,18 @@ def test_running_component_failure_clears_lineage_and_preserves_ownership_after_
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         assert storage.register_component_topology(snapshot) is True
-        _session(storage, 'int-origin', 'interrupt', component)
+        _session(storage, 'int-origin', 'interrupt', component, snapshot)
         assert storage.finish_execution_session(
             'int-origin', outcome='done', finished_at='2026-09-05T12:01:00+00:00',
         ) is True
         key = encode_component_key(component)
         # Seed a retained lineage on the running state to isolate the generic
         # failure transition from sampled-resume session settlement.
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='running', stability='unstable', "
-            "instability_origin='int-origin', alignment_generation=7 WHERE component_key=?", (key,),
-        ).rowcount) == 1
-        owner = _session(storage, 'main-failure', 'main', component)
+        _seed_state(
+            storage, component, lifecycle='running', stability='unstable', origin='int-origin',
+            generation=7,
+        )
+        owner = _session(storage, 'main-failure', 'main', component, snapshot)
         assert (owner['session_kind'], owner['status']) == ('main', 'running')
         assert storage.reserve_execution_components(
             'main-failure', expected_shape=snapshot.shape_json,
@@ -151,7 +184,7 @@ def test_running_component_failure_clears_lineage_and_preserves_ownership_after_
 def _running_component(storage):
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage.register_component_topology(snapshot)
-    _session(storage, 'main-failure', 'main', ('A',))
+    _session(storage, 'main-failure', 'main', ('A',), snapshot)
     assert storage.reserve_execution_components('main-failure', expected_shape=snapshot.shape_json) is True
     # Public fresh activation is not present; seed only its owned running state.
     assert storage.submit_db_mutation(lambda connection: connection.execute(
@@ -184,7 +217,7 @@ def test_running_component_failure_requires_current_session_ownership(tmp_path, 
         elif ownership in ('no-reservation', 'other-owner'):
             assert storage.release_execution_components(actor) == 1
             if ownership == 'other-owner':
-                _session(storage, 'other-owner', 'interrupt', ('A',))
+                _session(storage, 'other-owner', 'interrupt', ('A',), snapshot)
                 assert storage.reserve_execution_components(
                     'other-owner', expected_shape=snapshot.shape_json,
                 ) is True
@@ -224,18 +257,11 @@ def test_running_component_failure_requires_current_shape_and_aligned_running_st
         if different_shape:
             expected_shape = ComponentTopology(nx.DiGraph([('A', 'C')]), []).snapshot().shape_json
             assert expected_shape != snapshot.shape_json
-        connection = sqlite3.connect(storage.state_database_path())
-        try:
-            # Misaligned running is damaged state and must not be repaired by failure publication.
-            connection.execute('PRAGMA ignore_check_constraints=ON')
-            assert connection.execute(
-                'UPDATE component_states SET lifecycle=?, stability=?, misaligned=?, '
-                'alignment_generation=? WHERE component_key=?',
-                (lifecycle, stability, misaligned, generation, encode_component_key(('A',))),
-            ).rowcount == 1
-            connection.commit()
-        finally:
-            connection.close()
+        # Misaligned running is damaged state and must not be repaired by failure publication.
+        _seed_state(
+            storage, ('A',), lifecycle=lifecycle, stability=stability, origin=None,
+            misaligned=misaligned, generation=generation,
+        )
         before = _stored_rows(storage)
 
         with pytest.raises(RuntimeError):
@@ -289,15 +315,14 @@ def test_running_component_failure_clears_each_valid_lineage_and_refuses_repeat(
         snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
         storage.register_component_topology(snapshot)
         if origin is not None:
-            _session(storage, origin, 'interrupt', ('A',))
+            _session(storage, origin, 'interrupt', ('A',), snapshot)
             assert storage.get_execution_session(origin)['status'] == 'running'
-        _session(storage, 'failing-owner', actor_kind, ('A',))
+        _session(storage, 'failing-owner', actor_kind, ('A',), snapshot)
         assert storage.reserve_execution_components('failing-owner', expected_shape=snapshot.shape_json) is True
         key = encode_component_key(('A',))
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='running', stability=?, instability_origin=?, "
-            'alignment_generation=7 WHERE component_key=?', (stability, origin, key),
-        ).rowcount) == 1
+        _seed_state(
+            storage, ('A',), lifecycle='running', stability=stability, origin=origin, generation=7,
+        )
         before = storage.get_component_state(('A',))
         expected_rows = _stored_rows(storage)
         matching = [row for row in expected_rows['component_states'] if row['component_key'] == key]
@@ -330,12 +355,12 @@ def test_running_component_failure_refuses_damaged_records_without_repair(tmp_pa
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         snapshot = _running_component(storage)
-        _session(storage, 'int-origin', 'interrupt', ('A',))
+        _session(storage, 'int-origin', 'interrupt', ('A',), snapshot)
         key = encode_component_key(('A',))
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET stability='unstable', instability_origin='int-origin' "
-            'WHERE component_key=?', (key,),
-        ).rowcount) == 1
+        _seed_state(
+            storage, ('A',), lifecycle='running', stability='unstable', origin='int-origin',
+            generation=7,
+        )
         connection = sqlite3.connect(storage.state_database_path())
         try:
             connection.execute('PRAGMA foreign_keys=OFF')
@@ -431,7 +456,7 @@ def test_running_component_failure_rechecks_after_waiting_for_its_transaction(
     awaiting_transaction, proceed = Event(), Event()
     try:
         snapshot = _running_component(storage)
-        _session(storage, 'next-owner', 'interrupt', ('A',))
+        _session(storage, 'next-owner', 'interrupt', ('A',), snapshot)
         original_transaction = storage.db_transaction
 
         @contextmanager
@@ -520,24 +545,16 @@ def test_completion_and_failure_compete_for_one_terminal_result_without_overwrit
         component = ('A',)
         snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
         storage.register_component_topology(snapshot)
-        _session(storage, 'int-origin', 'interrupt', component)
-        _session(storage, 'main-failure', 'main', component)
+        _session(storage, 'int-origin', 'interrupt', component, snapshot)
+        _session(storage, 'main-failure', 'main', component, snapshot)
         assert storage.reserve_execution_components(
             'main-failure', expected_shape=snapshot.shape_json,
         ) is True
         key = encode_component_key(('A',))
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='sampled', stability='unstable', "
-            "instability_origin='int-origin', "
-            'alignment_generation=7 '
-            'WHERE component_key=?', (key,),
-        ).rowcount) == 1
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            'INSERT INTO component_successful_results '
-            '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
-            "SELECT component_key, shape_id, 7, 'sampled', 'unstable', 'int-origin' "
-            'FROM component_definitions WHERE component_key=?', (key,),
-        ).rowcount) == 1
+        _seed_state(
+            storage, component, lifecycle='sampled', stability='unstable', origin='int-origin',
+            generation=7,
+        )
         assert storage.begin_sampled_component_execution(
             'main-failure', component, expected_shape=snapshot.shape_json,
             expected_alignment_generation=7, successful_lineage=('unstable', 'int-origin'),
@@ -632,6 +649,6 @@ def test_running_component_failure_refuses_missing_native_session_and_preserves_
         assert output.read_bytes() == b'established output'
         assert storage.db_connection().execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone()[0] == '5'
+        ).fetchone()[0] == '6'
     finally:
         _close(storage)

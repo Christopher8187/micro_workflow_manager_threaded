@@ -44,9 +44,12 @@ class JobExecutionOwnerStorageMixin:
         row = connection.execute(
             'SELECT owner.*, shape.shape_json AS producing_shape, '
             'creator.execution_id AS creator_execution_id, '
-            'session.session_id AS owner_session, selected.session_id AS selected_session '
+            'session.session_id AS owner_session, selected.session_id AS selected_session, '
+            'session.admitted_shape_id AS owner_admitted_shape, definition.shape_id AS definition_shape_id '
             'FROM job_execution_owners AS owner '
             'LEFT JOIN graph_shapes AS shape USING(shape_id) '
+            'LEFT JOIN component_definitions AS definition '
+            'ON definition.component_key=owner.component_key AND definition.shape_id=owner.shape_id '
             'LEFT JOIN job_execution_owners AS creator ON creator.execution_id=owner.created_by_execution_id '
             'LEFT JOIN execution_sessions AS session ON session.session_id=owner.session_id '
             'LEFT JOIN session_components AS selected '
@@ -57,7 +60,9 @@ class JobExecutionOwnerStorageMixin:
 
     @staticmethod
     def _execution_owner_from_row(row):
-        if row['owner_session'] != row['session_id'] or row['selected_session'] != row['session_id']:
+        if (row['owner_session'] != row['session_id'] or row['selected_session'] != row['session_id']
+                or row['owner_admitted_shape'] != row['shape_id']
+                or row['definition_shape_id'] != row['shape_id']):
             raise RuntimeError('Execution producing component is outside its recorded session')
         try:
             component = decode_component_key(row['component_key'])
@@ -175,6 +180,7 @@ class JobExecutionOwnerStorageMixin:
             'instance_creator.execution_id AS instance_creator_execution_id, '
             'o.*, s.session_id AS owner_session, creator.execution_id AS creator_execution_id, '
             'shape.shape_json AS producing_shape, '
+            's.admitted_shape_id AS owner_admitted_shape, definition.shape_id AS definition_shape_id, '
             'selected.session_id AS selected_session, '
             's.session_kind AS owner_session_kind, s.status AS owner_session_status, '
             's.parent_session_id AS owner_parent_session, s.outcome AS owner_session_outcome, '
@@ -185,6 +191,8 @@ class JobExecutionOwnerStorageMixin:
             'LEFT JOIN job_execution_owners AS o '
             'ON o.execution_id=COALESCE(j.active_execution_id, i.last_execution_id) '
             'LEFT JOIN graph_shapes AS shape ON shape.shape_id=o.shape_id '
+            'LEFT JOIN component_definitions AS definition '
+            'ON definition.component_key=o.component_key AND definition.shape_id=o.shape_id '
             'LEFT JOIN job_execution_owners AS creator ON creator.execution_id=o.created_by_execution_id '
             'LEFT JOIN job_execution_owners AS instance_creator '
             'ON instance_creator.execution_id=i.created_by_execution_id '

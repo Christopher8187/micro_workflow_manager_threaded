@@ -26,6 +26,7 @@ def _start_native_session(workflow, session_id, component):
         hostname=socket.gethostname(),
         pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
+        expected_shape=snapshot.shape_json,
     )
     storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
 

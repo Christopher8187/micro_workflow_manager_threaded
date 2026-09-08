@@ -43,6 +43,7 @@ def workflow(tmp_path, monkeypatch):
             session_id, session_kind=kind, command='run', start_component=component,
             selected_components=[component], started_at=now(), hostname=socket.gethostname(),
             pid=os.getpid(), process_identity=process_identity(os.getpid()),
+            expected_shape=workflow.topology.snapshot().shape_json,
         )
         storage.reserve_execution_components(session_id, expected_shape=workflow.topology.snapshot().shape_json)
     try:
@@ -892,6 +893,7 @@ def test_restart_refuses_the_entire_selection_when_one_job_has_another_last_owne
         'earlier-interrupt', session_kind='interrupt', command='run', start_component=('A', 'B'),
         selected_components=[('A', 'B')], started_at=now(), hostname=socket.gethostname(),
         pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=workflow.topology.snapshot().shape_json,
     )
     storage.release_execution_components('job-interrupt')
     storage.reserve_execution_components('earlier-interrupt', expected_shape=workflow.topology.snapshot().shape_json)

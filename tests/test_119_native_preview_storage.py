@@ -158,6 +158,7 @@ def test_native_preview_reports_abandoned_session_and_recovery_without_mutation(
         pid=99999999,
         process_identity='dead-preview-process',
         details={'start_node': 'A'},
+        expected_shape=workflow.topology.snapshot().shape_json,
     )
     storage.reserve_execution_components(
         session_id, expected_shape=workflow.topology.snapshot().shape_json,

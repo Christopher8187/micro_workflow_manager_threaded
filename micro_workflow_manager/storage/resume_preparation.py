@@ -13,17 +13,20 @@ from .preparation_files import stage_preparation_files
 from .preparation_guards import refuse_receiver_mutation
 from .preparation_receipts import PreparationReceipt, submit_preparation_decision
 from .preparation_footprint import _SnapshotPreparationStorage
+from .unproduced_membership import read_execution_component_states, read_unproduced_component_states
+from .component_result_identity import (
+    SuccessfulResultObservation,
+    observe_current_success,
+    read_admitted_component_shape,
+    read_component_state_record,
+)
 
 
-def _read_resume_successful_result(storage, connection, component, state):
-    identity = storage._read_component_producing_identity(connection, component)
-    if state['lifecycle'] in ('sampled', 'done'):
-        current = tuple(state[name] for name in ('lifecycle', 'stability', 'instability_origin'))
-        return storage._match_component_successful_result(connection, component, identity, current)
-    retained = storage._read_component_successful_result(connection, component, identity)
-    if state['lifecycle'] == 'queued' and retained is not None:
-        raise RuntimeError('Queued component unexpectedly retains success at its current alignment')
-    return retained
+def _read_resume_successful_result(connection, component, state):
+    recorded = read_component_state_record(connection, component)
+    if recorded is None or recorded.snapshot != state:
+        raise RuntimeError('Component changed during retained-result observation')
+    return observe_current_success(connection, recorded)
 
 
 def _validate_resume_job(storage, connection, node, job, component):
@@ -50,17 +53,27 @@ def _validate_resume_job(storage, connection, node, job, component):
         raise RuntimeError(f'Resume cannot change active job {node}/{job.job_id}')
 
 
-def validate_resume_job_owners(storage, states):
+def validate_resume_job_owners(storage, states, *, expected_shape):
     """Reject damaged or incompatible abandoned work before admitting a session."""
+    from .component_definitions import component_snapshot_from_shape
+
     connection = storage.db_connection()
     connection.execute('SAVEPOINT mwf_resume_owner_observation')
     try:
+        observed = read_execution_component_states(
+            connection, states, expected_shape=expected_shape,
+        )
+        if observed != states:
+            raise RuntimeError('Component changed during resume preflight')
+        projected = read_unproduced_component_states(
+            connection, component_snapshot_from_shape(expected_shape),
+        )
         successful_results = {}
         for component, state in states.items():
-            if storage._read_component_state(connection, component) != state:
-                raise RuntimeError('Component changed during resume preflight: ' + repr(component))
-            successful_results[component] = _read_resume_successful_result(
-                storage, connection, component, state,
+            successful_results[component] = (
+                None if component in projected else _read_resume_successful_result(
+                    connection, component, state,
+                )
             )
             for node in component:
                 for job in _read_jobs(connection, node):
@@ -106,7 +119,6 @@ def read_resume_plan_snapshot(
     connection, project_root, components, states, *, expected_shape,
 ):
     """Validate and summarize resume work without recovering or requeueing it."""
-    from .component_states import read_component_states_snapshot
     from .planning_observation import ResumeJobEffect, ResumePlanEffects
     from .preparation_guards import refuse_receiver_mutation
 
@@ -114,7 +126,7 @@ def read_resume_plan_snapshot(
     expected = {tuple(component): dict(state) for component, state in states.items()}
     if set(expected) != set(components):
         raise ValueError('Resume plan states must match its selected components')
-    observed = read_component_states_snapshot(
+    observed = read_execution_component_states(
         connection, components, expected_shape=expected_shape,
     )
     if observed != expected:
@@ -122,7 +134,9 @@ def read_resume_plan_snapshot(
     storage = _SnapshotResumeStorage(connection, project_root)
     connection.execute('SAVEPOINT mwf_resume_plan')
     try:
-        successful_results = validate_resume_job_owners(storage, expected)
+        successful_results = validate_resume_job_owners(
+            storage, expected, expected_shape=expected_shape,
+        )
         jobs = []
         for component in components:
             key = encode_component_key(component)
@@ -174,10 +188,11 @@ def _read_finished_outputs(storage, captured):
 
 def prepare_resume_components(
     storage, session_id, expected_states, *, expected_parents=None,
-    expected_successful_results=None, clear_trace_nodes=(),
+    expected_successful_results=None, expected_admitted_shape, clear_trace_nodes=(),
 ):
     storage._require_execution_session_storage()
     storage._session_text(session_id, 'session_id')
+    storage._session_text(expected_admitted_shape, 'expected_admitted_shape')
     expected = {storage._session_component(component): dict(state) for component, state in expected_states.items()}
     if not expected:
         raise ValueError('Resume requires a nonempty component selection')
@@ -192,29 +207,27 @@ def prepare_resume_components(
     retained_results = None
     if expected_successful_results is not None:
         retained_results = {
-            storage._session_component(component): None if result is None else tuple(result)
+            storage._session_component(component): result
             for component, result in expected_successful_results.items()
         }
         if set(retained_results) != set(expected):
             raise ValueError('Resume successful-result observations must match selected components')
+        if any(result is not None and not isinstance(result, SuccessfulResultObservation)
+               for result in retained_results.values()):
+            raise ValueError('Resume requires exact successful-result observations')
 
     def validate(connection, *, initial=False):
         for component, state in expected.items():
             key = encode_component_key(component)
-            owner = connection.execute(
-                'SELECT session.status, selected.component_key, reservation.session_id AS owner '
-                'FROM execution_sessions AS session LEFT JOIN session_components AS selected '
-                'ON selected.session_id=session.session_id AND selected.component_key=? '
-                'LEFT JOIN component_reservations AS reservation ON reservation.component_key=? '
-                'WHERE session.session_id=?', (key, key, session_id),
-            ).fetchone()
-            if (owner is None or owner['status'] != 'running' or owner['component_key'] is None
-                    or owner['owner'] != session_id or storage._read_session_job_roots(connection, session_id)):
+            read_admitted_component_shape(
+                connection, session_id, component, expected_admitted_shape,
+            )
+            if storage._read_session_job_roots(connection, session_id):
                 raise RuntimeError('Resume requires its exact full component owner and reservation: ' + key)
             current = storage._read_component_state(connection, component)
             if current != state or current['misaligned'] or current['lifecycle'] == 'running':
                 raise RuntimeError('Component changed before resume preparation: ' + repr(component))
-            retained = _read_resume_successful_result(storage, connection, component, current)
+            retained = _read_resume_successful_result(connection, component, current)
             if retained_results is not None and retained_results[component] != retained:
                 raise RuntimeError('Retained component result changed before resume preparation')
             if retained_results is None:
@@ -294,15 +307,29 @@ def prepare_resume_components(
         for component, state in expected.items():
             if state['lifecycle'] == 'failed':
                 retained = (observed_results if retained_results is None else retained_results)[component]
-                restored = retained if retained is not None and retained[0] == 'sampled' else None
+                restored = retained if retained is not None and retained.lifecycle == 'sampled' else None
+                retained_identity = None if retained is None else retained.identity
+                current_record = read_component_state_record(connection, component)
+                if current_record is None or current_record.snapshot != state:
+                    raise RuntimeError('Component changed before resume: ' + repr(component))
+                next_pointer = retained_identity if restored is not None else None
                 changed = connection.execute(
-                    'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=? '
+                    'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=?, '
+                    'retained_result_shape_id=?, retained_result_alignment_generation=? '
                     "WHERE component_key=? AND lifecycle='failed' "
-                    'AND misaligned=0 AND alignment_generation=? AND stability IS NULL AND instability_origin IS NULL',
-                    (restored[0] if restored is not None else 'queued',
-                     restored[1] if restored is not None else None,
-                     restored[2] if restored is not None else None,
-                     encode_component_key(component), state['alignment_generation']),
+                    'AND shape_id=? AND misaligned=0 AND alignment_generation=? '
+                    'AND stability IS NULL AND instability_origin IS NULL '
+                    'AND retained_result_shape_id IS ? AND retained_result_alignment_generation IS ?',
+                    (restored.lifecycle if restored is not None else 'queued',
+                     restored.stability if restored is not None else None,
+                     restored.instability_origin if restored is not None else None,
+                     None if next_pointer is None else next_pointer.shape_id,
+                     None if next_pointer is None else next_pointer.alignment_generation,
+                     encode_component_key(component),
+                     current_record.identity.shape_id,
+                     state['alignment_generation'],
+                     None if retained_identity is None else retained_identity.shape_id,
+                     None if retained_identity is None else retained_identity.alignment_generation),
                 ).rowcount
                 if changed != 1:
                     raise RuntimeError('Component changed before resume: ' + repr(component))

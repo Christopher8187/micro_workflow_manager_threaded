@@ -44,6 +44,7 @@ def _create_live_session(storage, shape, component, *, session_id):
         hostname=socket.gethostname(),
         pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
+        expected_shape=shape,
     )
     storage.reserve_execution_components(session_id, expected_shape=shape)
 

@@ -5,6 +5,8 @@ from micro_workflow_manager.component_identity import encode_component_key
 
 def read_selected_execution_jobs(storage, context, roots, expected_identity, *, connection=None):
     """Read the current invocation's exact roots and causal jobs in one snapshot."""
+    from .component_states import read_component_states_snapshot
+
     session_id, ownership, shape = context
     component = ownership[roots[0][0]]
     connection = storage.db_connection() if connection is None else connection
@@ -18,9 +20,11 @@ def read_selected_execution_jobs(storage, context, roots, expected_identity, *, 
             'SELECT session_id FROM component_reservations WHERE component_key=?',
             (encode_component_key(component),),
         ).fetchone()
-        state = storage._read_component_state(connection, component)
+        state = read_component_states_snapshot(
+            connection, (component,), expected_shape=shape, allow_missing=False,
+        )[component]
         if (session is None or session['status'] != 'running' or reservation is None
-                or reservation['session_id'] != session_id or state is None or state['shape_json'] != shape):
+                or reservation['session_id'] != session_id or state is None):
             raise RuntimeError('Selected execution no longer owns its captured component')
         identity = storage._read_component_producing_identity(connection, component)
         if identity != expected_identity:

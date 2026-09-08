@@ -3,7 +3,7 @@
 import pytest
 
 from micro_workflow_manager import cli
-from micro_workflow_manager.component_identity import encode_component_key
+from tests.test_076_component_state_transitions import _seed_state
 from tests.test_064_read_only_previews import (
     _close_without_sidecars, _initialize_native_project,
     _install_import_sentinels, _snapshot, _wait_restart_listener_retired,
@@ -29,10 +29,9 @@ def test_graph_command_previews_display_native_external_prerequisites(
     workflow = _initialize_native_project(tmp_path, monkeypatch, edges=edges)
     storage = workflow.storage
     if native_status == 'done':
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='done', stability='stable' WHERE component_key=?",
-            (encode_component_key(('P',)),),
-        ).rowcount) == 1
+        _seed_state(
+            storage, ('P',), lifecycle='done', stability='stable', origin=None, generation=0,
+        )
     storage.set_node_status('P', raw_status)
     assert storage.get_component_state(('P',))['lifecycle'] == native_status
     assert storage.get_node_status('P') == raw_status

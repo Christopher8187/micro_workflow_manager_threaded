@@ -26,6 +26,7 @@ def test_output_backed_terminal_reconciliation_is_idempotent(tmp_path, request):
         session_id, session_kind='main', command='run', start_component=('A',),
         selected_components=[('A',)], started_at=now(), hostname=socket.gethostname(),
         pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=snapshot.shape_json,
     )
     storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
     storage.create_job(Job(node_name="A", job_id=1, params={}))
@@ -101,6 +102,7 @@ def test_grouped_terminal_submissions_have_one_durable_result(tmp_path, monkeypa
         session_id, session_kind='main', command='run', start_component=('A',),
         selected_components=[('A',)], started_at=now(), hostname=socket.gethostname(),
         pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=snapshot.shape_json,
     )
     storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
     storage.create_job(Job(node_name='A', job_id=1, params={}))

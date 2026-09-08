@@ -3,7 +3,41 @@ from __future__ import annotations
 import pytest
 
 from micro_workflow_manager import MicroWorkflow
+from micro_workflow_manager.component_identity import encode_component_key
 from tests.test_090_component_session_settlement import _close
+
+
+def _replace_done_result_with_sampled(storage, component):
+    key = encode_component_key(component)
+
+    def replace(connection):
+        state = connection.execute(
+            'SELECT lifecycle, stability, instability_origin, shape_id, alignment_generation, '
+            'retained_result_shape_id, retained_result_alignment_generation '
+            'FROM component_states WHERE component_key=?', (key,),
+        ).fetchone()
+        assert state is not None
+        assert (state['lifecycle'], state['stability'], state['instability_origin']) == (
+            'done', 'stable', None,
+        )
+        assert (
+            state['retained_result_shape_id'], state['retained_result_alignment_generation'],
+        ) == (state['shape_id'], state['alignment_generation'])
+        result = connection.execute(
+            "UPDATE component_successful_results SET lifecycle='sampled' "
+            "WHERE component_key=? AND shape_id=? AND alignment_generation=? "
+            "AND lifecycle='done' AND stability='stable' AND instability_origin IS NULL",
+            (key, state['shape_id'], state['alignment_generation']),
+        ).rowcount
+        current = connection.execute(
+            "UPDATE component_states SET lifecycle='sampled' "
+            "WHERE component_key=? AND shape_id=? AND alignment_generation=? "
+            "AND lifecycle='done' AND stability='stable' AND instability_origin IS NULL",
+            (key, state['shape_id'], state['alignment_generation']),
+        ).rowcount
+        assert (result, current) == (1, 1)
+
+    storage.submit_db_mutation(replace)
 
 
 @pytest.mark.parametrize('operation', ['auto', 'explicit', 'prepared'])
@@ -877,10 +911,7 @@ def test_job_arrival_keeps_terminal_result_and_full_preparation_repairs_alignmen
             assert str(caught.value.__cause__) == 'receiver failure'
         else:
             workflow.run_node('B')
-            # Native sampled-result fixture; public sampling is a later increment.
-            storage.submit_db_mutation(lambda connection: connection.execute(
-                "UPDATE component_states SET lifecycle='sampled' WHERE component_key='[\"B\"]'"
-            ))
+            _replace_done_result_with_sampled(storage, ('B',))
         before = storage.get_component_state(('B',))
         control = storage.read_job_control('B', 1)
         output = storage.output_file('B', 1).read_bytes()
@@ -1046,12 +1077,15 @@ def test_job_arrival_refuses_changed_current_shape_before_mutation(tmp_path, ope
     workflow.start('B', value='established result')
     try:
         workflow.run()
-        workflow.graph([('B', 'A'), ('A', 'C')])
+        # The original B -> A topology has singleton components. Adding the
+        # reverse edge changes B's actual component to {A, B}; an unrelated
+        # global DAG change would correctly retain B's singleton membership.
+        workflow.graph([('A', 'B')])
         before = _rows(storage)
         files = {path.relative_to(tmp_path): path.read_bytes()
                  for path in (tmp_path / 'node').rglob('*') if path.is_file()}
 
-        with pytest.raises(RuntimeError, match='shape'):
+        with pytest.raises(RuntimeError, match='membership|preparation'):
             if operation == 'auto':
                 workflow.start('B', value='new work')
             elif operation == 'explicit':

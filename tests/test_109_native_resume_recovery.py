@@ -307,8 +307,8 @@ def test_resume_refuses_terminal_owner_from_prior_component_shape(tmp_path, requ
     def must_not_run(ctx):
         raise AssertionError("resume admitted work from a prior component shape")
 
-    # Establish the changed topology before the public pre-admission check.
-    # The old and new component keys differ, so both are valid stored history.
+    # Registration records the new definition but preserves active membership
+    # while the prior component still owns reusable work.
     storage.register_component_topology(current.topology.snapshot())
     before_rows = _rows(storage)
     before_files = _node_files(tmp_path)
@@ -317,8 +317,7 @@ def test_resume_refuses_terminal_owner_from_prior_component_shape(tmp_path, requ
     with pytest.raises(RuntimeError) as caught:
         resume_node(tmp_path, current, "A")
 
-    message = str(caught.value).lower()
-    assert "owner" in message and ("component" in message or "shape" in message)
+    assert str(caught.value) == "Resume requires initialized component ('A', 'B')"
     assert _rows(storage) == before_rows
     assert _node_files(tmp_path) == before_files
     assert storage.list_execution_sessions() == before_sessions
@@ -455,8 +454,9 @@ def test_resume_refuses_terminal_owner_from_prior_component_membership(
     before_files = _node_files(tmp_path)
     before_sessions = storage.list_execution_sessions()
 
-    with pytest.raises(RuntimeError, match="owner.*component|component.*owner"):
+    with pytest.raises(RuntimeError) as caught:
         resume_node(tmp_path, current, "A")
+    assert str(caught.value) == "Resume requires initialized component ('A', 'B')"
 
     assert _rows(storage) == before_rows
     assert _node_files(tmp_path) == before_files

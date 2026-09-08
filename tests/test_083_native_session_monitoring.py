@@ -28,7 +28,7 @@ def _close(storage):
     storage.close_database_connections()
 
 
-def _session(storage, session_id, kind, component, parent=None, hostname=None):
+def _session(storage, session_id, kind, component, expected_shape, parent=None, hostname=None):
     return storage.create_execution_session(
         session_id, session_kind=kind, command='run' if kind == 'main' else 'interrupt',
         start_component=component, selected_components=[component],
@@ -36,6 +36,7 @@ def _session(storage, session_id, kind, component, parent=None, hostname=None):
         parent_session_id=parent, started_at=now(), hostname=hostname or socket.gethostname(),
         pid=os.getpid(), process_identity=process_identity(os.getpid()),
         details={'start_node': component[0]},
+        expected_shape=expected_shape,
     )
 
 
@@ -46,11 +47,12 @@ def test_monitoring_lists_exact_native_main_interrupts_and_history(tmp_path, mon
     storage = workflow.storage
     storage.create_job(Job(node_name='A', job_id=1, params={'value': 7}))
     storage.register_component_topology(workflow.topology.snapshot())
-    _session(storage, 'finished-main', 'main', ('A', 'B'))
+    expected_shape = workflow.topology.snapshot().shape_json
+    _session(storage, 'finished-main', 'main', ('A', 'B'), expected_shape)
     storage.finish_execution_session('finished-main', outcome='done', finished_at=now())
-    _session(storage, 'current-main', 'main', ('A', 'B'))
-    _session(storage, 'first-interrupt', 'interrupt', ('C', 'D'), parent='current-main')
-    _session(storage, 'second-interrupt', 'interrupt', ('E', 'F'))
+    _session(storage, 'current-main', 'main', ('A', 'B'), expected_shape)
+    _session(storage, 'first-interrupt', 'interrupt', ('C', 'D'), expected_shape, parent='current-main')
+    _session(storage, 'second-interrupt', 'interrupt', ('E', 'F'), expected_shape)
     for session_id in ('current-main', 'first-interrupt', 'second-interrupt'):
         storage.reserve_execution_components(session_id, expected_shape=workflow.topology.snapshot().shape_json)
     before_sessions = storage.list_execution_sessions()
@@ -89,7 +91,12 @@ def test_top_does_not_attribute_local_process_metrics_to_a_foreign_session(tmp_p
 
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
-    _session(workflow.storage, 'foreign-interrupt', 'interrupt', ('A',), hostname='other-mwf-host')
+    snapshot = workflow.topology.snapshot()
+    workflow.storage.register_component_topology(snapshot)
+    _session(
+        workflow.storage, 'foreign-interrupt', 'interrupt', ('A',), snapshot.shape_json,
+        hostname='other-mwf-host',
+    )
 
     def reject_local_probe(pid):
         raise AssertionError('A foreign session was attributed to a local process')
@@ -113,7 +120,9 @@ def test_top_does_not_assign_process_metrics_without_current_session_identity(tm
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
     storage = workflow.storage
-    _session(storage, 'uncertain-session', 'interrupt', ('A',))
+    snapshot = workflow.topology.snapshot()
+    storage.register_component_topology(snapshot)
+    _session(storage, 'uncertain-session', 'interrupt', ('A',), snapshot.shape_json)
     if state == 'finished':
         storage.finish_execution_session('uncertain-session', outcome='done', finished_at=now())
     else:
@@ -141,11 +150,14 @@ def test_top_does_not_assign_process_metrics_without_current_session_identity(tm
 def test_monitoring_renders_native_timezone_aware_session_times(tmp_path, view):
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
+    snapshot = workflow.topology.snapshot()
+    workflow.storage.register_component_topology(snapshot)
     workflow.storage.create_execution_session(
         'aware-session', session_kind='interrupt', command='interrupt',
         start_component=('A',), selected_components=[('A',)],
         started_at=datetime.now(timezone.utc).isoformat(),
         hostname=socket.gethostname(), pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=snapshot.shape_json,
     )
     try:
         snapshot = workflow_snapshot(workflow) if view == 'monitor' else top_snapshot(workflow, ['A'])
@@ -170,10 +182,13 @@ def test_top_observes_writer_of_verified_session_in_another_local_process(tmp_pa
         workflow = MicroWorkflow(root, runner='direct', persist_graph=False)
         workflow.graph([('A', 'B')])
         storage = workflow.storage
+        snapshot = workflow.topology.snapshot()
+        storage.register_component_topology(snapshot)
         storage.create_execution_session(
             'child-session', session_kind='interrupt', command='interrupt',
             start_component=('A',), selected_components=[('A',)], started_at=now(),
             hostname=socket.gethostname(), pid=os.getpid(), process_identity=process_identity(os.getpid()),
+            expected_shape=snapshot.shape_json,
         )
         storage.create_job(Job(node_name='A', job_id=1, params={'value': 9}))
         storage.db_mutation_barrier()
@@ -242,6 +257,8 @@ def test_top_observes_writer_of_verified_session_in_another_local_process(tmp_pa
 def test_top_renders_recorded_api_settings_for_each_native_session(tmp_path):
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
+    snapshot = workflow.topology.snapshot()
+    workflow.storage.register_component_topology(snapshot)
     workflow.storage.create_execution_session(
         'settings-session', session_kind='interrupt', command='interrupt',
         start_component=('A',), selected_components=[('A',)], started_at=now(),
@@ -251,6 +268,7 @@ def test_top_renders_recorded_api_settings_for_each_native_session(tmp_path):
             'api_max_admission_burst': '768', 'api_admission_target_rounds': '5',
             'api_claim_transaction_rows': '64',
         },
+        expected_shape=snapshot.shape_json,
     )
     try:
         text = render_top(top_snapshot(workflow, ['A']))

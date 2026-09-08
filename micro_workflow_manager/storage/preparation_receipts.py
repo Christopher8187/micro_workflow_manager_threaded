@@ -24,7 +24,7 @@ def submit_preparation_decision(storage, operation):
 
 
 class PreparationReceipt:
-    def __init__(self, storage, guard_id, operation, component, session_id, validate, effects):
+    def __init__(self, storage, guard_id, operation, component, session_id, validate, effects, *, membership=None):
         self.storage = storage
         self.operation_id = uuid4().hex
         self.guard_id = guard_id
@@ -33,6 +33,7 @@ class PreparationReceipt:
         self.session_id = session_id
         self.validate = validate
         self.effects = effects
+        self.membership = membership
 
     def state(self):
         connection = self.storage._new_db_connection()
@@ -44,12 +45,16 @@ class PreparationReceipt:
             connection.close()
 
     def prepare(self, manifest):
+        manifest = dict(manifest, effects=self.effects)
+        if self.membership is not None:
+            manifest["membership"] = self.membership
+
         def prepare(connection):
             self.validate(connection)
             connection.execute(
                 "INSERT INTO preparation_receipts VALUES(?,?,?,?,?,'prepared',?)",
                 (self.operation_id, self.guard_id, self.operation, encode_component_key(self.component),
-                 self.session_id, json.dumps(dict(manifest, effects=self.effects), separators=(',', ':'))),
+                 self.session_id, json.dumps(manifest, separators=(',', ':'))),
             )
         submit_preparation_decision(self.storage, prepare)
 

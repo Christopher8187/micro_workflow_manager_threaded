@@ -123,6 +123,7 @@ def execute_graph_command(
         workflow, nodes, node, command=command, components=selection.components,
         stats=stats, stats_interval=stats_interval,
         monitor=monitor, monitor_interval=monitor_interval, prepare=prepare,
+        fresh_preparation=selection.operation == 'run',
         refuse_after_node=refuse_after_node, refuse_before_node=refuse_before_node,
     )
 

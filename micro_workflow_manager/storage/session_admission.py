@@ -4,6 +4,7 @@ import json
 from collections.abc import Sequence
 
 from micro_workflow_manager.component_identity import encode_component_key
+from .session_shapes import read_admission_shape, validate_session_shape_snapshot
 
 
 class NoSelectedJobs(RuntimeError):
@@ -30,12 +31,13 @@ class SessionAdmissionStorageMixin:
         details: dict | None = None,
         _reserved_sample_builder=None,
         sample_id: str | None = None,
-        expected_shape: str | None = None,
+        expected_shape: str,
         _wait: bool = True,
     ):
         self._require_execution_session_storage()
         self._session_text(session_id, "session_id")
         self._session_text(command, "command")
+        self._session_text(expected_shape, "expected_shape")
         self._session_text(hostname, "hostname")
         self._session_time(started_at, "started_at")
         if session_kind not in {"main", "interrupt"}:
@@ -80,10 +82,11 @@ class SessionAdmissionStorageMixin:
                 raise ValueError('Reserved sample admission requires its internal plan reader')
             self._session_text(expected_shape, 'expected_shape')
             self._session_text(sample_id, 'sample_id')
-        elif sample_id is not None or expected_shape is not None:
+        elif sample_id is not None:
             raise ValueError('Sample admission metadata requires its internal reserved plan reader')
 
         def create(connection):
+            shape_id, revision = read_admission_shape(connection, expected_shape, component_keys)
             job_roots = []
             for position, (node, job_id) in enumerate(jobs):
                 observed = self._read_job_owner_observation(connection, node, job_id)
@@ -94,11 +97,12 @@ class SessionAdmissionStorageMixin:
             connection.execute(
                 "INSERT INTO execution_sessions("
                 "session_id, session_kind, parent_session_id, command, selection_kind, start_component, "
-                "status, started_at, heartbeat_at, hostname, pid, process_identity, details_json) "
-                "VALUES(?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
+                "status, started_at, heartbeat_at, hostname, pid, process_identity, details_json, "
+                "admitted_shape_id, partition_revision) "
+                "VALUES(?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session_id, session_kind, parent_session_id, command, selection_kind,
                  encode_component_key(start_component), started_at, started_at,
-                 hostname, pid, process_identity, json.dumps(details or {})),
+                 hostname, pid, process_identity, json.dumps(details or {}), shape_id, revision),
             )
             connection.executemany(
                 "INSERT INTO session_components(session_id, position, component_key) VALUES(?, ?, ?)",
@@ -167,6 +171,7 @@ class SessionAdmissionStorageMixin:
         process_identity,
         details,
         reserved,
+        expected_shape,
         expected_job_instances=None,
     ):
         """Read and validate one possibly committed admission in one snapshot."""
@@ -198,6 +203,8 @@ class SessionAdmissionStorageMixin:
                     raise RuntimeError('Admission rollback left rows without its execution session')
                 return None
             session = self._execution_session_from_row(connection, row)
+            if validate_session_shape_snapshot(connection, session) != expected_shape:
+                raise RuntimeError("Committed admission has a different graph shape")
             roots = tuple(self._read_session_job_roots(
                 connection, session_id, components=session['selected_components'],
             ))

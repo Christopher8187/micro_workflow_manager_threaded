@@ -13,7 +13,7 @@ from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.topology import ComponentTopology
 from tests.test_036_hoeflein_scheduling import make_project
-from tests.test_076_component_state_transitions import _session
+from tests.test_076_component_state_transitions import _seed_state, _session
 from tests.test_090_component_session_settlement import _close, _rows
 from tests.test_093_native_cli_readiness import _node_files
 
@@ -22,7 +22,7 @@ def _fresh_owner(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage.register_component_topology(snapshot)
-    _session(storage, 'fresh-main', 'main', ('A',))
+    _session(storage, 'fresh-main', 'main', ('A',), snapshot)
     storage.reserve_execution_components('fresh-main', expected_shape=snapshot.shape_json)
     return storage, snapshot
 
@@ -44,11 +44,11 @@ def test_full_preparation_queues_and_realigns_only_its_component(tmp_path, lifec
                 return storage.complete_component_reset_preparation(('A',), expected_state=expected)
             return storage.complete_component_fresh_preparation('fresh-main', ('A',), expected_state=expected)
 
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            'UPDATE component_states SET lifecycle=?, stability=?, misaligned=?, alignment_generation=7 '
-            'WHERE component_key=?',
-            (lifecycle, 'stable' if lifecycle in ('done', 'sampled') else None, int(misaligned), '["A"]'),
-        ))
+        _seed_state(
+            storage, ('A',), lifecycle=lifecycle,
+            stability='stable' if lifecycle in ('done', 'sampled') else None,
+            origin=None, generation=7, misaligned=int(misaligned),
+        )
         before = _rows(storage)
         if authority == 'reset':
             prepared_from = storage.read_component_reset_preparation(('A',), expected_shape=snapshot.shape_json)
@@ -68,7 +68,9 @@ def test_full_preparation_queues_and_realigns_only_its_component(tmp_path, lifec
         for row in before['component_states']:
             if row['component_key'] == '["A"]':
                 row.update(lifecycle='queued', stability=None, instability_origin=None,
-                           misaligned=0, alignment_generation=8)
+                           misaligned=0, alignment_generation=8,
+                           retained_result_shape_id=None,
+                           retained_result_alignment_generation=None)
         assert _rows(storage) == before
         with pytest.raises(RuntimeError, match='changed'):
             complete(prepared_from)
@@ -100,7 +102,7 @@ def test_full_preparation_transition_refuses_unowned_or_invalid_state(tmp_path, 
                 "UPDATE component_states SET lifecycle='running' WHERE component_key=?", ('["A"]',),
             ))
         elif damage == 'wrong-shape':
-            shape = snapshot.shape_json.replace('"B"', '"C"')
+            shape = snapshot.shape_json.replace('"A"', '"C"')
             expected['shape_json'] = shape
         elif damage == 'stale-generation':
             expected['alignment_generation'] = 1
@@ -115,16 +117,25 @@ def test_full_preparation_transition_refuses_unowned_or_invalid_state(tmp_path, 
                 'DELETE FROM session_components WHERE session_id=?', (session,),
             ))
         elif damage == 'missing-state':
-            storage.submit_db_mutation(lambda connection: connection.execute(
-                'DELETE FROM component_states WHERE component_key=?', ('["A"]',),
-            ))
+            storage.db_mutation_barrier()
+            connection = storage.db_connection()
+            connection.execute('PRAGMA foreign_keys=OFF')
+            try:
+                assert connection.execute(
+                    'DELETE FROM component_states WHERE component_key=?', ('["A"]',),
+                ).rowcount == 1
+            finally:
+                connection.execute('PRAGMA foreign_keys=ON')
         elif damage == 'held':
             storage.acquire_component_holds(session, [('A',)])
         elif damage == 'pending':
             storage.submit_db_mutation(lambda connection: connection.execute(
                 'INSERT INTO pending_component_executions '
-                '(session_id, component_key, shape_id, alignment_generation, stability) '
-                "SELECT ?, component_key, shape_id, 0, 'stable' FROM component_definitions WHERE component_key=?",
+                '(session_id, component_key, shape_id, starting_shape_id, alignment_generation, '
+                'completion_ready, execution_kind, starting_lifecycle, starting_misaligned, '
+                'stability, instability_origin) '
+                "SELECT ?, component_key, shape_id, shape_id, 0, 0, 'full', 'queued', 0, 'stable', NULL "
+                'FROM component_states WHERE component_key=?',
                 (session, '["A"]'),
             ))
         elif damage == 'active-job':
@@ -151,9 +162,10 @@ def test_full_preparation_transition_refuses_unowned_or_invalid_state(tmp_path, 
                 )
             storage.submit_db_mutation(select_job)
         elif damage == 'changed-result':
-            storage.submit_db_mutation(lambda connection: connection.execute(
-                "UPDATE component_states SET lifecycle='done', stability='stable' WHERE component_key=?", ('["A"]',),
-            ))
+            _seed_state(
+                storage, ('A',), lifecycle='done', stability='stable',
+                origin=None, generation=0,
+            )
         elif damage == 'invalid-state':
             def corrupt(connection):
                 connection.execute('PRAGMA ignore_check_constraints=ON')
@@ -240,12 +252,12 @@ def test_competing_full_preparation_completions_have_one_winner(tmp_path):
 def test_full_preparation_clears_established_interrupt_lineage(tmp_path, lifecycle):
     storage, snapshot = _fresh_owner(tmp_path)
     try:
-        _session(storage, 'old-interrupt', 'interrupt', ('B',))
+        _session(storage, 'old-interrupt', 'interrupt', ('B',), snapshot)
         storage.finish_execution_session('old-interrupt', outcome='done', finished_at='2026-09-06T12:00:00+00:00')
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle=?, stability='unstable', instability_origin='old-interrupt', "
-            'misaligned=1 WHERE component_key=?', (lifecycle, '["A"]'),
-        ))
+        _seed_state(
+            storage, ('A',), lifecycle=lifecycle, stability='unstable',
+            origin='old-interrupt', generation=0, misaligned=1,
+        )
         expected = storage.read_component_fresh_preparation('fresh-main', ('A',), expected_shape=snapshot.shape_json)
         origin = storage.get_execution_session('old-interrupt')
         assert storage.complete_component_fresh_preparation('fresh-main', ('A',), expected_state=expected) == 1
@@ -274,7 +286,8 @@ def test_reset_refuses_every_live_session_without_mutating_the_project(tmp_path,
     assert cli.main(['runfrom', 'A']) == 0
     storage = FileStorage(tmp_path)
     try:
-        _session(storage, 'other-live', kind, ('B',))
+        snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
+        _session(storage, 'other-live', kind, ('B',), snapshot)
         before, files = _rows(storage), _node_files(tmp_path)
         assert cli.main(['reset', 'A', '--yes']) == 1
         assert _rows(storage) == before

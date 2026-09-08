@@ -55,8 +55,9 @@ class SelectedExecutionOperation(ComponentExecutionOperation):
                 self.component, self.roots, execution_context=self.execution_context,
                 expected_identity=self.producing_identity,
             )
-            if identity != self.producing_identity:
+            if identity[1] != self.producing_identity[1]:
                 raise RuntimeError('Selected execution changed its captured component alignment before start')
+            self.producing_identity = identity
             self.selected_started = True
         self.completed = False
         self.frontier = self.read_frontier()

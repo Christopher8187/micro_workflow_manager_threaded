@@ -207,6 +207,7 @@ class StateEventStorageMixin:
         thread = self._state_listener_thread
         if thread is not None and thread.is_alive():
             return
+        self._stop_state_listener_locked()
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listener.bind(("127.0.0.1", 0))
         listener.settimeout(0.5)
@@ -229,16 +230,13 @@ class StateEventStorageMixin:
         self._state_listener_record = record
         self._state_listener_thread = threading.Thread(
             target=self._state_listener_loop,
+            args=(listener, stop, record),
             name="mwf-state-events",
             daemon=True,
         )
         self._state_listener_thread.start()
 
-    def _state_listener_loop(self) -> None:
-        listener = self._state_listener_socket
-        stop = self._state_listener_stop
-        if listener is None or stop is None:
-            return
+    def _state_listener_loop(self, listener, stop, record) -> None:
         try:
             while not stop.is_set():
                 try:
@@ -248,6 +246,8 @@ class StateEventStorageMixin:
                 except OSError:
                     return
                 with self._state_cross_guard:
+                    if stop.is_set():
+                        return
                     callbacks = tuple(self._state_cross_callbacks)
                 for callback in callbacks:
                     try:
@@ -259,6 +259,21 @@ class StateEventStorageMixin:
                 listener.close()
             except OSError:
                 pass
+            self._retire_state_listener_record(record)
+
+    @staticmethod
+    def _retire_state_listener_record(record) -> None:
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                record.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.01)
 
     def _stop_state_listener_locked(self) -> None:
         stop = self._state_listener_stop
@@ -272,12 +287,7 @@ class StateEventStorageMixin:
             except OSError:
                 pass
         if record is not None:
-            try:
-                record.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
+            self._retire_state_listener_record(record)
         self._state_listener_socket = None
         self._state_listener_stop = None
         self._state_listener_record = None

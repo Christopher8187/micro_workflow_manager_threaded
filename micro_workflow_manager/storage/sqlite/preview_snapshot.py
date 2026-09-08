@@ -431,7 +431,7 @@ def open_preview_snapshot(
     database: Path,
     *,
     stable_copy_attempts: int = 30,
-    timeout_seconds: float = 1.0,
+    timeout_seconds: float = 5.0,
 ) -> sqlite3.Connection:
     """Return a validated, query-only in-memory view of a native database.
 

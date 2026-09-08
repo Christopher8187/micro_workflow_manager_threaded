@@ -44,6 +44,10 @@ def test_component_observations_use_one_snapshot_during_a_concurrent_change(tmp_
     storage = FileStorage._create_new_project_state(tmp_path)
     topology = ComponentTopology(nx.DiGraph([('A', 'C'), ('B', 'C')]), []).snapshot()
     storage.register_component_topology(topology)
+    current_graph = nx.DiGraph([('A', 'C'), ('B', 'C')])
+    if allow_missing:
+        current_graph.add_node('absent')
+    current = ComponentTopology(current_graph, []).snapshot()
     other = FileStorage(tmp_path)
     first_read, proceed = Event(), Event()
     trace_errors = []
@@ -54,7 +58,7 @@ def test_component_observations_use_one_snapshot_during_a_concurrent_change(tmp_
 
         def trace(sql):
             nonlocal state_reads
-            if 'FROM component_definitions d ' in sql:
+            if 'FROM component_states AS state ' in sql:
                 state_reads += 1
                 if state_reads == 2:
                     first_read.set()
@@ -65,7 +69,7 @@ def test_component_observations_use_one_snapshot_during_a_concurrent_change(tmp_
         try:
             requested = [('A',), ('B',), ('absent',)] if allow_missing else [('A',), ('B',)]
             options = {'allow_missing': True} if allow_missing else {}
-            result = storage.read_component_states(requested, expected_shape=topology.shape_json, **options)
+            result = storage.read_component_states(requested, expected_shape=current.shape_json, **options)
             assert not connection.in_transaction
             return result
         finally:
@@ -114,6 +118,9 @@ def test_component_observation_cleanup_preserves_the_callers_transaction(
         shape = topology.shape_json.replace('"B"', '"C"')
     elif damage == 'missing-component':
         requested.insert(1, ('C',))
+        current_graph = nx.DiGraph([('A', 'B')])
+        current_graph.add_node('C')
+        shape = ComponentTopology(current_graph, []).snapshot().shape_json
     elif damage == 'missing-state':
         storage.submit_db_mutation(lambda writer: writer.execute(
             'DELETE FROM component_states WHERE component_key=?', ('["B"]',),

@@ -67,7 +67,7 @@ def _owned_storage(tmp_path):
         storage.create_execution_session(
             session_id, session_kind='interrupt', command='run', start_component=component,
             selected_components=[component], started_at=STARTED_AT, hostname='worker.example',
-            pid=os.getpid(), process_identity='test-process',
+            pid=os.getpid(), process_identity='test-process', expected_shape=snapshot.shape_json,
         )
         storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
     for node in ['A', 'B', 'C']:

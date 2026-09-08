@@ -4,11 +4,13 @@ import sqlite3
 from pathlib import Path
 
 from .input_schema import INPUT_TABLES, create_input_tables
+from .membership_schema import MEMBERSHIP_TABLES, create_membership_tables
+from .component_schema import create_component_tables
 from .misalignment_schema import MISALIGNMENT_TABLES, create_misalignment_tables
 from .preparation_schema import PREPARATION_TABLES, create_preparation_tables
 
 
-DATABASE_SCHEMA_VERSION = 5
+DATABASE_SCHEMA_VERSION = 6
 SESSION_TABLES = frozenset({
     "execution_sessions", "session_components", "session_jobs",
     "graph_shapes", "component_definitions", "component_reservations", "component_holds",
@@ -20,7 +22,8 @@ CORE_TABLES = frozenset({
     "metadata", "nodes", "jobs", "job_events", "idempotency",
     "default_job_specs", "advisory_locks", "job_sequences", "network_state",
 })
-NATIVE_TABLES = CORE_TABLES | SESSION_TABLES | INPUT_TABLES | MISALIGNMENT_TABLES | PREPARATION_TABLES
+NATIVE_TABLES = (CORE_TABLES | SESSION_TABLES | INPUT_TABLES | MISALIGNMENT_TABLES
+                 | PREPARATION_TABLES | MEMBERSHIP_TABLES)
 
 
 class SQLiteSchemaMixin:
@@ -90,6 +93,8 @@ class SQLiteSchemaMixin:
                         f"({existing_version} > {DATABASE_SCHEMA_VERSION}). "
                         "Install a compatible newer package instead of downgrading."
                     )
+        if existing_version is not None and existing_version < DATABASE_SCHEMA_VERSION:
+            raise RuntimeError("Unsupported MWF project format. Use migration.md to prepare a separate fresh project.")
         existing_triggers = {
             str(row[0]) for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='trigger'"
@@ -97,7 +102,7 @@ class SQLiteSchemaMixin:
         }
         if (existing_tables.intersection(SESSION_TABLES)
                 or existing_triggers.intersection(SESSION_TRIGGERS)) and existing_version != DATABASE_SCHEMA_VERSION:
-            raise RuntimeError("Incomplete SQLite execution-session schema: missing version 5 marker")
+            raise RuntimeError("Incomplete SQLite execution-session schema: missing current format marker")
         if existing_version != DATABASE_SCHEMA_VERSION:
             raise RuntimeError("Unsupported MWF project format. Use migration.md to prepare a separate fresh project.")
         if not NATIVE_TABLES.issubset(existing_tables):
@@ -233,7 +238,7 @@ class SQLiteSchemaMixin:
                 )
             }
 
-        # Version 5 has one complete shape. Compare its declarations, including
+        # The current format has one complete shape. Compare declarations, including
         # column checks, foreign keys and the partial main-slot uniqueness rule.
         reference = sqlite3.connect(":memory:")
         try:
@@ -309,7 +314,10 @@ class SQLiteSchemaMixin:
                 process_identity TEXT,
                 outcome TEXT,
                 failures_json TEXT NOT NULL DEFAULT '[]',
-                details_json TEXT NOT NULL DEFAULT '{}'
+                details_json TEXT NOT NULL DEFAULT '{}',
+                admitted_shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id),
+                partition_revision INTEGER NOT NULL
+                    CHECK(typeof(partition_revision)='integer' AND partition_revision>=0)
             )
         """)
         connection.execute("""
@@ -340,120 +348,8 @@ class SQLiteSchemaMixin:
                 UNIQUE(session_id, position)
             )
         """)
-        connection.execute("""
-            CREATE TABLE graph_shapes (
-                shape_id INTEGER PRIMARY KEY,
-                shape_json TEXT NOT NULL UNIQUE
-            )
-        """)
-        connection.execute("""
-            CREATE TRIGGER prevent_graph_shape_update BEFORE UPDATE ON graph_shapes
-            BEGIN
-                SELECT RAISE(ABORT, 'Producing graph shapes are immutable');
-            END
-        """)
-        connection.execute("""
-            CREATE TABLE component_definitions (
-                component_key TEXT PRIMARY KEY,
-                shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id)
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE component_states (
-                component_key TEXT PRIMARY KEY REFERENCES component_definitions(component_key),
-                lifecycle TEXT NOT NULL DEFAULT 'queued'
-                    CHECK(lifecycle IN ('queued','running','sampled','done','failed')),
-                stability TEXT CHECK(stability IN ('stable','unstable')),
-                instability_origin TEXT REFERENCES execution_sessions(session_id),
-                misaligned INTEGER NOT NULL DEFAULT 0
-                    CHECK(typeof(misaligned)='integer' AND misaligned IN (0,1)),
-                alignment_generation INTEGER NOT NULL DEFAULT 0
-                    CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
-                CHECK((
-                    (
-                        (lifecycle IN ('queued','running','failed')
-                            AND stability IS NULL AND instability_origin IS NULL)
-                        OR (lifecycle IN ('running','sampled','done') AND (
-                            (stability='stable' AND instability_origin IS NULL)
-                            OR (stability='unstable' AND instability_origin IS NOT NULL
-                                AND length(instability_origin)>0)
-                        ))
-                    )
-                    AND (lifecycle<>'queued' OR misaligned=0)
-                ) IS 1)
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE component_reservations (
-                component_key TEXT PRIMARY KEY REFERENCES component_definitions(component_key),
-                session_id TEXT NOT NULL REFERENCES execution_sessions(session_id)
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE pending_component_executions (
-                session_id TEXT NOT NULL,
-                component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
-                shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id),
-                alignment_generation INTEGER NOT NULL
-                    CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
-                completion_ready INTEGER NOT NULL DEFAULT 0
-                    CHECK(typeof(completion_ready)='integer' AND completion_ready IN (0,1)),
-                execution_kind TEXT NOT NULL DEFAULT 'full' CHECK(execution_kind IN ('full','jobs','resume')),
-                starting_lifecycle TEXT NOT NULL DEFAULT 'queued'
-                    CHECK(starting_lifecycle IN ('queued','sampled','done','failed')),
-                starting_misaligned INTEGER NOT NULL DEFAULT 0
-                    CHECK(typeof(starting_misaligned)='integer' AND starting_misaligned IN (0,1)),
-                stability TEXT NOT NULL CHECK(stability IN ('stable','unstable')),
-                instability_origin TEXT REFERENCES execution_sessions(session_id),
-                PRIMARY KEY(session_id, component_key),
-                FOREIGN KEY(session_id, component_key) REFERENCES session_components(session_id, component_key),
-                CHECK((
-                    (stability='stable' AND instability_origin IS NULL)
-                    OR (stability='unstable' AND instability_origin IS NOT NULL AND length(instability_origin)>0)
-                ) IS 1)
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE component_successful_results (
-                component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
-                shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id),
-                alignment_generation INTEGER NOT NULL
-                    CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
-                lifecycle TEXT NOT NULL CHECK(lifecycle IN ('sampled','done')),
-                stability TEXT NOT NULL CHECK(stability IN ('stable','unstable')),
-                instability_origin TEXT REFERENCES execution_sessions(session_id),
-                PRIMARY KEY(component_key, shape_id, alignment_generation),
-                CHECK(((stability='stable' AND instability_origin IS NULL)
-                    OR (stability='unstable' AND instability_origin IS NOT NULL
-                        AND length(instability_origin)>0)) IS 1)
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE component_holds (
-                session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
-                component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
-                hold_count INTEGER NOT NULL CHECK(typeof(hold_count)='integer' AND hold_count>0),
-                PRIMARY KEY(session_id, component_key)
-            )
-        """)
-        connection.execute("""
-            CREATE TABLE job_execution_owners (
-                execution_id TEXT PRIMARY KEY,
-                node_name TEXT NOT NULL,
-                job_id INTEGER NOT NULL,
-                job_instance_id TEXT NOT NULL
-                    CHECK(typeof(job_instance_id)='text' AND length(job_instance_id)=32
-                          AND length(CAST(job_instance_id AS BLOB))=32
-                          AND job_instance_id NOT GLOB '*[^0-9a-f]*'),
-                generation INTEGER NOT NULL,
-                session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
-                component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
-                shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id),
-                alignment_generation INTEGER NOT NULL
-                    CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
-                created_by_execution_id TEXT REFERENCES job_execution_owners(execution_id)
-            )
-        """)
+        create_component_tables(connection)
+        create_membership_tables(connection)
 
         create_input_tables(connection)
         create_preparation_tables(connection)

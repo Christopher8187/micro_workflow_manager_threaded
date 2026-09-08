@@ -102,6 +102,7 @@ def _native_receiver_owner(workflow, *, running):
         session_id, session_kind='interrupt', command='run',
         start_component=('B',), selected_components=[('B',)], started_at=now(),
         hostname=socket.gethostname(), pid=os.getpid(), process_identity=identity,
+        expected_shape=snapshot.shape_json,
     )
     storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
     if running:
@@ -363,6 +364,7 @@ def test_held_receiver_guard_refuses_new_component_reservation(tmp_path):
             session_id, session_kind='interrupt', command='run',
             start_component=('B',), selected_components=[('B',)], started_at=now(),
             hostname=socket.gethostname(), pid=os.getpid(), process_identity=identity,
+            expected_shape=snapshot.shape_json,
         )
         with pytest.raises(RuntimeError) as caught:
             storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from micro_workflow_manager.component_identity import component_key, decode_component_key, encode_component_key
+from micro_workflow_manager.component_identity import component_key, encode_component_key
 from .base import FileStorageBase
 from .component_transitions import ComponentTransitionStorageMixin
 from .component_settlement import ComponentSettlementStorageMixin
 from .selected_component_lifecycle import SelectedComponentLifecycleStorageMixin
+from .component_result_identity import (
+    ComponentGenerationIdentity,
+    read_admitted_component_shape,
+    read_component_state_record,
+    observe_current_success,
+)
 
 
 @dataclass(frozen=True)
@@ -68,32 +74,10 @@ def validate_component_state_snapshot(row) -> None:
 
 
 def read_component_state_snapshot(connection, component) -> dict | None:
-    members = _observation_component(component)
-    row = connection.execute(
-        "SELECT d.component_key, g.shape_json, s.component_key AS state_key, "
-        "s.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, "
-        "origin.session_kind AS origin_kind "
-        "FROM component_definitions d "
-        "LEFT JOIN graph_shapes g USING(shape_id) "
-        "LEFT JOIN component_states s USING(component_key) "
-        "LEFT JOIN execution_sessions origin ON origin.session_id=s.instability_origin "
-        "WHERE d.component_key=?",
-        (encode_component_key(members),),
-    ).fetchone()
-    if row is None:
-        return None
-    if row['state_key'] is None or row['shape_json'] is None:
-        raise RuntimeError('Incomplete component state or producing graph shape')
-    validate_component_state_snapshot(row)
-    return {
-        'members': decode_component_key(row['component_key']),
-        'shape_json': row['shape_json'],
-        'lifecycle': row['lifecycle'],
-        'stability': row['stability'],
-        'instability_origin': row['instability_origin'],
-        'misaligned': bool(row['misaligned']),
-        'alignment_generation': row['alignment_generation'],
-    }
+    state = read_component_state_record(
+        connection, _observation_component(component), require_active=False,
+    )
+    return None if state is None else state.snapshot
 
 
 def read_component_states_snapshot(
@@ -104,10 +88,20 @@ def read_component_states_snapshot(
     members = tuple(_observation_component(component) for component in components)
     connection.execute('SAVEPOINT mwf_component_observation')
     try:
-        observed = {component: read_component_state_snapshot(connection, component) for component in members}
-        if any((not allow_missing if state is None else state['shape_json'] != expected_shape)
-               for state in observed.values()):
-            raise RuntimeError('Component observations require the expected producing shape')
+        from .component_definitions import component_snapshot_from_shape
+
+        try:
+            snapshot = component_snapshot_from_shape(expected_shape)
+        except ValueError as error:
+            raise RuntimeError('Component observations require a valid current graph shape') from error
+        if any(component not in snapshot.components for component in members):
+            raise RuntimeError('Component observations require current graph membership')
+        observed = {}
+        for component in members:
+            state = read_component_state_record(connection, component)
+            observed[component] = None if state is None else state.snapshot
+        if any(not allow_missing and state is None for state in observed.values()):
+            raise RuntimeError('Component observations require initialized current state')
         return observed
     finally:
         connection.execute('RELEASE SAVEPOINT mwf_component_observation')
@@ -157,10 +151,12 @@ class ComponentStateStorageMixin(
 
     def _read_pending_component_work(self, connection, session_id, component):
         pending = connection.execute(
-            'SELECT shape.shape_json, pending.alignment_generation, '
+            'SELECT pending.component_key, pending.shape_id, pending.starting_shape_id, shape.shape_json, '
+            'pending.alignment_generation, '
             'pending.completion_ready, pending.stability, pending.instability_origin, '
             'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned '
-            'FROM pending_component_executions AS pending LEFT JOIN graph_shapes AS shape USING(shape_id) '
+            'FROM pending_component_executions AS pending '
+            'LEFT JOIN graph_shapes AS shape ON shape.shape_id=pending.shape_id '
             'WHERE pending.session_id=? AND pending.component_key=?',
             (session_id, encode_component_key(component)),
         ).fetchone()
@@ -293,53 +289,37 @@ class ComponentStateStorageMixin(
 
         def begin(connection):
             self._validate_component_task_parent(connection, session_id, task_parent)
+            admitted = read_admitted_component_shape(
+                connection, session_id, proposal.component if proposal is not None else component,
+                expected_shape,
+            )
             owner = connection.execute(
-                'SELECT session.status, session.command, reservation.session_id AS owner, '
-                'selected.component_key AS selected_key '
-                'FROM execution_sessions AS session '
-                'LEFT JOIN component_reservations AS reservation ON reservation.component_key=? '
-                'LEFT JOIN session_components AS selected '
-                'ON selected.session_id=session.session_id AND selected.component_key=? '
-                'WHERE session.session_id=?', (key, key, session_id),
+                'SELECT command FROM execution_sessions WHERE session_id=?', (session_id,),
             ).fetchone()
-            if owner is None or owner['status'] != 'running':
-                raise RuntimeError('Component start requires an existing running session: ' + session_id)
-            if owner['owner'] != session_id:
-                raise RuntimeError('Component start requires the exact component reservation: ' + key)
-            if owner['selected_key'] is None:
-                raise RuntimeError('Component is outside the session selected scope: ' + key)
             if (starting_lifecycle == 'sampled'
                     and owner['command'] not in ('resume', 'resumefrom', 'resumebetween')):
                 raise RuntimeError('Sampled component execution requires a resume session')
-            state = connection.execute(
-                'SELECT d.component_key, d.shape_id, g.shape_json, s.component_key AS state_key, '
-                's.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, '
-                'origin.session_kind AS origin_kind '
-                'FROM component_definitions d '
-                'LEFT JOIN graph_shapes g USING(shape_id) '
-                'LEFT JOIN component_states s USING(component_key) '
-                'LEFT JOIN execution_sessions origin ON origin.session_id=s.instability_origin '
-                'WHERE d.component_key=?', (key,),
-            ).fetchone()
-            if state is None:
+            state_record = read_component_state_record(connection, component)
+            if state_record is None:
                 raise RuntimeError('Unknown component: ' + key)
-            if state['state_key'] is None or state['shape_json'] is None:
-                raise RuntimeError('Incomplete component state or producing graph shape')
-            self._validate_component_state_row(state)
-            if state['shape_json'] != expected_shape:
-                raise RuntimeError('Component start requires the expected producing graph shape')
+            state = state_record.snapshot
             if (state['lifecycle'] == 'running' and task_parent is not None
                     and encode_component_key(task_parent.component) == key):
                 pending = connection.execute(
-                    'SELECT shape.shape_json, pending.alignment_generation, '
+                    'SELECT pending.component_key, pending.shape_id, pending.starting_shape_id, shape.shape_json, '
+                    'pending.alignment_generation, '
                     'pending.completion_ready, pending.stability, pending.instability_origin, '
                     'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned '
-                    'FROM pending_component_executions AS pending JOIN graph_shapes AS shape USING(shape_id) '
+                    'FROM pending_component_executions AS pending '
+                    'JOIN graph_shapes AS shape ON shape.shape_id=pending.shape_id '
                     'WHERE pending.session_id=? AND pending.component_key=?', (session_id, key),
                 ).fetchone()
                 if (pending is None or pending['shape_json'] != expected_shape
+                        or pending['shape_id'] != admitted.shape_id
                         or pending['alignment_generation'] != state['alignment_generation']
-                        or state['alignment_generation'] != expected_alignment_generation):
+                        or state_record.identity != ComponentGenerationIdentity(
+                            admitted.shape_id, expected_alignment_generation,
+                        )):
                     raise RuntimeError('Nested component execution has no matching recorded start')
                 self._validate_pending_component_row(connection, pending)
                 return False
@@ -353,40 +333,47 @@ class ComponentStateStorageMixin(
             retained_lineage = (state['stability'], state['instability_origin'])
             if (starting_lifecycle == 'queued' and retained_lineage != (None, None)):
                 raise RuntimeError('Queued component start cannot retain successful lineage')
-            if (starting_lifecycle == 'sampled'
-                    and retained_lineage != (proposal.stability, proposal.instability_origin)):
-                raise RuntimeError('Sampled resume cannot replace retained successful lineage')
+            retained = observe_current_success(connection, state_record)
+            if starting_lifecycle == 'sampled':
+                if (retained is None or retained.result != ('sampled', *retained_lineage)
+                        or retained_lineage != (proposal.stability, proposal.instability_origin)):
+                    raise RuntimeError('Sampled resume cannot replace retained successful result')
+            retained_pointer = state_record.retained_result_identity
             execution_kind = 'resume' if starting_lifecycle == 'sampled' else 'full'
             self._validate_pending_component_row(connection, {
                 'completion_ready': 0, 'stability': proposal.stability,
                 'instability_origin': proposal.instability_origin,
                 'execution_kind': execution_kind, 'starting_lifecycle': starting_lifecycle,
-                'starting_misaligned': 0,
+                'starting_misaligned': 0, 'shape_id': admitted.shape_id,
+                'starting_shape_id': state_record.identity.shape_id, 'component_key': key,
             })
-            if starting_lifecycle == 'sampled':
-                self._match_component_successful_result(
-                    connection, proposal.component, (state['shape_id'], state['alignment_generation']),
-                    ('sampled', *retained_lineage), record_missing=True,
-                )
             for parent, observed in parents.items():
                 if self._read_component_state(connection, parent) != observed:
                     raise RuntimeError('Component parent changed before start: ' + encode_component_key(parent))
             changed = connection.execute(
-                "UPDATE component_states SET lifecycle='running' "
-                "WHERE component_key=? AND lifecycle=? AND misaligned=0 AND alignment_generation=? "
-                "AND stability IS ? AND instability_origin IS ?",
-                (key, starting_lifecycle, expected_alignment_generation, *retained_lineage),
+                "UPDATE component_states SET shape_id=?, lifecycle='running', "
+                "retained_result_shape_id=?, retained_result_alignment_generation=? "
+                "WHERE component_key=? AND shape_id=? AND lifecycle=? AND misaligned=0 "
+                "AND alignment_generation=? AND stability IS ? AND instability_origin IS ? "
+                "AND retained_result_shape_id IS ? AND retained_result_alignment_generation IS ?",
+                (admitted.shape_id,
+                 None if retained_pointer is None else retained_pointer.shape_id,
+                 None if retained_pointer is None else retained_pointer.alignment_generation,
+                 key, state_record.identity.shape_id, starting_lifecycle,
+                 expected_alignment_generation, *retained_lineage,
+                 None if retained_pointer is None else retained_pointer.shape_id,
+                 None if retained_pointer is None else retained_pointer.alignment_generation),
             ).rowcount
             if changed != 1:
                 raise RuntimeError('Component changed before start: ' + key)
             recorded = connection.execute(
                 'INSERT INTO pending_component_executions '
-                '(session_id, component_key, shape_id, alignment_generation, stability, instability_origin, '
-                'execution_kind, starting_lifecycle, starting_misaligned) '
-                'SELECT ?, component_key, shape_id, ?, ?, ?, ?, ?, 0 '
-                'FROM component_definitions WHERE component_key=?',
-                (session_id, expected_alignment_generation, proposal.stability, proposal.instability_origin,
-                 execution_kind, starting_lifecycle, key),
+                '(session_id, component_key, shape_id, starting_shape_id, alignment_generation, '
+                'stability, instability_origin, execution_kind, starting_lifecycle, starting_misaligned) '
+                'VALUES(?,?,?,?,?,?,?,?,?,0)',
+                (session_id, key, admitted.shape_id, state_record.identity.shape_id,
+                 expected_alignment_generation, proposal.stability, proposal.instability_origin,
+                 execution_kind, starting_lifecycle),
             ).rowcount
             if recorded != 1:
                 raise RuntimeError('Component start was not recorded: ' + key)

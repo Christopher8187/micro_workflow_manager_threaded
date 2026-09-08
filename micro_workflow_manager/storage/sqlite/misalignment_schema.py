@@ -10,7 +10,7 @@ def create_misalignment_tables(connection):
             receiver_node TEXT NOT NULL,
             alignment_generation INTEGER NOT NULL
                 CHECK(typeof(alignment_generation)='integer' AND alignment_generation>=0),
-            component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
+            component_key TEXT NOT NULL,
             shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id),
             producer_execution_id TEXT REFERENCES job_execution_owners(execution_id),
             arrival_kind TEXT CHECK(arrival_kind IN ('managed-input','managed-job')),
@@ -38,6 +38,7 @@ def create_misalignment_tables(connection):
                       AND length(receiver_job_instance_id)=32
                       AND length(CAST(receiver_job_instance_id AS BLOB))=32
                       AND receiver_job_instance_id NOT GLOB '*[^0-9a-f]*')),
-            PRIMARY KEY(receiver_node, alignment_generation)
+            PRIMARY KEY(receiver_node, alignment_generation),
+            FOREIGN KEY(component_key, shape_id) REFERENCES component_definitions(component_key, shape_id)
         )
     ''')

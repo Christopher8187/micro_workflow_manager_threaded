@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -10,10 +12,47 @@ from threading import Barrier
 import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeInputFileSystem
+from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.errors import JobFailedError
+from micro_workflow_manager.models import now
+from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.storage.component_states import ComponentTerminalOutcome
 from micro_workflow_manager.storage.input_publication_files import InputFileChange
 from tests.test_090_component_session_settlement import _close
+
+
+def _replace_done_result_with_sampled(storage, component):
+    key = encode_component_key(component)
+
+    def replace(connection):
+        state = connection.execute(
+            'SELECT lifecycle, stability, instability_origin, shape_id, alignment_generation, '
+            'retained_result_shape_id, retained_result_alignment_generation '
+            'FROM component_states WHERE component_key=?', (key,),
+        ).fetchone()
+        assert state is not None
+        assert (state['lifecycle'], state['stability'], state['instability_origin']) == (
+            'done', 'stable', None,
+        )
+        assert (
+            state['retained_result_shape_id'], state['retained_result_alignment_generation'],
+        ) == (state['shape_id'], state['alignment_generation'])
+        result = connection.execute(
+            "UPDATE component_successful_results SET lifecycle='sampled' "
+            "WHERE component_key=? AND shape_id=? AND alignment_generation=? "
+            "AND lifecycle='done' AND stability='stable' AND instability_origin IS NULL",
+            (key, state['shape_id'], state['alignment_generation']),
+        ).rowcount
+        current = connection.execute(
+            "UPDATE component_states SET lifecycle='sampled' "
+            "WHERE component_key=? AND shape_id=? AND alignment_generation=? "
+            "AND lifecycle='done' AND stability='stable' AND instability_origin IS NULL",
+            (key, state['shape_id'], state['alignment_generation']),
+        ).rowcount
+        assert (result, current) == (1, 1)
+
+    storage.submit_db_mutation(replace)
 
 
 def test_late_managed_input_marks_completed_receiver_without_rerunning_it(tmp_path):
@@ -136,10 +175,7 @@ def test_terminal_receiver_keeps_lifecycle_and_gets_a_new_cause_after_full_repai
         else:
             workflow.run()
         if lifecycle == 'sampled':
-            # Native sampled-result fixture until public sampling is integrated.
-            storage.submit_db_mutation(lambda connection: connection.execute(
-                "UPDATE component_states SET lifecycle='sampled' WHERE component_key='[\"B\"]'"
-            ))
+            _replace_done_result_with_sampled(storage, ('B',))
         before = storage.get_component_state(('B',))
         assert before['lifecycle'] == lifecycle
         assert storage.read_component_misalignment_causes(('B',)) == []
@@ -552,22 +588,49 @@ def test_native_receiver_noop_allows_later_terminal_arrival_in_the_same_session(
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
     storage = workflow.storage
+    snapshot = workflow.topology.snapshot()
+    storage.register_component_topology(snapshot)
+    receiver_session = 'receiver-result'
+    receiver_started = False
+
+    def begin_receiver():
+        nonlocal receiver_started
+        assert not receiver_started
+        receiver_started = True
+        storage.create_execution_session(
+            receiver_session, session_kind='interrupt', command='run',
+            start_component=('B',), selected_components=[('B',)], started_at=now(),
+            hostname=socket.gethostname(), pid=os.getpid(),
+            process_identity=process_identity(os.getpid()), expected_shape=snapshot.shape_json,
+        )
+        assert storage.reserve_execution_components(
+            receiver_session, expected_shape=snapshot.shape_json,
+        ) is True
+        assert storage.begin_queued_component_execution(
+            receiver_session, ('B',), expected_shape=snapshot.shape_json,
+            expected_alignment_generation=0, successful_lineage=('stable', None),
+        ) is True
+
+    def finish_receiver():
+        decision = storage.decide_execution_session_exit(
+            receiver_session, outcome='done', finished_at=now(),
+            component_outcomes=[ComponentTerminalOutcome(
+                ('B',), snapshot.shape_json, 0, 'done', 'stable', None,
+            )],
+        )
+        assert decision == {'restarts': {}, 'released': 1}
 
     @workflow.task('A')
     def produce(ctx):
         owner = storage.read_job_current_owner('A', 1)
-        # Exercise the storage result boundary within one producer session.
-        # Public interrupt scheduling of this sequence is a later increment.
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle=? WHERE component_key='[\"B\"]'", (initial_lifecycle,),
-        ))
         before = storage.get_component_state(('B',))
+        assert before['lifecycle'] == initial_lifecycle
         ctx.node('B').write_input('before.txt', 'while receiver has no established result')
         assert storage.get_component_state(('B',)) == before
         assert storage.read_component_misalignment_causes(('B',)) == []
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='done', stability='stable' WHERE component_key='[\"B\"]'"
-        ))
+        if not receiver_started:
+            begin_receiver()
+        finish_receiver()
         established = storage.get_component_state(('B',))
         assert established['alignment_generation'] == before['alignment_generation']
         ctx.node('B').write_input('after.txt', 'after receiver result')
@@ -579,10 +642,17 @@ def test_native_receiver_noop_allows_later_terminal_arrival_in_the_same_session(
             'arrival_kind': 'managed-input', 'path': 'A/after.txt',
         }]
 
-    workflow.start('A')
     try:
+        if initial_lifecycle == 'running':
+            begin_receiver()
+        workflow.start('A')
         workflow.run_node('A')
-        assert len(storage.list_execution_sessions()) == 1
+        sessions = {session['session_id']: session for session in storage.list_execution_sessions()}
+        assert len(sessions) == 2
+        assert sessions[receiver_session]['status'] == 'terminal'
+        assert sessions[receiver_session]['outcome'] == 'done'
+        producer, = [session for session in sessions.values() if session['session_id'] != receiver_session]
+        assert producer['status'] == 'terminal' and producer['outcome'] == 'done'
     finally:
         _close(storage)
 

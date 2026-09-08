@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 from micro_workflow_manager.component_identity import encode_component_key
+from .component_result_identity import (
+    ComponentGenerationIdentity,
+    read_admitted_component_shape,
+    read_component_state_record,
+    read_retained_successful_result,
+)
 
 
 class ComponentSettlementStorageMixin:
@@ -41,11 +47,15 @@ class ComponentSettlementStorageMixin:
         return tuple(normalized)
 
     def _validate_pending_component_row(self, connection, row):
+        if 'component_key' not in row.keys():
+            raise RuntimeError('Pending component execution has no component identity')
         ready = row['completion_ready']
         stability, origin = row['stability'], row['instability_origin']
         if type(ready) is not int or ready not in (0, 1):
             raise RuntimeError('Invalid pending component completion metadata')
-        if (row['execution_kind'] not in ('full', 'jobs', 'resume')
+        if (type(row['shape_id']) is not int or row['shape_id'] < 1
+                or type(row['starting_shape_id']) is not int or row['starting_shape_id'] < 1
+                or row['execution_kind'] not in ('full', 'jobs', 'resume')
                 or row['starting_lifecycle'] not in ('queued', 'sampled', 'done', 'failed')
                 or type(row['starting_misaligned']) is not int or row['starting_misaligned'] not in (0, 1)
                 or (row['execution_kind'] == 'full'
@@ -64,6 +74,13 @@ class ComponentSettlementStorageMixin:
             ).fetchone()
             if recorded_origin is None or recorded_origin['session_kind'] != 'interrupt':
                 raise RuntimeError('A pending component requires an exact interrupt origin')
+        definitions = connection.execute(
+            'SELECT shape_id FROM component_definitions '
+            'WHERE component_key=? AND shape_id IN (?, ?)',
+            (row['component_key'], row['shape_id'], row['starting_shape_id']),
+        ).fetchall()
+        if {item['shape_id'] for item in definitions} != {row['shape_id'], row['starting_shape_id']}:
+            raise RuntimeError('Pending component execution has an invalid historical shape')
 
     def _validate_component_terminal_outcomes(self, connection, session_id, outcomes):
         for outcome in outcomes:
@@ -79,14 +96,20 @@ class ComponentSettlementStorageMixin:
             if (owner is None or owner['status'] != 'running' or owner['owner'] != session_id
                     or owner['selected_key'] is None):
                 raise RuntimeError('Component settlement requires its selected running owner and reservation: ' + key)
+            admitted = read_admitted_component_shape(
+                connection, session_id, outcome.component, outcome.expected_shape,
+            )
             pending = connection.execute(
-                'SELECT shape.shape_json, pending.alignment_generation, '
+                'SELECT pending.component_key, pending.shape_id, pending.starting_shape_id, shape.shape_json, '
+                'pending.alignment_generation, '
                 'pending.completion_ready, pending.stability, pending.instability_origin, '
                 'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned '
-                'FROM pending_component_executions AS pending JOIN graph_shapes AS shape USING(shape_id) '
+                'FROM pending_component_executions AS pending '
+                'JOIN graph_shapes AS shape ON shape.shape_id=pending.shape_id '
                 'WHERE pending.session_id=? AND pending.component_key=?', (session_id, key),
             ).fetchone()
             if (pending is None or pending['shape_json'] != outcome.expected_shape
+                    or pending['shape_id'] != admitted.shape_id
                     or pending['alignment_generation'] != outcome.expected_alignment_generation):
                 raise RuntimeError('Component settlement requires its matching pending execution: ' + key)
             self._validate_pending_component_row(connection, pending)
@@ -96,37 +119,27 @@ class ComponentSettlementStorageMixin:
                     and (pending['stability'], pending['instability_origin'])
                     != (outcome.stability, outcome.instability_origin)):
                 raise RuntimeError('Component completion cannot replace recorded successful lineage')
-            state = connection.execute(
-                'SELECT d.component_key, d.shape_id, g.shape_json, s.component_key AS state_key, '
-                's.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, '
-                'origin.session_kind AS origin_kind '
-                'FROM component_definitions d '
-                'LEFT JOIN graph_shapes g USING(shape_id) '
-                'LEFT JOIN component_states s USING(component_key) '
-                'LEFT JOIN execution_sessions origin ON origin.session_id=s.instability_origin '
-                'WHERE d.component_key=?', (key,),
-            ).fetchone()
-            if state is None or state['state_key'] is None or state['shape_json'] is None:
+            state = read_component_state_record(connection, outcome.component)
+            if state is None:
                 raise RuntimeError('Incomplete component state or producing graph shape')
-            self._validate_component_state_row(state)
-            if (state['shape_json'] != outcome.expected_shape or state['lifecycle'] != 'running'
-                    or state['misaligned'] != pending['starting_misaligned']
-                    or state['alignment_generation'] != outcome.expected_alignment_generation):
+            if (state.identity != ComponentGenerationIdentity(
+                    pending['shape_id'], outcome.expected_alignment_generation,
+                ) or state.lifecycle != 'running'
+                    or state.misaligned != bool(pending['starting_misaligned'])):
                 raise RuntimeError('Component settlement requires the expected aligned running state: ' + key)
             if (pending['execution_kind'] == 'resume'
-                    and (state['stability'], state['instability_origin'])
+                    and (state.stability, state.instability_origin)
                     != (pending['stability'], pending['instability_origin'])):
                 raise RuntimeError('Sampled resume lost its retained successful lineage')
             if pending['execution_kind'] == 'resume':
-                self._match_component_successful_result(
-                    connection, outcome.component,
-                    (state['shape_id'], outcome.expected_alignment_generation),
-                    ('sampled', pending['stability'], pending['instability_origin']),
-                    require_present=True,
-                )
+                retained = read_retained_successful_result(connection, state)
+                if retained is None or retained.result != (
+                    'sampled', pending['stability'], pending['instability_origin'],
+                ):
+                    raise RuntimeError('Sampled resume lost its retained successful result')
             if outcome.lifecycle != 'failed':
-                if state['stability'] is not None and (
-                    state['stability'], state['instability_origin']
+                if state.stability is not None and (
+                    state.stability, state.instability_origin
                 ) != (outcome.stability, outcome.instability_origin):
                     raise RuntimeError('Component settlement cannot replace retained successful lineage')
                 if outcome.instability_origin is not None:
@@ -166,20 +179,27 @@ class ComponentSettlementStorageMixin:
                         raise ComponentExecutionIncomplete(
                             f'Component completion has unfinished job {node}/{job["job_id"]}'
                         )
-            changed = connection.execute(
-                'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=? '
-                "WHERE component_key=? AND lifecycle='running' AND misaligned=? AND alignment_generation=?",
-                (outcome.lifecycle, outcome.stability, outcome.instability_origin,
-                 encode_component_key(outcome.component), pending['starting_misaligned'],
-                 outcome.expected_alignment_generation),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError('Component changed before settlement')
             if outcome.lifecycle != 'failed':
                 self._record_component_successful_result(
                     connection, outcome.component, (pending['shape_id'], outcome.expected_alignment_generation),
                     (outcome.lifecycle, outcome.stability, outcome.instability_origin),
                 )
+                pointer = pending['shape_id'], outcome.expected_alignment_generation
+            else:
+                pointer = None
+            changed = connection.execute(
+                'UPDATE component_states SET lifecycle=?, stability=?, instability_origin=?'
+                + (', retained_result_shape_id=?, retained_result_alignment_generation=?'
+                   if pointer is not None else '')
+                + " WHERE component_key=? AND shape_id=? AND lifecycle='running' "
+                'AND misaligned=? AND alignment_generation=?',
+                (outcome.lifecycle, outcome.stability, outcome.instability_origin,
+                 *(pointer if pointer is not None else ()),
+                 encode_component_key(outcome.component), pending['shape_id'],
+                 pending['starting_misaligned'], outcome.expected_alignment_generation),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError('Component changed before settlement')
             removed = connection.execute(
                 'DELETE FROM pending_component_executions WHERE session_id=? AND component_key=?',
                 (session_id, encode_component_key(outcome.component)),

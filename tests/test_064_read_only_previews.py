@@ -300,6 +300,7 @@ def test_native_preview_reports_abandoned_session_and_owned_job_without_mutation
         pid=99999999,
         process_identity='retired-preview-process',
         details={'start_node': 'A'},
+        expected_shape=snapshot.shape_json,
     )
     storage.reserve_execution_components(
         session_id,

@@ -319,6 +319,33 @@ def test_done_misaligned_failure_and_repair_restore_prior_done_result(tmp_path):
         _close(storage)
 
 
+def _set_done_result(storage, component, stability, origin):
+    key = encode_component_key(component)
+
+    def seed(connection):
+        state = connection.execute(
+            'SELECT shape_id, alignment_generation FROM component_states WHERE component_key=?',
+            (key,),
+        ).fetchone()
+        assert state is not None
+        connection.execute(
+            'INSERT INTO component_successful_results '
+            '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
+            "VALUES(?,?,?,'done',?,?) ON CONFLICT(component_key, shape_id, alignment_generation) "
+            'DO UPDATE SET lifecycle=excluded.lifecycle, stability=excluded.stability, '
+            'instability_origin=excluded.instability_origin',
+            (key, state['shape_id'], state['alignment_generation'], stability, origin),
+        )
+        return connection.execute(
+            "UPDATE component_states SET lifecycle='done', stability=?, instability_origin=?, "
+            'retained_result_shape_id=shape_id, retained_result_alignment_generation=alignment_generation '
+            'WHERE component_key=?',
+            (stability, origin, key),
+        ).rowcount
+
+    return storage.submit_db_mutation(seed)
+
+
 def _seed_unstable_parent(storage, component, origin):
     storage.create_execution_session(
         origin,
@@ -330,15 +357,10 @@ def _seed_unstable_parent(storage, component, origin):
         hostname=socket.gethostname(),
         pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
+        expected_shape=storage.get_component_definition(component)["shape_json"],
     )
     assert storage.finish_execution_session(origin, outcome="done", finished_at=now()) is True
-    assert storage.submit_db_mutation(
-        lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='done', stability='unstable', "
-            "instability_origin=? WHERE component_key=?",
-            (origin, encode_component_key(component)),
-        ).rowcount
-    ) == 1
+    assert _set_done_result(storage, component, "unstable", origin) == 1
     storage.set_node_status(component[0], "done")
 
 

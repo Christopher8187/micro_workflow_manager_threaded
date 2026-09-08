@@ -266,6 +266,7 @@ def test_keep_trace_does_not_guard_an_orphan_only_excluded_receiver(
             session_id, session_kind='interrupt', command='resume',
             start_component=('B',), selected_components=[('B',)], started_at=now(),
             hostname=socket.gethostname(), pid=os.getpid(), process_identity=identity,
+            expected_shape=snapshot.shape_json,
         )
         storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
         before_a = (

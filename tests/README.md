@@ -104,13 +104,22 @@ and use the `mwf-test` skill for execution order and isolation.
 | `test_127_between_command_previews.py` | Half-open interval previews, component expansion, excluded endpoints, crossing edges, invalid directed endpoints, and unchanged project files without user imports. |
 | `test_128_sample_plan_filtered_acquisition.py` | Fresh read-only sampling observations accept excluded-status changes while retaining the later complete job baseline. |
 | `test_129_sampled_resume_history.py` | Refuse conflicting history before admission, preserve sampled lineage after failed repair, and check selected parent lineage before preparation. |
-| `test_130_sampled_resume_history_writers.py` | Retained history at resume start and settlement, rollback after failed writes, and file restoration after history changes during preparation. |
+| `test_130_sampled_resume_history_writers.py` | Missing-history refusal, retained results through failed resume, atomic pending-write rollback, and file restoration after history changes during preparation. |
 | `test_131_native_command_planning.py` | All nine previews use native prerequisite state despite raw-status disagreement and include retained publication receivers outside graph edges. |
 | `test_132_between_command_execution.py` | Fresh and resumed interval execution, excluded operator work, producer cleanup, native alignment, and publication without receiver execution. |
 | `test_133_readonly_reset_live_refusal.py` | Applied reset forms refuse a live interrupt before imports or mutation, preserving all database rows and project bytes. |
 | `test_134_between_external_prerequisites.py` | Wide interval preparation with a blocked interior merge across all four runners, preserving excluded component state, jobs, and node trees. |
 | `test_135_graph_preview_busy_boundaries.py` | Valid reservations, holds, and pending work render as busy; damaged links fail; excluded receiver guards and active jobs appear without mutation. |
 | `test_136_nine_command_wiring_regressions.py` | Stale-session reset refusal, parent drift after reservation, consistent interval order, unknown refusal-boundary validation, and exact interval repair guidance. |
+| `test_137_between_run_membership.py` | Public split and merge repair through fresh run and reset, exact preparation scope, preserved execution selection, and unchanged unrelated data. |
+| `test_138_membership_reconciliation_boundaries.py` | Automatic reconciliation without reusable history, retained unowned jobs and inputs, unchanged components, and refusal of non-fresh reuse or damaged state. |
+| `test_139_membership_commit_boundaries.py` | Regional mapping changes after all preparation units commit, failure and retry behavior, historical producer cleanup, and removed members. |
+| `test_140_unchanged_membership_execution_shapes.py` | Resume and selected execution across unrelated graph changes, exact new producing identity, and preserved earlier ownership and successful results. |
+| `test_141_membership_alignment_generation.py` | Repaired membership starts above the alignment generations of all overlapping historical components. |
+| `test_142_regional_membership_session_continuity.py` | Disjoint fresh repair preserves a live interrupt's admitted membership, while overlapping repair refuses before session, database, or filesystem mutation. |
+| `test_143_unproduced_membership_reconciliation.py` | Read-only and applied no-history reconciliation agree for resume and selected execution; returning components start queued above their overlapping history. |
+| `test_144_deletion_only_membership_reconciliation.py` | Entirely removed no-history components leave active membership while preserving stored data; live overlap refuses atomically and reusable history remains active. |
+| `test_145_state_listener_retirement.py` | Transient subscriber-record deletion failures and delayed old listener startup cannot leak records or retire a replacement listener. |
 | `test_active_job_restart.py` | Generation-fenced restart during active threaded, direct, and process runs, refusal cases, fast-path imports, and replacement-runtime isolation after the old checkpoint deadline and stale-write attempt. |
 | `test_autostart_cycles.py` | Self, mutual, diamond, ring, and stochastic cyclic scheduling. Run each test in a fresh process. |
 | `test_benchmark_exit_codes.py` | Nonzero benchmark status for workflow exceptions, failed jobs, unfinished work, missing expected rounds, and repeated-API slowdown beyond the fixed allowance; successful completion and exact allowance equality. |

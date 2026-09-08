@@ -22,7 +22,7 @@ assert 'networkx' not in sys.modules, 'Storage import loaded graph dependencies'
 assert 'micro_workflow_manager.topology' not in sys.modules
 storage = FileStorage(sys.argv[1])
 assert 'networkx' not in sys.modules, 'Ordinary storage creation loaded graph dependencies'
-assert storage.db_connection().execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '5'
+assert storage.db_connection().execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '6'
 assert storage.database_integrity_check() == 'ok'
 storage.close_database_connections()
 '''
@@ -36,11 +36,13 @@ def test_component_identity_and_session_scope_keep_exact_sorted_members(tmp_path
     topology = ComponentTopology(nx.DiGraph([('A', 'B')]), [('A', 'B')])
     assert topology.component_key(members) == ('A', 'B')
     storage = FileStorage._create_new_project_state(tmp_path)
+    snapshot = topology.snapshot()
+    storage.register_component_topology(snapshot)
     storage.create_execution_session(
         'int-17', session_kind='interrupt', command='run',
         start_component=members, selected_components=[members],
         started_at='2026-09-05T12:00:00+00:00', hostname='worker.example',
-        pid=123, process_identity='instance-1',
+        pid=123, process_identity='instance-1', expected_shape=snapshot.shape_json,
     )
     storage.close_database_connections()
 
@@ -61,12 +63,12 @@ def _definition_rows(storage):
     }
 
 
-def _session(storage, session_id, components, *, kind='interrupt'):
+def _session(storage, session_id, components, expected_shape, *, kind='interrupt'):
     return storage.create_execution_session(
         session_id, session_kind=kind, command='run',
         start_component=components[0], selected_components=components,
         started_at='2026-09-05T12:00:00+00:00', hostname='worker.example',
-        pid=123, process_identity='instance-1',
+        pid=123, process_identity='instance-1', expected_shape=expected_shape,
     )
 
 
@@ -192,19 +194,37 @@ def test_many_component_definitions_keep_bounded_storage_and_exact_shapes(tmp_pa
     reopened.close_database_connections()
 
 
-def test_registration_refuses_an_existing_exact_component_under_another_shape_atomically(tmp_path):
+def test_registration_preserves_unchanged_component_state_across_an_unrelated_shape_change(tmp_path):
     old = ComponentTopology(nx.DiGraph([('A', 'B')]), [('A', 'B')]).snapshot()
     changed = ComponentTopology(nx.DiGraph([('A', 'B'), ('B', 'C')]), [('A', 'B')]).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(old)
-    before = _definition_rows(storage)
+    before = storage.get_component_state(('A', 'B'))
 
-    with pytest.raises(RuntimeError, match='different graph shape') as refused:
-        storage.register_component_topology(changed)
+    assert storage.register_component_topology(changed) is True
 
-    assert 'A' in str(refused.value) and 'B' in str(refused.value)
-    assert _definition_rows(storage) == before
-    assert storage.get_component_definition(('C',)) is None
+    assert storage.get_component_state(('A', 'B')) == before
+    assert storage.get_component_definition(('A', 'B')) == {
+        'members': ('A', 'B'), 'shape_json': old.shape_json,
+    }
+    assert storage.get_component_state(('C',)) == {
+        'members': ('C',), 'shape_json': changed.shape_json,
+        'lifecycle': 'queued', 'stability': None, 'instability_origin': None,
+        'misaligned': False, 'alignment_generation': 0,
+    }
+    definitions = {
+        (row['component_key'], row['shape_json'])
+        for row in storage.db_connection().execute(
+            'SELECT definition.component_key, shape.shape_json '
+            'FROM component_definitions AS definition '
+            'JOIN graph_shapes AS shape ON shape.shape_id=definition.shape_id'
+        )
+    }
+    assert definitions == {
+        (json.dumps(['A', 'B']), old.shape_json),
+        (json.dumps(['A', 'B']), changed.shape_json),
+        (json.dumps(['C']), changed.shape_json),
+    }
     storage.close_database_connections()
 
 
@@ -319,7 +339,9 @@ def test_component_schema_damage_refuses_in_a_new_process_without_importing_lega
         if damage == 'older-private-shape':
             connection.execute('DROP TABLE graph_shapes')
         elif damage == 'missing-shape-reference':
-            connection.execute('CREATE TABLE component_definitions(component_key TEXT PRIMARY KEY, shape_id INTEGER NOT NULL)')
+            connection.execute('''CREATE TABLE component_definitions(
+                component_key TEXT NOT NULL, shape_id INTEGER NOT NULL,
+                PRIMARY KEY(component_key, shape_id))''')
         elif damage in {'missing-shape-uniqueness', 'missing-shape-identifier'}:
             connection.execute('DROP TABLE graph_shapes')
             primary = '' if damage == 'missing-shape-identifier' else ' PRIMARY KEY'
@@ -338,16 +360,19 @@ def test_component_schema_damage_refuses_in_a_new_process_without_importing_lega
             connection.execute('DROP TABLE component_holds')
             connection.execute('''CREATE TABLE component_holds(
                 session_id TEXT NOT NULL REFERENCES execution_sessions(session_id),
-                component_key TEXT NOT NULL REFERENCES component_definitions(component_key),
+                component_key TEXT NOT NULL REFERENCES component_states(component_key),
                 hold_count INTEGER NOT NULL, PRIMARY KEY(session_id, component_key))''')
         else:
             original = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE name='job_execution_owners'"
             ).fetchone()[0]
             connection.execute('DROP TABLE job_execution_owners')
-            reference = (' REFERENCES execution_sessions(session_id)'
-                         if damage == 'missing-owner-session-reference'
-                         else ' REFERENCES component_definitions(component_key)')
+            reference = (
+                ' REFERENCES execution_sessions(session_id)'
+                if damage == 'missing-owner-session-reference'
+                else ',\n            FOREIGN KEY(component_key, shape_id) '
+                     'REFERENCES component_definitions(component_key, shape_id)'
+            )
             changed = original.replace(reference, '')
             assert changed != original, 'Damage fixture did not remove the named reference'
             connection.execute(changed)
@@ -391,7 +416,7 @@ def test_session_reserves_its_whole_persisted_scope_and_keeps_exact_owners_after
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B'), ('B', 'C')]), [('A', 'B')]).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A', 'B'), ('C',)])
+    _session(storage, 'int-17', [('A', 'B'), ('C',)], snapshot.shape_json)
 
     assert storage.reserve_execution_components('int-17', expected_shape=snapshot.shape_json) is True
     assert storage.reserve_execution_components('int-17', expected_shape=snapshot.shape_json) is False
@@ -414,7 +439,7 @@ def test_reservation_conflict_reports_every_exact_owner_and_grants_no_partial_sc
     storage.register_component_topology(snapshot)
     for session_id, scope in [('int-17', [('A', 'B')]), ('int-19', [('D',)]),
                               ('int-18', [('A', 'B'), ('C',), ('D',)])]:
-        _session(storage, session_id, scope)
+        _session(storage, session_id, scope, snapshot.shape_json)
     storage.reserve_execution_components('int-17', expected_shape=snapshot.shape_json)
     storage.reserve_execution_components('int-19', expected_shape=snapshot.shape_json)
     storage.heartbeat_execution_session('int-17', '2000-01-01T00:00:00+00:00')
@@ -437,7 +462,7 @@ def test_only_a_persisted_running_session_can_acquire_reservations(tmp_path, kno
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
     if known:
-        _session(storage, 'int-17', [('A',), ('B',)])
+        _session(storage, 'int-17', [('A',), ('B',)], snapshot.shape_json)
         storage.finish_execution_session('int-17', outcome='done', finished_at='2026-09-05T12:01:00+00:00')
 
     with pytest.raises(RuntimeError, match='running session'):
@@ -452,7 +477,7 @@ def test_partial_same_session_reservation_refuses_as_damaged_state_without_filli
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A',), ('B',)])
+    _session(storage, 'int-17', [('A',), ('B',)], snapshot.shape_json)
     with sqlite3.connect(storage.state_database_path()) as connection:
         connection.execute('INSERT INTO component_reservations VALUES(?, ?)', ('["A"]', 'int-17'))
 
@@ -468,7 +493,7 @@ def test_reservation_outside_immutable_session_scope_refuses_without_adding_sele
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A',)])
+    _session(storage, 'int-17', [('A',)], snapshot.shape_json)
     with sqlite3.connect(storage.state_database_path()) as connection:
         connection.execute('INSERT INTO component_reservations VALUES(?, ?)', ('["B"]', 'int-17'))
 
@@ -485,13 +510,24 @@ def test_reservation_requires_every_component_under_the_expected_shape(tmp_path,
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    scope = [('A',), ('Outside',)] if unknown_component else [('A',), ('B',)]
-    _session(storage, 'int-17', scope)
+    _session(storage, 'int-17', [('A',), ('B',)], snapshot.shape_json)
+    if unknown_component:
+        assert storage.submit_db_mutation(lambda connection: connection.execute(
+            'UPDATE session_components SET component_key=? '
+            'WHERE session_id=? AND component_key=?',
+            ('["Outside"]', 'int-17', '["B"]'),
+        ).rowcount) == 1
     expected_shape = snapshot.shape_json if unknown_component else 'another graph shape'
+    before = [tuple(row) for row in storage.db_connection().execute(
+        'SELECT * FROM session_components WHERE session_id=? ORDER BY position', ('int-17',),
+    )]
 
     with pytest.raises(RuntimeError, match='expected graph shape'):
         storage.reserve_execution_components('int-17', expected_shape=expected_shape)
 
+    assert [tuple(row) for row in storage.db_connection().execute(
+        'SELECT * FROM session_components WHERE session_id=? ORDER BY position', ('int-17',),
+    )] == before
     assert storage.get_component_reservation(('A',)) is None
     assert storage.get_component_reservation(('B',)) is None
     assert storage.get_component_reservation(('Outside',)) is None
@@ -503,7 +539,7 @@ def test_two_processes_racing_for_one_scope_produce_one_complete_owner(tmp_path)
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
     for session_id in ['int-17', 'int-18']:
-        _session(storage, session_id, [('A', 'B'), ('C',)])
+        _session(storage, session_id, [('A', 'B'), ('C',)], snapshot.shape_json)
     script = '''
 import json, sys, time
 from pathlib import Path
@@ -555,7 +591,7 @@ def test_failed_reservation_batch_retains_no_partial_scope_and_can_retry(tmp_pat
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B'), ('B', 'C')]), [('A', 'B')]).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A', 'B'), ('C',)])
+    _session(storage, 'int-17', [('A', 'B'), ('C',)], snapshot.shape_json)
     with sqlite3.connect(storage.state_database_path()) as connection:
         connection.execute('''
             CREATE TRIGGER fail_reservation BEFORE INSERT ON component_reservations
@@ -576,8 +612,8 @@ def test_releasing_one_session_keeps_disjoint_owners_and_all_session_history(tmp
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B'), ('B', 'C')]), []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    main = _session(storage, 'main-1', [('A',)], kind='main')
-    _session(storage, 'int-17', [('B',), ('C',)])
+    main = _session(storage, 'main-1', [('A',)], snapshot.shape_json, kind='main')
+    _session(storage, 'int-17', [('B',), ('C',)], snapshot.shape_json)
     storage.reserve_execution_components('main-1', expected_shape=snapshot.shape_json)
     storage.reserve_execution_components('int-17', expected_shape=snapshot.shape_json)
     storage.finish_execution_session('int-17', outcome='done', finished_at='2026-09-05T12:01:00+00:00')
@@ -592,7 +628,7 @@ def test_releasing_one_session_keeps_disjoint_owners_and_all_session_history(tmp
     assert storage.get_component_reservation(('C',)) is None
     assert storage.get_execution_session('main-1') == main
     assert storage.get_execution_session('int-17') == terminal
-    _session(storage, 'int-18', [('B',), ('C',)])
+    _session(storage, 'int-18', [('B',), ('C',)], snapshot.shape_json)
     assert storage.reserve_execution_components('int-18', expected_shape=snapshot.shape_json)
     storage.close_database_connections()
 
@@ -601,8 +637,8 @@ def test_shared_predecessor_holds_keep_per_session_counts_and_heartbeats_after_r
     snapshot = ComponentTopology(nx.DiGraph([('P', 'A'), ('P', 'B')]), []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A',)])
-    _session(storage, 'int-18', [('B',)])
+    _session(storage, 'int-17', [('A',)], snapshot.shape_json)
+    _session(storage, 'int-18', [('B',)], snapshot.shape_json)
 
     assert storage.acquire_component_holds('int-17', [('P',)]) == {('P',): 1}
     assert storage.acquire_component_holds('int-17', [('P',)]) == {('P',): 2}
@@ -632,8 +668,8 @@ def test_reservations_refuse_raw_node_overlap_across_split_and_merged_shapes(tmp
         storage.register_component_topology(snapshot)
     first, second = (combined, split) if combined_first else (split, combined)
     owned = ('A', 'B') if combined_first else ('A',)
-    _session(storage, 'int-17', [owned])
-    _session(storage, 'int-18', second.components)
+    _session(storage, 'int-17', [owned], first.shape_json)
+    _session(storage, 'int-18', second.components, second.shape_json)
     storage.reserve_execution_components('int-17', expected_shape=first.shape_json)
 
     with pytest.raises(RuntimeError) as refused:
@@ -653,7 +689,7 @@ def test_only_a_persisted_running_session_can_acquire_holds(tmp_path, known, com
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
     if known:
-        _session(storage, 'int-17', [('A',)])
+        _session(storage, 'int-17', [('A',)], snapshot.shape_json)
         storage.finish_execution_session('int-17', outcome='done', finished_at='2026-09-05T12:01:00+00:00')
 
     with pytest.raises(RuntimeError, match='running session'):
@@ -667,8 +703,8 @@ def test_releasing_counted_holds_keeps_other_sessions_and_deletes_at_zero(tmp_pa
     snapshot = ComponentTopology(nx.DiGraph([('P', 'A'), ('P', 'B')]), []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A',)])
-    _session(storage, 'int-18', [('B',)])
+    _session(storage, 'int-17', [('A',)], snapshot.shape_json)
+    _session(storage, 'int-18', [('B',)], snapshot.shape_json)
     storage.acquire_component_holds('int-17', [('P',)])
     storage.acquire_component_holds('int-17', [('P',)])
     storage.acquire_component_holds('int-18', [('P',)])
@@ -697,7 +733,7 @@ def test_one_hold_batch_rejects_duplicate_component_requests_without_changing_co
     snapshot = ComponentTopology(nx.DiGraph([('P', 'Q'), ('Q', 'A')]), [('P', 'Q')]).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A',)])
+    _session(storage, 'int-17', [('A',)], snapshot.shape_json)
     storage.acquire_component_holds('int-17', [('P', 'Q')])
     before = storage.get_component_holds(('P', 'Q'))
 
@@ -713,7 +749,7 @@ def test_failed_hold_batch_preserves_all_counts_and_can_retry(tmp_path, operatio
     snapshot = ComponentTopology(nx.DiGraph([('P', 'A'), ('Q', 'A')]), []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A',)])
+    _session(storage, 'int-17', [('A',)], snapshot.shape_json)
     for _ in range(2):
         storage.acquire_component_holds('int-17', [('P',), ('Q',)])
     before = [storage.get_component_holds(component) for component in [('P',), ('Q',)]]
@@ -740,7 +776,7 @@ def test_unknown_component_rolls_back_hold_batch_and_reads_keep_stale_owners(tmp
     snapshot = ComponentTopology(nx.DiGraph([('P', 'A')]), []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [('A',)])
+    _session(storage, 'int-17', [('A',)], snapshot.shape_json)
 
     with pytest.raises(sqlite3.IntegrityError):
         storage.acquire_component_holds('int-17', [('P',), ('Unknown',)])
@@ -786,7 +822,7 @@ def test_noncanonical_spelling_of_an_equivalent_shape_refuses_without_inserting(
 
 
 @pytest.mark.parametrize('same_shape', [False, True])
-def test_two_processes_register_one_component_without_orphaning_a_conflicting_shape(tmp_path, same_shape):
+def test_two_processes_preserve_first_producing_shape_and_last_active_membership(tmp_path, same_shape):
     first = ComponentTopology(nx.DiGraph([('A', 'B')]), [('A', 'B')]).snapshot()
     second = first if same_shape else ComponentTopology(
         nx.DiGraph([('A', 'B'), ('B', 'C')]), [('A', 'B')],
@@ -807,15 +843,9 @@ while not (root / 'start-registration').exists():
     if time.monotonic() > deadline:
         raise RuntimeError('parent did not release registration race')
     time.sleep(0.001)
-try:
-    changed = storage.register_component_topology(snapshot)
-except RuntimeError as error:
-    assert 'different graph shape' in str(error), str(error)
-    print(json.dumps({'result': 'refused', 'shape': snapshot.shape_json}), flush=True)
-else:
-    print(json.dumps({'result': 'inserted' if changed else 'unchanged', 'shape': snapshot.shape_json}), flush=True)
-finally:
-    storage.close_database_connections()
+changed = storage.register_component_topology(snapshot)
+print(json.dumps({'result': 'inserted' if changed else 'unchanged', 'shape': snapshot.shape_json}), flush=True)
+storage.close_database_connections()
 '''
     processes = [subprocess.Popen(
         [sys.executable, '-c', script, str(tmp_path), snapshot.shape_json, json.dumps(snapshot.components), str(position)],
@@ -838,12 +868,52 @@ finally:
             if process.poll() is None:
                 process.kill()
                 process.communicate(timeout=5)
-    assert sorted(outcome['result'] for outcome in outcomes) == ['inserted', 'unchanged' if same_shape else 'refused']
-    winner = next(outcome['shape'] for outcome in outcomes if outcome['result'] == 'inserted')
+    assert sorted(outcome['result'] for outcome in outcomes) == (
+        ['inserted', 'unchanged'] if same_shape else ['inserted', 'inserted']
+    )
     reopened = FileStorage(tmp_path)
-    assert reopened.get_component_definition(('A', 'B'))['shape_json'] == winner
-    assert _definition_rows(reopened)['shapes'] == [(winner,)]
-    assert (reopened.get_component_definition(('C',)) is not None) == ('C' in json.loads(winner)['nodes'])
+    producing_shape = reopened.get_component_definition(('A', 'B'))['shape_json']
+    connection = reopened.db_connection()
+    shape_order = [
+        row['shape_json']
+        for row in connection.execute('SELECT shape_json FROM graph_shapes ORDER BY shape_id')
+    ]
+    assert producing_shape == shape_order[0]
+    definitions = {
+        (row['component_key'], row['shape_json'])
+        for row in connection.execute(
+            'SELECT definition.component_key, shape.shape_json '
+            'FROM component_definitions AS definition '
+            'JOIN graph_shapes AS shape ON shape.shape_id=definition.shape_id'
+        )
+    }
+    active = {
+        tuple(json.loads(row['component_key']))
+        for row in connection.execute('SELECT component_key FROM active_components')
+    }
+    revision = connection.execute(
+        'SELECT revision FROM component_partition_state WHERE singleton=1'
+    ).fetchone()['revision']
+    if same_shape:
+        assert shape_order == [first.shape_json]
+        assert definitions == {(json.dumps(['A', 'B']), first.shape_json)}
+        assert active == {('A', 'B')}
+        assert revision == 0
+    else:
+        assert len(shape_order) == 2
+        assert set(shape_order) == {first.shape_json, second.shape_json}
+        assert definitions == {
+            (json.dumps(['A', 'B']), first.shape_json),
+            (json.dumps(['A', 'B']), second.shape_json),
+            (json.dumps(['C']), second.shape_json),
+        }
+        assert active == (
+            {('A', 'B'), ('C',)} if shape_order[-1] == second.shape_json else {('A', 'B')}
+        )
+        assert revision == 1
+        assert reopened.get_component_definition(('C',)) == {
+            'members': ('C',), 'shape_json': second.shape_json,
+        }
     assert reopened.database_integrity_check() == 'ok'
     reopened.close_database_connections()
 
@@ -858,7 +928,7 @@ def test_component_keys_keep_existing_bytes_across_every_persisted_association(t
     snapshot = ComponentTopology(graph, list(graph.edges)).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
     storage.register_component_topology(snapshot)
-    _session(storage, 'int-17', [members])
+    _session(storage, 'int-17', [members], snapshot.shape_json)
     storage.reserve_execution_components('int-17', expected_shape=snapshot.shape_json)
     storage.acquire_component_holds('int-17', [members])
     connection = storage.db_connection()
@@ -880,10 +950,12 @@ def test_component_keys_keep_existing_bytes_across_every_persisted_association(t
 def test_historical_combined_and_split_holds_keep_separate_counts_and_release_identity(tmp_path):
     graph = nx.DiGraph([('A', 'B')])
     storage = FileStorage._create_new_project_state(tmp_path)
-    for autostart in [[('A', 'B')], []]:
-        storage.register_component_topology(ComponentTopology(graph, autostart).snapshot())
-    _session(storage, 'int-17', [('A', 'B')])
-    _session(storage, 'int-18', [('A',)])
+    combined = ComponentTopology(graph, [('A', 'B')]).snapshot()
+    split = ComponentTopology(graph, []).snapshot()
+    for snapshot in [combined, split]:
+        storage.register_component_topology(snapshot)
+    _session(storage, 'int-17', [('A', 'B')], combined.shape_json)
+    _session(storage, 'int-18', [('A',)], split.shape_json)
     storage.acquire_component_holds('int-17', [('A', 'B')])
     storage.acquire_component_holds('int-17', [('A', 'B')])
     storage.acquire_component_holds('int-18', [('A',)])

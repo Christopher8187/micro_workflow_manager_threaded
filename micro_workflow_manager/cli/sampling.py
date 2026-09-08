@@ -4,7 +4,8 @@ import secrets
 import shlex
 
 from micro_workflow_manager.component_readiness import calculate_component_readiness
-from micro_workflow_manager.storage.component_states import ComponentStateStorageMixin
+from micro_workflow_manager.storage.component_states import read_component_states_snapshot
+from micro_workflow_manager.storage.membership_observation import read_membership_change, require_reusable_membership_match
 from micro_workflow_manager.storage.sample_planning import parse_sample_statuses, plan_sample
 
 from .preview import load_preview
@@ -16,10 +17,11 @@ def _require_sample_ready(preview, node):
     component = preview.component_for(node)
     parents = {preview.component_key(preview.component_for(parent))
                for parent in preview.component_predecessors(component)}
-    reader = ComponentStateStorageMixin()
-    states = [reader._read_component_state(preview.storage.connection, parent) for parent in sorted(parents)]
-    shape = preview.topology.snapshot().shape_json
-    if (any(state is None or state['shape_json'] != shape for state in states)
+    states = read_component_states_snapshot(
+        preview.storage.connection, sorted(parents),
+        expected_shape=preview.topology.snapshot().shape_json, allow_missing=True,
+    ).values()
+    if (any(state is None for state in states)
             or calculate_component_readiness(
                 (state['lifecycle'], state['stability'], state['instability_origin']) for state in states
             ) is None):
@@ -34,6 +36,9 @@ def read_sample_plan(root, node, selectors, *, seed, statuses=(), expected_popul
         preview = load_preview(root)
         try:
             require_node(preview, node)
+            require_reusable_membership_match(read_membership_change(
+                preview.storage.connection, preview.topology.snapshot(), (preview.component_id(node),),
+            ))
             if report_recovery and attempt == 0:
                 if print_recovery_preview(preview, quiet_if_empty=True):
                     raise RuntimeError('Damaged execution state requires recovery before sampling')

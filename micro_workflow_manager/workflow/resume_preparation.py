@@ -6,6 +6,7 @@ from shlex import join
 from ..component_readiness import calculate_component_readiness, calculate_sampled_resume_lineage
 from ..errors import InvalidGraphError
 from ..storage.resume_preparation import prepare_resume_components, validate_resume_job_owners
+from ..storage.unproduced_membership import read_execution_component_states
 from .graph_command_selection import select_graph_command
 
 
@@ -50,8 +51,8 @@ def predict_resume_lineages(components, all_parents, observations, successful_re
             retained = state['stability'], state['instability_origin']
         elif (state['lifecycle'] == 'failed'
               and successful_results[component] is not None
-              and successful_results[component][0] == 'sampled'):
-            retained = successful_results[component][1:]
+              and successful_results[component].lifecycle == 'sampled'):
+            retained = successful_results[component].lineage
         if retained is not None:
             lineage = calculate_sampled_resume_lineage(*retained, readiness)
             if lineage is None:
@@ -85,8 +86,9 @@ def observe_resume_selection(
         parents = {component: all_parents[component] - selected for component in components}
         descendants = {component: set(workflow.component_descendants(set(component))) for component in components}
     external = sorted({parent for group in parents.values() for parent in group})
-    observations = workflow.storage.read_component_states(
-        [*components, *external], expected_shape=shape, allow_missing=True,
+    observations = read_execution_component_states(
+        workflow.storage.db_connection(), [*components, *external],
+        expected_shape=shape, allow_missing=True,
     )
     for component in components:
         state = observations[component]
@@ -113,7 +115,7 @@ def observe_resume_selection(
         if state['lifecycle'] == 'running':
             raise RuntimeError(f'Resume requires recovery of running component {component}')
     states = {key: observations[key] for key in components}
-    successful_results = validate_resume_job_owners(workflow.storage, states)
+    successful_results = validate_resume_job_owners(workflow.storage, states, expected_shape=shape)
     predict_resume_lineages(components, all_parents, observations, successful_results)
     return ResumeSelection(shape, components, states,
                            {key: observations[key] for key in external}, successful_results,
@@ -130,6 +132,7 @@ def prepare_admitted_resume(workflow, nodes, selection, *, clear_trace_nodes=())
         raise RuntimeError('Resume selection changed during admission')
     return prepare_resume_components(
         workflow.storage, context[0], selection.states,
+        expected_admitted_shape=selection.shape,
         expected_parents=selection.parents,
         expected_successful_results=selection.successful_results,
         clear_trace_nodes=clear_trace_nodes,

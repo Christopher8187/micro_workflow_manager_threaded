@@ -46,7 +46,7 @@ def programmatic_execution(
     preparation = observe_programmatic_fresh_preparation(workflow, nodes) if fresh or selected_preparation else None
     with execution_session(
         workflow, command=command, start_node=start_node,
-        nodes=nodes, selected_jobs=selected_jobs,
+        nodes=nodes, selected_jobs=selected_jobs, fresh_preparation=fresh and not selected_preparation,
     ) as driver:
         if preparation is not None:
             if selected_preparation:

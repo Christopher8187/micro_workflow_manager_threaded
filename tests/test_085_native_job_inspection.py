@@ -35,6 +35,7 @@ def workflow(tmp_path):
             session_id, session_kind=kind, command='run', start_component=component,
             selected_components=[component], started_at=now(), hostname=socket.gethostname(),
             pid=os.getpid(), process_identity=process_identity(os.getpid()),
+            expected_shape=workflow.topology.snapshot().shape_json,
         )
         storage.reserve_execution_components(session_id, expected_shape=workflow.topology.snapshot().shape_json)
     try:
@@ -161,6 +162,7 @@ def test_actual_inspect_cli_reports_native_owner_and_preserves_stored_state(tmp_
             'cli-owner', session_kind='interrupt', command='run', start_component=('A',),
             selected_components=[('A',)], started_at=now(), hostname=socket.gethostname(),
             pid=os.getpid(), process_identity=process_identity(os.getpid()),
+            expected_shape=workflow.topology.snapshot().shape_json,
         )
         storage.reserve_execution_components('cli-owner', expected_shape=workflow.topology.snapshot().shape_json)
         generation, execution_id = storage.claim_job_execution(

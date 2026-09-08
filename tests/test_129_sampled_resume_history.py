@@ -95,6 +95,33 @@ def _make_failing_parented_component(tmp_path, monkeypatch):
     return storage
 
 
+def _set_done_result(storage, component, stability, origin):
+    key = encode_component_key(component)
+
+    def seed(connection):
+        state = connection.execute(
+            'SELECT shape_id, alignment_generation FROM component_states WHERE component_key=?',
+            (key,),
+        ).fetchone()
+        assert state is not None
+        connection.execute(
+            'INSERT INTO component_successful_results '
+            '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
+            "VALUES(?,?,?,'done',?,?) ON CONFLICT(component_key, shape_id, alignment_generation) "
+            'DO UPDATE SET lifecycle=excluded.lifecycle, stability=excluded.stability, '
+            'instability_origin=excluded.instability_origin',
+            (key, state['shape_id'], state['alignment_generation'], stability, origin),
+        )
+        return connection.execute(
+            "UPDATE component_states SET lifecycle='done', stability=?, instability_origin=?, "
+            'retained_result_shape_id=shape_id, retained_result_alignment_generation=alignment_generation '
+            'WHERE component_key=?',
+            (stability, origin, key),
+        ).rowcount
+
+    return storage.submit_db_mutation(seed)
+
+
 def _set_unstable_result(storage, component, origin):
     storage.create_execution_session(
         origin,
@@ -106,14 +133,11 @@ def _set_unstable_result(storage, component, origin):
         hostname=socket.gethostname(),
         pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
+        expected_shape=storage.get_component_definition(component)["shape_json"],
     )
     assert storage.finish_execution_session(origin, outcome="done", finished_at=now()) is True
     key = encode_component_key(component)
-    assert storage.submit_db_mutation(lambda connection: connection.execute(
-        "UPDATE component_states SET lifecycle='done', stability='unstable', "
-        "instability_origin=? WHERE component_key=?",
-        (origin, key),
-    ).rowcount) == 1
+    assert _set_done_result(storage, component, "unstable", origin) == 1
     for node in component:
         storage.set_node_status(node, "done")
 
@@ -130,11 +154,7 @@ def test_failed_sampled_resume_repair_retains_exact_origin_with_stable_parent(
             sampled["lifecycle"], sampled["stability"], sampled["instability_origin"],
             sampled["alignment_generation"],
         ) == ("sampled", "unstable", "interrupt-own-result", 0)
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET stability='stable', instability_origin=NULL "
-            "WHERE component_key=? AND lifecycle='done'",
-            (encode_component_key(("P",)),),
-        ).rowcount) == 1
+        assert _set_done_result(storage, ("P",), "stable", None) == 1
         failing = queued[0]
         marker = tmp_path / f"fail-{failing}"
         marker.write_text("fail", encoding="utf-8")

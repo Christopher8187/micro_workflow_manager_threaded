@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from micro_workflow_manager.storage.preparation_footprint import PreparationFootprint
+from micro_workflow_manager.storage.component_result_identity import SuccessfulResultObservation
 from micro_workflow_manager.workflow.graph_command_selection import GraphCommandSelection
 
 
@@ -52,7 +53,7 @@ class ResumeJobEffect:
 class ResumePlanEffects:
     jobs: tuple[ResumeJobEffect, ...]
     successful_results: tuple[
-        tuple[tuple[str, ...], tuple[str, str | None, str | None] | None], ...
+        tuple[tuple[str, ...], SuccessfulResultObservation | None], ...
     ]
 
 

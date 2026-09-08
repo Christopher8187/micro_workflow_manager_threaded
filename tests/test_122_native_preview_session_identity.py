@@ -36,6 +36,7 @@ def test_damaged_session_identity_is_refused_before_liveness_classification(
             started_at=now() if live else '2020-01-01T00:00:00+00:00',
             hostname=socket.gethostname(), pid=os.getpid() if live else 99999999,
             process_identity=process_identity(os.getpid()) if live else 'retired-process',
+            expected_shape=shape,
         )
         storage.reserve_execution_components(session_id, expected_shape=shape)
         storage.begin_queued_component_execution(

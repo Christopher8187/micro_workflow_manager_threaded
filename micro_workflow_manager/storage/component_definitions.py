@@ -51,40 +51,48 @@ class ComponentDefinitionStorageMixin:
         components = [encode_component_key(component) for component in snapshot.components]
 
         def register(connection):
+            from .component_membership import (
+                initialize_active_component_partition, read_active_component_partition,
+            )
+
+            active = read_active_component_partition(connection)
+            has_definitions = connection.execute(
+                'SELECT 1 FROM component_definitions LIMIT 1',
+            ).fetchone() is not None
+            if active is None and has_definitions:
+                raise RuntimeError('Stored components have no active membership partition')
             shape = connection.execute(
                 'SELECT shape_id FROM graph_shapes WHERE shape_json=?', (snapshot.shape_json,),
             ).fetchone()
-            shape_id = shape['shape_id'] if shape is not None else None
-            conflicts = []
-            existing_components = set()
-            for offset in range(0, len(components), 500):
-                selected = components[offset:offset + 500]
-                placeholders = ','.join('?' for _ in selected)
-                rows = connection.execute(
-                    'SELECT d.component_key, d.shape_id, s.component_key AS state_key '
-                    'FROM component_definitions d LEFT JOIN component_states s USING(component_key) '
-                    f'WHERE d.component_key IN ({placeholders})', selected,
-                )
-                for row in rows:
-                    if row['state_key'] is None:
-                        raise RuntimeError('Incomplete component state for ' + row['component_key'])
-                    existing_components.add(row['component_key'])
-                    if row['shape_id'] != shape_id:
-                        conflicts.append(row['component_key'])
-            if conflicts:
-                raise RuntimeError('Components belong to a different graph shape: ' + ', '.join(sorted(conflicts)))
+            shape_id = None if shape is None else shape['shape_id']
             if shape_id is not None:
-                registered_components = {
-                    row['component_key']
-                    for row in connection.execute(
+                registered = {
+                    row['component_key'] for row in connection.execute(
                         'SELECT component_key FROM component_definitions WHERE shape_id=?',
                         (shape_id,),
                     )
                 }
-                if registered_components != set(components):
+                if registered != set(components):
                     raise RuntimeError('Incomplete registered component topology')
+            existing_components = set()
+            for component, key in zip(snapshot.components, components):
+                historical = connection.execute(
+                    'SELECT 1 FROM component_definitions WHERE component_key=? LIMIT 1',
+                    (key,),
+                ).fetchone()
+                state = self._read_component_state(connection, component)
+                if historical is not None and state is None:
+                    raise RuntimeError('Incomplete component state for ' + key)
+                if state is not None:
+                    existing_components.add(key)
+                    try:
+                        producing = component_snapshot_from_shape(state['shape_json'])
+                    except ValueError as error:
+                        raise RuntimeError('Invalid producing component shape') from error
+                    if component not in producing.components:
+                        raise RuntimeError('Stored component is outside its producing shape')
             changed = connection.execute(
-                "INSERT INTO graph_shapes(shape_json) VALUES(?) ON CONFLICT DO NOTHING",
+                'INSERT INTO graph_shapes(shape_json) VALUES(?) ON CONFLICT DO NOTHING',
                 (snapshot.shape_json,),
             ).rowcount
             if shape_id is None:
@@ -92,15 +100,24 @@ class ComponentDefinitionStorageMixin:
                     'SELECT shape_id FROM graph_shapes WHERE shape_json=?', (snapshot.shape_json,),
                 ).fetchone()['shape_id']
             changed += connection.executemany(
-                "INSERT INTO component_definitions(component_key, shape_id) VALUES(?, ?) "
-                "ON CONFLICT(component_key) DO NOTHING",
+                'INSERT INTO component_definitions(component_key, shape_id) VALUES(?, ?) '
+                'ON CONFLICT(component_key, shape_id) DO NOTHING',
                 [(component, shape_id) for component in components],
             ).rowcount
             connection.executemany(
-                "INSERT INTO component_states(component_key) VALUES(?)",
-                [(component,) for component in components if component not in existing_components],
+                'INSERT INTO component_states(component_key, shape_id) VALUES(?, ?)',
+                [(component, shape_id) for component in components if component not in existing_components],
             )
-            return changed > 0
+            if active is None:
+                initialize_active_component_partition(connection, snapshot.components)
+            from .membership_registration import reconcile_unproduced_memberships
+
+            reconciled = reconcile_unproduced_memberships(
+                connection, snapshot,
+                new_components=[component for component in snapshot.components
+                                if encode_component_key(component) not in existing_components],
+            )
+            return changed > 0 or reconciled
 
         return self.submit_db_mutation(register, wait=True, priority=0)
 
@@ -124,7 +141,7 @@ class ComponentDefinitionStorageMixin:
         if component not in snapshot.components:
             raise RuntimeError('Producing component does not belong to its recorded shape')
         shape = connection.execute(
-            'SELECT shape_id FROM component_definitions WHERE component_key=?',
+            'SELECT shape_id FROM component_states WHERE component_key=?',
             (encode_component_key(component),),
         ).fetchone()
         return shape['shape_id'], state['alignment_generation']
@@ -133,10 +150,15 @@ class ComponentDefinitionStorageMixin:
         self._require_execution_session_storage()
         members = self._session_component(component)
         row = self.db_connection().execute(
-            "SELECT component_key, shape_json FROM component_definitions "
-            "JOIN graph_shapes USING(shape_id) WHERE component_key=?",
+            "SELECT state.component_key, shape.shape_json FROM component_states AS state "
+            "LEFT JOIN component_definitions AS definition "
+            "ON definition.component_key=state.component_key AND definition.shape_id=state.shape_id "
+            "LEFT JOIN graph_shapes AS shape ON shape.shape_id=definition.shape_id "
+            "WHERE state.component_key=?",
             (encode_component_key(members),),
         ).fetchone()
         if row is None:
             return None
+        if row['shape_json'] is None:
+            raise RuntimeError('Incomplete component definition or producing shape')
         return {'members': decode_component_key(row['component_key']), 'shape_json': row['shape_json']}

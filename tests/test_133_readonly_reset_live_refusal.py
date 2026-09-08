@@ -57,6 +57,7 @@ def test_applied_reset_refuses_live_interrupt_before_import_or_mutation(
         pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
         details={'start_node': 'B'},
+        expected_shape=shape,
     )
     storage.reserve_execution_components(session_id, expected_shape=shape)
     session = storage.get_execution_session(session_id)

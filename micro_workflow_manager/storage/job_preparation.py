@@ -54,8 +54,17 @@ def _read_orphan_creations(connection, node):
     ))
 
 
-def read_job_preparation(storage, nodes, producers, *, reset_retained: bool, preserve_external: bool):
+def read_job_preparation(storage, nodes, producers, *, reset_retained: bool, preserve_external: bool,
+                         producer_executions=None):
     """Read exact job instances and orphan provenance from one ordered snapshot."""
+    selected_executions = None if producer_executions is None else frozenset(producer_executions)
+
+    def selected(owner):
+        return owner is not None and (
+            owner['component'] in producers if selected_executions is None
+            else owner['execution_id'] in selected_executions
+        )
+
     connection = storage.db_connection()
     connection.execute('SAVEPOINT mwf_job_preparation')
     try:
@@ -78,8 +87,7 @@ def read_job_preparation(storage, nodes, producers, *, reset_retained: bool, pre
                         raise RuntimeError(f'Preparation requires the recorded job creator: {node}/{job.job_id}')
                 creators[job.job_id] = creator
             delete_ids = tuple(job.job_id for job in jobs
-                               if creators[job.job_id] is not None
-                               and creators[job.job_id]['component'] in producers)
+                               if selected(creators[job.job_id]))
             deleted = set(delete_ids)
             retained = [job for job in jobs if job.job_id not in deleted]
             reset_ids = tuple(job.job_id for job in retained
@@ -93,7 +101,7 @@ def read_job_preparation(storage, nodes, producers, *, reset_retained: bool, pre
                 ).fetchall()
                 owners = [storage._read_execution_owner(connection, row['created_by_execution_id'])
                           if row['created_by_execution_id'] is not None else None for row in histories]
-                if owners and all(owner is not None and owner['component'] in producers for owner in owners):
+                if owners and all(selected(owner) for owner in owners):
                     orphan_ids.append(job_id)
             result.append(NodeJobPreparation(
                 node, jobs, orphans, delete_ids, reset_ids, tuple(orphan_ids),

@@ -9,6 +9,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import networkx as nx
 import pytest
 
 from micro_workflow_manager import cli
@@ -21,6 +22,7 @@ from micro_workflow_manager.cli.node_clipboard import (
 )
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.topology import ComponentTopology
 
 
 def _close(storage):
@@ -88,7 +90,7 @@ def test_native_preview_validates_the_database_before_returning_observations(tmp
         connection = sqlite3.connect(database)
         try:
             connection.execute('DROP TRIGGER create_job_instance' if state == 'missing-trigger' else
-                               "UPDATE metadata SET value='05' WHERE key='database_schema_version'")
+                               "UPDATE metadata SET value='06' WHERE key='database_schema_version'")
             connection.commit()
         finally:
             connection.close()
@@ -123,7 +125,7 @@ def test_cli_config_returns_the_same_value_it_validated(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, 'read_text', replace_after_read)
     config = read_config(tmp_path)
-    assert config['version'] == 5
+    assert config['version'] == 6
     assert len(reads) == 1
 
 
@@ -328,7 +330,7 @@ storage.close_database_connections()
         try:
             assert storage.database_integrity_check() == 'ok'
             assert storage.list_execution_sessions() == []
-            assert read_config(root)['version'] == 5
+            assert read_config(root)['version'] == 6
         finally:
             _close(storage)
         assert {path.name for path in (root / '.mwf').iterdir()} == {'project.json', 'state.sqlite3'}
@@ -434,6 +436,10 @@ def test_ordinary_creation_and_fresh_process_reopen_use_native_sessions(tmp_path
     storage = FileStorage(tmp_path)
     try:
         assert storage.list_execution_sessions() == []
+        graph = nx.DiGraph()
+        graph.add_node('A')
+        snapshot = ComponentTopology(graph, []).snapshot()
+        storage.register_component_topology(snapshot)
         storage.create_job(Job(node_name='A', job_id=1, params={'value': 'retained'}))
         instance_id = storage.read_job_instance_id('A', 1)
         record = storage.create_execution_session(
@@ -441,6 +447,7 @@ def test_ordinary_creation_and_fresh_process_reopen_use_native_sessions(tmp_path
             start_component=('A',), selected_components=[('A',)],
             selected_jobs=[('A', 1)], started_at='2026-09-05T12:00:00+00:00',
             hostname='worker.example', pid=123, process_identity='native-process',
+            expected_shape=snapshot.shape_json,
         )
         assert record['session_id'] == 'native-main'
         assert storage.finish_execution_session(
@@ -531,7 +538,7 @@ def test_same_process_reopen_refuses_damaged_native_schema_without_repair(tmp_pa
     assert database.read_bytes() == before
 
 
-@pytest.mark.parametrize('marker', ['05', ' 5 ', b'5'])
+@pytest.mark.parametrize('marker', ['06', ' 6 ', b'6'])
 def test_native_reopen_refuses_noncanonical_database_version_without_repair(tmp_path, marker):
     storage = FileStorage(tmp_path)
     _close(storage)

@@ -9,6 +9,11 @@ from ..errors import InvalidGraphError
 from ..storage.preparation_execution import prepare_component_unit
 from ..storage.preparation_footprint import read_preparation_footprint
 from ..storage.preparation_guards import hold_preparation_guards
+from ..storage.membership_observation import (
+    read_membership_change, membership_needs_fresh_preparation, membership_repair_lines,
+)
+from ..storage.membership_footprint import read_membership_preparation_footprint
+from ..storage.membership_preparation import MembershipPreparation
 
 if TYPE_CHECKING:
     from ..system import MicroWorkflow
@@ -81,26 +86,51 @@ def prepare_fresh_components(
         with workflow.lock:
             snapshot = workflow.topology.snapshot()
             selected = [workflow.component_id(component) for component in components]
+        storage = workflow.storage
         if context is None:
-            workflow.storage.refuse_live_sessions_for_reset()
-            workflow.storage.register_component_topology(snapshot)
-            observations = {
-                component: workflow.storage.read_component_reset_preparation(component, expected_shape=snapshot.shape_json)
-                for component in selected
-            }
-        else:
-            if snapshot.shape_json != context[2]:
-                raise RuntimeError('Fresh preparation graph changed after admission')
-            observations = {
-                component: workflow.storage.read_component_fresh_preparation(
+            storage.refuse_live_sessions_for_reset()
+            pending = read_membership_change(storage.db_connection(), snapshot, selected)
+            for line in membership_repair_lines(pending):
+                print(line)
+            storage.register_component_topology(snapshot)
+        elif snapshot.shape_json != context[2]:
+            raise RuntimeError('Fresh preparation graph changed after admission')
+        change = read_membership_change(storage.db_connection(), snapshot, selected)
+        if membership_needs_fresh_preparation(change):
+            footprint = read_membership_preparation_footprint(
+                storage, change, start_component=selected[0], keep_trace=keep_trace,
+            )
+            session_id = None if context is None else context[0]
+            preparation = MembershipPreparation(storage, change, footprint, session_id, operation)
+            observations = {unit.component: storage.get_component_state(unit.component) for unit in footprint.units}
+            removed = {}
+            with hold_preparation_guards(
+                storage, footprint, session_id, observations, membership_preparation=preparation,
+            ) as guard_id:
+                for unit in footprint.units:
+                    changed = prepare_component_unit(
+                        storage, root, unit, observations[unit.component], session_id, guard_id,
+                        operation, keep_trace=keep_trace, membership_preparation=preparation,
+                    )
+                    for node, count in changed.items():
+                        removed[node] = removed.get(node, 0) + count
+                preparation.finish(guard_id)
+            return removed
+        observations = {
+            component: (
+                storage.read_component_reset_preparation(component, expected_shape=snapshot.shape_json)
+                if context is None else storage.read_component_fresh_preparation(
                     context[0], component, expected_shape=context[2],
-                ) for component in selected
-            }
+                )
+            ) for component in selected
+        }
         return _prepare_observed_components(root, workflow, selected, observations, context,
-                                             keep_trace=keep_trace, operation=operation)
+                                             keep_trace=keep_trace, operation=operation,
+                                             target_shape=snapshot.shape_json)
 
 
-def _prepare_observed_components(root, workflow, components, observations, context, *, keep_trace, operation):
+def _prepare_observed_components(root, workflow, components, observations, context, *, keep_trace, operation,
+                                 target_shape):
     storage = workflow.storage
     footprint = read_preparation_footprint(storage, components, keep_trace=keep_trace)
     session_id = None if context is None else context[0]
@@ -108,7 +138,7 @@ def _prepare_observed_components(root, workflow, components, observations, conte
     with hold_preparation_guards(storage, footprint, session_id, observations) as guard_id:
         for unit in footprint.units:
             changed = prepare_component_unit(storage, root, unit, observations[unit.component], session_id,
-                                             guard_id, operation, keep_trace=keep_trace)
+                                             guard_id, operation, keep_trace=keep_trace, target_shape=target_shape)
             for node, count in changed.items():
                 removed[node] = removed.get(node, 0) + count
     return removed

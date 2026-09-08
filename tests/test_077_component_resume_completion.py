@@ -26,11 +26,12 @@ def _close(storage):
     storage.close_thread_connection()
 
 
-def _session(storage, session_id, kind, component):
+def _session(storage, session_id, kind, component, snapshot):
     return storage.create_execution_session(
         session_id, session_kind=kind, command='resume', start_component=component,
         selected_components=[component], started_at='2026-09-05T12:00:00+00:00',
         hostname='worker.example', pid=os.getpid(), process_identity=session_id,
+        expected_shape=snapshot.shape_json,
     )
 
 
@@ -46,12 +47,90 @@ def _stored_rows(storage):
 
 
 def _seed_sample_history(storage, component, *, lineage=('stable', None)):
-    assert storage.submit_db_mutation(lambda connection: connection.execute(
+    key = encode_component_key(component)
+
+    def seed(connection):
+        state = connection.execute(
+            'SELECT shape_id FROM component_states WHERE component_key=?', (key,),
+        ).fetchone()
+        assert state is not None
+        inserted = connection.execute(
+            'INSERT INTO component_successful_results '
+            '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
+            "VALUES(?, ?, 7, 'sampled', ?, ?)", (key, state['shape_id'], *lineage),
+        ).rowcount
+        pointed = connection.execute(
+            "UPDATE component_states SET lifecycle='sampled', stability=?, instability_origin=?, "
+            'alignment_generation=7, retained_result_shape_id=?, '
+            'retained_result_alignment_generation=7 WHERE component_key=?',
+            (*lineage, state['shape_id'], key),
+        ).rowcount
+        assert (inserted, pointed) == (1, 1)
+
+    storage.submit_db_mutation(seed)
+
+
+def _replace_sample_lineage(storage, component, lineage):
+    key = encode_component_key(component)
+
+    def replace_lineage(connection):
+        state = connection.execute(
+            'SELECT retained_result_shape_id, retained_result_alignment_generation '
+            'FROM component_states WHERE component_key=?', (key,),
+        ).fetchone()
+        assert state is not None and state['retained_result_shape_id'] is not None
+        assert connection.execute(
+            'UPDATE component_successful_results SET stability=?, instability_origin=? '
+            'WHERE component_key=? AND shape_id=? AND alignment_generation=?',
+            (*lineage, key, state['retained_result_shape_id'],
+             state['retained_result_alignment_generation']),
+        ).rowcount == 1
+        assert connection.execute(
+            'UPDATE component_states SET stability=?, instability_origin=? WHERE component_key=?',
+            (*lineage, key),
+        ).rowcount == 1
+
+    storage.submit_db_mutation(replace_lineage)
+
+
+def _replace_running_sample_generation(connection, component, generation):
+    key = encode_component_key(component)
+    state = connection.execute(
+        'SELECT shape_id, alignment_generation, retained_result_shape_id, '
+        'retained_result_alignment_generation FROM component_states WHERE component_key=?',
+        (key,),
+    ).fetchone()
+    assert state is not None
+    if generation == state['alignment_generation']:
+        return 1
+    retained = connection.execute(
+        'SELECT lifecycle, stability, instability_origin FROM component_successful_results '
+        'WHERE component_key=? AND shape_id=? AND alignment_generation=?',
+        (key, state['retained_result_shape_id'], state['retained_result_alignment_generation']),
+    ).fetchone()
+    assert retained is not None and retained['lifecycle'] == 'sampled'
+    assert connection.execute(
         'INSERT INTO component_successful_results '
         '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
-        "SELECT component_key, shape_id, 7, 'sampled', ?, ? FROM component_definitions "
-        'WHERE component_key=?', (*lineage, encode_component_key(component)),
-    ).rowcount) == 1
+        'VALUES(?, ?, ?, ?, ?, ?)',
+        (key, state['shape_id'], generation, retained['lifecycle'], retained['stability'],
+         retained['instability_origin']),
+    ).rowcount == 1
+    assert connection.execute(
+        'UPDATE pending_component_executions SET alignment_generation=? '
+        'WHERE component_key=? AND shape_id=? AND alignment_generation=?',
+        (generation, key, state['shape_id'], state['alignment_generation']),
+    ).rowcount == 1
+    changed = connection.execute(
+        'UPDATE component_states SET alignment_generation=?, retained_result_shape_id=shape_id, '
+        'retained_result_alignment_generation=? WHERE component_key=? AND shape_id=? '
+        'AND alignment_generation=? AND retained_result_shape_id=? '
+        'AND retained_result_alignment_generation=?',
+        (generation, generation, key, state['shape_id'], state['alignment_generation'],
+         state['retained_result_shape_id'], state['retained_result_alignment_generation']),
+    ).rowcount
+    assert changed == 1
+    return changed
 
 
 def _finish(storage, session_id, component, *, expected_shape,
@@ -69,6 +148,10 @@ def _expect_completion(rows, component, *, lineage=('stable', None)):
     assert (state['lifecycle'], state['stability'], state['instability_origin']) == ('running', *lineage)
     pending, = [row for row in rows['pending_component_executions'] if row['component_key'] == key]
     assert pending['execution_kind'] == 'resume'
+    assert pending['starting_shape_id'] == state['retained_result_shape_id']
+    assert (
+        state['retained_result_shape_id'], state['retained_result_alignment_generation']
+    ) == (pending['starting_shape_id'], state['alignment_generation'])
     state['lifecycle'] = 'done'
     rows['pending_component_executions'].remove(pending)
     retained, = [row for row in rows['component_successful_results']
@@ -88,20 +171,16 @@ def test_resumed_sample_completion_preserves_exact_lineage_and_ownership_after_r
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         storage.register_component_topology(snapshot)
-        _session(storage, 'int-origin', 'interrupt', component)
+        _session(storage, 'int-origin', 'interrupt', component, snapshot)
         assert storage.finish_execution_session(
             'int-origin', outcome='done', finished_at='2026-09-05T12:01:00+00:00',
         ) is True
         key = encode_component_key(component)
         # Seed the established result to isolate native completion and reopen behavior.
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='sampled', stability='unstable', "
-            "instability_origin='int-origin', alignment_generation=7 WHERE component_key=?", (key,),
-        ).rowcount) == 1
-        owner = _session(storage, 'main-resume', 'main', component)
+        _seed_sample_history(storage, component, lineage=('unstable', 'int-origin'))
+        owner = _session(storage, 'main-resume', 'main', component, snapshot)
         assert (owner['session_kind'], owner['status']) == ('main', 'running')
         assert storage.reserve_execution_components('main-resume', expected_shape=snapshot.shape_json) is True
-        _seed_sample_history(storage, component, lineage=('unstable', 'int-origin'))
         assert storage.begin_sampled_component_execution(
             'main-resume', component, expected_shape=snapshot.shape_json,
             expected_alignment_generation=7, successful_lineage=('unstable', 'int-origin'),
@@ -152,12 +231,8 @@ def test_resumed_sample_completion_preserves_exact_lineage_and_ownership_after_r
 def _running_sample(storage):
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage.register_component_topology(snapshot)
-    _session(storage, 'main-resume', 'main', ('A',))
+    _session(storage, 'main-resume', 'main', ('A',), snapshot)
     assert storage.reserve_execution_components('main-resume', expected_shape=snapshot.shape_json) is True
-    assert storage.submit_db_mutation(lambda connection: connection.execute(
-        "UPDATE component_states SET lifecycle='sampled', stability='stable', "
-        "alignment_generation=7 WHERE component_key=?", (encode_component_key(('A',)),),
-    ).rowcount) == 1
     _seed_sample_history(storage, ('A',))
     assert storage.begin_sampled_component_execution(
         'main-resume', ('A',), expected_shape=snapshot.shape_json,
@@ -190,7 +265,7 @@ def test_resumed_sample_completion_requires_current_session_ownership(tmp_path, 
         elif ownership in ('no-reservation', 'other-owner'):
             assert storage.release_execution_components(actor) == 1
             if ownership == 'other-owner':
-                _session(storage, 'other-owner', 'interrupt', ('A',))
+                _session(storage, 'other-owner', 'interrupt', ('A',), snapshot)
                 assert storage.reserve_execution_components(
                     'other-owner', expected_shape=snapshot.shape_json,
                 ) is True
@@ -226,7 +301,7 @@ def test_resumed_sample_completion_requires_the_captured_producing_shape(tmp_pat
         assert other_shape != snapshot.shape_json
         before = _stored_rows(storage)
 
-        with pytest.raises(RuntimeError, match='matching pending execution'):
+        with pytest.raises(RuntimeError, match='admitted graph shape'):
             _finish(storage,
                 'main-resume', ('A',), expected_shape=other_shape,
                 expected_alignment_generation=7,
@@ -267,6 +342,17 @@ def test_resumed_sample_completion_requires_current_result_bearing_running_state
                 'alignment_generation=? WHERE component_key=?',
                 (lifecycle, stability, misaligned, generation, encode_component_key(('A',))),
             ).rowcount == 1
+            if lifecycle == 'done':
+                assert connection.execute(
+                    "UPDATE component_successful_results SET lifecycle='done' WHERE component_key=?",
+                    (encode_component_key(('A',)),),
+                ).rowcount == 1
+            elif lifecycle in ('queued', 'failed') or (lifecycle == 'running' and stability is None):
+                assert connection.execute(
+                    'UPDATE component_states SET retained_result_shape_id=NULL, '
+                    'retained_result_alignment_generation=NULL WHERE component_key=?',
+                    (encode_component_key(('A',)),),
+                ).rowcount == 1
             connection.commit()
         finally:
             connection.close()
@@ -292,10 +378,11 @@ def test_resumed_sample_completion_rejects_generation_coercion(
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         snapshot = _running_sample(storage)
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            'UPDATE component_states SET alignment_generation=? WHERE component_key=?',
-            (stored_generation, encode_component_key(('A',))),
-        ).rowcount) == 1
+        assert storage.submit_db_mutation(
+            lambda connection: _replace_running_sample_generation(
+                connection, ('A',), stored_generation,
+            )
+        ) == 1
         before = _stored_rows(storage)
 
         with pytest.raises(ValueError, match='nonnegative integer'):
@@ -322,15 +409,11 @@ def test_resumed_sample_completion_preserves_exact_lineage_and_refuses_repeat(
         snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
         storage.register_component_topology(snapshot)
         if origin is not None:
-            _session(storage, origin, 'interrupt', ('A',))
+            _session(storage, origin, 'interrupt', ('A',), snapshot)
             assert storage.get_execution_session(origin)['status'] == 'running'
-        _session(storage, 'resuming-owner', actor_kind, ('A',))
+        _session(storage, 'resuming-owner', actor_kind, ('A',), snapshot)
         assert storage.reserve_execution_components('resuming-owner', expected_shape=snapshot.shape_json) is True
         key = encode_component_key(('A',))
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET lifecycle='sampled', stability=?, instability_origin=?, "
-            'alignment_generation=7 WHERE component_key=?', (stability, origin, key),
-        ).rowcount) == 1
         _seed_sample_history(storage, ('A',), lineage=(stability, origin))
         assert storage.begin_sampled_component_execution(
             'resuming-owner', ('A',), expected_shape=snapshot.shape_json,
@@ -364,12 +447,9 @@ def test_resumed_sample_completion_refuses_damaged_records_without_repair(tmp_pa
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         snapshot = _running_sample(storage)
-        _session(storage, 'int-origin', 'interrupt', ('A',))
+        _session(storage, 'int-origin', 'interrupt', ('A',), snapshot)
         key = encode_component_key(('A',))
-        assert storage.submit_db_mutation(lambda connection: connection.execute(
-            "UPDATE component_states SET stability='unstable', instability_origin='int-origin' "
-            'WHERE component_key=?', (key,),
-        ).rowcount) == 1
+        _replace_sample_lineage(storage, ('A',), ('unstable', 'int-origin'))
         connection = sqlite3.connect(storage.state_database_path())
         try:
             connection.execute('PRAGMA foreign_keys=OFF')
@@ -401,7 +481,11 @@ def test_resumed_sample_completion_refuses_damaged_records_without_repair(tmp_pa
             connection.close()
         before = _stored_rows(storage)
 
-        with pytest.raises(RuntimeError, match='[Cc]omponent'):
+        error = (
+            'Session admitted graph shape is missing'
+            if damage == 'missing-shape' else '[Cc]omponent'
+        )
+        with pytest.raises(RuntimeError, match=error):
             _finish(storage,
                 'main-resume', ('A',), expected_shape=snapshot.shape_json,
                 expected_alignment_generation=7,
@@ -452,7 +536,8 @@ def test_resumed_sample_completion_rolls_back_failed_or_suppressed_update_and_ca
 @pytest.mark.parametrize('change,error', [
     ('terminal', 'selected running owner and reservation'),
     ('transferred', 'reservation'),
-    ('generation', 'expected aligned running state'),
+    pytest.param('generation', 'matching pending execution',
+                 id='generation-expected aligned running state'),
 ])
 def test_resumed_sample_completion_rechecks_after_waiting_for_its_transaction(
     tmp_path, monkeypatch, change, error,
@@ -462,7 +547,7 @@ def test_resumed_sample_completion_rechecks_after_waiting_for_its_transaction(
     awaiting_transaction, proceed = Event(), Event()
     try:
         snapshot = _running_sample(storage)
-        _session(storage, 'next-owner', 'interrupt', ('A',))
+        _session(storage, 'next-owner', 'interrupt', ('A',), snapshot)
         original_transaction = storage.db_transaction
 
         @contextmanager
@@ -494,10 +579,11 @@ def test_resumed_sample_completion_rechecks_after_waiting_for_its_transaction(
                     assert other.release_execution_components('main-resume') == 1
                     assert other.reserve_execution_components('next-owner', expected_shape=snapshot.shape_json) is True
                 else:
-                    assert other.submit_db_mutation(lambda connection: connection.execute(
-                        'UPDATE component_states SET alignment_generation=8 WHERE component_key=?',
-                        (encode_component_key(('A',)),),
-                    ).rowcount) == 1
+                    assert other.submit_db_mutation(
+                        lambda connection: _replace_running_sample_generation(
+                            connection, ('A',), 8,
+                        )
+                    ) == 1
                 expected = _stored_rows(other)
             finally:
                 proceed.set()
@@ -562,6 +648,6 @@ def test_resumed_sample_completion_refuses_missing_native_session_and_preserves_
         assert output.read_bytes() == b'established output'
         assert storage.db_connection().execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone()[0] == '5'
+        ).fetchone()[0] == '6'
     finally:
         _close(storage)

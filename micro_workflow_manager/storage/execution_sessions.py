@@ -6,6 +6,8 @@ from datetime import datetime
 from micro_workflow_manager.session_liveness import execution_session_liveness
 from .session_selection import SessionSelectionStorageMixin
 from .session_admission import SessionAdmissionStorageMixin
+from .session_shapes import validate_session_shape_snapshot
+from .sqlite.schema import DATABASE_SCHEMA_VERSION
 from micro_workflow_manager.component_identity import component_key, decode_component_key, encode_component_key
 
 
@@ -48,6 +50,7 @@ def execution_session_from_row_snapshot(connection, row) -> dict:
         ]
     except (json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
         raise RuntimeError('Damaged execution session: ' + str(session_id)) from error
+    validate_session_shape_snapshot(connection, result)
     return result
 
 
@@ -112,7 +115,7 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
     """Persist exact execution-session records in SQLite."""
 
     def _require_execution_session_storage(self) -> None:
-        if self._metadata_value("database_schema_version") != "5":
+        if self._metadata_value("database_schema_version") != str(DATABASE_SCHEMA_VERSION):
             raise RuntimeError("Execution-session storage requires a session-capable database")
 
     @staticmethod
@@ -312,7 +315,8 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
             for pending_row in connection.execute(
                 'SELECT pending.component_key, shape.shape_json, pending.alignment_generation, '
                 'pending.completion_ready, pending.stability, pending.instability_origin, '
-                'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned '
+                'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned, '
+                'pending.starting_shape_id, pending.session_id '
                 'FROM pending_component_executions AS pending JOIN graph_shapes AS shape USING(shape_id) '
                 'JOIN component_reservations AS reservation USING(component_key) '
                 'WHERE pending.session_id=? AND reservation.session_id=?', (session_id, session_id),
@@ -361,7 +365,8 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
             pending = connection.execute(
                 'SELECT pending.component_key, shape.shape_json, pending.alignment_generation, '
                 'pending.completion_ready, pending.stability, pending.instability_origin, pending.shape_id, '
-                'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned '
+                'pending.execution_kind, pending.starting_lifecycle, pending.starting_misaligned, '
+                'pending.starting_shape_id, pending.session_id '
                 'FROM pending_component_executions AS pending '
                 'JOIN graph_shapes AS shape USING(shape_id) '
                 'JOIN component_reservations AS reservation USING(component_key) '

@@ -131,6 +131,11 @@ def read_preparation_footprint_snapshot(
     footprint = _read_preparation_footprint(
         storage, connection, components, keep_trace=keep_trace,
     )
+    return validate_preparation_snapshot(storage, connection, components, footprint)
+
+
+def validate_preparation_snapshot(storage, connection, components, footprint):
+    """Validate unfinished native operations for an already observed footprint."""
     from .preparation_guards import refuse_unfinished_preparation
 
     for component in components:

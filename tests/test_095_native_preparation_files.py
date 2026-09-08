@@ -210,7 +210,7 @@ def test_preparation_restoration_preserves_a_new_file_at_the_original_path(tmp_p
 def test_component_preparation_rechecks_job_instances_and_orphan_identity(tmp_path, change):
     storage, snapshot = _fresh_owner(tmp_path)
     try:
-        _session(storage, 'creator-interrupt', 'interrupt', ('B',))
+        _session(storage, 'creator-interrupt', 'interrupt', ('B',), snapshot)
         storage.reserve_execution_components('creator-interrupt', expected_shape=snapshot.shape_json)
         storage.create_job(Job(node_name='B', job_id=1, params={}))
         _, producer_execution = storage.claim_job_execution(

@@ -256,6 +256,14 @@ def test_selected_terminal_settlement_refuses_impossible_queued_start_history(
                         pending["alignment_generation"], "sampled", "stable",
                     ),
                 )
+                # A result row alone is audit history. Attach it to this running
+                # component to create the impossible queued-start retention.
+                assert connection.execute(
+                    "UPDATE component_states SET retained_result_shape_id=?, "
+                    "retained_result_alignment_generation=?, stability='stable' "
+                    "WHERE component_key=?",
+                    (pending["shape_id"], pending["alignment_generation"], pending["component_key"]),
+                ).rowcount == 1
 
         storage.submit_db_mutation(damage_pending, wait=True, priority=0)
         captured["rows"] = _settlement_rows(storage)

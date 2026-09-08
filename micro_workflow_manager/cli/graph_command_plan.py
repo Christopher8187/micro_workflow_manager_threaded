@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from micro_workflow_manager.storage.membership_footprint import MembershipPreparationFootprint
+from micro_workflow_manager.storage.membership_observation import membership_repair_lines
+
 
 def _component(component):
     return "{" + ", ".join(component) + "}"
@@ -40,12 +43,17 @@ def render_graph_command_plan(observation, *, command_line=None) -> str:
         "  leaving edges: " + _edges(selection.leaving_edges),
         "  selected component state:",
     ))
+    membership = (observation.preparation_footprint.change
+                  if isinstance(observation.preparation_footprint, MembershipPreparationFootprint) else None)
+    floors = {} if membership is None else {item.members: item.generation_floor for item in membership.preparation}
+    for line in membership_repair_lines(membership):
+        lines.append('  ' + line)
     for state in observation.selected_states:
         lines.append(f"    {_component(state.component)}: {_state_text(state)}")
         if selection.operation in {"run", "reset"} and state.lifecycle is not None:
             lines.append(
                 "      fresh preparation would queue alignment generation "
-                + str(state.alignment_generation + 1)
+                + str(max(state.alignment_generation, floors.get(state.component) or 0) + 1)
             )
     lines.append("  existing jobs:")
     for jobs in observation.node_job_counts:

@@ -33,7 +33,7 @@ def owned_component(tmp_path, request):
         'ordinary-start', session_kind='main', command='run',
         start_component=('A', 'B'), selected_components=[('A', 'B')],
         started_at='2026-09-06T08:00:00+00:00', hostname='test-worker',
-        pid=os.getpid(), process_identity='ordinary-start',
+        pid=os.getpid(), process_identity='ordinary-start', expected_shape=topology.shape_json,
     )
     storage.reserve_execution_components('ordinary-start', expected_shape=topology.shape_json)
     return storage, topology
@@ -59,7 +59,7 @@ def test_ordinary_component_start_records_its_lifecycle_and_pending_execution_an
     component['lifecycle'] = 'running'
     expected_rows['pending_component_executions'] = [{
         'session_id': 'ordinary-start', 'component_key': json.dumps(['A', 'B']),
-        'shape_id': 1, 'alignment_generation': 0,
+        'shape_id': 1, 'starting_shape_id': 1, 'alignment_generation': 0,
         'completion_ready': 0, 'stability': 'stable', 'instability_origin': None,
         'execution_kind': 'full', 'starting_lifecycle': 'queued', 'starting_misaligned': 0,
     }]
@@ -131,7 +131,7 @@ def test_component_start_refuses_ineligible_state_without_partial_changes(owned_
             'other', session_kind='interrupt', command='run',
             start_component=('A', 'B'), selected_components=[('A', 'B')],
             started_at='2026-09-06T08:00:00+00:00', hostname='test-worker',
-            pid=os.getpid(), process_identity='other',
+            pid=os.getpid(), process_identity='other', expected_shape=topology.shape_json,
         )
         storage.submit_db_mutation(lambda connection: connection.execute(
             "UPDATE component_reservations SET session_id='other' WHERE component_key=?", (key,),
@@ -141,19 +141,45 @@ def test_component_start_refuses_ineligible_state_without_partial_changes(owned_
             'DELETE FROM session_components WHERE session_id=?', ('ordinary-start',),
         ))
     elif case == 'missing-state':
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            'DELETE FROM component_states WHERE component_key=?', (key,),
-        ))
+        storage.db_mutation_barrier()
+        connection = storage.db_connection()
+        connection.execute('PRAGMA foreign_keys=OFF')
+        try:
+            connection.execute('DELETE FROM component_states WHERE component_key=?', (key,))
+        finally:
+            connection.execute('PRAGMA foreign_keys=ON')
     elif case == 'shape':
         expected_shape = topology.shape_json.replace('"C"', '"D"')
     elif case == 'generation':
         expected_generation = 1
     elif case in ('running', 'failed', 'sampled', 'done'):
         stability = 'stable' if case in ('sampled', 'done') else None
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            'UPDATE component_states SET lifecycle=?, stability=? WHERE component_key=?',
-            (case, stability, key),
-        ))
+
+        def establish_ineligible_state(connection):
+            if case in ('sampled', 'done'):
+                state = connection.execute(
+                    'SELECT shape_id, alignment_generation FROM component_states WHERE component_key=?',
+                    (key,),
+                ).fetchone()
+                assert state is not None
+                assert connection.execute(
+                    'INSERT INTO component_successful_results '
+                    '(component_key, shape_id, alignment_generation, lifecycle, stability, instability_origin) '
+                    'VALUES(?, ?, ?, ?, ?, NULL)',
+                    (key, state['shape_id'], state['alignment_generation'], case, stability),
+                ).rowcount == 1
+                assert connection.execute(
+                    'UPDATE component_states SET lifecycle=?, stability=?, retained_result_shape_id=?, '
+                    'retained_result_alignment_generation=? WHERE component_key=?',
+                    (case, stability, state['shape_id'], state['alignment_generation'], key),
+                ).rowcount == 1
+            else:
+                assert connection.execute(
+                    'UPDATE component_states SET lifecycle=?, stability=? WHERE component_key=?',
+                    (case, stability, key),
+                ).rowcount == 1
+
+        storage.submit_db_mutation(establish_ineligible_state)
     else:
         def damage(connection):
             connection.execute('PRAGMA ignore_check_constraints=ON')
@@ -245,7 +271,7 @@ def test_component_start_rechecks_state_when_its_mutation_is_submitted(owned_com
         'next-owner', session_kind='interrupt', command='run',
         start_component=('A', 'B'), selected_components=[('A', 'B')],
         started_at='2026-09-06T08:00:00+00:00', hostname='test-worker',
-        pid=os.getpid(), process_identity='next-owner',
+        pid=os.getpid(), process_identity='next-owner', expected_shape=topology.shape_json,
     )
     awaiting_write, proceed = Event(), Event()
     submit = storage.submit_db_mutation

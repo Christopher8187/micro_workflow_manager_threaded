@@ -108,6 +108,7 @@ def admit_sample_execution_session(
                 expected_job_instances=roots, started_at=started_at,
                 hostname=hostname, pid=pid, process_identity=process_identity,
                 details={**details, 'selection': selection}, reserved=True,
+                expected_shape=snapshot.shape_json,
             )
 
         settled = resolve_admission_future(pending, readback)

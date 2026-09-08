@@ -46,6 +46,7 @@ def _session(workflow, session_id):
         session_id, session_kind='main', command='run', start_component=('A', 'B'),
         selected_components=[('A', 'B')], started_at=now(),
         hostname=socket.gethostname(), pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=workflow.topology.snapshot().shape_json,
     )
     storage.reserve_execution_components(session_id, expected_shape=workflow.topology.snapshot().shape_json)
 

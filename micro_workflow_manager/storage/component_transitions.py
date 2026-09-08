@@ -70,9 +70,11 @@ class ComponentTransitionStorageMixin:
                 (node,),
             ).fetchone():
                 raise RuntimeError('Full preparation cannot change active component jobs: ' + key)
-        state = self._read_component_state(connection, members)
-        if state is None or state['shape_json'] != expected_shape:
-            raise RuntimeError('Full preparation requires the expected producing graph shape')
+        from .component_states import read_component_states_snapshot
+
+        state = read_component_states_snapshot(
+            connection, (members,), expected_shape=expected_shape,
+        )[members]
         if state['lifecycle'] == 'running':
             raise RuntimeError('Full preparation cannot change a running component: ' + key)
         return state
@@ -89,7 +91,7 @@ class ComponentTransitionStorageMixin:
         return self._complete_component_preparation(None, component, expected_state, job_preparation, keep_trace)
 
     def _complete_component_preparation(self, session_id, component, expected_state, job_preparation, keep_trace,
-                                        *, connection=None):
+                                        *, connection=None, target_shape=None):
         self._require_execution_session_storage()
         members = self._session_component(component)
         expected = dict(expected_state)
@@ -100,6 +102,7 @@ class ComponentTransitionStorageMixin:
                 or type(expected.get('members')) is not tuple or expected['members'] != members):
             raise ValueError('Full preparation requires an exact captured component observation')
         expected_shape = self._session_text(expected.get('shape_json'), 'expected_shape')
+        target_shape = expected_shape if target_shape is None else self._session_text(target_shape, 'target_shape')
         key = encode_component_key(members)
         preparations = tuple(job_preparation)
         if preparations and (len(preparations) != len(members) or {plan.node for plan in preparations} != set(members)):
@@ -109,13 +112,26 @@ class ComponentTransitionStorageMixin:
             state = self._read_component_preparation(connection, session_id, members, expected_shape)
             if state != expected:
                 raise RuntimeError('Component changed during full preparation: ' + key)
+            target = connection.execute(
+                'SELECT definition.shape_id FROM component_definitions AS definition '
+                'JOIN graph_shapes AS shape USING(shape_id) WHERE definition.component_key=? AND shape.shape_json=?',
+                (key, target_shape),
+            ).fetchone()
+            if target is None:
+                raise RuntimeError('Full preparation target shape is not registered')
+            if session_id is not None:
+                owner = connection.execute('SELECT admitted_shape_id FROM execution_sessions WHERE session_id=?',
+                                           (session_id,)).fetchone()
+                if owner is None or owner['admitted_shape_id'] != target['shape_id']:
+                    raise RuntimeError('Full preparation differs from its admitted graph shape')
             apply_job_preparation(connection, preparations, keep_trace=keep_trace)
             changed = connection.execute(
-                "UPDATE component_states SET lifecycle='queued', stability=NULL, instability_origin=NULL, "
+                "UPDATE component_states SET shape_id=?, retained_result_shape_id=NULL, "
+                "retained_result_alignment_generation=NULL, lifecycle='queued', stability=NULL, instability_origin=NULL, "
                 'misaligned=0, alignment_generation=alignment_generation+1 '
                 'WHERE component_key=? AND lifecycle=? AND stability IS ? AND instability_origin IS ? '
                 'AND misaligned=? AND alignment_generation=?',
-                (key, expected['lifecycle'], expected['stability'], expected['instability_origin'],
+                (target['shape_id'], key, expected['lifecycle'], expected['stability'], expected['instability_origin'],
                  int(expected['misaligned']), expected['alignment_generation']),
             ).rowcount
             if changed != 1:
@@ -153,9 +169,9 @@ class ComponentTransitionStorageMixin:
                 'SELECT d.component_key, g.shape_json, s.component_key AS state_key, '
                 's.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, '
                 'origin.session_kind AS origin_kind '
-                'FROM component_definitions d '
-                'LEFT JOIN graph_shapes g USING(shape_id) '
-                'LEFT JOIN component_states s USING(component_key) '
+                'FROM component_states s '
+                'LEFT JOIN component_definitions d ON d.component_key=s.component_key AND d.shape_id=s.shape_id '
+                'LEFT JOIN graph_shapes g ON g.shape_id=s.shape_id '
                 'LEFT JOIN execution_sessions origin ON origin.session_id=s.instability_origin '
                 'WHERE d.component_key=?', (key,),
             ).fetchone()

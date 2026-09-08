@@ -39,20 +39,23 @@ def validate_held_guards(connection, receivers, operation_id):
 
 
 @contextmanager
-def hold_preparation_guards(storage, footprint, session_id, observations):
+def hold_preparation_guards(storage, footprint, session_id, observations, *, membership_preparation=None):
     operation_id = uuid4().hex
     receivers = footprint.excluded_nodes
 
     def acquire(connection):
-        for unit in footprint.units:
-            expected = observations[unit.component]
-            observed = storage._read_component_preparation(
-                connection, session_id, unit.component, expected['shape_json'],
-                selected_roots=footprint.roots or None,
-            )
-            if observed != expected:
-                raise RuntimeError('Component changed during complete preparation preflight: ' + repr(unit.component))
-        validate_preparation_footprint(storage, connection, footprint)
+        if membership_preparation is not None:
+            membership_preparation.validate_initial(connection)
+        else:
+            for unit in footprint.units:
+                expected = observations[unit.component]
+                observed = storage._read_component_preparation(
+                    connection, session_id, unit.component, expected['shape_json'],
+                    selected_roots=footprint.roots or None,
+                )
+                if observed != expected:
+                    raise RuntimeError('Component changed during complete preparation preflight: ' + repr(unit.component))
+            validate_preparation_footprint(storage, connection, footprint)
         nodes = {plan.node for unit in footprint.units for plan in unit.jobs}
         nodes.update(item.receiver for unit in footprint.units for item in unit.inputs)
         for node in sorted(nodes):
@@ -82,6 +85,11 @@ def hold_preparation_guards(storage, footprint, session_id, observations):
         connection.executemany('INSERT INTO receiver_mutation_guards VALUES(?,?,?,?,?,?)',
                                [(node, operation_id, session_id, os.getpid(), identity, socket.gethostname())
                                 for node in receivers])
+        if membership_preparation is not None:
+            # Recheck the complete footprint in the transaction that now owns
+            # every temporary receiver guard.
+            membership_preparation.validate_initial(connection)
+            validate_held_guards(connection, receivers, operation_id)
 
     def release():
         def release(connection):

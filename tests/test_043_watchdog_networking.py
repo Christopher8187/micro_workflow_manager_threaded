@@ -50,6 +50,7 @@ def _claimed_runtime_storage(tmp_path):
         hostname=socket.gethostname(),
         pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
+        expected_shape=snapshot.shape_json,
     )
     storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
     storage.create_job(Job(node_name="A", job_id=1, params={}))

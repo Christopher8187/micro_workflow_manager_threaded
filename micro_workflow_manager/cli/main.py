@@ -22,6 +22,7 @@ from .monitoring import monitor_command
 from .top import top_command
 from .planning import print_run_plan
 from .preview import load_preview
+from .membership_preflight import validate_command_membership
 from .graph_command_dispatch import graph_preview_requested, print_graph_preview, refuse_reset_running_sessions
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
@@ -73,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"reset", "resetfrom", "resetbetween"} and not read_only_plan:
             refuse_reset_running_sessions(root)
         if not read_only_plan:
+            validate_command_membership(root, args)
             ensure_runtime_layout(root)
 
         if args.command == "copy":

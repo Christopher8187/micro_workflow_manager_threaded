@@ -6,6 +6,8 @@ import json
 from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
 from micro_workflow_manager.file_helpers import _relative_file_parts
 from .component_definitions import component_snapshot_from_shape
+from .component_membership import read_active_component_for_node
+from .membership_receipts import validate_membership_receipt_producer
 
 
 class ComponentMisalignmentStorageMixin:
@@ -20,8 +22,9 @@ class ComponentMisalignmentStorageMixin:
         connection.execute('SAVEPOINT mwf_misalignment_observation')
         try:
             state = self._read_component_state(connection, members)
-            if expected_shape is not None and (state is None or state['shape_json'] != expected_shape):
-                raise RuntimeError('Misalignment causes require the expected component shape')
+            if expected_shape is not None:
+                from .component_states import read_component_states_snapshot
+                read_component_states_snapshot(connection, (members,), expected_shape=expected_shape)
             return [] if state is None else self._read_component_arrival_causes(connection, state)
         finally:
             connection.execute('RELEASE SAVEPOINT mwf_misalignment_observation')
@@ -44,8 +47,10 @@ class ComponentMisalignmentStorageMixin:
                 or row['receiver_node'] not in state['members']
                 or type(row['alignment_generation']) is not int
                 or row['alignment_generation'] != state['alignment_generation']
-                or shape is None or shape['shape_json'] != state['shape_json']):
+                or shape is None):
             raise RuntimeError('Damaged component misalignment cause')
+        if state['members'] not in component_snapshot_from_shape(shape['shape_json']).components:
+            raise RuntimeError('Misalignment cause has a different historical receiver component')
         if row['preparation_kind'] is not None:
             return self._decode_component_preparation_cause(connection, row, state)
         if (row['arrival_kind'] not in ('managed-input', 'managed-job')
@@ -58,7 +63,7 @@ class ComponentMisalignmentStorageMixin:
             parts = _relative_file_parts(row['relative_path'])
         except (TypeError, ValueError) as error:
             raise RuntimeError('Damaged component misalignment path') from error
-        if (owner is None or owner['shape_id'] != row['shape_id'] or len(parts) < 2
+        if (owner is None or len(parts) < 2
                 or row['receiver_job_id'] is not None or row['receiver_job_instance_id'] is not None
                 or parts[0] != owner['node_name'] or '/'.join(parts) != row['relative_path']):
             raise RuntimeError('Damaged component misalignment producer or path')
@@ -78,7 +83,7 @@ class ComponentMisalignmentStorageMixin:
         owner = None
         if row['producer_execution_id'] is not None:
             owner = self._read_execution_owner(connection, row['producer_execution_id'])
-            if owner is None or owner['shape_id'] != row['shape_id']:
+            if owner is None:
                 raise RuntimeError('Damaged component misalignment job producer')
         current = connection.execute(
             'SELECT instance_id, created_by_execution_id FROM job_instances WHERE node_name=? AND job_id=?',
@@ -101,9 +106,9 @@ class ComponentMisalignmentStorageMixin:
         if (row['arrival_kind'] is not None or row['preparation_kind'] != 'preparation-removal'
                 or row['action'] != 'delete' or row['affected_kind'] not in ('managed-input', 'managed-job')
                 or owner is None or receipt is None or receipt['state'] != 'committed'
-                or receipt['operation'] != row['operation']
-                or receipt['component_key'] != encode_component_key(owner['component'])):
+                or receipt['operation'] != row['operation']):
             raise RuntimeError('Damaged component preparation cause')
+        validate_membership_receipt_producer(connection, receipt, owner)
         effect = {'receiver': row['receiver_node'], 'kind': row['affected_kind'],
                   'producer_execution_id': row['producer_execution_id']}
         result = {
@@ -161,29 +166,20 @@ class ComponentMisalignmentStorageMixin:
             connection.execute('RELEASE SAVEPOINT mwf_job_receiver_observation')
 
     def _read_job_receiver_state(self, connection, receiver, expected_shape):
+        members = read_active_component_for_node(connection, receiver)
+        if members is None:
+            return None
         if expected_shape is not None:
             expected = component_snapshot_from_shape(expected_shape)
-            if not any(receiver in members for members in expected.components):
-                raise RuntimeError('Current graph shape does not contain the managed job receiver')
-        definitions = connection.execute('SELECT component_key, shape_id FROM component_definitions').fetchall()
-        if not definitions:
-            return None
-        try:
-            matching = [(decode_component_key(row['component_key']), row['shape_id']) for row in definitions
-                        if receiver in decode_component_key(row['component_key'])]
-        except ValueError as error:
-            raise RuntimeError('Invalid managed job receiver component') from error
-        if len(matching) != 1:
-            raise RuntimeError('Managed job receiver requires one established component')
-        members, shape_id = matching[0]
+            if members not in expected.components or receiver not in members:
+                raise RuntimeError('Managed receiver membership requires fresh preparation')
         state = self._read_component_state(connection, members)
         if state is None:
-            raise RuntimeError('Managed job receiver component state is missing')
-        if expected_shape is not None and state['shape_json'] != expected_shape:
-            raise RuntimeError('Managed job receiver requires the current graph shape')
+            raise RuntimeError('Managed receiver component state is missing')
         snapshot = component_snapshot_from_shape(state['shape_json'])
         if members not in snapshot.components:
-            raise RuntimeError('Managed job receiver does not match its producing shape')
+            raise RuntimeError('Managed receiver does not match its producing shape')
+        shape_id, _ = self._read_component_producing_identity(connection, members)
         return shape_id, state
 
     def _mark_component_job_arrival(self, connection, receiver, job_id, *, expected_shape=None):
@@ -200,8 +196,8 @@ class ComponentMisalignmentStorageMixin:
         creator = instance['created_by_execution_id']
         if creator is not None:
             owner = self._read_execution_owner(connection, creator)
-            if owner is None or owner['shape_id'] != shape_id:
-                raise RuntimeError('Managed job producer and receiver shapes disagree')
+            if owner is None:
+                raise RuntimeError('Managed job producer has no historical execution identity')
         return self._mark_component_arrival(
             connection, receiver, shape_id, state, creator, 'managed-job',
             job_id=job_id, job_instance_id=instance['instance_id'],
@@ -212,13 +208,12 @@ class ComponentMisalignmentStorageMixin:
                                    (owner['shape_id'],)).fetchone()
         if shape is None:
             raise RuntimeError('Managed input producing graph shape is missing')
-        snapshot = component_snapshot_from_shape(shape['shape_json'])
-        members, = (component for component in snapshot.components if receiver in component)
-        state = self._read_component_state(connection, members)
-        if state is None or state['shape_json'] != shape['shape_json']:
-            raise RuntimeError('Managed input receiver requires its matching component shape')
+        observed = self._read_job_receiver_state(connection, receiver, shape['shape_json'])
+        if observed is None:
+            raise RuntimeError('Managed input receiver has no established membership')
+        receiver_shape_id, state = observed
         return self._mark_component_arrival(
-            connection, receiver, owner['shape_id'], state, owner['execution_id'], 'managed-input',
+            connection, receiver, receiver_shape_id, state, owner['execution_id'], 'managed-input',
             relative=relative,
         )
 

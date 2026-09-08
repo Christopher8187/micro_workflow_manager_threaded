@@ -77,6 +77,7 @@ def test_applied_reset_refuses_abandoned_native_session_before_import_or_mutatio
         pid=99999999,
         process_identity='retired-process',
         details={'start_node': 'B'},
+        expected_shape=shape,
     )
     storage.reserve_execution_components(session_id, expected_shape=shape)
     before_rows = _tuple_rows(storage)
@@ -133,7 +134,8 @@ def run(ctx):
             changed.append(True)
             changed_rows = self.submit_db_mutation(lambda connection: connection.execute(
                 "UPDATE component_states SET lifecycle='queued', stability=NULL, "
-                "instability_origin=NULL WHERE component_key=? AND lifecycle='done'",
+                "instability_origin=NULL, retained_result_shape_id=NULL, "
+                "retained_result_alignment_generation=NULL WHERE component_key=? AND lifecycle='done'",
                 (encode_component_key(('P',)),),
             ).rowcount)
             assert changed_rows == 1
