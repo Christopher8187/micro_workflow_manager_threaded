@@ -6,8 +6,12 @@ following baseline `f6dc5a3d0d21181a32c08756dcbb27dc500c2652`, on
 [Implement and verify the agreed MWF 0.6.2 workflow-management changes](https://github.com/Christopher8187/product/issues/45).
 The required checkpoint checks and reviews passed before the commit.
 The requirement audit is integrated and its structural checks pass.
-Christopher has put the final Astra review on hold.
-Pushing and publication are not authorized for this checkpoint.
+Christopher [explicitly waived the final Astra review](approved-final-review-waiver-20260910.md)
+and authorized GitHub wrap-up. Astra was not performed or passed. The accepted
+MWF commits through `15936d4d431f3508e00daa725562f0734e79e74b` are pushed on
+the implementation branch. The [verification summary](verification-summary.md)
+records completed checks, bounded reviews, and validation limits. The
+implementation task records the final documentation commit and GitHub actions.
 
 ## Implemented scope in the local checkpoint
 
@@ -48,7 +52,8 @@ source freezes and execution identities remain unchanged.
 ## Whole-issue reconciliation
 
 The [fresh-project rebuild guide](../../../../migration.md) is committed in the
-Parent Repo at `bad9f53e26902ed09d6e549404240a1f97778698`. It covers source,
+Parent Repo at `bad9f53e26902ed09d6e549404240a1f97778698`
+and is pushed on `codex/mwf-062-guide`. It covers source,
 graph, tasks, inputs, documentation, and operating instructions before creating
 new native state. The [guide verification](../../../../testing_ground/issue-45/migration-guide-verification-root-revision01.json)
 and [guide commit verification](../../../../testing_ground/issue-45/migration-guide-commit-verification-root-revision01.json)
@@ -78,8 +83,8 @@ The [initial generated audit validation](../../../../testing_ground/issue-45/who
 passed for all 694 rows. It preserved every requirement and the first five
 settled cells, matched the reviewed current statements, resolved 864 local
 links, and checked all 542 Python files against the accepted checkpoint source.
-Its scope is structural and evidence consistency. Final Astra review and
-external publication and closure remain open.
+Its scope is structural and evidence consistency. It predates the final Astra
+waiver and GitHub wrap-up authorization.
 
 The [integrated audit](requirements-audit.md) uses the reviewed successor
 statements and tooling. Its [final structural validation](../../../../testing_ground/issue-45/whole-issue-final-reconciliation-validation-root-revision02.json)
@@ -89,13 +94,14 @@ hold. The [independent input review](../../../../testing_ground/issue-45/whole-i
 accepts the first render, successor requirement statements, and corrected
 historical framing. No executable source changed during this reconciliation.
 
-## Final review hold on 2026-09-10
+## Earlier review hold, superseded on 2026-09-10
 
-Christopher asked to hold the final exhaustive Astra review. His instruction
+Christopher first asked to hold the final exhaustive Astra review. His instruction
 was relayed from `Check issue 45 progress (2)`, task
-`01a071cf-399b-7712-8409-461f1ad4746a`. That review has not started. Audit
-integration, document validation, and local commits continue. The hold does
-not permanently waive review or authorize pushing, publication, or closure.
+`01a071cf-399b-7712-8409-461f1ad4746a`. That review never started. Audit
+integration, document validation, and local commits continued. Christopher
+then explicitly waived the review and authorized relevant pushes, GitHub
+updates, and closure. The later waiver replaces this earlier hold.
 
 ## Earlier verification and review chronology
 
@@ -457,8 +463,9 @@ unused single-node reset wrapper, obsolete API startup-strategy spellings,
 and obsolete network-mode translations are now removed and pass the current
 checks. These removals are included in the local checkpoint.
 
-The 694-row reconciliation is integrated and structurally validated. The final
-Astra review remains on hold at Christopher's request. The external
-project-revamping guide is complete within its recorded validation limits.
-Push, issue publication, and closure remain open. Packaging and package
-publication belong to the downstream task.
+The 694-row reconciliation and external project-revamping guide are complete
+within their recorded validation limits. Christopher explicitly waived the
+final Astra review. The implementation-task resolution records the final
+documentation push, verification and review evidence, handoff, closure and
+Wayfinder update. Packaging, the required README/RUN guidance amendment,
+package publication and release identity belong to the downstream task.
