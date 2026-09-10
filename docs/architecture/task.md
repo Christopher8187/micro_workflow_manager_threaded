@@ -71,6 +71,11 @@ raw node, including inside a Hoeflein component. It contains no producer job
 number. `NodeInputFileSystem` applies its bound `base` below that producer
 prefix, including for `write_jsons()` batches.
 
+A project-owned direct input such as `node/A/input/prompt.md` stays at that
+path when A reads it. By contrast, `node/A/input/B/...` holds managed input
+received at A from actual producing raw node B. Follow the installed framework
+version when documenting an existing project's paths.
+
 Managed forwarding records the exact producing execution independently of
 optional trace. Each batch waits for a durable ownership and trace decision.
 A synchronous file or metadata failure restores the prior files. If restoration

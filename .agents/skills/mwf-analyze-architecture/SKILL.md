@@ -10,7 +10,8 @@ and session state investigation, use `mwf-debug-workflow`. Use this procedure
 when the question concerns the architecture across workflow paths.
 
 1. Read the framework `README.md`, relevant glossary and architecture pages,
-   project and node READMEs, source, tests, and available run evidence. Finish
+   project and node READMEs, node and central component RUN files, source, tests,
+   and available run evidence. Finish
    when the intended design and current behavior can be compared at graph, node,
    and task scales.
 2. Trace Job Scope through semantic paths, quotient-DAG vertices, Hoeflein

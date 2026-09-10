@@ -1,4 +1,4 @@
-# micro-workflow-manager 0.6.1
+# micro-workflow-manager 0.6.2
 
 Micro Workflow Manager (MWF) runs Python jobs through a directed graph while
 keeping user data visible on disk and high-churn scheduling state in SQLite. It
@@ -23,6 +23,8 @@ pages own deeper design or operating detail:
   recovery, cleanup, clipboard use, and deployment.
 - [Installation](docs/installation.md): development installs, builds, wheels,
   uninstalling, and persistence.
+- [Workflow documentation](docs/workflow-documentation.md): project and node
+  READMEs, concise node RUN files, and shared component guidance.
 - [Testing](docs/testing.md), [test modules](tests/README.md), and
   [benchmarks](benchmarks/README.md): isolated verification and performance
   programs.
@@ -61,7 +63,7 @@ The filesystem and SQLite have separate responsibilities:
 - `node/<name>/jobs/<id>/output.json` stores the concise terminal return or
   failure summary.
 
-MWF 0.6.1 does not provide per-job file storage. Substantial results,
+MWF does not provide per-job file storage. Substantial results,
 diagnostics, and intermediate files belong under the node output prefix, not
 under `jobs/<id>/`.
 
@@ -78,6 +80,7 @@ project/
 ├── node/
 │   └── <node-name>/
 │       ├── README.md
+│       ├── RUN.md
 │       ├── input/
 │       ├── output/
 │       └── jobs/
@@ -95,16 +98,16 @@ SQLite stores execution sessions, exact job owners, component results, runtime
 thread settings, and recovery decisions. Native projects do not use separate
 run-state or thread-settings JSON files.
 
-The root README should explain the project purpose, graph, component behavior,
-setup, execution, inspection, and important operating boundaries. Each node
-README should explain its role and Job Scope, task and fallback hierarchy,
-parameters, file inputs and outputs, routing, validation hierarchy,
-validator-fallback balancing, fallback context control, runner, concurrency,
-timeouts, and idempotency. Add `src/README.md` only when the source layout needs
-its own explanation.
+Begin root and node READMEs with a human-readable workflow summary. Each node
+README explains node and task architecture and links to its RUN, which holds
+concise current operating knowledge. A central component README and RUN hold
+shared architecture and operating information. Follow the
+[workflow documentation guide](docs/workflow-documentation.md) when creating or
+updating these files, including input paths, current defects, and test links.
+Add `src/README.md` only when source organization needs its own explanation.
 
-These README files are documentation standards, not framework validity checks.
-Current `mwf init` and `mwf graph` do not create them automatically.
+README and RUN files are documentation requirements. Current `mwf init` and
+`mwf graph` do not generate them or require them for runtime validity.
 
 ## Quick start
 
@@ -279,7 +282,7 @@ for node, params, key in children:
     ctx.node(node).add(idempotency_key=key, **params)
 ```
 
-MWF 0.6.1 has no `ctx.transaction()` staging helper. Existing projects using it
+MWF has no `ctx.transaction()` staging helper. Existing projects using it
 must finish or clear affected partial runs before upgrading, then use the two
 patterns above. The internal SQLite transaction machinery and generation fences
 remain framework implementation details.
@@ -299,7 +302,7 @@ copying, listing, generation fencing, Windows extended-path handling, and trace
 events where appropriate. `ctx.input_path()`, `ctx.output_path()`,
 `ctx.write_output()`, and `ctx.write_output_bytes()` remain available for direct
 node-scoped access. `ctx.write()`, `ctx.write_bytes()`, `ctx.files_dir`,
-`ctx.storage_dir`, and `JobFileSystem` do not exist in 0.6.1.
+`ctx.storage_dir`, and `JobFileSystem` do not exist in 0.6.2.
 
 Generation fencing applies to framework-managed write and copy methods. A
 filesystem entry's `.path`, path-like conversion, `ctx.output_path()`, and a
@@ -398,7 +401,7 @@ For API nodes, `--api-total` limits active API executions across every session
 in the project. Per-node values remain local allocation weights and upper
 bounds. Existing API work counts when a limit is installed or lowered and
 continues until it finishes or reaches a cooperative interrupt checkpoint.
-The option is deprecated in the 0.6.2 development branch and
+The option is deprecated in 0.6.2 and
 prints a warning when used. Setting and resetting the budget remain functional;
 the budget clears after the final session ends. No removal date or
 session-specific form is introduced. Raising a live threaded
@@ -574,17 +577,27 @@ tests; and ask an independent reviewer to look for mismatches when available.
 Any executable or runtime-configuration change uses the focused, adjacent, and
 release checks selected by the testing guide.
 
-## 0.6.1 upgrade boundaries
+## 0.6.2 upgrade boundaries
 
 - The public per-job file APIs and automatic copying of returned paths are
-  removed. Old per-job file trees remain on disk until an already-authorized
-  cleanup or manual migration.
+  absent, as in 0.6.1. Preserve old project data while rebuilding a project for
+  the native 0.6.2 model.
 - `ctx.transaction()` is removed without an alias or deprecation period. Use
   `add_many()` or explicit idempotency keys.
 - Node-output layout is project-owned. MWF enforces one node output prefix and
   safe managed access, not a required result format.
-- Root and node READMEs are required by the documentation standard but not by
-  runtime validation, and MWF does not generate them in this release.
+- Projects use one native runtime model. Unsupported older state is refused;
+  there is no embedded legacy conversion. Use the
+  [project-revamping guide](https://github.com/Christopher8187/product/blob/bad9f53e26902ed09d6e549404240a1f97778698/migration.md)
+  to rebuild an older project's source and initialize fresh native state.
+- The nine graph commands replace the removed `clean`, `cleanfrom`, `wipe`, and
+  `wipefrom` commands. `MicroWorkflow.skip_node()` is removed; skipped job
+  outcomes remain supported.
+- Root READMEs and node README/RUN pairs are documentation requirements. MWF
+  does not generate these files or require them for runtime validity.
+- Existing example repair and completion belong to 0.6.3. The
+  [accepted verification record](docs/plans/0.6.2/verification-summary.md#two-approved-example-deferrals)
+  names the two deferred example failures.
 - Public Python API compatibility beyond the documented current surface remains
   unsettled. Check the installed version before relying on undocumented names.
 

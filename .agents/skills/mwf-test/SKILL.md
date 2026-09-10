@@ -61,7 +61,8 @@ or runtime configuration changed, continue with the isolated sequence below.
    ownership, project-wide API capacity, native clipboard recovery, and full
    and compact lineage views wherever the change reaches those behaviors.
 4. For another project built with MWF, copy the exact project tree into its
-   derived Test Area. Read its root and affected node READMEs, install its own
+   derived Test Area. Read its root and affected node READMEs and RUN files,
+   including linked component operating guidance. Install its own
    declared test dependencies, and install the MWF wheel or version the project
    records. Do not assume that project supports `.[test]`. Run its focused
    tests and workflow acceptance from the copy, never its durable working

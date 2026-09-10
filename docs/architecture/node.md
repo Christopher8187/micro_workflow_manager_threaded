@@ -25,20 +25,15 @@ role that creates or routes multiple children. Neither term means
 
 ## Node README
 
-Each project node should have `node/<node-name>/README.md`. Describe the node's
-role and Job Scope, main and fallback tasks, parameters, input paths, output
-layout, downstream routes, functional hierarchy, validation hierarchy,
-validator-fallback balancing, fallback context control, runner, concurrency,
-timeouts, checkpoints, idempotency, and replay behavior.
+Each project node has a README for node and task architecture and a linked RUN
+for concise current operating knowledge. Begin README with a human-readable
+workflow summary. A central component README explains shared graph and handler
+architecture; member READMEs describe their differences. Follow the
+[workflow documentation guide](../workflow-documentation.md) for file
+responsibilities, current defects, test references, and version-specific paths.
 
-Do not fill every node README with routine command instructions for restart,
-recovery, or cleanup. Put project-wide operating procedures in the root README
-and keep framework command detail in `docs/operations.md`. A node README should
-mention an operating exception only when that node has a special boundary that
-changes how an operator must act.
-
-The README is a documentation standard, not a runtime validity condition. MWF
-0.6.1 does not generate it automatically.
+These files are documentation requirements. MWF does not generate them or
+require them for runtime validity.
 
 ## Functional and validation hierarchies
 

@@ -19,8 +19,10 @@ repository or a production system.
 2. Read the relevant definitions and boundaries in `CONTEXT.md`.
 3. Follow the README links to the relevant graph, node, task, or testing
    document.
-4. For an MWF project, read its root `README.md`, the README for every affected
-   node, and `src/README.md` when present.
+4. For an MWF project, read its root `README.md`, each affected node's README,
+   and `src/README.md` when present. For operation, diagnosis, testing, or
+   documentation, also read affected node RUN files and their central component
+   RUN. Follow `docs/workflow-documentation.md` when writing these documents.
 5. Inspect the relevant source and tests before asserting current behavior or
    planning a change.
 6. Use a repository skill when the request matches a repeatable procedure.

@@ -7,7 +7,7 @@ description: Design graph, node, and task architecture for an MWF project that h
 
 1. Read the framework `README.md`, relevant `CONTEXT.md` terms, and all three
    architecture documents. Then inspect the target project's root README,
-   node READMEs, `src/README.md` when present, source, and tests. Finish when the
+   node READMEs and RUN files, `src/README.md` when present, source, and tests. Finish when the
    current inputs, outputs, constraints, and existing decisions are accounted
    for.
 2. Define the start state, durable end state, semantic oases, and Job Scope on
@@ -25,6 +25,7 @@ description: Design graph, node, and task architecture for an MWF project that h
    against exact-path or fixed-depth reads.
 4. Record documentation and source disagreements using `AGENTS.md`. Continue
    independent design with visible provisional assumptions.
-5. Write design documentation only when requested. Implement nothing unless the
+5. Use `mwf-document-workflow` for requested design documentation and README/RUN
+   responsibilities. Implement nothing unless the
    user explicitly asks. Return consulted sources, settled decisions,
    assumptions, inconsistencies, and the next decision or implementation step.

@@ -8,7 +8,8 @@ description: Debug or diagnose MWF execution, inspect input, trace lineage, or i
 1. Read the framework [README](../../../README.md), relevant
    [glossary](../../../CONTEXT.md) terms, and
    [operations](../../../docs/operations.md). Resolve the installed version,
-   project root, project README, affected node READMEs, and the observed failure.
+   project root, project README, affected node READMEs and RUN files, their
+   central component RUN, and the observed failure.
    Finish when expected behavior and actual behavior have distinct evidence.
 2. Inspect the named job and its component. Keep job status separate from
    component state, stability, exact instability origin, and misalignment.
@@ -37,3 +38,6 @@ description: Debug or diagnose MWF execution, inspect input, trace lineage, or i
 7. Finish when the original failure is explained and an authorized repair has
    been verified, or when the missing evidence or unresolved decision is named.
    Report consulted sources and any assumptions still affecting the diagnosis.
+   When updating documentation, record current defects and repair pointers in
+   the affected node README and useful job findings in RUN, following the
+   [documentation guide](../../../docs/workflow-documentation.md).

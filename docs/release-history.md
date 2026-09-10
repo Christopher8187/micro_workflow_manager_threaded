@@ -1,15 +1,17 @@
 # Release history
 
-These notes record what changed in each MWF release through 0.6.1.
+These notes record what changed in each MWF release through 0.6.2.
 Later releases may supersede behavior described in an earlier entry. Use the
 [current README](../README.md) and linked architecture and operations guides for
 current behavior.
 
-## In development for 0.6.2
+## What changed in 0.6.2
 
-This source branch is under verification. The
-[integration record](plans/0.6.2/native-workflow-management-progress.md) records
-current checks and unresolved findings; this entry does not announce a release.
+The [accepted verification record](plans/0.6.2/verification-summary.md) records
+completed native checks, bounded reviews, the explicit final Astra waiver, and
+the two existing example failures deferred to 0.6.3. The
+[release task](https://github.com/Christopher8187/product/issues/46) records
+the published source and artifact identities.
 
 - Execution uses native main and interrupt sessions with exact component and
   job ownership. Recovery, restart, and per-node thread overrides follow those
@@ -35,11 +37,15 @@ current checks and unresolved findings; this entry does not announce a release.
   the originating project. Saved native history supports completed jobs, while
   node-scoped paste preserves compatible peer work. Interrupted file operations
   use recorded recovery decisions.
-- The branch supports one native project model and refuses unsupported older
+- MWF supports one native project model and refuses unsupported older
   project state. It removes `clean`, `cleanfrom`, `wipe`, `wipefrom`, and
   `MicroWorkflow.skip_node()`. Use reset commands to prepare retained work;
   skipped jobs remain supported. Two management skills join the five existing
   architecture, documentation, and testing skills.
+
+- Node documentation now pairs a design README with a concise current RUN.
+  Shared component and handler explanations have one owner, and all seven
+  workflow skills follow the [documentation guide](workflow-documentation.md).
 
 ## What changed in 0.6.1
 

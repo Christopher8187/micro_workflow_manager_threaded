@@ -29,8 +29,8 @@ python -m build
 The output under `dist/` should include:
 
 ```text
-micro_workflow_manager-0.6.1-py3-none-any.whl
-micro_workflow_manager-0.6.1.tar.gz
+micro_workflow_manager-0.6.2-py3-none-any.whl
+micro_workflow_manager-0.6.2.tar.gz
 ```
 
 Build only the wheel with `python -m build --wheel`. The `py3-none-any` tag
@@ -48,21 +48,21 @@ Give pip the actual wheel path:
 
 ```powershell
 python -m pip install --force-reinstall `
-  .\dist\micro_workflow_manager-0.6.1-py3-none-any.whl
+  .\dist\micro_workflow_manager-0.6.2-py3-none-any.whl
 ```
 
 On Linux or WSL:
 
 ```bash
 python -m pip install --force-reinstall \
-  ./dist/micro_workflow_manager-0.6.1-py3-none-any.whl
+  ./dist/micro_workflow_manager-0.6.2-py3-none-any.whl
 ```
 
 A project may keep the wheel under `vendor/` and reference it from
 `requirements.txt`:
 
 ```text
-./vendor/micro_workflow_manager-0.6.1-py3-none-any.whl
+./vendor/micro_workflow_manager-0.6.2-py3-none-any.whl
 ```
 
 Verify the installed version, import location, and CLI:
@@ -88,7 +88,7 @@ entry, or persistent global worker.
 ## Project data persists
 
 Uninstalling the package does not remove project data. Graph code, root and node
-README files, `node/`, `.mwf/`, clipboard copies, deployment archives, and other
+README and RUN files, `node/`, `.mwf/`, clipboard copies, deployment archives, and other
 project files remain until the user deliberately removes them.
 
 Treat `.mwf/state.sqlite3` as authoritative queue and runtime state. Do not

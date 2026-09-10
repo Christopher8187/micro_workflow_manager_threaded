@@ -8,7 +8,8 @@ description: Run, resume, reset, interrupt, sample, or isolate work in an MWF pr
 1. Read the framework [README](../../../README.md), relevant
    [glossary](../../../CONTEXT.md) terms, and
    [operations](../../../docs/operations.md). Resolve the project's root,
-   installed MWF version, root README, and affected node READMEs. Finish when
+   installed MWF version, root README, affected node READMEs and RUN files,
+   and their central component RUN. Finish when
    the available commands and the project's durable inputs and outputs are
    known for that version.
 2. Translate the requested result into named raw nodes, quotient components,
@@ -36,7 +37,10 @@ description: Run, resume, reset, interrupt, sample, or isolate work in an MWF pr
    holds or a specific refusal or failure prevents it. Use native recovery for
    abandoned ownership. Route unexplained behavior to
    [mwf-debug-workflow](../mwf-debug-workflow/SKILL.md).
-7. Report the exact command, selection, sample and interrupt identities when
+7. Keep useful current costs, filter statistics, job problems, and operating
+   findings in the affected RUN, following the
+   [documentation guide](../../../docs/workflow-documentation.md#node-run).
+   Report the exact command, selection, sample and interrupt identities when
    present, session outcome, durable result locations, and any remaining failed,
    sampled, stopped, or misaligned work. A stopped session or sampled component
    does not establish completion of the whole downstream workflow.

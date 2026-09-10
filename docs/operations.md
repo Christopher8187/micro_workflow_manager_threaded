@@ -22,7 +22,7 @@ mounting routers.
 
 `mwf init` creates `.mwf/project.json`, `.mwf/state.sqlite3`, and lightweight
 editor and ignore-file support. It does not import `src/graph.py`, execute task
-code, or create project and node README files.
+code, or create project READMEs and node README/RUN pairs.
 
 Register the initial graph explicitly:
 
@@ -334,7 +334,7 @@ Resetting the aggregate budget removes the project limit. Ending one session
 clears only its node overrides and execution permits. The aggregate budget
 clears when the final session ends.
 
-The `--api-total` option is deprecated in the 0.6.2 development branch. Help
+The `--api-total` option is deprecated in 0.6.2. Help
 marks the option deprecated, and using it prints a warning to standard error,
 including when a supplied value is rejected. Setting and resetting the budget
 remain functional. No removal date or session-specific form is introduced.

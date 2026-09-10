@@ -6,7 +6,7 @@ description: Apply a known architecture change to an existing MWF project. Use w
 # Modify existing MWF architecture
 
 1. Read the framework `README.md`, relevant glossary and architecture pages,
-   then the project's root and affected node READMEs, source, and tests. State
+   then the project's root and affected node READMEs and RUN files, source, and tests. State
    the known change and the current behavior. Finish when its graph, node, and
    task effects are bounded.
 2. If the desired change is still broad or unknown, stop modification and use
@@ -24,6 +24,7 @@ description: Apply a known architecture change to an existing MWF project. Use w
    apply the explicit one-change approval gate in `AGENTS.md`. An implementation
    request includes only the separately approved source, regression coverage,
    and documentation changes for the known change.
-5. Use `mwf-test` for verification. Finish when the requested behavior, affected
+5. Update affected README/RUN pairs through `mwf-document-workflow`. Use
+   `mwf-test` for verification. Finish when the requested behavior, affected
    documents, regression result, preserved dirty state, and unresolved risks are
    reported.
