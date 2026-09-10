@@ -166,7 +166,7 @@ def test_readme_routes_documentation_and_requires_output_provenance():
     task = (root / "docs" / "architecture" / "task.md").read_text(
         encoding="utf-8"
     )
-    assert "# micro-workflow-manager 0.6.1" in readme
+    assert "# micro-workflow-manager 0.6.2" in readme
     for target in (
         "CONTEXT.md",
         "docs/architecture/graph.md",
