@@ -275,6 +275,7 @@ def test_pending_node_override_binds_only_when_the_next_session_claims_that_node
         assert storage.read_thread_override_observation("A") == {
             "node": "A", "value": 4, "session_id": "main-A",
         }
+        _wait_writer(storage)
         inspect_files_before = _snapshot(tmp_path)
         assert cli.main(["threads", "A"]) == 0
         inspected = capsys.readouterr().out
