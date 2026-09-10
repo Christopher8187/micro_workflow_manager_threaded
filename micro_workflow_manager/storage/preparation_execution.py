@@ -60,6 +60,7 @@ def prepare_component_unit(storage, root, unit, expected, session_id, guard_id, 
     identities = {}
 
     def commit(connection):
+        receipt.require_prepared(connection)
         validate(connection)
         selected = tuple(plan for plan in unit.jobs if plan.node in unit.component)
         outside = tuple(plan for plan in unit.jobs if plan.node not in unit.component)

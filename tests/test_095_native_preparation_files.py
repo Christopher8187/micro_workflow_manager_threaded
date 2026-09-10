@@ -12,6 +12,7 @@ from micro_workflow_manager.cli.run_commands import run_node
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import preparation_files
 from micro_workflow_manager.storage.job_preparation import NodeJobPreparation, PreparationJob, read_job_preparation
+from micro_workflow_manager.storage.preparation_staging import PreparationStaging
 from tests.test_036_hoeflein_scheduling import make_project
 from tests.test_076_component_state_transitions import _session
 from tests.test_090_component_session_settlement import _close, _rows
@@ -80,9 +81,14 @@ def test_restoration_failure_preserves_original_error_and_recovery_location(tmp_
 
     original = PreparationError('database preparation failed')
     rename = Path.rename
+    reached = []
 
     def fail_restoration(path, target):
-        if path.parent.parent.name == 'preparation-trash':
+        if path.name == '0' and path.parent.parent.name == 'preparation-trash' and target == output:
+            saved = path / 'retained.txt'
+            assert saved.read_bytes() == b'original result'
+            assert not output.exists()
+            reached.append((path, target))
             raise OSError('restoration blocked by a file handle')
         return rename(path, target)
 
@@ -91,6 +97,7 @@ def test_restoration_failure_preserves_original_error_and_recovery_location(tmp_
         with preparation_files.stage_preparation_files(tmp_path, [_plan()]):
             raise original
     assert caught.value is original
+    assert len(reached) == 1 and reached[0][1] == output
     assert any('Preparation files require recovery at' in note for note in original.__notes__)
     saved, = (tmp_path / '.mwf' / 'preparation-trash').glob('*/0/retained.txt')
     assert saved.read_bytes() == b'original result'
@@ -111,21 +118,25 @@ def test_committed_preparation_continues_when_retired_files_cannot_be_deleted(tm
     assert cli.main(['run', 'A']) == 0
     workflow = load_workflow(tmp_path)
     storage = workflow.storage
-    notify, remove = storage.notify_queue_changes, preparation_files.shutil.rmtree
+    notify = storage.notify_queue_changes
     notifications = []
+    retained_cleanup = []
     generation = storage.get_component_state(('A',))['alignment_generation']
 
     def record(nodes):
         notifications.append((tuple(nodes), storage.get_component_state(('A',))['lifecycle']))
         return notify(nodes)
 
-    def retain_private_trash(path, *args, **kwargs):
-        if Path(path).parent.name == 'preparation-trash':
+    def retain_private_trash(files, relative, expected):
+        if not retained_cleanup and (files.root / Path(relative)).exists():
+            assert relative.startswith(files.relative + '/')
+            retained_cleanup.append(relative)
             raise PermissionError('retired file is still open')
-        return remove(path, *args, **kwargs)
+        return remove_recorded(files, relative, expected)
 
     monkeypatch.setattr(storage, 'notify_queue_changes', record)
-    monkeypatch.setattr(preparation_files.shutil, 'rmtree', retain_private_trash)
+    remove_recorded = PreparationStaging._remove_recorded_tree
+    monkeypatch.setattr(PreparationStaging, '_remove_recorded_tree', retain_private_trash)
     try:
         assert run_node(tmp_path, workflow, 'A') == 0
         assert storage.get_component_state(('A',))['alignment_generation'] == generation + 1
@@ -134,6 +145,7 @@ def test_committed_preparation_continues_when_retired_files_cannot_be_deleted(tm
         assert (('A',), 'queued') in notifications
         assert (tmp_path / 'node' / 'A' / 'output' / 'ran.txt').read_bytes() == b'A'
         assert all(session['outcome'] == 'done' for session in storage.list_execution_sessions())
+        assert len(retained_cleanup) == 1
         assert 'temporary files remain' in caplog.text
         saved, = (tmp_path / '.mwf' / 'preparation-trash').glob('*/*/ran.txt')
         assert saved.read_bytes() == b'A'

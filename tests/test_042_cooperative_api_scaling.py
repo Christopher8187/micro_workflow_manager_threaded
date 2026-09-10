@@ -6,6 +6,7 @@ from concurrent.futures import Future
 
 from micro_workflow_manager import cli
 from micro_workflow_manager.runners.api import ApiRunner
+from micro_workflow_manager.storage import FileStorage
 
 
 def test_two_thousand_api_jobs_are_cooperative_not_thread_per_job():
@@ -62,7 +63,7 @@ def test_monitor_reports_no_aggregate_api_limit(tmp_path, monkeypatch, capsys):
     snapshot = json.loads(capsys.readouterr().out)
     assert snapshot["api_runtime"]["mode"] == "cooperative"
     assert snapshot["api_runtime"]["aggregate_limit"] is None
-    assert snapshot["api_runtime"]["declared_capacity"] == 12000
+    assert snapshot["api_runtime"]["requested_capacity"] == 12000
 
 
 def test_api_runtime_override_can_exceed_os_thread_ceiling(tmp_path, monkeypatch, capsys):
@@ -93,10 +94,16 @@ def test_api_runtime_override_can_exceed_os_thread_ceiling(tmp_path, monkeypatch
     assert "cannot exceed" in capsys.readouterr().err
 
 
-def test_api_total_option_creates_pending_run_scoped_budget(tmp_path, monkeypatch):
+def test_api_total_option_persists_native_project_budget(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert cli.main(["init"]) == 0
     assert cli.main(["threads", "--api-total", "7"]) == 0
-    state = json.loads((tmp_path / ".mwf" / "threads.json").read_text(encoding="utf-8"))
-    assert state["run_id"] is None
-    assert state["api_total_limit"] == 7
+    storage = FileStorage(tmp_path)
+    try:
+        assert storage.read_api_total_limit() == 7
+        assert [tuple(row) for row in storage.db_connection().execute(
+            "SELECT singleton, value FROM api_thread_limit ORDER BY singleton"
+        )] == [(1, 7)]
+        assert not (tmp_path / ".mwf" / "threads.json").exists()
+    finally:
+        storage.close_database_connections()

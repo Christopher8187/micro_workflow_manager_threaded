@@ -311,7 +311,7 @@ def test_run_job_selection_runs_individual_jobs_and_ranges_only(tmp_path, monkey
         status_path = tmp_path / "node" / "work" / "jobs" / str(job_id) / "status.json"
         assert read_status_or_queued(status_path) == "queued"
 
-    assert FileStorage(tmp_path).get_node_status("work") == "queued"
+    assert FileStorage(tmp_path).get_node_status("work") == "sampled"
 
 
 def test_run_job_selection_preserves_existing_node_output(tmp_path, monkeypatch, capsys):
@@ -368,20 +368,12 @@ def test_init_creates_vscode_settings_and_gitignore(tmp_path, monkeypatch, capsy
         "node/*/input/*/",
         "node/*/jobs/**",
         "node/*/output/*/",
-        "node/*/queued/**",
-        "node/*/node_state.json",
-        "node/*/job_index.json",
-        "node/*/default_jobs.json",
         "node/*/schema.json",
         "clipboard/*/input/*/",
         "clipboard/*/jobs/**",
         "clipboard/*/output/*/",
-        "clipboard/*/queued/**",
-        "clipboard/*/node_state.json",
-        "clipboard/*/job_index.json",
-        "clipboard/*/job_index.dirty",
-        "clipboard/*/default_jobs.json",
         "clipboard/*/schema.json",
+        "clipboard/*/.mwf-node-state.sqlite3",
         "*.egg-info/",
         "__pycache__/",
         ".pytest_cache/",
@@ -407,19 +399,14 @@ def test_init_gitignore_keeps_direct_input_output_files_but_ignores_nested(tmp_p
         "node/work/input/nested/page.txt",
         "node/work/output/result.txt",
         "node/work/output/images/page.png",
-        "node/work/jobs/1/job.json",
-        "node/work/queued/1.queued",
+        "node/work/jobs/1/input.json",
         "clipboard/work/input/root.txt",
         "clipboard/work/input/nested/page.txt",
         "clipboard/work/output/result.txt",
         "clipboard/work/output/images/page.png",
-        "clipboard/work/jobs/1/job.json",
-        "clipboard/work/queued/1.queued",
-        "clipboard/work/node_state.json",
-        "clipboard/work/job_index.json",
-        "clipboard/work/job_index.dirty",
-        "clipboard/work/default_jobs.json",
+        "clipboard/work/jobs/1/input.json",
         "clipboard/work/schema.json",
+        "clipboard/work/.mwf-node-state.sqlite3",
     ]
     for rel in paths:
         path = tmp_path / rel
@@ -440,20 +427,15 @@ def test_init_gitignore_keeps_direct_input_output_files_but_ignores_nested(tmp_p
     assert is_ignored("node/work/input/nested/page.txt")
     assert not is_ignored("node/work/output/result.txt")
     assert is_ignored("node/work/output/images/page.png")
-    assert is_ignored("node/work/jobs/1/job.json")
-    assert is_ignored("node/work/queued/1.queued")
+    assert is_ignored("node/work/jobs/1/input.json")
 
     assert not is_ignored("clipboard/work/input/root.txt")
     assert is_ignored("clipboard/work/input/nested/page.txt")
     assert not is_ignored("clipboard/work/output/result.txt")
     assert is_ignored("clipboard/work/output/images/page.png")
-    assert is_ignored("clipboard/work/jobs/1/job.json")
-    assert is_ignored("clipboard/work/queued/1.queued")
-    assert is_ignored("clipboard/work/node_state.json")
-    assert is_ignored("clipboard/work/job_index.json")
-    assert is_ignored("clipboard/work/job_index.dirty")
-    assert is_ignored("clipboard/work/default_jobs.json")
+    assert is_ignored("clipboard/work/jobs/1/input.json")
     assert is_ignored("clipboard/work/schema.json")
+    assert is_ignored("clipboard/work/.mwf-node-state.sqlite3")
 
 
 def test_reinit_updates_sidecars_without_duplicating_gitignore_section(tmp_path, monkeypatch, capsys):

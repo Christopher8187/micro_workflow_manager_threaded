@@ -137,7 +137,7 @@ def test_selected_preparation_removes_prior_same_component_work_and_preserves_qu
         incoming.write_bytes(b'project input')
         root_instance = storage.read_job_instance_id('A', 1)
         before_calls = list(calls)
-        before_raw = {name: storage.get_node_status(name) for name in ('A', 'X', 'B', 'C')}
+        before_node_states = {name: storage.get_node_status(name) for name in ('A', 'X', 'B', 'C')}
         removed_inputs = {
             relative: storage.read_node_input_owner('B', relative)
             for relative in ('A/selected-0.txt', 'A/selected-2.txt', 'X/selected-child.txt')
@@ -172,7 +172,7 @@ def test_selected_preparation_removes_prior_same_component_work_and_preserves_qu
         assert incoming.read_bytes() == b'project input'
         assert storage.get_component_state(('A', 'X')) == before_component
         if entry == 'reset':
-            assert {name: storage.get_node_status(name) for name in before_raw} == dict(before_raw, A='queued')
+            assert {name: storage.get_node_status(name) for name in before_node_states} == before_node_states
         assert storage.get_component_state(('B',)) == dict(before_b, misaligned=True)
         assert storage.get_component_state(('C',)) == before_c
         assert storage.read_component_misalignment_causes(('A', 'X')) == []
@@ -319,8 +319,8 @@ def _multiple_generation_root_history(tmp_path):
         if generation < 2:
             restart = storage.request_job_restart('A', 1)
             assert restart['generation'] == generation + 1
-    storage.release_execution_components(session_id)
     storage.finish_execution_session(session_id, outcome='done', finished_at=now())
+    storage.release_execution_components(session_id)
     return workflow, root_instance, tuple(executions)
 
 

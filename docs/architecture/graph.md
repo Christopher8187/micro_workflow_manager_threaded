@@ -137,16 +137,51 @@ when retained jobs still depend on it.
 
 ## Scheduling and lifecycle
 
-The quotient DAG controls readiness between components. A starting component
-requires its external predecessors to be complete. A selected branch may reach
-a merge component before an unselected branch does, and that merge component
-may reactivate when later work arrives.
+The quotient DAG controls readiness between components. Ordinary execution
+requires complete compatible direct-parent results. All stable parents produce
+a stable result. All unstable parents must share one exact instability origin.
+Mixed stable/unstable parents or different origins create an instability
+conflict. A component with no parents is ordinarily runnable.
+
+Each component has one authoritative state: queued, running, sampled, done, or
+failed. Every raw member derives its lifecycle from that record. Stability and
+misalignment remain separate. Successful partial execution is sampled and
+blocks ordinary quotient descendants until completion.
+
+Late managed input or jobs make a retained done, sampled, or failed result
+misaligned. Preparation that changes an excluded receiver's managed work does
+the same. Manual file edits are the actor's responsibility. Misalignment does
+not spread merely through graph position. Full fresh preparation clears it and
+advances alignment generation; selected-job preparation does not.
 
 Within a running Hoeflein component, ordinary members remain available while
 peer work can still arrive. A component failure stops new admission and joins
 already-started work before the component reaches a durable failed boundary.
 Waiting nodes gate admission based on the configured peer queues; they do not
 introduce a new job status.
+
+An interrupt declaration covers the complete component. Ordinary commands
+resolve run-or-stop decisions before mutation. Explicit interruption pauses
+only active direct predecessors and runs the start against frozen input. Its
+selected descendants retain ordinary readiness. A target that uses overridden
+readiness can establish a new unstable origin. It never reruns automatically
+after predecessor work resumes. See [operations](../operations.md) for fences,
+session transfers, and the distinction between execution and retained origin.
+
+Fresh preparation follows immutable producers to affected jobs and managed input
+inside and outside the selection. It preserves incoming start input and material
+from unselected producers. Execution membership stays fixed for each admitted
+session. Changed membership requires repair through overlapping old and new
+components; unrelated components retain their state.
+
+## Report interrupt branches
+
+Give a report interrupt component the same direct predecessors as its related
+semantic oasis. Keep their descendant branches disjoint so partial reporting data cannot
+merge into the oasis result path. A report can stand alone or feed an analysis
+branch. Branch length is architecture guidance, not a framework validity rule.
+Each explicit run may publish a new report. Aligned unfinished work may resume;
+late managed input requires fresh execution.
 
 Fresh execution, resume, restart, and reset have different data
 boundaries. Consult [README.md](../../README.md) for command semantics and
@@ -155,20 +190,26 @@ boundaries. Consult [README.md](../../README.md) for command semantics and
 ## Current evidence boundaries
 
 The framework accepts `ctx.node(...).add`, `add_many`, `add_job`, and `add_jobs`
-as routing forms. The static autostart scanner currently recognizes only the
-literal `add` form. This is a framework risk, not a demonstrated component
-failure. Inspect synchronized autostart edges and current source before relying
-on another form for component construction.
+as routing forms. The static autostart scanner recognizes literal
+`ctx.node(...).add(autostart=True)` calls. It also recognizes a module-level
+`from micro_workflow_manager import NodeInputFileSystem` import, with an
+optional alias, followed by one simple module-level assignment that constructs
+an unshadowed handle from a literal positional receiver. Calls to that handle's
+`add_job(..., autostart=True)` or `add_jobs(..., autostart=True)` contribute an
+autostart edge. The scanner does not infer keyword receiver names, module
+attributes, direct temporary constructors, dynamic receiver names, computed
+autostart values, or bindings invalidated by rebinding or wildcard imports.
+Inspect synchronized autostart edges before relying on another form for
+component construction.
 
 Engine tests establish graph-only loading, component collapse, loopback access,
 token handling, and absence of runtime-layout initialization. They do not show
 that a human can read every rendered graph layout. That remains missing visual
 evidence, not a demonstrated engine defect.
 
-Sampling tests establish deterministic selection, preservation of unselected
-jobs, and planning that does not apply the sample run. They do not exercise a sampled task that tries to
-route descendants or circulate through a Hoeflein component. Treat those
-stronger isolation claims as missing evidence until a focused regression exists.
+Selected-job and sampling regressions exercise newly created same-component
+circulation and publication to excluded quotient descendants. Those receivers
+are not executed by the selected invocation.
 
 The exact semantic contraction algorithm, treatment of noncontractible
 subgraphs, fan-out expansion, and graph-viewer behavior remain deferred design

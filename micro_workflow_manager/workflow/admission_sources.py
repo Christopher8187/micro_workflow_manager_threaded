@@ -7,6 +7,7 @@ from time import perf_counter
 from typing import Callable
 
 from ..models import Job, now
+from ..storage import InterruptAdmissionPaused
 
 
 @dataclass(slots=True)
@@ -58,9 +59,20 @@ class ClaimedQueuedJobSource:
         self.required_params = set(required_params or ())
         self.allowed_params = set(allowed_params or ())
         self.on_abandoned = on_abandoned
+        self._pending = []
+        self._pending_lock = Lock()
+        self._closed = False
 
     def pull(self, max_items: int) -> list[ClaimedJob]:
-        jobs = self.source.pull(max_items)
+        if type(max_items) is not int or max_items < 0:
+            raise ValueError('max_items must be an integer >= 0')
+        if max_items == 0 or self._closed:
+            return []
+        with self._pending_lock:
+            jobs = self._pending[:max_items]
+            del self._pending[:len(jobs)]
+        if not jobs:
+            jobs = self.source.pull(max_items)
         if not jobs:
             return []
         started_at = now()
@@ -70,18 +82,27 @@ class ClaimedQueuedJobSource:
             task_started_mask = []
             for job in jobs:
                 present = {key for key in job.params if key in self.allowed_params}
-                if "error" in self.allowed_params:
-                    present.add("error")
+                present.update({
+                    name for name in ("error", "errors")
+                    if name in self.allowed_params
+                })
                 task_started_mask.append(not (self.required_params - present))
-        leases = self.storage.claim_job_executions_batch(
-            self.node_name,
-            [job.job_id for job in jobs],
-            started_at=started_at,
-            task_started_data=self.task_started_data,
-            task_started_mask=task_started_mask,
-            session_id=self.session_id,
-            component=self.component,
-        )
+        try:
+            leases = self.storage.claim_job_executions_batch(
+                self.node_name,
+                [job.job_id for job in jobs],
+                started_at=started_at,
+                task_started_data=self.task_started_data,
+                task_started_mask=task_started_mask,
+                session_id=self.session_id,
+                component=self.component,
+            )
+        except InterruptAdmissionPaused:
+            # Cursor pulls have already consumed these jobs. Retain them until
+            # admission resumes, including across concurrent API startup lanes.
+            with self._pending_lock:
+                self._pending.extend(jobs)
+            return []
         return [
             ClaimedJob(
                 storage=self.storage,
@@ -100,15 +121,29 @@ class ClaimedQueuedJobSource:
         ]
 
     def close(self):
+        self._closed = True
         close = getattr(self.source, "close", None)
         if callable(close):
             close()
 
     def remaining_hint(self):
         hint = getattr(self.source, "remaining_hint", None)
-        return None if not callable(hint) else hint()
+        remaining = None if not callable(hint) else hint()
+        with self._pending_lock:
+            pending = len(self._pending)
+        return None if remaining is None else remaining + pending
 
     def wait_for_change(self, timeout: float = 5.0) -> bool:
+        if self._closed:
+            return False
+        with self._pending_lock:
+            pending = bool(self._pending)
+        if pending:
+            blockers = self.storage.interrupt_component_admission_blockers(self.session_id, self.component)
+            if blockers and timeout > 0:
+                from time import sleep
+                sleep(min(timeout, 0.05))
+            return not self._closed
         waiter = getattr(self.source, "wait_for_change", None)
         return False if not callable(waiter) else bool(waiter(timeout))
 

@@ -1,6 +1,9 @@
 """Atomic sampled history checks at native start and session settlement."""
 
 import sqlite3
+import hashlib
+import json
+from datetime import datetime
 
 import networkx as nx
 import pytest
@@ -23,9 +26,17 @@ def _sampled_owner(storage, *, repair_job=False, retained_history=True):
         storage.create_job(Job(node_name='A', job_id=1, params={'retained': True}))
         storage.set_job_status('A', 1, 'cancelled')
     _session(storage, 'sample-origin', 'interrupt', ('A',), snapshot)
+    assert storage.reserve_execution_components(
+        'sample-origin', expected_shape=snapshot.shape_json,
+    ) is True
+    assert storage.db_connection().execute(
+        'SELECT scope_admitted FROM execution_sessions WHERE session_id=?', ('sample-origin',),
+    ).fetchone()[0] == 1
     assert storage.finish_execution_session(
         'sample-origin', outcome='done', finished_at='2026-09-07T10:00:00+00:00',
     ) is True
+    assert storage.release_execution_components('sample-origin') == 1
+    assert storage.get_component_reservation(('A',)) is None
     if retained_history:
         _seed_state(
             storage, ('A',), lifecycle='sampled', stability='unstable',
@@ -228,9 +239,24 @@ def test_resume_preparation_rechecks_history_after_staging_and_restores_files(tm
         assert before_locks == []
         expected['advisory_locks'] = before_locks
         assert len(expected['preparation_receipts']) == 1
-        assert expected['preparation_receipts'][0]['state'] == 'prepared'
-        expected['preparation_receipts'][0]['state'] = 'aborted'
-        assert _rows(storage) == expected
+        receipt = expected['preparation_receipts'][0]
+        assert receipt['state'] == 'prepared'
+        decision = {
+            'table': 'preparation_receipts', 'operation_id': receipt['operation_id'],
+            'state': 'aborted', 'intent_digest': receipt['intent_digest'],
+            'details': {'restored': True},
+        }
+        decision_json = json.dumps(decision, sort_keys=True, separators=(',', ':'))
+        receipt.update(state='aborted', decision_json=decision_json,
+                       decision_digest=hashlib.sha256(decision_json.encode()).hexdigest())
+        actual = _rows(storage)
+        assert len(expected['preparation_attempts']) == 1
+        attempt = expected['preparation_attempts'][0]
+        assert attempt['state'] == 'preparing' and attempt['finished_at'] is None
+        finished_at = actual['preparation_attempts'][0]['finished_at']
+        assert datetime.fromisoformat(finished_at) >= datetime.fromisoformat(attempt['started_at'])
+        attempt.update(state='aborted', finished_at=finished_at)
+        assert actual == expected
         assert _node_files(tmp_path) == before_files
         assert not (tmp_path / '.mwf' / 'preparation-trash').exists()
     finally:

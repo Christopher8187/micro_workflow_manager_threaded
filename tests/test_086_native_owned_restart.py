@@ -16,6 +16,12 @@ from micro_workflow_manager import MicroWorkflow, NodeRouter, cli
 from micro_workflow_manager.models import Job, now
 from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.storage import execution_restart
+from micro_workflow_manager.storage.restart_receipts import (
+    require_restart_pre_state,
+    validate_restart_manifest,
+    validate_restart_terminal_decision,
+)
 
 
 def _close(storage):
@@ -27,15 +33,35 @@ def _close(storage):
     storage.close_database_connections()
 
 
-@pytest.fixture
-def workflow(tmp_path, monkeypatch):
+def _workflow(tmp_path, monkeypatch, *, prior_owner=False):
     monkeypatch.chdir(tmp_path)
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B'), ('B', 'A'), ('B', 'C')])
     storage = workflow.storage
-    storage.register_component_topology(workflow.topology.snapshot())
+    snapshot = workflow.topology.snapshot()
+    storage.register_component_topology(snapshot)
     for node in ('A', 'B'):
         storage.create_job(Job(node_name=node, job_id=1, params={'value': node}))
+    if prior_owner:
+        storage.create_job(Job(node_name='A', job_id=2, params={'value': 'old owner'}))
+        storage.create_execution_session(
+            'earlier-interrupt', session_kind='interrupt', command='run',
+            start_component=('A', 'B'), selected_components=[('A', 'B')],
+            started_at=now(), hostname=socket.gethostname(), pid=os.getpid(),
+            process_identity=process_identity(os.getpid()), expected_shape=snapshot.shape_json,
+        )
+        storage.reserve_execution_components('earlier-interrupt', expected_shape=snapshot.shape_json)
+        earlier = storage.claim_job_execution(
+            'A', 2, started_at=now(), session_id='earlier-interrupt', component=('A', 'B'),
+        )
+        storage.finalize_job_execution('A', 2, *earlier, 'failed')
+        assert storage.get_job_status('A', 2) == 'failed'
+        assert storage.read_job_control('A', 2)['active_execution_id'] is None
+        storage.output_file('A', 2).write_bytes(b'earlier output\n')
+        assert storage.finish_execution_session(
+            'earlier-interrupt', outcome='failed', finished_at=now(),
+        ) is True
+        storage.release_execution_components('earlier-interrupt')
     for session_id, kind, component in [
         ('unrelated-main', 'main', ('C',)), ('job-interrupt', 'interrupt', ('A', 'B')),
     ]:
@@ -43,13 +69,31 @@ def workflow(tmp_path, monkeypatch):
             session_id, session_kind=kind, command='run', start_component=component,
             selected_components=[component], started_at=now(), hostname=socket.gethostname(),
             pid=os.getpid(), process_identity=process_identity(os.getpid()),
-            expected_shape=workflow.topology.snapshot().shape_json,
+            expected_shape=snapshot.shape_json,
         )
-        storage.reserve_execution_components(session_id, expected_shape=workflow.topology.snapshot().shape_json)
+        storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
+        if session_id == 'job-interrupt':
+            state = storage.get_component_state(component)
+            assert state['lifecycle'] == 'queued'
+            assert storage.begin_queued_component_execution(
+                session_id, component, expected_shape=snapshot.shape_json,
+                expected_alignment_generation=state['alignment_generation'],
+                successful_lineage=('stable', None), expected_parent_states={},
+            ) is True
     try:
         yield workflow
     finally:
         _close(storage)
+
+
+@pytest.fixture
+def workflow(tmp_path, monkeypatch):
+    yield from _workflow(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def workflow_with_prior_owner(tmp_path, monkeypatch):
+    yield from _workflow(tmp_path, monkeypatch, prior_owner=True)
 
 
 @pytest.mark.parametrize('entry', ['run_jobs', 'run_node_jobs'])
@@ -376,6 +420,66 @@ def _snapshot(storage):
     return list(storage.db_connection().iterdump()), files
 
 
+def _restart_business_snapshot(storage):
+    database, files = _snapshot(storage)
+    database = [
+        statement for statement in database
+        if not statement.startswith('INSERT INTO "restart_receipts"')
+    ]
+    return database, files
+
+
+def _restart_receipt(storage, targets, state):
+    [receipt] = [
+        dict(row) for row in storage.db_connection().execute(
+            'SELECT * FROM restart_receipts ORDER BY operation_id',
+        )
+    ]
+    manifest, files = validate_restart_manifest(storage.project_dir, receipt)
+    assert receipt['state'] == state
+    assert manifest['session_id'] == 'job-interrupt'
+    assert manifest['owned'] is True
+    assert manifest['reason'] == 'second-terminal restart'
+    assert manifest['requested_by_pid'] == os.getpid()
+    assert [
+        (item['node'], item['job_id'], item['target'])
+        for item in manifest['targets']
+    ] == [
+        (target['node'], target['job_id'], json.loads(json.dumps(target)))
+        for target in sorted(targets, key=lambda item: (item['node'], item['job_id']))
+    ]
+    assert [
+        (item['node'], item['job_id']) for item in manifest['database']
+    ] == sorted((target['node'], target['job_id']) for target in targets)
+    if state == 'committed':
+        validate_restart_terminal_decision(manifest, receipt)
+    else:
+        require_restart_pre_state(storage.db_connection(), manifest)
+        if state == 'aborted':
+            validate_restart_terminal_decision(manifest, receipt)
+    return receipt, manifest, files
+
+
+def _fail_second_restart_writer(storage, monkeypatch, error):
+    submit = storage.submit_db_mutation
+    calls = []
+
+    def submit_with_one_failure(operation, *args, **kwargs):
+        calls.append(operation)
+        if len(calls) == 2:
+            original_operation = operation
+
+            def fail_after_operation(connection):
+                original_operation(connection)
+                raise error
+
+            operation = fail_after_operation
+        return submit(operation, *args, **kwargs)
+
+    monkeypatch.setattr(storage, 'submit_db_mutation', submit_with_one_failure)
+    return calls
+
+
 def _change(storage, sql, values=()):
     with storage.db_transaction() as connection:
         connection.execute(sql, values)
@@ -385,7 +489,7 @@ def _change(storage, sql, values=()):
     'queued', 'done', 'no-owner', 'wrong-instance', 'wrong-selected-scope',
     'terminal-session', 'reused-pid', 'missing-reservation', 'foreign-reservation',
 ])
-def test_native_restart_refuses_ineligible_or_damaged_owner_without_changing_work(workflow, damage, capsys):
+def test_native_restart_refuses_ineligible_or_damaged_owner_without_changing_work(workflow, damage, capsys, monkeypatch):
     storage = workflow.storage
     generation, execution = _claim_with_output(storage)
     if damage == 'queued':
@@ -408,11 +512,50 @@ def test_native_restart_refuses_ineligible_or_damaged_owner_without_changing_wor
     elif damage == 'foreign-reservation':
         _change(storage, "UPDATE component_reservations SET session_id='unrelated-main' WHERE session_id='job-interrupt'")
     before = _snapshot(storage)
+    after_startup = []
+    if damage == 'reused-pid':
+        from micro_workflow_manager.cli import restart as restart_module
+
+        # The ownership reader refuses without mutation. Applied startup must
+        # first recover this abandoned session, then refuse its queued job.
+        with pytest.raises(RuntimeError):
+            storage.plan_owned_job_restarts([('A', 1)])
+        assert _snapshot(storage) == before
+        recover = restart_module.recover_before_mutation
+        owner = storage.read_job_current_owner('A', 1)
+        peer = storage.read_job_control('B', 1), storage.read_job_events('B', 1)
+        unrelated = storage.get_execution_session('unrelated-main')
+        events = storage.read_job_events('A', 1)
+
+        def observe_recovery(root):
+            recover(root)
+            control = storage.read_job_control('A', 1)
+            assert storage.get_job_status('A', 1) == 'queued'
+            assert control['generation'] == generation + 1
+            assert control['active_execution_id'] is None
+            assert storage.read_job_current_owner('A', 1) == owner
+            assert not storage.output_file('A', 1).exists()
+            recovered_events = storage.read_job_events('A', 1)
+            assert recovered_events[:-2] == events
+            assert [event['event'] for event in recovered_events[-2:]] == ['recovered', 'queued']
+            session = storage.get_execution_session('job-interrupt')
+            assert session['status'] == 'terminal' and session['outcome'] == 'failed'
+            assert storage.get_component_state(('A', 'B'))['lifecycle'] == 'failed'
+            assert storage.get_component_reservation(('A', 'B')) is None
+            assert (storage.read_job_control('B', 1), storage.read_job_events('B', 1)) == peer
+            assert storage.get_execution_session('unrelated-main') == unrelated
+            after_startup.append(_snapshot(storage))
+
+        monkeypatch.setattr(restart_module, 'recover_before_mutation', observe_recovery)
     capsys.readouterr()
 
     assert cli.main(['restart', 'A', 'job', '1']) == 1
 
-    assert _snapshot(storage) == before
+    if damage == 'reused-pid':
+        assert len(after_startup) == 1
+        assert _snapshot(storage) == after_startup[0]
+    else:
+        assert _snapshot(storage) == before
     assert 'Restarted' not in capsys.readouterr().out
 
 
@@ -431,8 +574,11 @@ def test_restart_rechecks_state_after_cli_preflight(workflow, change, monkeypatc
             assert restarted['generation'] == generation + 1
             storage.output_file('A', 1).write_bytes(b'new generation output\n')
         elif change == 'owner':
-            storage.finalize_job_execution('A', 1, generation, execution, 'failed')
-            storage.claim_job_execution('A', 1, started_at=now(), session_id='job-interrupt', component=('A', 'B'))
+            assert storage.release_unstarted_job_execution('A', 1, generation, execution)
+            replacement = storage.claim_job_execution(
+                'A', 1, started_at=now(), session_id='job-interrupt', component=('A', 'B'),
+            )
+            assert replacement[0] == generation and replacement[1] != execution
         elif change == 'instance':
             storage.delete_job('A', 1)
             storage.create_job(Job(node_name='A', job_id=1, params={'value': 'replacement'}))
@@ -466,32 +612,35 @@ def test_native_restart_batch_restores_all_work_on_synchronous_failure(workflow,
                 "WHEN NEW.job_id=2 AND NEW.event='restart_requested' "
                 "BEGIN SELECT RAISE(ABORT, 'injected restart event failure'); END")
     elif failure == 'second-output':
-        rename = Path.rename
+        move = execution_restart._move_restart_output
         second_output = storage.output_file('A', 2)
 
         def fail_second_output(path, destination):
             if path == second_output:
                 raise PermissionError('injected output staging failure')
-            return rename(path, destination)
+            return move(path, destination)
 
-        monkeypatch.setattr(Path, 'rename', fail_second_output)
-    before = _snapshot(storage)
+        monkeypatch.setattr(execution_restart, '_move_restart_output', fail_second_output)
+    before = _restart_business_snapshot(storage)
+    writer_calls = None
     if failure == 'commit':
-        connection = storage.db_connection()
-
-        class FailedCommit:
-            def __getattr__(self, name):
-                return getattr(connection, name)
-
-            def commit(self):
-                raise RuntimeError('injected restart commit failure')
-
-        monkeypatch.setattr(storage, 'db_connection', lambda: FailedCommit())
+        writer_calls = _fail_second_restart_writer(
+            storage, monkeypatch, RuntimeError('injected restart commit failure'),
+        )
 
     with pytest.raises(Exception, match='injected'):
         storage.request_owned_job_restarts(targets)
 
-    assert _snapshot(storage) == before
+    assert _restart_business_snapshot(storage) == before
+    receipt, manifest, files = _restart_receipt(storage, targets, 'aborted')
+    assert json.loads(receipt['decision_json'])['details'] == {'restored': True}
+    assert files.has_private_path() is False
+    for item in manifest['targets']:
+        output = item['output']
+        assert output['original'] is not None
+        assert not (storage.project_dir / output['saved']).exists()
+    if failure == 'commit':
+        assert len(writer_calls) == 3
 
 
 def test_explicit_restart_batch_advances_every_target_in_one_request(workflow, capsys):
@@ -552,14 +701,14 @@ def test_restart_reports_postcommit_failures_without_restoring_old_output(workfl
     generation, execution = _claim_with_output(storage)
     targets = storage.plan_owned_job_restarts([('A', 1)])
     if failure == 'cleanup':
-        unlink = Path.unlink
+        discard = execution_restart._discard_restart_output
 
-        def fail_staged_cleanup(path, *args, **kwargs):
+        def fail_staged_cleanup(path):
             if path.name.startswith('.restart-'):
                 raise PermissionError('injected staged cleanup failure')
-            return unlink(path, *args, **kwargs)
+            return discard(path)
 
-        monkeypatch.setattr(Path, 'unlink', fail_staged_cleanup)
+        monkeypatch.setattr(execution_restart, '_discard_restart_output', fail_staged_cleanup)
     else:
         def fail_notification(*args, **kwargs):
             raise RuntimeError('injected notification failure')
@@ -592,12 +741,17 @@ def test_restart_zero_row_update_rolls_back_every_target(workflow):
     _change(storage, "CREATE TRIGGER skip_restart BEFORE UPDATE ON jobs "
             "WHEN OLD.node_name='B' AND NEW.restart_requested_at IS NOT NULL "
             "BEGIN SELECT RAISE(IGNORE); END")
-    before = _snapshot(storage)
+    before = _restart_business_snapshot(storage)
 
     with pytest.raises(RuntimeError, match='Restart state changed'):
         storage.request_owned_job_restarts(targets)
 
-    assert _snapshot(storage) == before
+    assert _restart_business_snapshot(storage) == before
+    receipt, manifest, files = _restart_receipt(storage, targets, 'aborted')
+    assert json.loads(receipt['decision_json'])['details'] == {'restored': True}
+    assert files.has_private_path() is False
+    assert all(not (storage.project_dir / item['output']['saved']).exists()
+               for item in manifest['targets'])
 
 
 def test_opposite_order_restart_requests_commit_once_without_deadlock(workflow):
@@ -626,37 +780,46 @@ def test_opposite_order_restart_requests_commit_once_without_deadlock(workflow):
         assert storage.read_job_control(node, 1)['generation'] == target['generation'] + 1
         assert len([event for event in storage.read_job_events(node, 1) if event['event'] == 'restart_requested']) == 1
         assert not list(storage.job_base_dir(node, 1).glob('.restart-*'))
+    receipt, _, files = _restart_receipt(storage, targets, 'committed')
+    assert json.loads(receipt['decision_json'])['details']['restart_revision'] == 1
+    assert files.has_private_path() is False
 
 
 def test_restart_cli_reports_retained_output_when_rollback_restoration_fails(workflow, monkeypatch, capsys):
     storage = workflow.storage
     _claim_with_output(storage)
     before_database = []
+    planned_targets = []
     apply = FileStorage.request_owned_job_restarts
 
     def apply_with_failure(target_storage, targets, **kwargs):
         _change(storage, "CREATE TRIGGER fail_restart BEFORE INSERT ON job_events "
                 "WHEN NEW.event='restart_requested' "
                 "BEGIN SELECT RAISE(ABORT, 'injected restart event failure'); END")
-        before_database.extend(storage.db_connection().iterdump())
+        before_database.extend(_restart_business_snapshot(storage)[0])
+        planned_targets.extend(targets)
         return apply(target_storage, targets, **kwargs)
 
     monkeypatch.setattr(FileStorage, 'request_owned_job_restarts', apply_with_failure)
-    rename = Path.rename
+    move = execution_restart._move_restart_output
 
     def fail_restoration(path, destination):
         if path.name.startswith('.restart-'):
             raise PermissionError('injected output restoration failure')
-        return rename(path, destination)
+        return move(path, destination)
 
-    monkeypatch.setattr(Path, 'rename', fail_restoration)
+    monkeypatch.setattr(execution_restart, '_move_restart_output', fail_restoration)
     capsys.readouterr()
 
     assert cli.main(['restart', 'A', 'job', '1']) == 1
 
-    assert list(storage.db_connection().iterdump()) == before_database
+    assert _restart_business_snapshot(storage)[0] == before_database
     [saved] = list(storage.job_base_dir('A', 1).glob('.restart-*'))
     assert saved.read_bytes() == b'prior output\n'
+    receipt, manifest, files = _restart_receipt(storage, planned_targets, 'prepared')
+    assert receipt['decision_json'] is None and receipt['decision_digest'] is None
+    assert files.has_private_path() is True
+    assert storage.project_dir / manifest['targets'][0]['output']['saved'] == saved
     text = capsys.readouterr().err
     assert 'injected restart event failure' in text
     assert 'restoration failed' in text
@@ -689,10 +852,12 @@ def test_restart_node_selects_the_persisted_component_and_only_eligible_jobs(wor
     storage = workflow.storage
     running = _claim_with_output(storage)
     failed = _claim_with_output(storage, node='B')
-    storage.finalize_job_execution('B', 1, *failed, 'failed')
+    terminal = []
     for job_id, status in ((2, 'done'), (3, 'cancelled')):
         storage.create_job(Job(node_name='B', job_id=job_id, params={'status': status}))
-        lease = _claim_with_output(storage, node='B', job_id=job_id)
+        terminal.append((job_id, status, _claim_with_output(storage, node='B', job_id=job_id)))
+    storage.finalize_job_execution('B', 1, *failed, 'failed')
+    for job_id, status, lease in terminal:
         storage.finalize_job_execution('B', job_id, *lease, status)
     storage.create_job(Job(node_name='B', job_id=4, params={'status': 'queued'}))
     untouched = {
@@ -741,8 +906,7 @@ def test_restart_restoration_failure_preserves_error_without_python311_add_note(
     _claim_with_output(storage)
     _claim_with_output(storage, node='B')
     targets = storage.plan_owned_job_restarts([('A', 1), ('B', 1)])
-    before = list(storage.db_connection().iterdump())
-    connection = storage.db_connection()
+    before = _restart_business_snapshot(storage)[0]
 
     class Python310Error(RuntimeError):
         def __getattribute__(self, name):
@@ -750,29 +914,28 @@ def test_restart_restoration_failure_preserves_error_without_python311_add_note(
                 raise AttributeError('Python 3.10 has no add_note')
             return super().__getattribute__(name)
 
-    class FailedCommit:
-        def __getattr__(self, name):
-            return getattr(connection, name)
-
-        def commit(self):
-            raise Python310Error('injected original commit failure')
-
-    rename = Path.rename
+    original_error = Python310Error('injected original commit failure')
+    writer_calls = _fail_second_restart_writer(storage, monkeypatch, original_error)
+    move = execution_restart._move_restart_output
     attempted = []
 
     def fail_restoration(path, destination):
         if path.name.startswith('.restart-'):
             attempted.append(path)
             raise PermissionError('injected restoration failure')
-        return rename(path, destination)
+        return move(path, destination)
 
-    monkeypatch.setattr(storage, 'db_connection', lambda: FailedCommit())
-    monkeypatch.setattr(Path, 'rename', fail_restoration)
+    monkeypatch.setattr(execution_restart, '_move_restart_output', fail_restoration)
 
     with pytest.raises(Python310Error, match='injected original commit failure') as captured:
         storage.request_owned_job_restarts(targets)
 
-    assert list(connection.iterdump()) == before
+    assert captured.value is original_error
+    assert len(writer_calls) == 2
+    assert _restart_business_snapshot(storage)[0] == before
+    receipt, _, files = _restart_receipt(storage, targets, 'prepared')
+    assert receipt['decision_json'] is None and receipt['decision_digest'] is None
+    assert files.has_private_path() is True
     assert len(attempted) == 2
     for saved in attempted:
         assert saved.read_bytes() == b'prior output\n'
@@ -886,22 +1049,10 @@ def test_component_restart_rechecks_the_entire_selection_before_changing_work(wo
 
 
 @pytest.mark.parametrize('form', ['component', 'jobs'])
-def test_restart_refuses_the_entire_selection_when_one_job_has_another_last_owner(workflow, form, capsys):
-    storage = workflow.storage
-    storage.create_job(Job(node_name='A', job_id=2, params={'value': 'old owner'}))
-    storage.create_execution_session(
-        'earlier-interrupt', session_kind='interrupt', command='run', start_component=('A', 'B'),
-        selected_components=[('A', 'B')], started_at=now(), hostname=socket.gethostname(),
-        pid=os.getpid(), process_identity=process_identity(os.getpid()),
-        expected_shape=workflow.topology.snapshot().shape_json,
-    )
-    storage.release_execution_components('job-interrupt')
-    storage.reserve_execution_components('earlier-interrupt', expected_shape=workflow.topology.snapshot().shape_json)
-    earlier = storage.claim_job_execution('A', 2, started_at=now(), session_id='earlier-interrupt', component=('A', 'B'))
-    storage.finalize_job_execution('A', 2, *earlier, 'failed')
-    storage.output_file('A', 2).write_bytes(b'earlier output\n')
-    storage.release_execution_components('earlier-interrupt')
-    storage.reserve_execution_components('job-interrupt', expected_shape=workflow.topology.snapshot().shape_json)
+def test_restart_refuses_the_entire_selection_when_one_job_has_another_last_owner(
+    workflow_with_prior_owner, form, capsys,
+):
+    storage = workflow_with_prior_owner.storage
     _claim_with_output(storage)
     before = _snapshot(storage)
     capsys.readouterr()
@@ -971,7 +1122,7 @@ def test_component_restart_refuses_running_job_without_an_active_execution(workf
 
     assert _snapshot(storage) == before
     text = capsys.readouterr()
-    assert 'active running execution' in text.err
+    assert 'Recovery requires an exact active owner' in text.err
     assert 'No matching jobs' not in text.out
 
 

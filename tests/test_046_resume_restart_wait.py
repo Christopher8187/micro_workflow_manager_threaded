@@ -63,8 +63,8 @@ def test_resume_registers_output_backed_completion_before_restart_selection(tmp_
             "result_repr": "'already finished'",
         },
     )
-    storage.release_execution_components(session_id)
     storage.finish_execution_session(session_id, outcome=FAILED, finished_at=now())
+    storage.release_execution_components(session_id)
     storage.set_node_status("A", FAILED)
 
     assert storage.get_job_status("A", 1) == "running"

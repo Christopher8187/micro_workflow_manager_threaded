@@ -276,7 +276,9 @@ def test_job_event_append_uses_one_groupable_journal_mutation(tmp_path, monkeypa
 
 def _admit_event_owner(storage):
     import networkx as nx
+    import socket
     from micro_workflow_manager.topology import ComponentTopology
+    from micro_workflow_manager.session_liveness import process_identity
 
     graph = nx.DiGraph()
     graph.add_node('A')
@@ -285,8 +287,8 @@ def _admit_event_owner(storage):
     storage.create_execution_session(
         'event-owner', session_kind='main', command='run',
         start_component=('A',), selected_components=[('A',)],
-        started_at='2026-01-01T00:00:00', hostname='worker.example',
-        pid=os.getpid(), process_identity='event-test-process',
+        started_at='2026-01-01T00:00:00', hostname=socket.gethostname(),
+        pid=os.getpid(), process_identity=process_identity(os.getpid()),
         expected_shape=snapshot.shape_json,
     )
     assert storage.reserve_execution_components('event-owner', expected_shape=snapshot.shape_json)

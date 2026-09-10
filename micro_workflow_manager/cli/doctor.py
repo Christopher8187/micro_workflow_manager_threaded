@@ -2,17 +2,14 @@ from __future__ import annotations
 
 import ast
 import json
-from datetime import datetime
 from pathlib import Path
 
-from micro_workflow_manager.models import RUNNING
-from micro_workflow_manager.paths import run_file, threads_file
-from micro_workflow_manager.storage import FileStorage
 
-from .active_run import process_is_alive, run_state_liveness
 from .files import read_config
-from .migration import migration_plan
-from .project import import_file, read_edges, resolve_configured_graph_path
+from .engine import _stored_edges
+from .preview import PreviewStorage
+from .doctor_native import inspect_native_state
+from .project import resolve_configured_graph_path
 
 
 def _json_problem(path: Path) -> str | None:
@@ -49,34 +46,26 @@ def doctor_command(root: Path) -> int:
         config = read_config(root)
         graph_file = resolve_configured_graph_path(root, config)
         checks.append(f"graph file exists: {graph_file.relative_to(root).as_posix()}")
-        storage = FileStorage(root)
+        edges = _stored_edges(config)
+        storage = PreviewStorage(root)
     except Exception as error:
         print("MWF doctor found a project error:")
         print(f"  ERROR: {error}")
         return 1
 
-    integrity = storage.database_integrity_check()
+    try:
+        return _doctor_report(root, config, graph_file, edges, storage, checks, warnings, errors)
+    finally:
+        storage.close()
+
+
+def _doctor_report(root, config, graph_file, edges, storage, checks, warnings, errors):
+    connection = storage.connection
+    integrity = connection.execute('PRAGMA quick_check').fetchone()[0]
     if integrity == "ok":
         checks.append("SQLite workflow state passed PRAGMA quick_check")
     else:
         errors.append(f"SQLite workflow state failed integrity check: {integrity}")
-
-    schema_plan = migration_plan(root)
-    if schema_plan["malformed"]:
-        errors.append(
-            "malformed framework metadata: "
-            + ", ".join(path.relative_to(root).as_posix() for path in schema_plan["malformed"])
-        )
-    if schema_plan["newer"]:
-        errors.append(
-            "framework metadata uses a newer state schema: "
-            + ", ".join(path.relative_to(root).as_posix() for path in schema_plan["newer"])
-        )
-    if schema_plan["outdated"]:
-        warnings.append(
-            f"{len(schema_plan['outdated'])} framework JSON file(s) need schema migration; "
-            "run mwf migrate --dry-run"
-        )
 
     stored = config.get("graph_path")
     if isinstance(stored, str) and "\\" in stored:
@@ -84,12 +73,6 @@ def doctor_command(root: Path) -> int:
             "stored graph_path uses Windows separators; it is accepted and will be "
             "rewritten with '/' by mwf graph --update"
         )
-
-    try:
-        edges = read_edges(import_file(graph_file))
-    except Exception as error:
-        errors.append(f"graph.py could not be loaded: {error}")
-        edges = []
 
     graph_nodes = {item for edge in edges for item in edge}
     disk_root = root / "node"
@@ -147,7 +130,9 @@ def doctor_command(root: Path) -> int:
     # Job identity is authoritative in SQLite, while each job input remains a
     # file. Report interrupted half-commits in either direction explicitly.
     for node_name in sorted(graph_nodes | disk_nodes):
-        database_ids = set(storage.list_job_ids(node_name))
+        database_ids = {row[0] for row in connection.execute(
+            'SELECT job_id FROM jobs WHERE node_name=?', (node_name,),
+        )}
         jobs_root = root / "node" / node_name / "jobs"
         disk_ids = {
             int(path.name)
@@ -177,79 +162,13 @@ def doctor_command(root: Path) -> int:
                 + ", ".join(map(str, missing_inputs))
             )
 
-    abandoned_running: list[str] = []
-    overdue_checkpoints: list[str] = []
-    now_aware = datetime.now().astimezone()
-    for node_name in sorted(graph_nodes | disk_nodes):
-        for row in storage.list_jobs(node_name, status=RUNNING):
-            job_id = int(row["job_id"])
-            control = storage.read_job_control(node_name, job_id)
-            pid = control.get("active_pid") or row.get("pid")
-            if not process_is_alive(pid):
-                abandoned_running.append(f"{node_name}/{job_id}")
-
-            runtime = storage.read_job_runtime(node_name, job_id)
-            if runtime.get("state") != "running":
-                continue
-            deadline_text = runtime.get("checkpoint_deadline_at")
-            if not isinstance(deadline_text, str):
-                continue
-            try:
-                deadline = datetime.fromisoformat(deadline_text)
-            except ValueError:
-                continue
-            comparison_now = now_aware if deadline.tzinfo is not None else datetime.now()
-            if deadline < comparison_now:
-                overdue_checkpoints.append(f"{node_name}/{job_id}")
-
-    if abandoned_running:
-        warnings.append(
-            "running jobs have no live owner: " + ", ".join(abandoned_running) + "; run mwf recover"
-        )
-    if overdue_checkpoints:
-        warnings.append(
-            "checkpoint deadlines are overdue: "
-            + ", ".join(overdue_checkpoints)
-            + "; inspect the job and verify the active scheduler heartbeat"
-        )
-
-    thread_override_path = threads_file(root)
-    if thread_override_path.exists():
-        problem = _json_problem(thread_override_path)
-        if problem:
-            errors.append(f"malformed JSON: {problem}")
-        else:
-            try:
-                overrides = storage.read_thread_overrides()
-            except Exception as error:
-                errors.append(f"invalid runtime thread overrides: {error}")
-            else:
-                unknown = sorted(set(overrides) - graph_nodes)
-                if unknown:
-                    warnings.append(
-                        "runtime max_threads overrides reference nodes outside the graph: "
-                        + ", ".join(unknown)
-                    )
-                checks.append(f"checked {len(overrides)} runtime max_threads override(s)")
-
-    state_path = run_file(root)
-    if state_path.exists():
-        problem = _json_problem(state_path)
-        if problem:
-            errors.append(f"malformed JSON: {problem}")
-        else:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            liveness = run_state_liveness(state)
-            if state.get("status") == "running" and not liveness["live"]:
-                warnings.append(f"stale running sequence: {liveness['reason']}; run mwf recover")
-            elif liveness["live"]:
-                checks.append("active run ownership is live")
+    inspect_native_state(connection, graph_nodes, checks, warnings, errors, root=root)
 
     temp_files = list(root.rglob(".*.tmp"))
     if temp_files:
         warnings.append(f"found {len(temp_files)} temporary files left by interrupted atomic writes")
 
-    lock_count = storage.db_connection().execute(
+    lock_count = connection.execute(
         "SELECT COUNT(*) FROM advisory_locks"
     ).fetchone()[0]
     checks.append(f"SQLite advisory lock table is readable ({int(lock_count)} active lease(s))")

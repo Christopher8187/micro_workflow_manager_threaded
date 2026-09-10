@@ -12,7 +12,6 @@ Common flow:
   mwf graph src/graph.py
   mwf engine
   mwf doctor
-  mwf migrate --dry-run
   mwf run A --plan
   mwf run A --monitor
   mwf restart <node-name>
@@ -32,11 +31,11 @@ Use 'mwf <command> --help' for syntax. Use 'mwf --describe <command>' for a long
 """
 COMMAND_HELP_DESCRIPTIONS = {
     "init": "Initialize the current folder as an MWF project. This creates .mwf/project.json, .mwf/state.sqlite3, and lightweight editor/git sidecars but does not load task code.",
-    "copy": "Save a node folder and its SQLite job and trace state under clipboard/<node>, replacing an older saved copy.",
-    "paste": "Replace a node folder and its SQLite job and trace state from clipboard/<node>, then reconcile restored jobs for use.",
+    "copy": "Save an idle node component's node files, native job identities, and supporting history under clipboard/<node>.",
+    "paste": "Restore one node and its native history from this project's clipboard after validating current component peers.",
     "graph": "Set or explicitly synchronize the graph file. Graph paths are stored with '/' and paths containing either '/' or '\\' are accepted on Linux and Windows.",
     "engine": "Open the synchronized workflow as a read-only, graph-only local browser view. Hoeflein components are collapsed into scheduling units.",
-    "doctor": "Check graph/router mismatches, malformed state, stale runs, and undeclared literal ctx.node(...) edges without executing jobs or applying repairs; normal CLI bootstrap may still migrate old runtime layout.",
+    "doctor": "Check the synchronized graph, payload files, native session owners, and runtime settings without importing project code or changing project state.",
     "inspect": "Inspect a node/job, list failed job IDs, or show node debug output.",
     "trace": "Render one job's chronological origin, task/fallback starts, ctx.trace objects, outputs, forwarded inputs, downstream jobs, and terminal state.",
     "filter": "Show the retry/fallback funnel, or list jobs at one stage boundary.",
@@ -45,7 +44,7 @@ COMMAND_HELP_DESCRIPTIONS = {
     "resetfrom": "Perform the same producer-aware fresh descendant preparation as mwf runfrom, but do not execute task code.",
     "run": "Reset and run the ready Hoeflein component selected by one node, or selected roots and their same-component causal work; --monitor prints the full timestamped dashboard in the same terminal.",
     "restart": "Second-terminal control that restarts running and failed/cancelled jobs in the selected active Hoeflein component; it never starts another scheduler.",
-    "threads": "View or change run-scoped per-node max_threads overrides and the deprecated aggregate API admission budget; active threaded and API nodes scale live.",
+    "threads": "View or change session-owned per-node max_threads overrides and the deprecated aggregate API admission budget; active threaded and API nodes scale live.",
     "deploy": "Create .mwfignore, build an overwrite-in-place local deployment archive, and upload/extract it on a configured server.",
     "resume": "Register output-backed finished jobs, then continue unsuccessful or queued work for the Hoeflein component selected by one node without resetting done or skipped jobs.",
     "runfrom": "Reset and run the Hoeflein component selected by one node and its quotient-DAG descendants; optional refuse stops before a boundary and refuseafter stops after it.",
@@ -71,10 +70,19 @@ the external migration.md guide to prepare a separate revamped project with
 fresh native state. Deployment archives initialize a separate fresh directory.
 """,
     "copy": """
-`mwf copy classify` saves the complete `node/classify` tree and a matching SQLite job, status, and trace snapshot under `clipboard/classify`. It replaces an older saved copy without changing the live node or running task code. Use it as a project-scoped restoration point, not a source-control substitute or cross-project interchange format.
+`mwf copy classify` saves `node/classify` and its native job identities,
+supporting execution history, and retained component result under
+`clipboard/classify`. Its component must be idle. Copy replaces the previous
+saved copy without changing the live node. Recover abandoned ownership first.
 """,
     "paste": """
-`mwf paste classify` replaces `node/classify`, restores its saved SQLite state, and reconciles job payloads and terminal statuses without executing jobs. The saved node must belong to this project's clipboard and should match the synchronized graph. Inspect or resume it after restoration.
+`mwf paste classify` restores only `classify` within the originating project.
+It validates native identities, supporting history, active membership, and the
+combined state of the saved node and its current component peers before mutation.
+Peer files and jobs remain intact. Completed and queued work retain their saved
+state. Paste advances the component generation and restores the saved result.
+Use `mwf recover --dry-run` to inspect interrupted clipboard file work, then
+`mwf recover` to restore an undecided replacement or finish terminal cleanup.
 """,
     "graph": """
 The help text describes graph as the explicit synchronization point. This means
@@ -104,22 +112,24 @@ read-only loopback viewer has no external assets or mutation endpoints and does 
 import/run project code or modify project state. Stop it with Ctrl+C.
 """,
     "doctor": """
-Doctor is a diagnostic pass that does not execute jobs or apply repairs. Normal
-CLI bootstrap may still migrate an old runtime layout. It compares graph nodes,
-node folders, and node_behavior filenames; checks SQLite integrity and on-disk payload/config JSON; checks whether a recorded run is live or stale; and warns about literal
-ctx.node("B") calls whose A -> B edge is absent.
+Doctor reads a database snapshot and the synchronized graph without importing
+project code or changing project state. It compares node folders and
+node_behavior filenames, checks SQLite integrity and payload JSON, reports
+exact live or stale session owners, and warns about undeclared literal
+ctx.node("B") calls.
 
 Run it after editing the graph or moving the project between machines:
   mwf doctor
 
-For example, if graph.py contains A -> B but src/node_behavior/B.py is missing,
+For example, if the synchronized graph contains A -> B but src/node_behavior/B.py is missing,
 doctor reports that mismatch without creating the file or changing job status.
 A warning does not necessarily make the project unusable, while an ERROR causes
 a nonzero exit status suitable for a simple test script.
 """,
     "inspect": """
 Inspect turns the hybrid file/SQLite state into a readable explanation. Node inspection
-shows predecessors, successors, component membership, status counts, runner,
+shows predecessors, successors, component state, stability, interrupt origin,
+first misalignment causes, raw-node job counts, runner,
 total timeout, checkpoint timeout, and why the node is ready, blocked, complete,
 or failed. Job inspection additionally shows the active or last task, named
 checkpoint, checkpoint deadline, progress percentage/detail, input, output,
@@ -149,6 +159,10 @@ forwarded inputs, downstream jobs, and terminal state.
 
 Example: `mwf trace classify_document job 17 [--errors]`
 Use `--errors` for identity, origin, ordered failures, attempt details, terminal state, and terminal error.
+Use `--lineage [--json]` for persisted component state, sample and interrupt IDs,
+the creating job, and directly created jobs. This view loads no project code
+and omits task bodies and recursive descendants. JSON uses schema version 1.
+`--errors` and `--lineage` are mutually exclusive; `--json` requires `--lineage`.
 
 Trace values are serialized defensively, and displayed file contents are
 truncated so a diagnostic command cannot flood the terminal. Event ordering is
@@ -171,23 +185,22 @@ successfully at X+1. For the final stage, it lists terminally failed jobs. Both
 stage forms use compact `job_id: error` rows.
 """,
     "recover": """
-Recover is for an interrupted command whose owning process is definitely gone.
-Active runs write a hostname, process ID, and scheduler heartbeat to
-.mwf/run.json. The scheduler supervisor also manages job checkpoint deadlines,
-but the two signals remain separate: a fresh run heartbeat proves the scheduler
-is alive, while the job runtime row describes one job's latest progress. Recover uses
-run ownership and each running job's execution record before it acts. It advances
-the execution generation first, then requeues only abandoned running jobs, which
-prevents a late stale process from committing afterward.
+Recover examines native execution sessions and exact job owners in SQLite.
+It leaves live sessions active. For each abandoned execution it retains a
+valid terminal result, or advances the generation and requeues unfinished
+work. It then settles that session's component results, reservations, and
+holds. Damaged or ambiguous ownership refuses before the affected work changes.
+A scheduler heartbeat and an individual job checkpoint describe different
+kinds of progress.
 
 Preview or apply recovery:
   mwf recover --dry-run
   mwf recover
 
-Suppose A finished, B was running a short calculation, and the terminal process crashed.
-Recover leaves A done, requeues B, and records that the old run was recovered.
-You can then use mwf resume B or mwf resumefrom B. Recover refuses to operate
-while the recorded owner is still live.
+If A finished and B's owner crashed, recovery preserves A and recovers B's
+unfinished work. An unrelated live session stays active. Use mwf resume B or
+mwf resumefrom B after recovery. The preview changes no project state.
+
 """,
     "reset": """
 Reset is `mwf run` without execution. Whole-node mode performs the exact fresh-run
@@ -235,12 +248,13 @@ Examples:
 
 `--monitor` prints the full timestamped dashboard in this terminal without
 clearing prior task output. `--monitor-interval` controls the cadence. The final
-snapshot is emitted after the run record becomes terminal, so it reports
-`active run: none`. `--stats` remains the compact alternative.
+snapshot is emitted after its session becomes terminal. It preserves that
+session's result and shows other sessions separately. `--stats` is compact.
 
 A basic task might choose a random integer, double it, or call ctx.sleep(1). Run
 uses the configured threaded, API, process, or direct runner and refuses to start if
-another CLI sequence already owns the project. To preserve completed work after
+another main session owns the main slot. Explicit interrupt sessions have their
+own selection and ownership checks. To preserve completed work after
 a failure, use resume rather than run. Fresh runs clear affected trace journals
 unless `--keeptrace` is supplied.
 
@@ -280,7 +294,7 @@ work.
     "threads": """
 Threads is a lightweight second-terminal control for testing node concurrency.
 The max_threads value declared in the node router remains the durable default;
-this command stores a local runtime override in .mwf/threads.json. It does not
+this command stores an override against its exact native session owner in SQLite. It does not
 edit node_behavior source or restart the workflow.
 
 Examples:
@@ -296,11 +310,11 @@ within roughly 0.2 seconds. Decreasing it never kills jobs already running; MWF
 stops launching replacements until active concurrency falls to the new limit.
 For example, a node declared with `max_threads=2` can be raised to 5 during a test.
 API node values are cooperative fiber counts. They may be set into the thousands
-without one OS thread per job. `mwf threads --api-total 500` sets a run-scoped aggregate API admission budget across API nodes; `reset` restores the default.
+without one OS thread per job. `mwf threads --api-total 500` sets a project-wide aggregate API admission budget across API sessions; `reset` restores the default.
 The --api-total option is deprecated and remains functional. No removal date or
 session-specific form is introduced in 0.6.2.
-Per-node overrides are scoped to the active or next run and are cleared when that
-run finishes. Process pools read overrides when created, while a direct runner
+Per-node overrides belong to the exact live owner, or remain pending for the
+next owner of that node. Settlement clears only the ending session's overrides. Process pools read overrides when created, while a direct runner
 always executes one job at a time.
 """,
     "deploy": """
@@ -410,8 +424,9 @@ Examples:
   mwf top --once --json
 """,
     "monitor": """
-Monitor displays SQLite node/job summaries plus the low-churn `.mwf/run.json`
-ownership record. It does not execute jobs or claim the run slot. Normal CLI
+Monitor displays component state, stability, exact interrupt origin, first
+misalignment causes, raw-node job counts, and native execution sessions,
+including exact parent session IDs. It does not execute jobs or claim a session. Normal CLI
 bootstrap and router mounting may still update framework state.
 
 Examples:
@@ -422,9 +437,8 @@ Examples:
 
 During a task that waits for several seconds, monitor shows the observation time,
 running job ID, queued and completed counts, effective `max_threads`, average
-duration, and approximate remaining time. A run record is called active only
-while its status is `running`; terminal records are shown as `active run: none`
-plus a separate last-run line. Use inspect when you need the detailed lifecycle,
+duration, and approximate remaining time. Each session shows its own running or terminal status, selected components,
+parent sessions, and result. Multiple interrupts remain separately visible. Use inspect when you need the detailed lifecycle,
 checkpoint, retry, or fallback history of one specific node or job.
 """,
 
@@ -463,3 +477,14 @@ session prevents reset. Use `--dry-run` to inspect the effects; apply with a
 typed resetbetween confirmation or `--yes`.
 """,
 })
+
+for _command in ('run', 'runfrom', 'runbetween', 'resume', 'resumefrom', 'resumebetween'):
+    COMMAND_DESCRIPTIONS[_command] += """
+Ordinary commands resolve reachable interrupt choices before changing state.
+For unattended execution, use --interrupt-policy run-all, stop-all, or
+individual with explicit --interrupt-choice NODE=run|stop values. Stopped
+components retain their work. Use --interrupt at an interrupt-classified start
+to pause active direct-parent attempts and freeze input before execution.
+Partial samples and effective readiness overrides fence earlier commands.
+Aligned sampled interrupt resume keeps its compatible original lineage.
+"""

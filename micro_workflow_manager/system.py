@@ -60,13 +60,9 @@ class MicroWorkflow(
         self._included_routers: set[object] = set()
         self.scheduler_supervisor = SchedulerSupervisor(self)
 
-        # Runtime max_threads overrides are local testing controls stored in
-        # .mwf/threads.json. The cache is refreshed only when that one file's
-        # stat signature changes, so active runners do not repeatedly parse JSON.
-        self._thread_override_lock = RLock()
-        self._thread_override_signature: tuple[int, int, int, int] | None | object = object()
-        self._thread_overrides: dict[str, int] = {}
-        self._api_total_limit: int | None = None
+        # Native per-node overrides are read through the owning execution
+        # session. SQLite is the sole writable runtime-limit source.
+        self._api_admission_lock = RLock()
         # Exact API nodes admitted by the live DAG scheduler. This is narrower
         # than allowed_run_nodes: completed and not-yet-started nodes must not
         # retain a share of a run-scoped aggregate admission budget.
@@ -98,35 +94,22 @@ class MicroWorkflow(
             raise RuntimeError(f'No active execution session owns node {node_name}')
         return context[0], context[1][node_name]
 
-    def _refresh_runtime_limits(self) -> dict[str, int]:
-        path = self.storage.thread_overrides_file()
-        try:
-            stat = path.stat()
-            signature: tuple[int, int, int, int] | None = (
-                stat.st_mtime_ns,
-                stat.st_ctime_ns,
-                stat.st_size,
-                stat.st_ino,
-            )
-        except FileNotFoundError:
-            signature = None
-
-        with self._thread_override_lock:
-            if signature == self._thread_override_signature:
-                return self._thread_overrides
-            state = self.storage.read_runtime_limit_state()
-            self._thread_overrides = dict(state["overrides"])
-            self._api_total_limit = state.get("api_total_limit")
-            self._thread_override_signature = signature
-            return self._thread_overrides
+    def _runtime_limit_session_id(self, node_name: str | None = None):
+        context = self.execution_session_context
+        if context is None:
+            return None
+        if node_name is not None and node_name not in context[1]:
+            return None
+        return context[0]
 
     def thread_override(self, node_name: str) -> int | None:
-        return self._refresh_runtime_limits().get(node_name)
+        return self.storage.read_thread_override_for_session(
+            node_name, self._runtime_limit_session_id(node_name),
+        )
 
     def api_total_limit_override(self) -> int | None:
-        """Return the run-scoped aggregate API admission budget, if configured."""
-        self._refresh_runtime_limits()
-        return self._api_total_limit
+        """Return the project-wide aggregate API admission budget, if configured."""
+        return self.storage.read_api_total_limit()
 
     def effective_api_total_limit(self) -> int:
         """Aggregate requested capacity after an optional proportional budget."""
@@ -134,17 +117,16 @@ class MicroWorkflow(
         return max(1, sum(limits.values()))
 
     def active_api_admission_nodes(self) -> frozenset[str] | None:
-        with self._thread_override_lock:
+        with self._api_admission_lock:
             return self._active_api_admission_nodes
 
     def set_active_api_admission_nodes(self, nodes) -> None:
-        with self._thread_override_lock:
+        with self._api_admission_lock:
             self._active_api_admission_nodes = (
                 None if nodes is None else frozenset(nodes)
             )
 
     def _effective_api_node_limits(self) -> dict[str, int]:
-        self._refresh_runtime_limits()
         active = self.active_api_admission_nodes()
         allowed = active if active is not None else self.allowed_run_nodes
         requested = {
@@ -156,7 +138,7 @@ class MicroWorkflow(
         if not requested:
             return {}
 
-        return allocate_api_capacity(requested, self._api_total_limit)
+        return allocate_api_capacity(requested, self.api_total_limit_override())
 
     def requested_max_threads(self, node_name: str) -> int:
         """Return a node's requested limit before aggregate API allocation."""
@@ -178,7 +160,3 @@ class MicroWorkflow(
                 return 1
             return self._effective_api_node_limits().get(node_name, node.max_threads)
         return self.requested_max_threads(node_name)
-
-    def invalidate_thread_override_cache(self) -> None:
-        with self._thread_override_lock:
-            self._thread_override_signature = object()

@@ -114,7 +114,7 @@ def _assert_terminal_main_session(
     assert session["selected_components"] == selected_components
     assert session["selection_kind"] == "components"
     assert session["selected_jobs"] == []
-    assert session["parent_session_id"] is None
+    assert session["parent_session_ids"] == []
     assert session["status"] == "terminal"
     assert session["outcome"] == "done"
     assert session["failures"] == []
@@ -132,7 +132,7 @@ def _rendered_session_prefix(session: dict, status: str) -> str:
     components = "; ".join(",".join(value) for value in session["selected_components"])
     return (
         f"session={session['session_id']} kind=main command={session['command']} "
-        f"status={status} parent=- components=[{components}]"
+        f"status={status} parents=- components=[{components}]"
     )
 
 

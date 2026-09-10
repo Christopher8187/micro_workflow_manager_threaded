@@ -12,7 +12,7 @@ This README is the current common-path guide. It is self-contained for the behav
 project author needs to create, run, inspect, and recover a workflow. The linked
 pages own deeper design or operating detail:
 
-- [CONTEXT.md](CONTEXT.md): MWF language and release boundaries.
+- [CONTEXT.md](CONTEXT.md): MWF language.
 - [Graph architecture](docs/architecture/graph.md): raw graphs, Hoeflein
   components, quotient-DAG scheduling, circulation, and semantic pathing.
 - [Node architecture](docs/architecture/node.md): tasks, fallbacks, validation,
@@ -30,7 +30,7 @@ pages own deeper design or operating detail:
 - [Provisional 0.6.4 planning](docs/plans/0.6.4.md): explicitly unsettled
   future work, not current behavior.
 
-Repository procedures for agents live in [AGENTS.md](AGENTS.md) and the five
+Repository procedures for agents live in [AGENTS.md](AGENTS.md) and the seven
 instruction-only skills under `.agents/skills/`.
 
 ## The model
@@ -45,7 +45,10 @@ An MWF project has three design scales:
 MWF contracts each communicating Hoeflein component into one vertex for
 dependency scheduling. The resulting quotient graph is acyclic. Ordinary DAG
 nodes are singleton components. Naming a node in a multi-node component for
-`run`, `resume`, restart, or cleanup selects the whole component.
+`run`, `resume`, restart, or cleanup selects the whole component. Its members
+share one lifecycle value, `queued`, `running`, `sampled`, `done`, or `failed`.
+Successful results also record stability and an exact interrupt origin when
+unstable. Misalignment records changed managed input or jobs separately.
 
 The filesystem and SQLite have separate responsibilities:
 
@@ -83,12 +86,14 @@ project/
 │               └── output.json
 ├── .mwf/
 │   ├── project.json
-│   ├── run.json
-│   ├── threads.json
 │   └── state.sqlite3
 ├── .mwfignore
 └── .gitignore
 ```
+
+SQLite stores execution sessions, exact job owners, component results, runtime
+thread settings, and recovery decisions. Native projects do not use separate
+run-state or thread-settings JSON files.
 
 The root README should explain the project purpose, graph, component behavior,
 setup, execution, inspection, and important operating boundaries. Each node
@@ -197,10 +202,14 @@ keeps its declared direction; the reverse relationship is used only when MWF
 builds component membership. The quotient DAG retains the original directions
 between components.
 
-Static component construction currently recognizes only the literal
-`ctx.node("...").add(..., autostart=True)` form. The runtime also accepts
-`add_many`, `add_job`, and `add_jobs`, but do not rely on those forms to declare
-component membership until the scanner supports them.
+Static component construction recognizes literal
+`ctx.node("...").add(..., autostart=True)` calls and simple handle assignments.
+It also recognizes `add_job` and `add_jobs` on unshadowed module-level
+`NodeInputFileSystem("...")` handles imported from `micro_workflow_manager`.
+These forms require literal receiver names and `autostart=True`. Dynamic targets
+and `add_many` do not establish static component membership. See the
+[scanner boundaries](docs/architecture/graph.md#current-evidence-boundaries)
+before relying on another routing form.
 
 A live Hoeflein component keeps ordinary threaded and API members available
 while peer work can still arrive. An internal `waiting=True` declaration is an
@@ -372,7 +381,8 @@ input, state updates, and child creation are rejected.
   process boundary.
 
 `max_threads` is the node's requested job concurrency, not a promise about
-provider, socket, database, or host capacity. Runtime overrides are run-scoped:
+provider, socket, database, or host capacity. A runtime node override belongs to
+the session owning that node. An idle node's override waits for its next session:
 
 ```powershell
 mwf threads
@@ -384,11 +394,14 @@ mwf threads --api-total reset
 mwf threads --update
 ```
 
-For API nodes, `--api-total` is an aggregate admission budget allocated
-proportionally across running API nodes. Per-node values remain weights and
-upper bounds. The option is deprecated in the 0.6.2 development branch and
+For API nodes, `--api-total` limits active API executions across every session
+in the project. Per-node values remain local allocation weights and upper
+bounds. Existing API work counts when a limit is installed or lowered and
+continues until it finishes or reaches a cooperative interrupt checkpoint.
+The option is deprecated in the 0.6.2 development branch and
 prints a warning when used. Setting and resetting the budget remain functional;
-no removal date or session-specific form is introduced. Raising a live threaded
+the budget clears after the final session ends. No removal date or
+session-specific form is introduced. Raising a live threaded
 or API limit is observed within roughly
 0.2 seconds; lowering it does not cancel jobs already running. A process pool
 reads the value when created, and the direct runner remains single-job.
@@ -411,7 +424,7 @@ project data. Execution commands can mount routers and create their declared job
 | Check and observe | `doctor`, `engine`, `inspect`, `trace`, `filter`, `monitor`, `top` | Read current graph or state without running jobs. `engine` is graph-only and loopback. |
 | Execute fresh work | `run`, `runfrom`, `runbetween` | Freshly prepare one component, its descendants, or a half-open quotient interval before execution. |
 | Continue work | `resume`, `resumefrom`, `resumebetween` | Preserve successful jobs and continue the selected component, descendants, or interval after native preflight. |
-| Control a live sequence | `restart`, `threads` | Fence selected active jobs or change run-scoped concurrency without starting another scheduler. |
+| Control a live sequence | `restart`, `threads` | Fence selected active jobs or change the owning session's node concurrency. |
 | Prepare a rerun | `reset`, `resetfrom`, `resetbetween` | Apply the same full fresh preparation without task execution; inspect it with `--dry-run`. |
 | Preserve node state | `copy`, `paste` | Save or restore a node tree with its SQLite node snapshot. |
 | Maintain state and deployment | `recover`, `deploy` | Recover a dead owner or build and transfer a filtered archive. |
@@ -443,14 +456,28 @@ work remains. A failed resumed attempt retains the prior sampled result
 for repair. Incompatible parent lineage or conflicting retained history refuses
 before preparation; misaligned sampled work requires fresh preparation.
 
+Declare `NodeRouter(..., interrupt=True)` to classify its whole component as an
+interrupt. Ordinary commands resolve reachable interrupt choices before
+mutation. For unattended execution, pass `--interrupt-policy run-all`,
+`stop-all`, or `individual` with each `--interrupt-choice NODE=run|stop`.
+Stopped components keep their work and results.
+
+Pass `--interrupt` to explicitly run an interrupt component while predecessors
+are unfinished. MWF pauses active direct-parent attempts cooperatively before
+freezing the target input. It records actual parent sessions, transfers selected
+ownership, and applies readiness and sample fences. Several disjoint interrupt
+sessions may coexist with one main session. See
+[interrupt operations](docs/operations.md#interrupt-choices-and-execution) for
+resume, retained origins, and later-command authority.
+
 `restart` is a second-terminal control for an active sequence. It advances the
 execution generation of selected running or failed jobs and leaves the original
 scheduler in control. It removes the selected job's terminal `output.json`, but
 cannot infer which files under the shared node output prefix belong to that job.
 Task design therefore owns stable output paths and idempotent replacement.
 
-`recover` acts only when the recorded CLI owner is dead. It fences and requeues
-abandoned running jobs while preserving done and failed jobs. Preview with
+`recover` settles abandoned native sessions and interrupted file operations.
+It fences and requeues abandoned running jobs while preserving done and failed jobs. Preview with
 `mwf recover --dry-run`.
 
 Fresh and destructive component operations clear their affected node output
@@ -469,6 +496,7 @@ mwf inspect classify job 17
 mwf inspect classify debug
 mwf trace classify job 17
 mwf trace classify job 17 --errors
+mwf trace classify job 17 --lineage --json
 mwf filter classify
 mwf filter classify stage 2
 mwf monitor --once
@@ -481,18 +509,28 @@ framework-aware file writes, forwarded inputs, child creation, failed attempts,
 and terminal state. `--errors` displays only identity, origin, ordered failures,
 attempt details, terminal state, and terminal error; recording is always on.
 
+`--lineage` reads persisted component state, misalignment, sample and interrupt
+IDs, the creating job, and directly created jobs without loading project code.
+Its optional JSON output uses version 1. Follow another job with another
+explicit command; the view does not recursively walk descendants.
+
 `filter` reconstructs the retry and fallback funnel from durable events. A
 specific non-final stage lists jobs rejected there and accepted at the next
 stage. The final stage lists terminal failures. `monitor` is the workflow status
-view; `top` adds event rates, queue and terminal latency, process, SQLite, and
+view. It shows component state, stability, origin, and first misalignment causes
+alongside each raw node's job counts. A waiting display applies only while the
+component is running. `top` adds event rates, queue and terminal latency, process, SQLite, and
 mutation-writer diagnostics.
 
 ## Clipboard and deployment
 
-`mwf copy NODE` saves `node/NODE` under `clipboard/NODE` with a cold SQLite
-snapshot. `mwf paste NODE` replaces the current node tree, restores that state,
-and reconciles payloads and stale running leases. It does not copy Python
-behavior or graph edges.
+`mwf copy NODE` saves `node/NODE` under `clipboard/NODE` with its native job
+identities, supporting execution history, and retained component result. Copy
+requires the node's component to be idle. `mwf paste NODE` restores that node
+within the originating project after validating the saved state and current
+component peers. Peer files and jobs remain intact. Interrupted file operations
+can be inspected and completed through `mwf recover`. See
+[node clipboard](docs/operations.md#node-clipboard) for refusal and recovery rules.
 
 `mwf deploy setup` records connection metadata and creates `.mwfignore`.
 `mwf deploy local` rebuilds a filtered local archive. `mwf deploy remote`

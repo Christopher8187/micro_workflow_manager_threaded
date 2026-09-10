@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from .parser_options import add_destructive_arguments, add_keeptrace_argument, add_stats_arguments, positive_float
+from .parser_options import (
+    add_destructive_arguments,
+    add_interrupt_arguments,
+    add_keeptrace_argument,
+    add_stats_arguments,
+    positive_float,
+)
 from .graph_command_parser import add_between_commands
 
 import argparse
@@ -76,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     graph_cmd.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show graph/node-folder changes without applying them; normal CLI bootstrap may still migrate framework state.",
+        help="Show graph/node-folder changes without changing project state.",
     )
     graph_cmd.add_argument(
         "--runner",
@@ -92,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser(
         "doctor",
-        help="Check project health without executing jobs or applying repairs; normal CLI bootstrap may still migrate framework state.",
+        help="Check native project health without importing project code or changing project state.",
         description=COMMAND_HELP_DESCRIPTIONS["doctor"],
     )
 
@@ -119,7 +125,10 @@ def build_parser() -> argparse.ArgumentParser:
     trace_cmd.add_argument("node", help="Node name containing the job.")
     trace_cmd.add_argument("job_mode", choices=("job",), metavar="job", help="Literal job.")
     trace_cmd.add_argument("job_id", type=int, metavar="id", help="Job ID to trace.")
-    trace_cmd.add_argument("--errors", action="store_true", help="Show only job identity, ordered task failures, and terminal details.")
+    trace_view = trace_cmd.add_mutually_exclusive_group()
+    trace_view.add_argument("--errors", action="store_true", help="Show only job identity, ordered task failures, and terminal details.")
+    trace_view.add_argument("--lineage", action="store_true", help="Show compact component state and directly related jobs without loading project code.")
+    trace_cmd.add_argument("--json", action="store_true", help="Emit versioned JSON for --lineage.")
 
 
     filter_cmd = commands.add_parser(
@@ -210,6 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refuse a sample run unless the current population has this SHA-256 digest.",
     )
     add_keeptrace_argument(run_cmd)
+    add_interrupt_arguments(run_cmd)
 
 
     resume_cmd = commands.add_parser(
@@ -220,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_cmd.add_argument("node", help="Node selecting the Hoeflein component to resume.")
     resume_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
     add_keeptrace_argument(resume_cmd)
+    add_interrupt_arguments(resume_cmd)
     resume_cmd.add_argument("--plan", action="store_true", help="Show the resume selection without applying it or running tasks.")
     add_stats_arguments(resume_cmd)
 
@@ -262,6 +273,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--update",
         action="store_true",
         help="Reload node behavior files and refresh declared max_threads/runner values in mounted schemas.",
+    )
+    threads_cmd.add_argument(
+        "--api-total",
+        metavar="VALUE",
+        help=(
+            "Deprecated: set the project-wide aggregate API admission value, "
+            "or use reset/default/clear."
+        ),
     )
 
     deploy_cmd = commands.add_parser(
@@ -327,6 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Temporarily override the workflow runner for this runfrom.",
     )
     add_keeptrace_argument(runfrom_cmd)
+    add_interrupt_arguments(runfrom_cmd)
     resumefrom_cmd = commands.add_parser(
         "resumefrom",
         help="Continue a selected Hoeflein component and its quotient-DAG descendants without resetting done jobs.",
@@ -351,6 +371,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resumefrom_cmd.add_argument("--runner", choices=RUNNER_CHOICES, help="Temporarily override the workflow runner.")
     add_keeptrace_argument(resumefrom_cmd)
+    add_interrupt_arguments(resumefrom_cmd)
 
     run_cmd.add_argument("--plan", action="store_true", help="Show run selection and reset effects without applying them or running tasks.")
     runfrom_cmd.add_argument("--plan", action="store_true", help="Show descendant run selection without applying it or running tasks.")

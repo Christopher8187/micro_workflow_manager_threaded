@@ -57,7 +57,9 @@ def validate_component_state_snapshot(row) -> None:
     result_lineage = (
         (stability == 'stable' and origin is None)
         or (stability == 'unstable' and isinstance(origin, str) and bool(origin.strip())
-            and row['origin_kind'] == 'interrupt')
+            and row['origin_kind'] == 'interrupt'
+            and type(row['origin_scope_admitted']) is int
+            and row['origin_scope_admitted'] == 1)
     )
     valid_lifecycle = (
         (lifecycle == 'queued' and no_lineage and misaligned == 0)
@@ -117,6 +119,9 @@ class ComponentStateStorageMixin(
         if batch.session_id is None:
             return None
         try:
+            self._require_interrupt_fence_authority(
+                connection, batch.session_id, encode_component_key(batch.component),
+            )
             pending = connection.execute(
                 'SELECT 1 FROM pending_component_executions WHERE session_id=? AND component_key=?',
                 (batch.session_id, encode_component_key(batch.component)),
@@ -288,6 +293,7 @@ class ComponentStateStorageMixin(
                    for parent, state in (expected_parent_states or {}).items()}
 
         def begin(connection):
+            self._require_interrupt_component_admission(connection, session_id, component)
             self._validate_component_task_parent(connection, session_id, task_parent)
             admitted = read_admitted_component_shape(
                 connection, session_id, proposal.component if proposal is not None else component,
@@ -330,6 +336,10 @@ class ComponentStateStorageMixin(
                 )
             if proposal is None:
                 raise ValueError('Component start requires its calculated successful lineage')
+            self._validate_interrupt_component_start(
+                connection, session_id, proposal.component,
+                (proposal.stability, proposal.instability_origin),
+            )
             retained_lineage = (state['stability'], state['instability_origin'])
             if (starting_lifecycle == 'queued' and retained_lineage != (None, None)):
                 raise RuntimeError('Queued component start cannot retain successful lineage')

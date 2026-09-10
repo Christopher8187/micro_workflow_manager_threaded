@@ -4,8 +4,7 @@ import json
 from typing import Any
 
 from micro_workflow_manager.session_liveness import execution_session_liveness
-
-from .active_run import live_active_run
+from micro_workflow_manager.node_observation import node_observation
 
 from micro_workflow_manager.models import (
     CANCELLED,
@@ -55,15 +54,21 @@ def _print_runtime(runtime: dict[str, Any]):
         print(f"  timeout: {runtime['timeout_message']}")
 
 
-def _node_explanation(workflow, node: str) -> str:
-    status = workflow.storage.get_node_status(node) or "missing"
+def _node_explanation(workflow, node: str, observation: dict) -> str:
+    status = observation["state"]
     summary = workflow.storage.node_job_summary(node)
     counts = summary["counts"]
+    if status == "sampled":
+        return "The component completed its selected sample; remaining jobs stay queued for resume."
+    if status == DONE:
+        return "The component has completed."
+    if status == FAILED:
+        return f"The component failed. Inspect failed jobs before using mwf resume {node}."
     if counts.get(RUNNING, 0):
         return f"The node is active because {counts[RUNNING]} job(s) are running."
     if counts.get(QUEUED, 0):
         waiting_blockers = sorted(workflow.waiting_blockers(node))
-        if waiting_blockers:
+        if status == RUNNING and waiting_blockers:
             return (
                 f"The node is waiting with {counts[QUEUED]} queued job(s) until "
                 + ", ".join(waiting_blockers)
@@ -86,8 +91,15 @@ def inspect_node(workflow, node: str) -> int:
     summary = workflow.storage.node_job_summary(node)
     schema = workflow.storage.read_json(workflow.storage.node_schema_file(node), default={})
     component = sorted(workflow.component_for(node))
+    observation = node_observation(workflow, node)
     print(f"Node {node}")
-    print(f"  status: {workflow.storage.get_node_status(node) or 'missing'}")
+    print(f"  status: {observation['status']}")
+    print(f"  state: {observation['state']}")
+    print(f"  stability: {observation['stability'] or '(none)'}")
+    print(f"  instability origin: {observation['instability_origin'] or '(none)'}")
+    print(f"  misaligned: {'yes' if observation['misaligned'] else 'no'}")
+    if observation["misalignment_causes"]:
+        _print_json("  first causes", observation["misalignment_causes"])
     print(f"  Hoeflein component: {', '.join(component)}")
     print(f"  predecessors: {', '.join(sorted(workflow.graph_obj.predecessors(node))) or '(none)'}")
     print(f"  successors: {', '.join(sorted(workflow.graph_obj.successors(node))) or '(none)'}")
@@ -95,10 +107,16 @@ def inspect_node(workflow, node: str) -> int:
     if schema:
         print(f"  runner: {schema.get('runner_override') or workflow.runner}")
         declared_threads = schema.get("max_threads")
-        override_threads = workflow.thread_override(node)
+        override_threads = observation["thread_override"]
         print(f"  declared max_threads: {declared_threads}")
         print(f"  runtime max_threads override: {override_threads if override_threads is not None else '(none)'}")
-        print(f"  effective max_threads: {workflow.effective_max_threads(node)}")
+        print(f"  requested max_threads: {observation['requested_max_threads']}")
+        if observation["runner"] == "api":
+            limit = workflow.api_total_limit_override()
+            print(f"  project-wide API limit: {limit if limit is not None else '(none)'}")
+        if override_threads is not None:
+            owner = observation["thread_override_session_id"]
+            print(f"  override scope: {'session ' + owner if owner else 'pending next claimant'}")
         print(f"  timeout: {schema.get('timeout')}")
         print(f"  checkpoint_timeout: {schema.get('checkpoint_timeout')}")
         print(f"  waiting node: {'yes' if schema.get('waiting') else 'no'}")
@@ -109,7 +127,7 @@ def inspect_node(workflow, node: str) -> int:
             print(f"  resolved wait_for: {', '.join(schema.get('resolved_wait_for') or []) or '(none)'}")
             print(f"  currently waiting on: {', '.join(sorted(workflow.waiting_blockers(node))) or '(none)'}")
         print(f"  fallbacks: {', '.join(schema.get('fallbacks') or []) or '(none)'}")
-    print(f"  explanation: {_node_explanation(workflow, node)}")
+    print(f"  explanation: {_node_explanation(workflow, node, observation)}")
     return 0
 
 
@@ -144,8 +162,8 @@ def inspect_job(workflow, node: str, job_id: int) -> int:
         print(f"  session liveness reason: {liveness['reason']}")
         print(f"  owner component: {', '.join(owner['component'])}")
         print(f"  claimed generation: {owner['generation']}")
-        if session['parent_session_id'] is not None:
-            print(f"  parent session: {session['parent_session_id']}")
+        if session['parent_session_ids']:
+            print(f"  parent sessions: {', '.join(session['parent_session_ids'])}")
         if session['outcome'] is not None:
             print(f"  session outcome: {session['outcome']}")
     if ownership['active_execution_id'] is not None:
@@ -222,13 +240,18 @@ def inspect_failed(workflow, node: str) -> int:
         print(f"  {job_id}: finished={finished_at} duration={duration_text}")
         print(f"     error: {_one_line(error or '(error not recorded)')}")
 
-    joined = " ".join(str(job_id) for job_id in job_ids)
     print("Commands:")
     print(f"  inspect one: mwf inspect {node} job {job_ids[0]}")
-    active = live_active_run(storage)
-    if active is not None and node in set(active.get("nodes") or []):
-        print(f"  restart all in the active run: mwf restart {node} jobs {joined}")
-    else:
+    live_owners = {}
+    for job_id in job_ids:
+        observed = storage.read_job_owner_observation(node, job_id)
+        session = None if observed is None else observed['session']
+        if session is not None and execution_session_liveness(session)['live']:
+            live_owners.setdefault(session['session_id'], []).append(job_id)
+    for session_id, owned_jobs in sorted(live_owners.items()):
+        selected = ' '.join(map(str, owned_jobs))
+        print(f"  restart jobs in session {session_id}: mwf restart {node} jobs {selected}")
+    if sum(map(len, live_owners.values())) < len(job_ids):
         print(f"  retry this node after the run: mwf resume {node}")
         print("  retry a descendant sequence: mwf resumefrom <start-node>")
     return 0

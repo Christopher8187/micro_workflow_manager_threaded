@@ -75,8 +75,10 @@ Managed forwarding records the exact producing execution independently of
 optional trace. Each batch waits for a durable ownership and trace decision.
 A synchronous file or metadata failure restores the prior files. If restoration
 cannot complete, MWF retains recovery material and refuses further managed
-publication and ownership reads for that receiver. Full crash recovery remains
-under implementation for 0.6.2.
+publication and ownership reads for that receiver. Native recovery uses the
+saved decision to restore the prior files of an uncommitted publication or
+preserve a committed publication, then removes its known recovery files. It refuses when ownership,
+visible files, or saved recovery material no longer match that decision.
 
 Managed input changes and newly created jobs mark done, sampled, or failed receivers
 misaligned while preserving their established results. The publication decision records one first
@@ -95,9 +97,9 @@ files at excluded receivers, preserves other producers' material, and records a
 preparation-removal cause for an established receiver result. It checks the whole
 mutation footprint and holds short-lived receiver guards before moving files.
 Durable receipts keep filesystem restoration consistent with the SQLite decision,
-including failures reported after commit. Selected-job preparation, interval
-commands, and automatic recovery remain under
-implementation. See [producer preparation progress](../plans/0.6.2/producer-footprint-preparation-progress.md).
+including failures reported after commit. Selected-job preparation and all
+interval commands use the same producer identities and receiver protections.
+Native recovery resolves unfinished preparation from its durable decision.
 
 An overwritten or appended path can retain several producing executions.
 Overwriting an existing unowned file also preserves that predecessor in the
@@ -180,11 +182,10 @@ idempotent reuse keeps the reused job's original creator. A retained handle
 cannot publish after its producer finishes or while another task is active.
 Default job declarations and calls outside a task have no task creator.
 
-The current implementation checks exact selected roots and their newly created
-same-component descendants at claim time. Automatic ordinary child execution
-for selected runs is still under implementation. See the
-[producing identity progress](../plans/0.6.2/execution-producing-identity-progress.md)
-for the verified boundary and remaining work.
+Selected runs admit exact selected roots and same-component jobs newly created
+by that invocation, including further causal circulation. They preserve
+unrelated preexisting jobs. Jobs published to another quotient component remain
+unexecuted until a command selects that component and readiness permits it.
 
 For fan-in, sort inputs by stable identity, check the expected set, reject
 duplicates or missing required inputs, and write one assembled result. Thread

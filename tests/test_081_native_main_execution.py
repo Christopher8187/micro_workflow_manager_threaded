@@ -11,11 +11,18 @@ import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeRouter
 from micro_workflow_manager import cli
+from micro_workflow_manager.cli.recovery import recover_native_project
 from micro_workflow_manager.cli.run_orchestration import run_nodes
 from micro_workflow_manager.cli.project import load_workflow
 from micro_workflow_manager.errors import JobFailedError
 from micro_workflow_manager.monitor import InlineMonitorReporter, InlineStatsReporter
 from micro_workflow_manager.storage import FileStorage
+from tests.test_064_read_only_previews import (
+    _mark_execution_session_stale,
+    _snapshot,
+    _wait_writer,
+)
+from tests.test_121_native_preview_recovery import _rows
 
 
 def _close(storage):
@@ -142,8 +149,13 @@ def test_failed_native_main_startup_releases_owned_state_and_allows_retry(tmp_pa
 
     workflow.include_routers(router)
     workflow.add_job(None, 'A')
-    workflow.storage.set_thread_override('A', 5)
-    method = 'reserve_execution_components' if fault == 'reservation' else 'bind_thread_overrides_to_run'
+    pending = workflow.storage.read_thread_override_observation('A')
+    workflow.storage.set_thread_override('A', 5, expected=pending)
+    method = (
+        '_reserve_execution_components'
+        if fault == 'reservation'
+        else '_bind_pending_thread_overrides'
+    )
     original = getattr(workflow.storage, method)
 
     def fail_after_change(*args, **kwargs):
@@ -166,13 +178,29 @@ def test_failed_native_main_startup_releases_owned_state_and_allows_retry(tmp_pa
         assert ran == []
         with pytest.raises(RuntimeError, match='No active execution session owns node A'):
             workflow.execution_claim_context('A')
-        assert workflow.storage.read_thread_overrides() == ({'A': 5} if fault == 'reservation' else {})
+        assert workflow.storage.read_thread_override_observation('A') == {
+            'node': 'A', 'value': 5, 'session_id': None,
+        }
+        assert [tuple(row) for row in workflow.storage.db_connection().execute(
+            'SELECT node_name, value FROM pending_node_thread_overrides ORDER BY node_name'
+        )] == [('A', 5)]
+        assert workflow.storage.db_connection().execute(
+            'SELECT 1 FROM node_thread_overrides LIMIT 1'
+        ).fetchone() is None
         assert run_nodes(workflow, ['A'], 'A') == 0
         assert len(ran) == 1
         owner = workflow.storage.get_job_execution_owner(ran[0])
         assert owner['session_id'] != failed['session_id']
         assert workflow.storage.get_execution_session(owner['session_id'])['outcome'] == 'done'
-        assert workflow.storage.read_thread_overrides() == {}
+        assert workflow.storage.read_thread_override_observation('A') == {
+            'node': 'A', 'value': None, 'session_id': None,
+        }
+        assert workflow.storage.db_connection().execute(
+            'SELECT 1 FROM pending_node_thread_overrides LIMIT 1'
+        ).fetchone() is None
+        assert workflow.storage.db_connection().execute(
+            'SELECT 1 FROM node_thread_overrides LIMIT 1'
+        ).fetchone() is None
     finally:
         _close(workflow.storage)
 
@@ -276,7 +304,8 @@ def test_native_heartbeat_cannot_change_a_finished_session_and_reuse_gets_a_new_
 
     workflow.include_routers(router)
     workflow.add_job(None, 'A')
-    workflow.storage.set_thread_override('A', 2)
+    pending = workflow.storage.read_thread_override_observation('A')
+    workflow.storage.set_thread_override('A', 2, expected=pending)
     workflow.storage.set_api_total_limit(3)
     monkeypatch.setattr(workflow.storage, 'heartbeat_execution_session', heartbeat)
     pool = ThreadPoolExecutor(max_workers=1)
@@ -285,6 +314,9 @@ def test_native_heartbeat_cannot_change_a_finished_session_and_reuse_gets_a_new_
         assert admitted.wait(10)
         first = workflow.storage.get_live_main_session()
         assert first is not None
+        assert workflow.storage.read_thread_override_observation('A') == {
+            'node': 'A', 'value': 2, 'session_id': first['session_id'],
+        }
         assert workflow.effective_max_threads('A') == 2
         assert workflow.api_total_limit_override() == 3
         assert stale_heartbeat.wait(10), 'The supervisor did not schedule two native heartbeats'
@@ -301,7 +333,15 @@ def test_native_heartbeat_cannot_change_a_finished_session_and_reuse_gets_a_new_
         assert heartbeat_finished.wait(10)
         assert delayed_outcomes == [False]
         assert workflow.storage.get_execution_session(first['session_id']) == terminal
-        assert workflow.storage.read_thread_overrides() == {}
+        assert workflow.storage.read_thread_override_observation('A') == {
+            'node': 'A', 'value': None, 'session_id': None,
+        }
+        assert workflow.storage.db_connection().execute(
+            'SELECT 1 FROM pending_node_thread_overrides LIMIT 1'
+        ).fetchone() is None
+        assert workflow.storage.db_connection().execute(
+            'SELECT 1 FROM node_thread_overrides LIMIT 1'
+        ).fetchone() is None
         assert workflow.storage.read_api_total_limit() is None
         workflow.add_job(None, 'A')
         assert workflow.run_job('A', 2) == 'done'
@@ -639,6 +679,8 @@ def test_missing_reserved_scope_is_reported_during_terminal_cleanup(tmp_path, mo
     workflow.graph([('A', 'B')])
 
     original = workflow.storage.decide_execution_session_exit
+    injected = {}
+    before_locks = _rows(workflow.storage)['advisory_locks']
 
     def finish(session_id, **kwargs):
         session_id = workflow.storage.get_live_main_session()['session_id']
@@ -651,20 +693,48 @@ def test_missing_reserved_scope_is_reported_during_terminal_cleanup(tmp_path, mo
             assert len(keys) == 2
             connection.executemany('DELETE FROM component_reservations WHERE session_id=? AND component_key=?',
                                    [(session_id, row['component_key']) for row in keys[:removed_count]])
+        injected['remaining'] = tuple(row['component_key'] for row in keys[removed_count:])
+        injected['rows'] = _rows(workflow.storage)
+        injected['active_run_locks'] = injected['rows'].pop('advisory_locks')
+        assert tuple(row[0] for row in injected['active_run_locks']) == ('active-run-state',)
+        injected['node_files'] = _snapshot(tmp_path / 'node')
         return original(session_id, **kwargs)
 
     try:
         monkeypatch.setattr(workflow.storage, 'decide_execution_session_exit', finish)
         with pytest.raises(RuntimeError, match='reservation cleanup.*expected 2'):
             run_nodes(workflow, ['A', 'B'], 'A')
+        after = _rows(workflow.storage)
+        assert after.pop('advisory_locks') == before_locks
+        assert after == injected['rows']
+        assert _snapshot(tmp_path / 'node') == injected['node_files']
         sessions = workflow.storage.list_execution_sessions()
         assert len(sessions) == 1
-        assert sessions[0]['status'] == 'terminal'
-        assert workflow.storage.get_live_main_session() is None
-        assert workflow.storage.get_component_reservation(('A',)) is None
-        assert workflow.storage.get_component_reservation(('B',)) is None
+        assert sessions[0]['status'] == 'running'
+        assert sessions[0]['outcome'] is None
+        assert sessions[0]['finished_at'] is None
+        assert sessions[0]['failures'] == []
+        remaining = tuple(row[0] for row in workflow.storage.db_connection().execute(
+            'SELECT component_key FROM component_reservations WHERE session_id=? ORDER BY component_key',
+            (sessions[0]['session_id'],),
+        ))
+        assert remaining == injected['remaining']
         with pytest.raises(RuntimeError, match='No active execution session owns node A'):
             workflow.execution_claim_context('A')
+
+        _mark_execution_session_stale(workflow.storage, sessions[0]['session_id'])
+        workflow.storage.db_mutation_barrier()
+        _wait_writer(workflow.storage)
+        before_recovery_rows = _rows(workflow.storage)
+        before_recovery_files = _snapshot(tmp_path / 'node')
+        recovered = recover_native_project(tmp_path, quiet=True)
+        assert recovered['recovered'] == []
+        assert any(
+            sessions[0]['session_id'] in error and 'reservation' in error.lower()
+            for error in recovered['errors']
+        )
+        assert _rows(workflow.storage) == before_recovery_rows
+        assert _snapshot(tmp_path / 'node') == before_recovery_files
     finally:
         _close(workflow.storage)
 

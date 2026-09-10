@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from micro_workflow_manager.component_readiness import calculate_component_readiness
 from micro_workflow_manager.system import MicroWorkflow
+from micro_workflow_manager.workflow.interrupt_execution import explicit_interrupt_component
 from micro_workflow_manager.workflow.resume_preparation import observe_resume_selection, prepare_admitted_resume
 
 from micro_workflow_manager.workflow.execution_session import refuse_competing_run
@@ -65,14 +67,20 @@ def execute_graph_command(
     end_node: str | None = None, stats: bool = False, stats_interval: float = 5.0,
     monitor: bool = False, monitor_interval: float = 2.0, keep_trace: bool = False,
     refuse_after_node: str | None = None, refuse_before_node: str | None = None,
+    interrupt_preflight=None,
 ) -> int:
-    refuse_competing_run(workflow)
+    explicit_interrupt = explicit_interrupt_component(interrupt_preflight) is not None
+    execution_session_id = uuid4().hex if explicit_interrupt else None
+    if not explicit_interrupt:
+        refuse_competing_run(workflow)
     with workflow.lock:
         selection = select_graph_command(workflow.topology, command, node, end_node)
         shape = workflow.topology.graph_shape()
     if selection.operation not in ('run', 'resume'):
         raise ValueError('Execution requires a run or resume selection')
     nodes = list(selection.nodes)
+    blocked = frozenset(() if interrupt_preflight is None else interrupt_preflight.blocked_components)
+    execution_components = tuple(component for component in selection.components if component not in blocked)
     if refuse_before_node is not None and refuse_after_node is not None:
         raise ValueError('refuse and refuseafter are mutually exclusive')
     refusal_node = refuse_before_node or refuse_after_node
@@ -87,12 +95,15 @@ def execute_graph_command(
     if selection.operation == 'run':
         _component_notice(workflow, node)
         parents = _read_start_component_inputs(workflow, node)
-        if _refuse_start_component_inputs(workflow, node, f'{command} {node}', observed=parents):
+        if not explicit_interrupt and _refuse_start_component_inputs(workflow, node, f'{command} {node}', observed=parents):
             return 1
         parent_results = _parent_result_observations(parents)
     else:
         options = {} if end_node is None else {'end_node': end_node}
-        resumed = observe_resume_selection(workflow, nodes, command=command, start_node=node, **options)
+        resumed = observe_resume_selection(
+            workflow, nodes, command=command, start_node=node,
+            interrupt_start_origin=execution_session_id, **options,
+        )
     clear_trace = () if keep_trace or selection.scope == 'one' else tuple(
         name for name in nodes if name not in selection.start_component
     )
@@ -105,14 +116,20 @@ def execute_graph_command(
                 or tuple(dict.fromkeys(context[1].values())) != selection.components):
             raise RuntimeError('Graph command selection changed during admission')
         if resumed is not None:
-            prepare_admitted_resume(workflow, nodes, resumed, clear_trace_nodes=clear_trace)
+            prepare_admitted_resume(
+                workflow, nodes, resumed, clear_trace_nodes=clear_trace, blocked_components=blocked,
+            )
             return
         current_parents = _read_start_component_inputs(workflow, node)
-        if _parent_result_observations(current_parents) != parent_results:
+        if not explicit_interrupt and _parent_result_observations(current_parents) != parent_results:
             raise RuntimeError('Start-component parent results changed during admission')
+        if not execution_components:
+            return
         removed = prepare_fresh_components(
-            root, workflow, [set(component) for component in selection.components],
+            root, workflow, [set(component) for component in execution_components],
             keep_trace=keep_trace, operation=command,
+            admitted_components=selection.components,
+            interrupt_preflight=interrupt_preflight,
         )
         if removed:
             summary = ', '.join(f'{name}={count}' for name, count in sorted(removed.items()))
@@ -125,6 +142,7 @@ def execute_graph_command(
         monitor=monitor, monitor_interval=monitor_interval, prepare=prepare,
         fresh_preparation=selection.operation == 'run',
         refuse_after_node=refuse_after_node, refuse_before_node=refuse_before_node,
+        interrupt_preflight=interrupt_preflight, execution_session_id=execution_session_id,
     )
 
 
@@ -138,6 +156,7 @@ def run_node(
     monitor: bool = False,
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
+    interrupt_preflight=None,
 ) -> int:
     return execute_graph_command(
         root, workflow, node, command='run',
@@ -146,6 +165,7 @@ def run_node(
         monitor=monitor,
         monitor_interval=monitor_interval,
         keep_trace=keep_trace,
+        interrupt_preflight=interrupt_preflight,
     )
 
 
@@ -159,6 +179,7 @@ def run_from(
     monitor: bool = False,
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
+    interrupt_preflight=None,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
 ) -> int:
@@ -171,6 +192,7 @@ def run_from(
         keep_trace=keep_trace,
         refuse_after_node=refuse_after_node,
         refuse_before_node=refuse_before_node,
+        interrupt_preflight=interrupt_preflight,
     )
 
 
@@ -184,6 +206,7 @@ def resume_node(
     monitor: bool = False,
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
+    interrupt_preflight=None,
 ) -> int:
     return execute_graph_command(
         root, workflow, node, command='resume',
@@ -192,6 +215,7 @@ def resume_node(
         monitor=monitor,
         monitor_interval=monitor_interval,
         keep_trace=keep_trace,
+        interrupt_preflight=interrupt_preflight,
     )
 
 
@@ -205,6 +229,7 @@ def resume_from(
     monitor: bool = False,
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
+    interrupt_preflight=None,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
 ) -> int:
@@ -217,6 +242,7 @@ def resume_from(
         keep_trace=keep_trace,
         refuse_after_node=refuse_after_node,
         refuse_before_node=refuse_before_node,
+        interrupt_preflight=interrupt_preflight,
     )
 
 

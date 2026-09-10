@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ import pytest
 from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.models import Job
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.storage.component_states import ComponentTerminalOutcome
 from micro_workflow_manager.topology import ComponentTopology
 
@@ -30,9 +32,21 @@ def _session(storage, session_id, kind, component, snapshot):
     return storage.create_execution_session(
         session_id, session_kind=kind, command='resume', start_component=component,
         selected_components=[component], started_at='2026-09-05T12:00:00+00:00',
-        hostname='worker.example', pid=os.getpid(), process_identity=session_id,
+        hostname=socket.gethostname(), pid=os.getpid(), process_identity=process_identity(os.getpid()),
         expected_shape=snapshot.shape_json,
     )
+
+
+def _admit_interrupt_origin(storage, session_id, component, snapshot, *, release=True):
+    result = _session(storage, session_id, 'interrupt', component, snapshot)
+    assert storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json) is True
+    if release:
+        assert storage.release_execution_components(session_id) == 1
+        assert storage.get_component_reservation(component) is None
+    assert storage.db_connection().execute(
+        'SELECT scope_admitted FROM execution_sessions WHERE session_id=?', (session_id,),
+    ).fetchone()[0] == 1
+    return result
 
 
 def _seed_state(
@@ -84,10 +98,12 @@ def test_running_component_failure_clears_lineage_and_preserves_ownership_after_
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
         assert storage.register_component_topology(snapshot) is True
-        _session(storage, 'int-origin', 'interrupt', component, snapshot)
+        _admit_interrupt_origin(storage, 'int-origin', component, snapshot, release=False)
         assert storage.finish_execution_session(
             'int-origin', outcome='done', finished_at='2026-09-05T12:01:00+00:00',
         ) is True
+        assert storage.release_execution_components('int-origin') == 1
+        assert storage.get_component_reservation(component) is None
         key = encode_component_key(component)
         # Seed a retained lineage on the running state to isolate the generic
         # failure transition from sampled-resume session settlement.
@@ -181,9 +197,11 @@ def test_running_component_failure_clears_lineage_and_preserves_ownership_after_
         _close(reopened)
 
 
-def _running_component(storage):
+def _running_component(storage, *, origin_session_id=None):
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage.register_component_topology(snapshot)
+    if origin_session_id is not None:
+        _admit_interrupt_origin(storage, origin_session_id, ('A',), snapshot)
     _session(storage, 'main-failure', 'main', ('A',), snapshot)
     assert storage.reserve_execution_components('main-failure', expected_shape=snapshot.shape_json) is True
     # Public fresh activation is not present; seed only its owned running state.
@@ -315,7 +333,7 @@ def test_running_component_failure_clears_each_valid_lineage_and_refuses_repeat(
         snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
         storage.register_component_topology(snapshot)
         if origin is not None:
-            _session(storage, origin, 'interrupt', ('A',), snapshot)
+            _admit_interrupt_origin(storage, origin, ('A',), snapshot)
             assert storage.get_execution_session(origin)['status'] == 'running'
         _session(storage, 'failing-owner', actor_kind, ('A',), snapshot)
         assert storage.reserve_execution_components('failing-owner', expected_shape=snapshot.shape_json) is True
@@ -354,8 +372,7 @@ def test_running_component_failure_clears_each_valid_lineage_and_refuses_repeat(
 def test_running_component_failure_refuses_damaged_records_without_repair(tmp_path, damage):
     storage = FileStorage._create_new_project_state(tmp_path)
     try:
-        snapshot = _running_component(storage)
-        _session(storage, 'int-origin', 'interrupt', ('A',), snapshot)
+        snapshot = _running_component(storage, origin_session_id='int-origin')
         key = encode_component_key(('A',))
         _seed_state(
             storage, ('A',), lifecycle='running', stability='unstable', origin='int-origin',
@@ -545,7 +562,7 @@ def test_completion_and_failure_compete_for_one_terminal_result_without_overwrit
         component = ('A',)
         snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
         storage.register_component_topology(snapshot)
-        _session(storage, 'int-origin', 'interrupt', component, snapshot)
+        _admit_interrupt_origin(storage, 'int-origin', component, snapshot)
         _session(storage, 'main-failure', 'main', component, snapshot)
         assert storage.reserve_execution_components(
             'main-failure', expected_shape=snapshot.shape_json,
@@ -649,6 +666,6 @@ def test_running_component_failure_refuses_missing_native_session_and_preserves_
         assert output.read_bytes() == b'established output'
         assert storage.db_connection().execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone()[0] == '6'
+        ).fetchone()[0] == '9'
     finally:
         _close(storage)

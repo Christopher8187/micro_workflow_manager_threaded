@@ -662,7 +662,7 @@ def test_autostart_creation_survives_failed_admission_and_retries_with_new_owner
         method = 'start_run_heartbeat'
     else:
         target = workflow.storage
-        method = 'reserve_execution_components' if fault == 'reservation' else 'bind_thread_overrides_to_run'
+        method = 'reserve_execution_components' if fault == 'reservation' else '_bind_pending_thread_overrides'
     original = getattr(target, method)
 
     def fail_after_change(*args, **kwargs):

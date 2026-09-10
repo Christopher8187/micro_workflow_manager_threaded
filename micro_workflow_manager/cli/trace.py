@@ -73,13 +73,10 @@ def _origin_label(parent: Any) -> str:
 def _origin_change_body(event: dict[str, Any]) -> str:
     previous = event.get("previous_origin")
     current = event.get("current_origin")
-    if not isinstance(previous, dict) or not isinstance(current, dict):
-        return (
-            "Previous: " + _origin_label(event.get("previous_parent"))
-            + "\nCurrent: " + _origin_label(event.get("current_parent"))
-        )
 
-    def describe(label: str, origin: dict[str, Any]) -> list[str]:
+    def describe(label: str, origin: Any) -> list[str]:
+        if not isinstance(origin, dict):
+            return [f"{label}: {_json(origin)}"]
         lines = [f"{label}: {_origin_label(origin.get('parent'))}"]
         producer = origin.get("producer_component") or []
         if producer:

@@ -1,20 +1,34 @@
 from __future__ import annotations
 
-import json
-import os
-import shutil
-from contextlib import ExitStack, contextmanager
-from datetime import datetime
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Iterator, TypeVar
-from uuid import uuid4
 
 from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
 from micro_workflow_manager.errors import JobRestartedError
-from micro_workflow_manager.models import CANCELLED, FAILED, QUEUED, RUNNING
+from micro_workflow_manager.models import CANCELLED, FAILED, RUNNING
 from micro_workflow_manager.session_liveness import execution_session_liveness
 
 
 T = TypeVar("T")
+_EXECUTION_FENCE_DEPTH = ContextVar("mwf_execution_fence_depth", default=0)
+
+
+def execution_fence_held() -> bool:
+    return _EXECUTION_FENCE_DEPTH.get() > 0
+
+
+def _move_restart_output(source, destination):
+    from .recovery_moves import move_without_replacement
+
+    return move_without_replacement(source, destination)
+
+
+def _discard_restart_output(path):
+    if path.is_dir():
+        path.rmdir()
+    else:
+        path.unlink()
 
 
 class JobRestartStorageMixin:
@@ -123,144 +137,14 @@ class JobRestartStorageMixin:
         reason: str = 'second-terminal restart',
         component_plan: dict | None = None,
     ) -> list[dict[str, Any]]:
-        """Recheck the planned owners and replace all selected generations together.
-
-        Output staging compensates synchronous failures. Crash recovery across
-        SQLite and the filesystem requires a separate durable recovery record.
-        """
+        """Recheck and restart selected generations with durable output recovery."""
         self._require_execution_session_storage()
-        targets = list(targets)
-        addresses = [(self.validate_node_name(target['node']), self.validate_job_id(target['job_id']))
-                     for target in targets]
-        if len(set(addresses)) != len(addresses):
-            raise ValueError('Restart selection contains duplicate jobs')
-        if not targets and component_plan is None:
-            return []
-        if targets and len({target['owner']['session_id'] for target in targets}) != 1:
-            raise RuntimeError('Restart selection must have one owning session')
-        requested_at = datetime.now().isoformat(timespec='milliseconds')
-        requester = os.getpid() if requested_by_pid is None else requested_by_pid
-        staged = []
-        restarted = []
-        committed = False
-        with ExitStack() as fences:
-            for node, job_id in sorted(addresses):
-                fences.enter_context(self.filesystem_interprocess_lock(
-                    'execution-fences', self.job_execution_lock_name(node, job_id),
-                ))
-            try:
-                # Handle notifications below, after marking the commit. A failed
-                # wake must never restore old output over a committed restart.
-                with self._database_write_lock():
-                    connection = self.db_connection()
-                    connection.execute('BEGIN IMMEDIATE')
-                    try:
-                        if component_plan is not None:
-                            current_plan = self._read_component_restart_plan(
-                                connection, component_plan['node'], failed_only=component_plan['failed_only'],
-                            )
-                            if current_plan != component_plan or current_plan['targets'] != targets:
-                                raise RuntimeError('Restart component selection or ownership changed after preflight')
-                        if not targets:
-                            connection.commit()
-                            committed = True
-                            return []
-                        for target in targets:
-                            current = self._read_owned_restart_target(connection, target['node'], target['job_id'])
-                            if current != target:
-                                raise RuntimeError(
-                                    f"Restart ownership or state changed for {target['node']}/{target['job_id']}"
-                                )
-                        for node, job_id in addresses:
-                            output = self.output_file(node, job_id)
-                            if output.exists() or output.is_symlink():
-                                saved = output.with_name(f'.restart-{uuid4().hex}-output.json')
-                                output.rename(saved)
-                                staged.append((output, saved))
-                        for target in targets:
-                            node, job_id = target['node'], target['job_id']
-                            generation = target['generation'] + 1
-                            row = connection.execute(
-                                'SELECT runtime_json FROM jobs WHERE node_name=? AND job_id=?', (node, job_id),
-                            ).fetchone()
-                            runtime = json.loads(row['runtime_json']) if row['runtime_json'] else None
-                            if runtime:
-                                runtime = {**runtime, 'state': 'restarted', 'updated_at': requested_at,
-                                           'restart_reason': reason, 'previous_generation': target['generation'],
-                                           'generation': generation}
-                            changed = connection.execute(
-                                "UPDATE jobs SET generation=?, active_execution_id=NULL, active_pid=NULL, "
-                                "active_thread_id=NULL, active_started_at=NULL, restart_requested_at=?, "
-                                "restart_requested_by_pid=?, restart_reason=?, status='queued', status_json='{}', "
-                                "runtime_json=? WHERE node_name=? AND job_id=? AND generation=? AND status=? "
-                                "AND active_execution_id IS ? AND EXISTS (SELECT 1 FROM job_instances AS i "
-                                "WHERE i.node_name=jobs.node_name AND i.job_id=jobs.job_id "
-                                "AND i.instance_id=? AND i.last_execution_id=?)",
-                                (generation, requested_at, requester, reason,
-                                 json.dumps(runtime, ensure_ascii=False, separators=(',', ':')) if runtime else None,
-                                 node, job_id, target['generation'], target['status'], target['active_execution_id'],
-                                 target['job_instance_id'], target['owner']['execution_id']),
-                            ).rowcount
-                            if changed != 1:
-                                raise RuntimeError(f'Restart state changed for {node}/{job_id}')
-                            owner_data = {
-                                'session_id': target['owner']['session_id'],
-                                'execution_id': target['owner']['execution_id'],
-                                'job_instance_id': target['job_instance_id'],
-                                'component': list(target['owner']['component']),
-                            }
-                            events = [
-                                ('queued', {**owner_data, 'previous_status': target['status'], 'status': QUEUED}),
-                                ('restart_requested', {**owner_data, 'previous_generation': target['generation'],
-                                                       'generation': generation, 'reason': reason,
-                                                       'requested_by_pid': requester}),
-                            ]
-                            connection.executemany(
-                                'INSERT INTO job_events(node_name, job_id, time, event, data_json) VALUES(?, ?, ?, ?, ?)',
-                                [(node, job_id, requested_at, event, json.dumps(data, separators=(',', ':')))
-                                 for event, data in events],
-                            )
-                            restarted.append({
-                                'node': node, 'job_id': job_id, 'mode': target['mode'],
-                                'session_id': target['owner']['session_id'],
-                                'previous_generation': target['generation'], 'generation': generation,
-                                'requested_at': requested_at, 'warnings': [],
-                            })
-                        connection.executemany(
-                            'INSERT INTO nodes(node_name, status) VALUES(?, ?) '
-                            'ON CONFLICT(node_name) DO UPDATE SET status=excluded.status, '
-                            'updated_at=CURRENT_TIMESTAMP WHERE nodes.status IS NOT excluded.status',
-                            [(node, RUNNING) for node in sorted({node for node, _ in addresses})],
-                        )
-                        self._increment_job_restart_revision(connection)
-                        connection.commit()
-                        committed = True
-                    except BaseException:
-                        connection.rollback()
-                        raise
-            except BaseException as error:
-                if not committed:
-                    for output, saved in reversed(staged):
-                        try:
-                            saved.rename(output)
-                        except OSError as restore_error:
-                            note = f'Restart output restoration failed; retained at {saved}: {restore_error}'
-                            error.__notes__ = [*getattr(error, '__notes__', ()), note]
-                raise
-            for output, saved in staged:
-                try:
-                    if saved.is_dir() and not saved.is_symlink():
-                        shutil.rmtree(saved)
-                    else:
-                        saved.unlink()
-                except OSError as error:
-                    restarted[0]['warnings'].append(f'Restart committed; staged output cleanup requires attention at {saved}: {error}')
-        for node in sorted({node for node, _ in addresses}):
-            try:
-                self.notify_queue_change(node)
-            except Exception as error:
-                restarted[0]['warnings'].append(f'Restart committed; scheduler notification requires attention: {error}')
-        return restarted
+        from .restart_application import apply_owned_restarts
+
+        return apply_owned_restarts(
+            self, targets, requested_by_pid=requested_by_pid, reason=reason,
+            component_plan=component_plan,
+        )
 
     def job_restart_revision(self) -> int:
         """Return the project-wide generation-change revision.
@@ -335,7 +219,11 @@ class JobRestartStorageMixin:
                 raise JobRestartedError(
                     f"Job {node_name}/{job_id} generation {generation} was restarted"
                 )
-            yield
+            token = _EXECUTION_FENCE_DEPTH.set(_EXECUTION_FENCE_DEPTH.get() + 1)
+            try:
+                yield
+            finally:
+                _EXECUTION_FENCE_DEPTH.reset(token)
 
     def run_guarded_job_side_effect(
         self,
@@ -348,99 +236,14 @@ class JobRestartStorageMixin:
         with self.guard_job_execution(node_name, job_id, generation, execution_id):
             return action()
 
-    def _remove_restart_artifact(self, path):
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-        else:
-            self.remove_if_exists(path)
+    def _restart_receipt_state(self, operation_id):
+        from .file_operation_receipts import read_file_receipt
 
-    def _request_job_restart_locked(
-        self,
-        node_name: str,
-        job_id: int,
-        *,
-        requested_by_pid: int | None,
-        reason: str,
-    ) -> dict[str, Any]:
-        observed = self._read_job_owner_observation(self.db_connection(), node_name, job_id)
-        if observed is None:
-            raise FileNotFoundError(f'Job does not exist: {node_name}/{job_id}')
-        previous_status = observed['status']
-        owner_live = observed['session'] is not None and execution_session_liveness(observed['session'])['live']
-        if owner_live and previous_status in (RUNNING, FAILED, CANCELLED):
-            raise RuntimeError(f'Job {node_name}/{job_id} owning-session restart state changed')
-        if previous_status == RUNNING:
-            owner = observed['owner']
-            if owner is None or observed['active_execution_id'] != owner['execution_id']:
-                raise RuntimeError(f'Job {node_name}/{job_id} has damaged abandoned execution ownership')
-        elif observed['active_execution_id'] is not None:
-            raise RuntimeError(f'Job {node_name}/{job_id} has inconsistent active execution ownership')
-
-        requested_at = datetime.now().isoformat(timespec="seconds")
-        previous_generation = observed["generation"]
-        generation = previous_generation + 1
-        runtime = self.read_job_runtime(node_name, job_id)
-        if runtime:
-            runtime = {
-                **runtime,
-                "state": "restarted",
-                "updated_at": requested_at,
-                "restart_reason": reason,
-                "previous_generation": previous_generation,
-                "generation": generation,
-            }
-        status_extra: dict[str, Any] = {}
-        with self.db_transaction() as connection:
-            changed = connection.execute(
-                "UPDATE jobs SET generation=?, active_execution_id=NULL, active_pid=NULL, "
-                "active_thread_id=NULL, active_started_at=NULL, restart_requested_at=?, "
-                "restart_requested_by_pid=?, restart_reason=?, status=?, status_json=?, runtime_json=? "
-                "WHERE node_name=? AND job_id=? AND generation=? AND status=? AND active_execution_id IS ? "
-                "AND EXISTS (SELECT 1 FROM job_instances AS i WHERE i.node_name=jobs.node_name "
-                "AND i.job_id=jobs.job_id AND i.instance_id=? AND i.last_execution_id IS ?)",
-                (
-                    generation,
-                    requested_at,
-                    requested_by_pid or os.getpid(),
-                    reason,
-                    QUEUED,
-                    json.dumps(status_extra),
-                    json.dumps(runtime, ensure_ascii=False, separators=(",", ":")) if runtime else None,
-                    node_name,
-                    job_id, previous_generation, previous_status, observed['active_execution_id'],
-                    observed['job_instance_id'],
-                    None if observed['owner'] is None else observed['owner']['execution_id'],
-                ),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError(f'Job {node_name}/{job_id} restart state changed')
-            self._increment_job_restart_revision(connection)
-        self.append_job_event(
-            node_name,
-            job_id,
-            "queued",
-            previous_status=previous_status,
-            status=QUEUED,
-        )
-        self.append_job_event(
-            node_name,
-            job_id,
-            "restart_requested",
-            previous_generation=previous_generation,
-            generation=generation,
-            reason=reason,
-            requested_by_pid=requested_by_pid or os.getpid(),
-        )
-
-        base = self.job_base_dir(node_name, job_id)
-        self._remove_restart_artifact(base / "output.json")
-        return {
-            "node": node_name,
-            "job_id": job_id,
-            "previous_generation": previous_generation,
-            "generation": generation,
-            "requested_at": requested_at,
-        }
+        connection = self._new_db_connection()
+        try:
+            return read_file_receipt(connection, 'restart_receipts', operation_id)
+        finally:
+            connection.close()
 
     def request_job_restart(
         self,
@@ -455,22 +258,20 @@ class JobRestartStorageMixin:
         observed = self._read_job_owner_observation(self.db_connection(), node_name, job_id)
         if observed is None:
             raise FileNotFoundError(f"Job does not exist: {node_name}/{job_id}")
-        owner_live = observed['session'] is not None and execution_session_liveness(observed['session'])['live']
+        owner_live = (
+            observed['session'] is not None
+            and execution_session_liveness(observed['session'])['live']
+        )
         if owner_live and observed['status'] in (RUNNING, FAILED, CANCELLED):
             target = self._read_owned_restart_target(self.db_connection(), node_name, job_id)
             return self.request_owned_job_restarts(
                 [target], requested_by_pid=requested_by_pid, reason=reason,
             )[0]
-        with self.filesystem_interprocess_lock(
-            "execution-fences",
-            self.job_execution_lock_name(node_name, job_id),
-        ):
-            return self._request_job_restart_locked(
-                node_name,
-                job_id,
-                requested_by_pid=requested_by_pid,
-                reason=reason,
-            )
+        from .restart_application import apply_independent_restart
+
+        return apply_independent_restart(
+            self, node_name, job_id, requested_by_pid=requested_by_pid, reason=reason,
+        )
 
     def request_active_job_restart(
         self,

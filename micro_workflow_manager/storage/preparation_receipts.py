@@ -6,6 +6,10 @@ import json
 from uuid import uuid4
 
 from micro_workflow_manager.component_identity import encode_component_key
+from .file_operation_receipts import (
+    prepared_receipt, insert_file_receipt, read_file_receipt, require_prepared_file_receipt,
+    finish_file_receipt, preparation_decision,
+)
 
 
 def submit_preparation_decision(storage, operation):
@@ -34,12 +38,15 @@ class PreparationReceipt:
         self.validate = validate
         self.effects = effects
         self.membership = membership
+        self.expected = None
+        self.files = None
 
     def state(self):
         connection = self.storage._new_db_connection()
         try:
-            row = connection.execute('SELECT state FROM preparation_receipts WHERE operation_id=?',
-                                     (self.operation_id,)).fetchone()
+            row = read_file_receipt(connection, 'preparation_receipts', self.operation_id)
+            if row is not None and (self.expected is None or row['intent_digest'] != self.expected['intent_digest']):
+                raise RuntimeError('Preparation receipt no longer matches its intent: ' + self.operation_id)
             return None if row is None else row['state']
         finally:
             connection.close()
@@ -49,29 +56,27 @@ class PreparationReceipt:
         if self.membership is not None:
             manifest["membership"] = self.membership
 
+        self.expected = prepared_receipt(
+            'preparation_receipts', operation_id=self.operation_id, guard_id=self.guard_id,
+            operation=self.operation, component_key=encode_component_key(self.component), session_id=self.session_id,
+            manifest_json=json.dumps(manifest, separators=(',', ':')),
+        )
+
         def prepare(connection):
             self.validate(connection)
-            connection.execute(
-                "INSERT INTO preparation_receipts VALUES(?,?,?,?,?,'prepared',?)",
-                (self.operation_id, self.guard_id, self.operation, encode_component_key(self.component),
-                 self.session_id, json.dumps(manifest, separators=(',', ':'))),
-            )
+            insert_file_receipt(connection, 'preparation_receipts', self.expected)
         submit_preparation_decision(self.storage, prepare)
 
+    def require_prepared(self, connection):
+        return require_prepared_file_receipt(connection, 'preparation_receipts', self.expected)
+
     def commit(self, connection):
-        changed = connection.execute(
-            "UPDATE preparation_receipts SET state='committed' WHERE operation_id=? AND state='prepared'",
-            (self.operation_id,),
-        ).rowcount
-        if changed != 1:
-            raise RuntimeError('Preparation lost its prepared receipt: ' + self.operation_id)
+        finish_file_receipt(connection, 'preparation_receipts', self.expected, 'committed',
+                            preparation_decision(connection, json.loads(self.expected['manifest_json'])))
 
     def abort(self):
         def abort(connection):
-            changed = connection.execute(
-                "UPDATE preparation_receipts SET state='aborted' WHERE operation_id=? AND state='prepared'",
-                (self.operation_id,),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError('Preparation restoration lost its prepared receipt: ' + self.operation_id)
+            self.require_prepared(connection)
+            self.files.require_restored()
+            finish_file_receipt(connection, 'preparation_receipts', self.expected, 'aborted', {'restored': True})
         submit_preparation_decision(self.storage, abort)

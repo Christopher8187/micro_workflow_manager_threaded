@@ -6,12 +6,14 @@ from hashlib import sha256
 import pytest
 
 from micro_workflow_manager import cli
+from micro_workflow_manager.project_format import new_project_config
 
 
 def _project(root):
-    (root / '.mwf').write_text(json.dumps({
-        'edges': [['A', 'B']], 'graph_path': 'src/graph.py',
-    }), encoding='utf-8')
+    config = new_project_config()
+    config.update(edges=[['A', 'B']], graph_path='src/graph.py')
+    (root / '.mwf').mkdir()
+    (root / '.mwf' / 'project.json').write_text(json.dumps(config), encoding='utf-8')
     (root / 'src' / 'node_behavior').mkdir(parents=True)
     (root / 'src' / 'graph.py').write_text("EDGES = [('A', 'B')]\n", encoding='utf-8')
     for node in ('A', 'B'):

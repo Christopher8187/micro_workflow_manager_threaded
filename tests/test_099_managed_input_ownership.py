@@ -7,12 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Thread
-from uuid import uuid4
 
 import pytest
 
 from micro_workflow_manager import MicroWorkflow, NodeInputFileSystem
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.storage import input_publication_files
 from micro_workflow_manager.storage.input_publication_files import InputFileChange
 from tests.test_090_component_session_settlement import _close
 
@@ -113,7 +113,7 @@ def test_failed_forwarded_batch_restores_prior_bytes_and_owner(tmp_path, monkeyp
     workflow.graph([('A', 'B')])
     storage = workflow.storage
     receiver = tmp_path / 'node' / 'B' / 'input' / 'A'
-    original_replace = os.replace
+    original_move = input_publication_files._move
     injected = []
 
     @workflow.task('A')
@@ -123,14 +123,14 @@ def test_failed_forwarded_batch_restores_prior_bytes_and_owner(tmp_path, monkeyp
         owner = storage.read_node_input_owner('B', 'A/keep.txt')
         assert owner == storage.read_job_current_owner('A', 1)
 
-        def fail_second(source, destination, *args, **kwargs):
+        def fail_second(source, destination):
             if Path(destination) == receiver / 'fail.txt' and not injected:
                 injected.append(True)
                 raise OSError('injected second publication failure')
-            return original_replace(source, destination, *args, **kwargs)
+            return original_move(source, destination)
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, 'replace', fail_second)
+            patch.setattr(input_publication_files, '_move', fail_second)
             with pytest.raises(OSError, match='injected second publication failure'):
                 handle.write_inputs([('keep.txt', 'replacement'), ('fail.txt', 'new')], overwrite=True)
         assert injected == [True]
@@ -337,7 +337,7 @@ def test_plural_copy_failure_restores_the_entire_publication(tmp_path, monkeypat
         source.write_bytes(b'copied payload')
     if read_only_first:
         sources[0].chmod(stat.S_IREAD)
-    original = os.replace
+    original_move = input_publication_files._move
     injected = []
 
     @workflow.task('A')
@@ -346,10 +346,10 @@ def test_plural_copy_failure_restores_the_entire_publication(tmp_path, monkeypat
             if Path(target) == receiver / 'second.txt' and not injected:
                 injected.append(True)
                 raise OSError('injected plural copy failure')
-            return original(source, target)
+            return original_move(source, target)
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, 'replace', fail_second)
+            patch.setattr(input_publication_files, '_move', fail_second)
             with pytest.raises(OSError, match='injected plural copy failure'):
                 ctx.node('B').add_input_files(sources)
         assert not receiver.exists()
@@ -415,7 +415,7 @@ def test_owner_read_waits_for_the_file_publication_decision(tmp_path, monkeypatc
     storage = workflow.storage
     reader = FileStorage(tmp_path)
     target = tmp_path / 'node' / 'B' / 'input' / 'A' / 'value.txt'
-    original = os.replace
+    original_move = input_publication_files._move
     started, finished = Event(), Event()
     observed, errors = [], []
 
@@ -434,7 +434,7 @@ def test_owner_read_waits_for_the_file_publication_decision(tmp_path, monkeypatc
     @workflow.task('A')
     def produce(ctx):
         def pause_after_replace(source, destination):
-            result = original(source, destination)
+            result = original_move(source, destination)
             if Path(destination) == target:
                 thread.start()
                 assert started.wait(5)
@@ -442,7 +442,7 @@ def test_owner_read_waits_for_the_file_publication_decision(tmp_path, monkeypatc
             return result
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, 'replace', pause_after_replace)
+            patch.setattr(input_publication_files, '_move', pause_after_replace)
             ctx.node('B').write_input('value.txt', 'published')
         assert finished.wait(5)
         assert errors == []
@@ -458,22 +458,45 @@ def test_owner_read_waits_for_the_file_publication_decision(tmp_path, monkeypatc
         _close(storage)
 
 
-def test_owner_read_refuses_an_unfinished_publication(tmp_path):
+def test_owner_read_refuses_an_unfinished_publication(tmp_path, monkeypatch):
     workflow = MicroWorkflow(tmp_path, runner='direct', persist_graph=False)
     workflow.graph([('A', 'B')])
     storage = workflow.storage
 
     @workflow.task('A')
     def produce(ctx):
-        path = ctx.node('B').write_input('value.txt', 'original')
+        handle = ctx.node('B')
+        path = handle.write_input('value.txt', 'original')
         owner = storage.read_job_current_owner('A', 1)
-        storage.submit_db_mutation(lambda connection: connection.execute(
-            "INSERT INTO input_publications VALUES(?,?,?,'prepared',?)",
-            (uuid4().hex, owner['execution_id'], 'B', '[]'),
-        ))
+        submit = storage._submit_input_decision
+        prepared = []
+
+        def interrupt_after_prepared(operation_id, expected, operation):
+            result = submit(operation_id, expected, operation)
+            if expected == 'prepared':
+                prepared.append(operation_id)
+                raise OSError('simulated loss after the real prepared publication receipt')
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(storage, '_submit_input_decision', interrupt_after_prepared)
+            patch.setattr(
+                storage,
+                '_input_publication_state',
+                lambda operation_id: (_ for _ in ()).throw(OSError('publication outcome unavailable')),
+            )
+            with pytest.raises(OSError, match='simulated loss after the real prepared publication receipt') as caught:
+                handle.write_input('value.txt', 'replacement', overwrite=True)
+        assert len(prepared) == 1
+        assert any('publication outcome unavailable' in note for note in caught.value.__notes__)
+        receipt = storage.db_connection().execute(
+            'SELECT * FROM input_publications WHERE operation_id=?', (prepared[0],),
+        ).fetchone()
+        assert receipt is not None and receipt['state'] == 'prepared'
         with pytest.raises(RuntimeError, match='unfinished publication'):
             storage.read_node_input_owner('B', 'A/value.txt')
         assert path.read_bytes() == b'original'
+        assert storage.read_job_current_owner('A', 1) == owner
 
     workflow.start('A')
     try:
@@ -498,6 +521,7 @@ def test_publication_cleanup_failure_keeps_the_original_error_and_recovery_mater
     def produce(ctx):
         handle = ctx.node('B')
         handle.write_input('keep.txt', 'original')
+        original_move = input_publication_files._move
         original_replace = os.replace
         original_connect = storage._new_db_connection
         original_transaction = storage.db_transaction
@@ -508,10 +532,13 @@ def test_publication_cleanup_failure_keeps_the_original_error_and_recovery_mater
                 source.write_bytes(b'replacement')
             copy_sources[0].chmod(stat.S_IREAD)
 
-        def fail_replace(source, target):
+        def fail_publication(source, target):
             if Path(target) == receiver / 'fail.txt' and not injected:
                 injected.append(True)
                 raise PublicationFailure('original publication failure')
+            return original_move(source, target)
+
+        def fail_restore(source, target):
             if secondary in {'restore', 'read-only-restore'} and injected and Path(target) == receiver / 'keep.txt':
                 cleanup_failed.append(True)
                 raise OSError(f'secondary {secondary} failure')
@@ -534,7 +561,8 @@ def test_publication_cleanup_failure_keeps_the_original_error_and_recovery_mater
                     raise OSError('secondary abort failure')
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, 'replace', fail_replace)
+            patch.setattr(input_publication_files, '_move', fail_publication)
+            patch.setattr(os, 'replace', fail_restore)
             patch.setattr(storage, '_new_db_connection', fail_read)
             patch.setattr(storage, 'db_transaction', fail_abort)
             with pytest.raises(OSError, match='original publication failure') as caught:

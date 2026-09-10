@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from micro_workflow_manager.component_identity import encode_component_key
 from .component_result_identity import (
@@ -70,10 +71,12 @@ class ComponentSettlementStorageMixin:
             raise RuntimeError('Invalid pending component completion lineage')
         if origin is not None:
             recorded_origin = connection.execute(
-                'SELECT session_kind FROM execution_sessions WHERE session_id=?', (origin,),
+                'SELECT session_kind, scope_admitted FROM execution_sessions WHERE session_id=?', (origin,),
             ).fetchone()
-            if recorded_origin is None or recorded_origin['session_kind'] != 'interrupt':
-                raise RuntimeError('A pending component requires an exact interrupt origin')
+            if (recorded_origin is None or recorded_origin['session_kind'] != 'interrupt'
+                    or type(recorded_origin['scope_admitted']) is not int
+                    or recorded_origin['scope_admitted'] != 1):
+                raise RuntimeError('A pending component requires an admitted interrupt origin')
         definitions = connection.execute(
             'SELECT shape_id FROM component_definitions '
             'WHERE component_key=? AND shape_id IN (?, ?)',
@@ -144,11 +147,13 @@ class ComponentSettlementStorageMixin:
                     raise RuntimeError('Component settlement cannot replace retained successful lineage')
                 if outcome.instability_origin is not None:
                     origin = connection.execute(
-                        'SELECT session_kind FROM execution_sessions WHERE session_id=?',
+                        'SELECT session_kind, scope_admitted FROM execution_sessions WHERE session_id=?',
                         (outcome.instability_origin,),
                     ).fetchone()
-                    if origin is None or origin['session_kind'] != 'interrupt':
-                        raise RuntimeError('An unstable component requires an exact interrupt origin')
+                    if (origin is None or origin['session_kind'] != 'interrupt'
+                            or type(origin['scope_admitted']) is not int
+                            or origin['scope_admitted'] != 1):
+                        raise RuntimeError('An unstable component requires an admitted interrupt origin')
 
     def _publish_component_terminal_outcomes(self, connection, session_id, outcomes):
         from .execution_sessions import ExecutionSessionHasActiveJobs
@@ -206,3 +211,7 @@ class ComponentSettlementStorageMixin:
             ).rowcount
             if removed != 1:
                 raise RuntimeError('Component pending execution was not removed')
+            self._settle_interrupt_component(
+                connection, session_id, outcome,
+                settled_at=datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+            )

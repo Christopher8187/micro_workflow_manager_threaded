@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 from micro_workflow_manager.cli.run import active_workflow_run
+from micro_workflow_manager.monitor import now_iso
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.storage.sqlite import advisory
 from micro_workflow_manager.system import MicroWorkflow
 
 
@@ -60,6 +62,7 @@ def _start_lock_holder(root: Path, ready: Path, *, lease: float, hold: float):
 
 def test_thread_override_lock_is_reclaimed_immediately_after_owner_process_dies(tmp_path):
     storage = FileStorage(tmp_path)
+    storage.set_node_status("A", "queued")
     ready = tmp_path / "holder-ready"
     holder = _start_lock_holder(tmp_path, ready, lease=300.0, hold=30.0)
 
@@ -67,11 +70,19 @@ def test_thread_override_lock_is_reclaimed_immediately_after_owner_process_dies(
     holder.wait(timeout=5)
 
     started = time.monotonic()
-    storage.set_thread_override("A", 750)
+    with storage.interprocess_lock("thread-overrides", timeout=2.0):
+        pass
+    expected = storage.read_thread_override_observation("A")
+    storage.set_thread_override("A", 750, expected=expected)
     elapsed = time.monotonic() - started
 
     assert elapsed < 2.0
-    assert storage.read_thread_overrides() == {"A": 750}
+    assert storage.read_thread_override_observation("A") == {
+        "node": "A", "value": 750, "session_id": None,
+    }
+    assert [tuple(row) for row in storage.db_connection().execute(
+        "SELECT node_name, value FROM pending_node_thread_overrides ORDER BY node_name"
+    )] == [("A", 750)]
     assert storage.db_connection().execute(
         "SELECT COUNT(*) FROM advisory_locks WHERE name='thread-overrides'"
     ).fetchone()[0] == 0
@@ -97,19 +108,47 @@ def test_expired_lease_is_not_stolen_while_local_owner_process_is_alive(tmp_path
         pass
 
 
-def test_legacy_dead_pid_lock_row_is_reclaimed_before_lease_expiry(tmp_path):
+@pytest.mark.parametrize('owner_form', ['opaque', 'colon-separated'])
+def test_unrecognized_lock_owner_waits_for_lease_expiry(tmp_path, monkeypatch, owner_form):
     storage = FileStorage(tmp_path)
     dead_pid = max(99_999_999, os.getpid() + 1_000_000)
+    owner = 'opaque-owner' if owner_form == 'opaque' else f'{dead_pid}:123:unrecognized'
     now_value = time.time()
     with storage.db_transaction() as connection:
         connection.execute(
             "INSERT INTO advisory_locks(name, owner, acquired_at, expires_at) "
             "VALUES(?, ?, ?, ?)",
-            ("thread-overrides", f"{dead_pid}:123:legacy", now_value, now_value + 300),
+            ('thread-overrides', owner, now_value, now_value + 300),
         )
+    before = tuple(storage.db_connection().execute(
+        "SELECT * FROM advisory_locks WHERE name='thread-overrides'",
+    ).fetchone())
 
-    with storage.interprocess_lock("thread-overrides", timeout=0.5):
-        pass
+    def refuse_local_process_guess(pid):
+        raise AssertionError(f'Unrecognized owner was treated as local process {pid}')
+
+    monkeypatch.setattr(advisory, 'process_is_alive', refuse_local_process_guess)
+    with pytest.raises(TimeoutError, match='thread-overrides'):
+        with storage.interprocess_lock('thread-overrides', timeout=0):
+            pytest.fail('An unexpired unknown owner must retain its lock')
+    assert tuple(storage.db_connection().execute(
+        "SELECT * FROM advisory_locks WHERE name='thread-overrides'",
+    ).fetchone()) == before
+
+    with storage.db_transaction() as connection:
+        connection.execute(
+            "UPDATE advisory_locks SET expires_at=? WHERE name='thread-overrides'",
+            (time.time() - 1,),
+        )
+    with storage.interprocess_lock('thread-overrides', timeout=0.5):
+        replacement = storage.db_connection().execute(
+            "SELECT owner FROM advisory_locks WHERE name='thread-overrides'",
+        ).fetchone()['owner']
+        assert replacement != owner
+        assert storage._parse_advisory_owner(replacement)['pid'] == os.getpid()
+    assert storage.db_connection().execute(
+        "SELECT 1 FROM advisory_locks WHERE name='thread-overrides'",
+    ).fetchone() is None
 
 
 def test_run_start_does_not_publish_running_state_when_override_binding_fails(
@@ -118,11 +157,15 @@ def test_run_start_does_not_publish_running_state_when_override_binding_fails(
 ):
     workflow = MicroWorkflow(project_dir=tmp_path)
     workflow.graph([('A', 'B')])
+    expected = workflow.storage.read_thread_override_observation('A')
+    workflow.storage.set_thread_override('A', 5, expected=expected)
+    original_bind = workflow.storage._bind_pending_thread_overrides
 
-    def fail_bind(_run_id: str):
+    def fail_bind(connection, session_id, nodes):
+        original_bind(connection, session_id, nodes)
         raise TimeoutError("synthetic thread-overrides failure")
 
-    monkeypatch.setattr(workflow.storage, "bind_thread_overrides_to_run", fail_bind)
+    monkeypatch.setattr(workflow.storage, "_bind_pending_thread_overrides", fail_bind)
 
     with pytest.raises(TimeoutError, match="synthetic"):
         with active_workflow_run(
@@ -137,33 +180,58 @@ def test_run_start_does_not_publish_running_state_when_override_binding_fails(
     assert session['status'] == 'terminal' and session['outcome'] == 'failed'
     assert workflow.storage.get_live_main_session() is None
     assert workflow.storage.get_component_reservation(('A',)) is None
+    assert workflow.storage.read_thread_override_observation('A') == {
+        'node': 'A', 'value': 5, 'session_id': None,
+    }
     assert not (tmp_path / '.mwf' / 'run.json').exists()
 
 
-def test_run_is_marked_terminal_even_when_override_cleanup_fails(
+def test_run_terminal_settlement_rolls_back_when_native_override_cleanup_fails(
     tmp_path,
     monkeypatch,
-    capsys,
 ):
     workflow = MicroWorkflow(project_dir=tmp_path)
     workflow.graph([('A', 'B')])
+    expected = workflow.storage.read_thread_override_observation('A')
+    workflow.storage.set_thread_override('A', 5, expected=expected)
+    original_cleanup = workflow.storage._clear_thread_overrides_for_session
 
-    def fail_cleanup(_run_id: str):
+    def fail_cleanup(connection, session_id):
+        original_cleanup(connection, session_id)
         raise TimeoutError("synthetic cleanup failure")
 
-    monkeypatch.setattr(workflow.storage, "clear_thread_overrides_for_run", fail_cleanup)
-
-    with active_workflow_run(
-        workflow,
-        command="run",
-        start_node="A",
-        nodes=["A"],
-    ) as finish:
-        finish("done")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workflow.storage, "_clear_thread_overrides_for_session", fail_cleanup,
+        )
+        with pytest.raises(TimeoutError, match="synthetic cleanup failure"):
+            with active_workflow_run(
+                workflow,
+                command="run",
+                start_node="A",
+                nodes=["A"],
+            ) as finish:
+                finish("done")
 
     state, = workflow.storage.list_execution_sessions()
-    assert state['status'] == 'terminal' and state['outcome'] == 'done'
+    assert state['status'] == 'running' and state['outcome'] is None
+    assert workflow.storage.get_component_reservation(('A',)) == {
+        'members': ('A',), 'session_id': state['session_id'],
+    }
+    assert workflow.storage.read_thread_override_observation('A') == {
+        'node': 'A', 'value': 5, 'session_id': state['session_id'],
+    }
+    workflow.storage.decide_execution_session_exit(
+        state['session_id'], outcome='done', finished_at=now_iso(), failures=[],
+    )
+    terminal = workflow.storage.get_execution_session(state['session_id'])
+    assert terminal['status'] == 'terminal' and terminal['outcome'] == 'done'
     assert workflow.storage.get_live_main_session() is None
     assert workflow.storage.get_component_reservation(('A',)) is None
+    assert workflow.storage.read_thread_override_observation('A') == {
+        'node': 'A', 'value': None, 'session_id': None,
+    }
+    assert workflow.storage.db_connection().execute(
+        'SELECT 1 FROM node_thread_overrides LIMIT 1'
+    ).fetchone() is None
     assert not (tmp_path / '.mwf' / 'run.json').exists()
-    assert "temporary thread override could not be removed" in capsys.readouterr().err

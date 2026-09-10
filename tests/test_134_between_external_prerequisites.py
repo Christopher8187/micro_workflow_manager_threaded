@@ -9,10 +9,14 @@ from tests.test_117_execution_sampling import _job_snapshot
 
 
 def _excluded_snapshot(storage, root, nodes):
+    storage.db_mutation_barrier()
     return {
         node: {
             'component': storage.get_component_state((node,)),
-            'raw_status': storage.get_node_status(node),
+            'lifecycle': storage.get_node_status(node),
+            'raw_status': storage.db_connection().execute(
+                'SELECT status FROM nodes WHERE node_name=?', (node,),
+            ).fetchone()['status'],
             'job': _job_snapshot(storage, node, 1),
             'tree': _snapshot(root / 'node' / node),
         }
@@ -62,7 +66,10 @@ def run(ctx):
         assert storage.get_job_status('C', 1) == ('done' if parent_done else 'queued')
         assert (tmp_path / 'node' / 'C' / 'output' / 'ran.txt').exists() is parent_done
         assert _excluded_snapshot(storage, tmp_path, excluded) == excluded
-        assert storage.get_node_status('X') == raw_status
+        assert storage.get_node_status('X') == ('done' if parent_done else 'queued')
+        assert storage.db_connection().execute(
+            'SELECT status FROM nodes WHERE node_name=?', ('X',),
+        ).fetchone()['status'] == raw_status
         assert {row['node_name'] for row in _rows(storage)['job_execution_owners']
                 if row['execution_id'] not in owners} == ({'A', 'C'} if parent_done else {'A'})
         current, = [session for session in storage.list_execution_sessions()

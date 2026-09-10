@@ -10,6 +10,7 @@ from micro_workflow_manager.storage import FileStorage
 from .files import find_root, safe_node_name
 from .jobs import selected_job_ids_from_args
 from .layout import ensure_runtime_layout
+from .startup_recovery import recover_before_mutation
 
 
 def _restart_owned(root, node, *, job_ids=None, failed_only=False, dry_run=False):
@@ -85,7 +86,6 @@ def restart_cli(argv: list[str]) -> int:
 
     try:
         root = find_root()
-        ensure_runtime_layout(root)
         node = safe_node_name(args.node)
         if args.mode in {"job", "jobs"}:
             job_ids = selected_job_ids_from_args(
@@ -94,9 +94,15 @@ def restart_cli(argv: list[str]) -> int:
                 command="restart",
             )
             assert job_ids is not None
+            if not args.dry_run:
+                recover_before_mutation(root)
+                ensure_runtime_layout(root)
             return restart_active_jobs(root, node, job_ids, dry_run=args.dry_run)
         if args.job_specs:
             raise RuntimeError("Job IDs require the literal job or jobs mode.")
+        if not args.dry_run:
+            recover_before_mutation(root)
+            ensure_runtime_layout(root)
         return restart_active_scope(
             root,
             node,

@@ -84,6 +84,7 @@ class GraphCommandObservation:
     resume_jobs: tuple[ResumeJobEffect, ...]
     declared_receivers: tuple[str, ...]
     refusals: tuple[str, ...]
+    interrupt_start_component: tuple[str, ...] | None = None
 
 
 class GraphPlanningReader(Protocol):
@@ -150,11 +151,23 @@ def _preparation_effects(footprint, selected_nodes, *, keep_trace):
 
 def observe_graph_command(
     reader: GraphPlanningReader, topology, selection, *, keep_trace=False,
-    static_receivers_by_node=None,
+    static_receivers_by_node=None, blocked_components=(), interrupt_start_component=None,
 ):
     """Read one coherent preview snapshot without admitting or preparing work."""
     if reader.shape_json != topology.graph_shape():
         raise RuntimeError("Stored native shape differs from the preview topology")
+    if interrupt_start_component is not None and (
+        selection.operation not in ('run', 'resume')
+        or interrupt_start_component != selection.start_component
+    ):
+        raise ValueError('Interrupt preview override requires exactly the executing start component')
+    blocked_components = frozenset(blocked_components)
+    if not blocked_components <= set(selection.components):
+        raise ValueError('Interrupt boundaries lie outside the planned selection')
+    if blocked_components and selection.operation == 'reset':
+        raise ValueError('Reset does not use interrupt stopping policy')
+    prepared_components = tuple(component for component in selection.components if component not in blocked_components)
+    prepared_nodes = frozenset(node for component in prepared_components for node in component)
     external = _external_predecessors(topology, selection)
     observed = reader.read_component_states(
         (*selection.components, *external), allow_missing=True,
@@ -176,17 +189,18 @@ def observe_graph_command(
     receiver_map = {} if static_receivers_by_node is None else static_receivers_by_node
     declared_receivers = tuple(sorted({
         receiver
-        for node in selection.nodes
+        for node in prepared_nodes
         for receiver in receiver_map.get(node, ())
         if receiver not in selection.node_set
     }))
     if selection.operation in {"run", "reset"}:
-        footprint = reader.read_preparation_footprint(
-            selection.components, keep_trace=keep_trace,
-        )
-        preparation_effects = _preparation_effects(
-            footprint, selection.node_set, keep_trace=keep_trace,
-        )
+        if prepared_components:
+            footprint = reader.read_preparation_footprint(
+                prepared_components, keep_trace=keep_trace,
+            )
+            preparation_effects = _preparation_effects(
+                footprint, prepared_nodes, keep_trace=keep_trace,
+            )
         effect_receivers = tuple(effect.receiver for effect in preparation_effects)
         excluded_receivers = tuple(
             effect.receiver for effect in preparation_effects
@@ -198,7 +212,7 @@ def observe_graph_command(
         refusals.extend(reader.read_receiver_activity(
             excluded_receivers, include_active_jobs=True,
         ))
-        if selection.operation == "run":
+        if selection.operation == "run" and interrupt_start_component is None:
             from micro_workflow_manager.component_readiness import calculate_component_readiness
 
             selected = set(selection.components)
@@ -243,15 +257,19 @@ def observe_graph_command(
                 for component in selection.components
             }
             try:
+                from uuid import uuid4
+
                 predict_resume_lineages(
                     selection.components,
                     all_parents,
                     observed,
                     dict(resume_plan.successful_results),
+                    interrupt_component=interrupt_start_component,
+                    interrupt_start_origin=None if interrupt_start_component is None else uuid4().hex,
                 )
             except InvalidGraphError as error:
                 refusals.append(str(error))
-            resume_jobs = resume_plan.jobs
+            resume_jobs = tuple(job for job in resume_plan.jobs if job.node in prepared_nodes)
     return GraphCommandObservation(
         shape_json=reader.shape_json,
         selection=selection,
@@ -264,4 +282,5 @@ def observe_graph_command(
         resume_jobs=resume_jobs,
         declared_receivers=declared_receivers,
         refusals=tuple(dict.fromkeys(refusals)),
+        interrupt_start_component=interrupt_start_component,
     )

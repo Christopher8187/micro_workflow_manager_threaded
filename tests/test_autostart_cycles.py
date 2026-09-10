@@ -101,6 +101,14 @@ def node_status(tmp_path: Path, node: str) -> str:
     return FileStorage(tmp_path).get_node_status(node)
 
 
+def _execution_sessions(tmp_path: Path) -> list[dict]:
+    storage = FileStorage(tmp_path)
+    try:
+        return storage.list_execution_sessions()
+    finally:
+        storage.close_database_connections()
+
+
 def test_runfrom_supports_self_and_mutual_autostart_cycles_before_downstream(tmp_path, monkeypatch, capsys):
     make_cycle_project(tmp_path, monkeypatch)
     capsys.readouterr()
@@ -113,8 +121,33 @@ def test_runfrom_supports_self_and_mutual_autostart_cycles_before_downstream(tmp
     out = captured.out
 
     assert "Ran:" in out
-    assert "active run: runfrom A" in captured.err
-    assert "last run: runfrom A | status=done" in captured.err
+    sessions = _execution_sessions(tmp_path)
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session["session_kind"] == "main"
+    assert session["command"] == "runfrom"
+    assert session["selection_kind"] == "components"
+    assert session["start_component"] == ("A", "B", "C")
+    assert session["details"]["start_node"] == "A"
+    assert session["selected_components"] == [("A", "B", "C"), ("D",)]
+    assert session["selected_jobs"] == []
+    assert session["parent_session_ids"] == []
+    assert session["status"] == "terminal"
+    assert session["outcome"] == "done"
+    assert session["failures"] == []
+    components = "; ".join(",".join(value) for value in session["selected_components"])
+    prefix = (
+        f"session={session['session_id']} kind=main command=runfrom "
+        f"parents=- components=[{components}]"
+    )
+    assert prefix.replace("parents=", "status=running parents=") in captured.err
+    assert (
+        prefix.replace("parents=", "status=terminal parents=")
+        + f" outcome=done finished={session['finished_at']}"
+        in captured.err
+    )
+    assert "active run:" not in captured.err
+    assert "last run:" not in captured.err
     assert "  A" in out
     assert "  B" in out
     assert "  C" in out

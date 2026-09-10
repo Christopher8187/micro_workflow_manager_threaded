@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import sqlite3
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,7 @@ import networkx as nx
 import pytest
 
 from micro_workflow_manager.models import Job
+from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.topology import ComponentTopology
 import micro_workflow_manager.storage.execution_claims as execution_claims_module
@@ -66,8 +68,8 @@ def _owned_storage(tmp_path):
     for session_id, component in [('int-17', ('A', 'B')), ('int-18', ('C',))]:
         storage.create_execution_session(
             session_id, session_kind='interrupt', command='run', start_component=component,
-            selected_components=[component], started_at=STARTED_AT, hostname='worker.example',
-            pid=os.getpid(), process_identity='test-process', expected_shape=snapshot.shape_json,
+            selected_components=[component], started_at=STARTED_AT, hostname=socket.gethostname(),
+            pid=os.getpid(), process_identity=process_identity(os.getpid()), expected_shape=snapshot.shape_json,
         )
         storage.reserve_execution_components(session_id, expected_shape=snapshot.shape_json)
     for node in ['A', 'B', 'C']:
@@ -141,7 +143,7 @@ def test_private_claims_require_both_explicit_owner_inputs_without_guessing(tmp_
 
 @pytest.mark.parametrize('batch', [False, True])
 @pytest.mark.parametrize(('condition', 'message'), [
-    ('unknown', 'running session'),
+    ('unknown', 'requires its execution session'),
     ('terminal', 'running session'),
     ('another-owner', 'reservation'),
     ('unreserved', 'reservation'),
@@ -266,7 +268,7 @@ def test_unstarted_release_and_job_recreation_keep_exact_execution_history(tmp_p
     storage.close_database_connections()
 
 
-def test_large_claim_batch_checks_its_owner_once_and_commits_every_execution(tmp_path, monkeypatch):
+def test_large_claim_batch_keeps_owner_checks_constant_and_commits_every_execution(tmp_path, monkeypatch):
     storage = _owned_storage(tmp_path)
     storage.create_jobs_batch([Job(node_name='A', job_id=job_id, params={}) for job_id in range(3, 601)])
     statements = []
@@ -282,12 +284,18 @@ def test_large_claim_batch_checks_its_owner_once_and_commits_every_execution(tmp
                 connection.set_trace_callback(None)
 
     monkeypatch.setattr(storage, 'db_transaction', traced_transaction)
+    storage.claim_job_executions_batch(
+        'C', [1, 2], started_at=STARTED_AT, session_id='int-18', component=('C',),
+    )
+    small_owner_reads = [statement for statement in statements if 'FROM execution_sessions AS session' in statement]
+    assert small_owner_reads
+    statements.clear()
     claims = storage.claim_job_executions_batch(
         'A', list(range(1, 601)), started_at=STARTED_AT, session_id='int-17', component=('B', 'A'),
     )
 
     owner_reads = [statement for statement in statements if 'FROM execution_sessions AS session' in statement]
-    assert len(owner_reads) == 1
+    assert len(owner_reads) == len(small_owner_reads)
     assert len(claims) == len({execution_id for _, execution_id in claims}) == 600
     assert {generation for generation, _ in claims} == {0}
     owners = storage.db_connection().execute(

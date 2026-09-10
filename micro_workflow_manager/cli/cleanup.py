@@ -286,51 +286,6 @@ def reset_component_jobs_for_fresh_run(
         workflow.storage.set_node_status(node, QUEUED)
 
 
-def reset_node_for_run(
-    root: Path,
-    workflow: MicroWorkflow,
-    node: str,
-    *,
-    remove_parented_jobs: bool = False,
-    mark_queued: bool = True,
-    keep_trace: bool = False,
-):
-    """Reset one node, retaining the legacy parent-deletion option."""
-    if not remove_parented_jobs:
-        return reset_nodes_for_run(
-            root,
-            workflow,
-            [node],
-            mark_queued=mark_queued,
-            keep_trace=keep_trace,
-        )
-
-    node_dir = safe_node_dir(root, node)
-    remove_dir(node_dir / "output")
-    retained_job_ids: list[int] = []
-    for metadata in workflow.storage.list_job_parent_metadata([node]):
-        job_id = metadata["job_id"]
-        if metadata.get("parent") is not None:
-            workflow.storage.delete_job(
-                node,
-                job_id,
-                remove_payload=True,
-                preserve_events=keep_trace,
-            )
-        else:
-            retained_job_ids.append(job_id)
-    _remove_job_artifacts_batch(workflow, node, retained_job_ids)
-    workflow.storage.reset_jobs_for_run_batch(
-        node,
-        retained_job_ids,
-        preserve_events=keep_trace,
-    )
-    workflow.storage.init_node_folders(node)
-    if mark_queued:
-        workflow.storage.set_node_status(node, QUEUED)
-    return len(retained_job_ids)
-
-
 def reset_job_for_run(
     root: Path,
     workflow: MicroWorkflow,

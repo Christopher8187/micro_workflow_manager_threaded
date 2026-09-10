@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -11,6 +13,7 @@ import networkx as nx
 import pytest
 
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.topology import ComponentTopology
 
 
@@ -22,7 +25,7 @@ assert 'networkx' not in sys.modules, 'Storage import loaded graph dependencies'
 assert 'micro_workflow_manager.topology' not in sys.modules
 storage = FileStorage(sys.argv[1])
 assert 'networkx' not in sys.modules, 'Ordinary storage creation loaded graph dependencies'
-assert storage.db_connection().execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '6'
+assert storage.db_connection().execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '9'
 assert storage.database_integrity_check() == 'ok'
 storage.close_database_connections()
 '''
@@ -67,8 +70,8 @@ def _session(storage, session_id, components, expected_shape, *, kind='interrupt
     return storage.create_execution_session(
         session_id, session_kind=kind, command='run',
         start_component=components[0], selected_components=components,
-        started_at='2026-09-05T12:00:00+00:00', hostname='worker.example',
-        pid=123, process_identity='instance-1', expected_shape=expected_shape,
+        started_at='2026-09-05T12:00:00+00:00', hostname=socket.gethostname(),
+        pid=os.getpid(), process_identity=process_identity(os.getpid()), expected_shape=expected_shape,
     )
 
 
@@ -664,9 +667,9 @@ def test_reservations_refuse_raw_node_overlap_across_split_and_merged_shapes(tmp
     combined = ComponentTopology(graph, [('A', 'B')]).snapshot()
     split = ComponentTopology(graph, []).snapshot()
     storage = FileStorage._create_new_project_state(tmp_path)
-    for snapshot in [combined, split]:
-        storage.register_component_topology(snapshot)
     first, second = (combined, split) if combined_first else (split, combined)
+    for snapshot in [second, first]:
+        storage.register_component_topology(snapshot)
     owned = ('A', 'B') if combined_first else ('A',)
     _session(storage, 'int-17', [owned], first.shape_json)
     _session(storage, 'int-18', second.components, second.shape_json)

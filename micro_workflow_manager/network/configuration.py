@@ -89,9 +89,6 @@ class NetworkConfigurationMixin:
         architecture = str(
             architecture or os.getenv("MWF_NETWORK_ARCHITECTURE", "manager")
         ).strip().lower()
-        architecture = {"legacy": "direct", "central": "manager"}.get(
-            architecture, architecture
-        )
         if architecture not in {"manager", "direct"}:
             raise ValueError("network architecture must be 'manager' or 'direct'")
         state_flush_interval = float(state_flush_interval)

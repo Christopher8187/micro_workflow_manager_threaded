@@ -55,6 +55,11 @@ or runtime configuration changed, continue with the isolated sequence below.
    `python -m pytest -q file.py::test_name` process. Run
    `python -m pytest -q -m stress tests/test_markov_chain_stress.py` when the
    selected scope requires stress or release verification.
+   For workflow-management changes, include all nine graph commands, read-only
+   plans, selected jobs and samples, producer-aware preparation, component
+   membership and misalignment, interrupt pauses and fences, concurrent session
+   ownership, project-wide API capacity, native clipboard recovery, and full
+   and compact lineage views wherever the change reaches those behaviors.
 4. For another project built with MWF, copy the exact project tree into its
    derived Test Area. Read its root and affected node READMEs, install its own
    declared test dependencies, and install the MWF wheel or version the project

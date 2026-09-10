@@ -8,7 +8,7 @@ from .paths import config_file
 from .schema import CURRENT_STATE_SCHEMA_VERSION
 
 
-PROJECT_FORMAT_VERSION = 6
+PROJECT_FORMAT_VERSION = 9
 UNSUPPORTED_PROJECT = (
     "Unsupported MWF project format. Use migration.md to prepare a separate "
     "fresh project; this project has not been migrated."

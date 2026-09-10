@@ -229,6 +229,9 @@ class AutoJobCreationStorageMixin:
 
                 try:
                     refuse_receiver_mutation(connection, node_name)
+                    self._refuse_interrupt_held_publication(
+                        connection, node_name, item.producer_execution_id,
+                    )
                 except Exception as error:
                     outcomes[index] = (False, error)
                     continue

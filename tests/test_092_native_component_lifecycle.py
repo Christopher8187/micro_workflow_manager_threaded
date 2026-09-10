@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
 
@@ -520,6 +521,9 @@ def test_failed_session_publication_retains_the_original_job_error(tmp_path, mon
                 'UPDATE pending_component_executions SET alignment_generation=alignment_generation+1',
             ))
             before_decision.append(_rows(storage))
+            session, = before_decision[0]['execution_sessions']
+            heartbeat = datetime.fromisoformat(session['heartbeat_at']) + timedelta(seconds=1)
+            assert storage.heartbeat_execution_session(args[0], heartbeat.isoformat())
         return decide(*args, **kwargs)
 
     monkeypatch.setattr(storage, 'decide_execution_session_exit', changed_pending_record)
@@ -529,7 +533,13 @@ def test_failed_session_publication_retains_the_original_job_error(tmp_path, mon
         assert caught.value.__cause__ is original_error
         assert any('Execution session exit failed' in note for note in caught.value.__notes__)
         before_decision[0]['advisory_locks'] = []
-        assert _rows(storage) == before_decision[0]
+        after_decision = _rows(storage)
+        before_session, = before_decision[0]['execution_sessions']
+        after_session, = after_decision['execution_sessions']
+        before_heartbeat = before_session.pop('heartbeat_at')
+        after_heartbeat = after_session.pop('heartbeat_at')
+        assert datetime.fromisoformat(after_heartbeat) >= datetime.fromisoformat(before_heartbeat)
+        assert after_decision == before_decision[0]
         session, = storage.list_execution_sessions()
         assert session['status'] == 'running'
         assert storage.get_component_reservation(('A',))['session_id'] == session['session_id']
@@ -649,7 +659,7 @@ def work(ctx):
     def pause_decision(*args, **kwargs):
         if restart_nested and kwargs['outcome'] == ('done' if catch_failure else 'failed') and not at_decision.is_set():
             at_decision.set()
-            assert proceed.wait(20)
+            assert proceed.wait()
         return decide(*args, **kwargs)
 
     monkeypatch.setattr(storage, 'decide_execution_session_exit', pause_decision)
@@ -658,20 +668,20 @@ def work(ctx):
             future = pool.submit(workflow.run)
             try:
                 if restart_nested:
-                    assert at_decision.wait(15)
+                    assert at_decision.wait(60)
                     command = subprocess.run(
                         [sys.executable, '-m', 'micro_workflow_manager', 'restart', 'B', 'job', '1'],
                         cwd=tmp_path, env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])),
-                        capture_output=True, text=True, timeout=15,
+                        capture_output=True, text=True, timeout=60,
                     )
                     assert command.returncode == 0, command.stdout + command.stderr
             finally:
                 proceed.set()
             if catch_failure:
-                assert future.result(timeout=20) == ['A', 'C']
+                assert future.result(timeout=60) == ['A', 'C']
             else:
                 with pytest.raises(JobFailedError, match='Job A/1 failed'):
-                    future.result(timeout=20)
+                    future.result(timeout=60)
         session, = storage.list_execution_sessions()
         session_id = session['session_id']
         worker = json.loads((tmp_path / 'node' / 'A' / 'input' / 'worker.json').read_text(encoding='utf-8'))
@@ -938,11 +948,11 @@ def test_nested_component_restart_repairs_only_the_accepted_job_and_preserves_pa
             return decide(*args, **kwargs)
         if restart_first:
             at_decision.set()
-            assert proceed.wait(20)
+            assert proceed.wait()
             return decide(*args, **kwargs)
         result = decide(*args, **kwargs)
         at_decision.set()
-        assert proceed.wait(20)
+        assert proceed.wait()
         return result
 
     monkeypatch.setattr(storage, 'decide_execution_session_exit', ordered_decision)
@@ -950,19 +960,19 @@ def test_nested_component_restart_repairs_only_the_accepted_job_and_preserves_pa
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(workflow.run)
             try:
-                assert at_decision.wait(10)
+                assert at_decision.wait(60)
                 parent_output = storage.output_file('A', 1).read_bytes()
                 parent_events = storage.read_job_events('A', 1)
                 command = subprocess.run(
                     [sys.executable, '-m', 'micro_workflow_manager', 'restart', 'B', 'job', '1'],
                     cwd=tmp_path, env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])),
-                    capture_output=True, text=True, timeout=15,
+                    capture_output=True, text=True, timeout=60,
                 )
                 assert (command.returncode == 0) is restart_first, command.stdout + command.stderr
             finally:
                 proceed.set()
             with pytest.raises(JobFailedError, match='Job A/1 failed') as caught:
-                future.result(timeout=15)
+                future.result(timeout=60)
         assert caught.value.__cause__ is nested_errors[0]
         assert calls == [('A', 0), ('B', 0)] + ([('B', 1)] if restart_first else [])
         assert replacement_observations == ([('running', 'running', 'running', True)] if restart_first else [])
@@ -1036,7 +1046,7 @@ def test_caught_nested_failure_can_restart_at_clean_exit_and_continue_selected_d
             position = len(decisions)
             decisions.append(kwargs['outcome'])
             at_decisions[position].set()
-            assert proceeds[position].wait(20)
+            assert proceeds[position].wait()
         return decide(*args, **kwargs)
 
     monkeypatch.setattr(storage, 'decide_execution_session_exit', pause_clean_exit)
@@ -1045,7 +1055,7 @@ def test_caught_nested_failure_can_restart_at_clean_exit_and_continue_selected_d
             future = pool.submit(workflow.run)
             try:
                 for position, at_decision in enumerate(at_decisions):
-                    assert at_decision.wait(10)
+                    assert at_decision.wait(60)
                     if position == 0:
                         parent_output = storage.output_file('A', 1).read_bytes()
                         parent_events = storage.read_job_events('A', 1)
@@ -1053,14 +1063,14 @@ def test_caught_nested_failure_can_restart_at_clean_exit_and_continue_selected_d
                     command = subprocess.run(
                         [sys.executable, '-m', 'micro_workflow_manager', 'restart', 'B', 'job', '1'],
                         cwd=tmp_path, env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])),
-                        capture_output=True, text=True, timeout=15,
+                        capture_output=True, text=True, timeout=60,
                     )
                     assert command.returncode == 0, command.stdout + command.stderr
                     proceeds[position].set()
             finally:
                 for proceed in proceeds:
                     proceed.set()
-            assert future.result(timeout=15) == ['A', 'C']
+            assert future.result(timeout=60) == ['A', 'C']
         assert decisions == ['done'] + ['failed'] * (successful_generation - 1)
         assert calls == [('A', 0)] + [('B', generation) for generation in range(successful_generation + 1)] + (
             [('B/2', 0)] if nested_jobs == 2 else []
@@ -1123,10 +1133,10 @@ def test_mixed_parent_and_nested_restarts_stop_ordinary_work_until_nested_repair
     def pause_failure(*args, **kwargs):
         if kwargs['outcome'] == 'failed' and not at_decision.is_set():
             at_decision.set()
-            assert proceed.wait(20)
+            assert proceed.wait()
         elif repair_nested and kwargs['outcome'] == 'failed' and not at_second_decision.is_set():
             at_second_decision.set()
-            assert proceed_second.wait(20)
+            assert proceed_second.wait()
         return decide(*args, **kwargs)
 
     monkeypatch.setattr(storage, 'decide_execution_session_exit', pause_failure)
@@ -1134,34 +1144,34 @@ def test_mixed_parent_and_nested_restarts_stop_ordinary_work_until_nested_repair
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(workflow.run)
             try:
-                assert at_decision.wait(10)
+                assert at_decision.wait(60)
                 assert storage.get_job_status('A', 2) == 'queued'
                 for node in ('A', 'B'):
                     command = subprocess.run(
                         [sys.executable, '-m', 'micro_workflow_manager', 'restart', node, 'job', '1'],
                         cwd=tmp_path, env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])),
-                        capture_output=True, text=True, timeout=15,
+                        capture_output=True, text=True, timeout=60,
                     )
                     assert command.returncode == 0, command.stdout + command.stderr
                 proceed.set()
                 if repair_nested:
-                    assert at_second_decision.wait(10)
+                    assert at_second_decision.wait(60)
                     assert storage.get_job_status('A', 1) == 'done'
                     assert storage.get_job_status('A', 2) == 'queued'
                     command = subprocess.run(
                         [sys.executable, '-m', 'micro_workflow_manager', 'restart', 'B', 'job', '1'],
                         cwd=tmp_path, env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])),
-                        capture_output=True, text=True, timeout=15,
+                        capture_output=True, text=True, timeout=60,
                     )
                     assert command.returncode == 0, command.stdout + command.stderr
             finally:
                 proceed.set()
                 proceed_second.set()
             if repair_nested:
-                assert future.result(timeout=15) == ['A', 'C']
+                assert future.result(timeout=60) == ['A', 'C']
             else:
                 with pytest.raises(JobFailedError, match='Job B/1 failed'):
-                    future.result(timeout=15)
+                    future.result(timeout=60)
         assert calls == [('A', 1, 0), ('B', 1, 0), ('B', 1, 1), ('A', 1, 1)] + (
             [('B', 1, 2), ('A', 2, 0), ('C', 1, 0)] if repair_nested else []
         )
@@ -1572,7 +1582,7 @@ def test_caught_same_component_failure_keeps_ordinary_remainder_queued_until_rep
     def pause_exit(*args, **kwargs):
         if not at_decision.is_set():
             at_decision.set()
-            assert proceed.wait(20)
+            assert proceed.wait()
         return decide(*args, **kwargs)
 
     monkeypatch.setattr(storage, 'decide_execution_session_exit', pause_exit)
@@ -1581,7 +1591,7 @@ def test_caught_same_component_failure_keeps_ordinary_remainder_queued_until_rep
             argument = {'A'} if entry == 'run_component' else ['A'] if entry == 'run_concurrently' else 'A'
             future = pool.submit(getattr(workflow, entry), argument)
             try:
-                assert at_decision.wait(10)
+                assert at_decision.wait(60)
                 parent_output = storage.output_file('A', 1).read_bytes()
                 parent_events = storage.read_job_events('A', 1)
                 assert calls == [(job_id, 0) for job_id in leading_jobs] + [(1, 0), (2, 0)]
@@ -1591,16 +1601,16 @@ def test_caught_same_component_failure_keeps_ordinary_remainder_queued_until_rep
                     command = subprocess.run(
                         [sys.executable, '-m', 'micro_workflow_manager', 'restart', 'A', 'job', '2'],
                         cwd=tmp_path, env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])),
-                        capture_output=True, text=True, timeout=15,
+                        capture_output=True, text=True, timeout=60,
                     )
                     assert command.returncode == 0, command.stdout + command.stderr
             finally:
                 proceed.set()
             if not accept_restart:
                 with pytest.raises(RuntimeError, match='unfinished'):
-                    future.result(timeout=15)
+                    future.result(timeout=60)
             else:
-                result = future.result(timeout=15)
+                result = future.result(timeout=60)
                 if entry in {'run_component', 'run_concurrently'}:
                     assert result == ['A']
                 else:

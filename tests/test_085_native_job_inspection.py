@@ -63,9 +63,7 @@ def test_job_inspection_reports_exact_native_owner_independently_of_trace(workfl
     def obsolete_reader():
         raise AssertionError('Job inspection guessed a singleton owner')
 
-    monkeypatch.setattr(storage, 'get_run_state', obsolete_reader)
     monkeypatch.setattr(storage, 'get_live_main_session', obsolete_reader)
-    monkeypatch.setattr(storage, 'get_live_execution_session', obsolete_reader)
     assert inspect_command(workflow, 'A', 1) == 0
     output = capsys.readouterr().out
     assert f'job instance: {instance}' in output

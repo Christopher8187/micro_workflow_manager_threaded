@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import networkx as nx
+import os
 import pytest
+import socket
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -9,7 +11,8 @@ from threading import Barrier
 from micro_workflow_manager import cli
 from micro_workflow_manager.cli.project import load_workflow
 from micro_workflow_manager.cli.run_commands import run_from
-from micro_workflow_manager.models import Job
+from micro_workflow_manager.models import Job, now
+from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.topology import ComponentTopology
 from tests.test_036_hoeflein_scheduling import make_project
@@ -18,10 +21,24 @@ from tests.test_090_component_session_settlement import _close, _rows
 from tests.test_093_native_cli_readiness import _node_files
 
 
-def _fresh_owner(tmp_path):
+def _fresh_owner(tmp_path, *, historical_origin=None):
     storage = FileStorage._create_new_project_state(tmp_path)
     snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
     storage.register_component_topology(snapshot)
+    if historical_origin is not None:
+        _session(storage, historical_origin, 'interrupt', ('A',), snapshot)
+        assert storage.reserve_execution_components(
+            historical_origin, expected_shape=snapshot.shape_json,
+        ) is True
+        assert storage.db_connection().execute(
+            'SELECT scope_admitted FROM execution_sessions WHERE session_id=?',
+            (historical_origin,),
+        ).fetchone()[0] == 1
+        assert storage.finish_execution_session(
+            historical_origin, outcome='done', finished_at='2026-09-06T12:00:00+00:00',
+        ) is True
+        assert storage.release_execution_components(historical_origin) == 1
+        assert storage.get_component_reservation(('A',)) is None
     _session(storage, 'fresh-main', 'main', ('A',), snapshot)
     storage.reserve_execution_components('fresh-main', expected_shape=snapshot.shape_json)
     return storage, snapshot
@@ -250,10 +267,8 @@ def test_competing_full_preparation_completions_have_one_winner(tmp_path):
 
 @pytest.mark.parametrize('lifecycle', ['done', 'sampled'])
 def test_full_preparation_clears_established_interrupt_lineage(tmp_path, lifecycle):
-    storage, snapshot = _fresh_owner(tmp_path)
+    storage, snapshot = _fresh_owner(tmp_path, historical_origin='old-interrupt')
     try:
-        _session(storage, 'old-interrupt', 'interrupt', ('B',), snapshot)
-        storage.finish_execution_session('old-interrupt', outcome='done', finished_at='2026-09-06T12:00:00+00:00')
         _seed_state(
             storage, ('A',), lifecycle=lifecycle, stability='unstable',
             origin='old-interrupt', generation=0, misaligned=1,
@@ -287,7 +302,13 @@ def test_reset_refuses_every_live_session_without_mutating_the_project(tmp_path,
     storage = FileStorage(tmp_path)
     try:
         snapshot = ComponentTopology(nx.DiGraph([('A', 'B')]), []).snapshot()
-        _session(storage, 'other-live', kind, ('B',), snapshot)
+        identity = process_identity(os.getpid())
+        assert identity
+        storage.create_execution_session(
+            'other-live', session_kind=kind, command='resume', start_component=('B',),
+            selected_components=[('B',)], started_at=now(), hostname=socket.gethostname(),
+            pid=os.getpid(), process_identity=identity, expected_shape=snapshot.shape_json,
+        )
         before, files = _rows(storage), _node_files(tmp_path)
         assert cli.main(['reset', 'A', '--yes']) == 1
         assert _rows(storage) == before

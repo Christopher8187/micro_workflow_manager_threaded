@@ -38,21 +38,24 @@ def print_run_plan(
     keep_trace: bool = False,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
+    interrupt_preflight=None,
 ) -> int:
-    if selected_jobs is not None:
-        nodes = [node]
-        companions: list[str] = []
-        blockers = set(workflow.graph_obj.predecessors(node)) if not workflow.node_ready(node) else set()
-    else:
-        nodes, companions, blockers = _selection(root, workflow, command, node)
-
+    nodes, companions, blockers = _selection(root, workflow, command, node)
+    component = workflow.component_key(workflow.component_for(node))
+    stopped = (interrupt_preflight is not None
+               and component in interrupt_preflight.blocked_components)
     fresh = command in {"run", "runfrom"}
     print(f"Plan for: mwf {command} {node}")
-    print("  mode: " + (
-        "fresh rerun; fully reset the start component and rebuild selected-producer work in descendants"
-        if fresh
-        else "preserve done/skipped jobs and continue queued or unsuccessful work"
-    ))
+    if stopped:
+        mode = 'selected jobs remain unchanged'
+    elif selected_jobs is not None and fresh:
+        mode = 'freshen selected jobs and remove work produced by their previous executions'
+    else:
+        mode = ("fresh rerun; fully reset the start component and rebuild selected-producer work in descendants"
+                if fresh else "preserve done/skipped jobs and continue queued or unsuccessful work")
+    print("  mode: " + mode)
+    if stopped:
+        print('  preparation stopped before component {' + ', '.join(component) + '}')
     if selected_jobs is not None:
         print("  selected jobs:")
         for job_id in selected_jobs:
@@ -92,7 +95,12 @@ def print_run_plan(
             print("  reset scope: unchanged; every selected runfrom component is still freshened")
         else:
             print("  resume scope: unchanged; later selected work remains queued for a future resume")
-    if command == "resume":
+    if stopped:
+        trace_mode = "preserve all affected trace journals"
+    elif selected_jobs is not None and fresh:
+        trace_mode = ("preserve all affected trace journals" if keep_trace
+                      else "clear selected-job traces and removed causal-descendant traces")
+    elif command == "resume":
         trace_mode = "preserve the current component trace journal"
     elif command == "resumefrom" and not keep_trace:
         trace_mode = "preserve the start component trace; clear descendant traces"

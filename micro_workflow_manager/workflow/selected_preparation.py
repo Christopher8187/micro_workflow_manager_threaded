@@ -6,6 +6,7 @@ from ..storage.preparation_execution import prepare_component_unit
 from ..storage.preparation_guards import hold_preparation_guards
 from ..storage.selected_preparation import read_selected_preparation_footprint
 from .preparation import observe_programmatic_fresh_preparation
+from .interrupt_execution import frozen_component_readiness
 
 
 def _normalize_selected_addresses(storage, addresses):
@@ -49,7 +50,11 @@ def prepare_selected_addresses(
         else:
             if context[2] != snapshot.shape_json or set(context[1].values()) != {component}:
                 raise RuntimeError('Selected preparation component changed after admission')
-            observed = observe_programmatic_fresh_preparation(workflow, selected_nodes)
+            frozen = frozen_component_readiness(workflow, component)
+            observed = observe_programmatic_fresh_preparation(
+                workflow, selected_nodes,
+                interrupt_component=component if frozen is not None else None,
+            )
             if selection is not None and observed != selection:
                 raise RuntimeError('Selected preparation changed after admission')
             roots = tuple(storage._read_session_job_roots(storage.db_connection(), session_id))
@@ -66,7 +71,7 @@ def prepare_selected_addresses(
             )
         finally:
             connection.execute('RELEASE SAVEPOINT mwf_selected_preparation_observation')
-        with hold_preparation_guards(storage, footprint, session_id, {component: expected}) as guard_id:
+        with hold_preparation_guards(storage, footprint, session_id, {component: expected}, operation=operation) as guard_id:
             return prepare_component_unit(
                 storage, root, footprint.units[0], expected, session_id, guard_id, operation,
                 keep_trace=keep_trace, selected_footprint=footprint,

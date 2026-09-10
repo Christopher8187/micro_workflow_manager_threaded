@@ -37,6 +37,8 @@ the question. It does not need a skill.
 | Apply a known architecture change to an existing project | Use `mwf-modify-architecture`. |
 | Assess or broadly improve an existing architecture | Start with `mwf-analyze-architecture`. Apply a selected recommendation only after the user asks. |
 | Test MWF or a project built with MWF | Use `mwf-test`. |
+| Run, resume, reset, interrupt, sample, or isolate MWF work | Use `mwf-run-workflow`. |
+| Debug, diagnose, inspect input, trace lineage, or investigate component and session state | Use `mwf-debug-workflow`. |
 | Create or update an MWF project's documentation | Use `mwf-document-workflow`. |
 
 Architecture skills divide work by intent. Each may need graph, node, and task

@@ -1,23 +1,104 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from threading import Event
 
 import pytest
 
 from micro_workflow_manager import MicroWorkflow
+from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.file_systems import NodeInputFileSystem
-from micro_workflow_manager.storage import preparation_files
 from micro_workflow_manager.storage.preparation_receipts import PreparationReceipt
+from micro_workflow_manager.storage.preparation_staging import PreparationStaging
 from tests.test_090_component_session_settlement import _close, _rows
 from tests.test_105_preparation_receiver_guards import _established_workflow, _files, _run_preparation
 
 
 def _business_rows(storage):
     rows = _rows(storage)
-    for table in ('preparation_receipts', 'receiver_mutation_guards'):
+    for table in ('preparation_attempts', 'preparation_receipts', 'receiver_mutation_guards'):
         rows.pop(table)
     return rows
+
+
+def _preparation_metadata(storage):
+    rows = _rows(storage)
+    return {
+        table: rows[table]
+        for table in ('preparation_attempts', 'preparation_receipts', 'receiver_mutation_guards')
+    }
+
+
+def _assert_new_preparation_outcome(
+    storage,
+    before,
+    *,
+    receipt_state,
+    attempt_state,
+    guarded,
+):
+    after = _preparation_metadata(storage)
+    receipt_ids = {row['operation_id'] for row in before['preparation_receipts']}
+    attempt_ids = {row['operation_id'] for row in before['preparation_attempts']}
+    assert [
+        row for row in after['preparation_receipts'] if row['operation_id'] in receipt_ids
+    ] == before['preparation_receipts']
+    assert [
+        row for row in after['preparation_attempts'] if row['operation_id'] in attempt_ids
+    ] == before['preparation_attempts']
+    receipt, = [
+        row for row in after['preparation_receipts'] if row['operation_id'] not in receipt_ids
+    ]
+    attempt, = [
+        row for row in after['preparation_attempts'] if row['operation_id'] not in attempt_ids
+    ]
+    assert receipt['state'] == receipt_state
+    assert (
+        receipt['operation'], receipt['component_key'], receipt['session_id'],
+    ) == ('reset', encode_component_key(('A',)), None)
+    assert attempt['operation_id'] == receipt['guard_id']
+    assert attempt['state'] == attempt_state
+    assert attempt['session_id'] == receipt['session_id']
+    assert type(attempt['owner_pid']) is int and attempt['owner_pid'] > 0
+    assert all(attempt[field] for field in ('process_identity', 'hostname', 'started_at', 'heartbeat_at'))
+    assert attempt['started_at'] == attempt['heartbeat_at']
+    receivers = json.loads(attempt['receivers_json'])
+    affected = json.loads(attempt['affected_nodes_json'])
+    assert receivers == sorted(set(receivers))
+    assert affected == sorted(set(affected))
+    assert set(receivers) <= set(affected)
+    manifest = json.loads(receipt['manifest_json'])
+    assert manifest['receivers'] == affected
+    assert {effect['receiver'] for effect in manifest['effects']} == {'B'}
+    assert {effect['kind'] for effect in manifest['effects']} == {'managed-input', 'managed-job'}
+    guards = [
+        row for row in after['receiver_mutation_guards']
+        if row['operation_id'] == attempt['operation_id']
+    ]
+    historical_guards = [
+        row for row in after['receiver_mutation_guards']
+        if row['operation_id'] in attempt_ids
+    ]
+    assert historical_guards == before['receiver_mutation_guards']
+    assert len(after['receiver_mutation_guards']) == len(historical_guards) + len(guards)
+    if guarded:
+        assert [guard['receiver_node'] for guard in guards] == receivers
+        assert all(
+            (
+                guard['session_id'], guard['owner_pid'],
+                guard['process_identity'], guard['hostname'],
+            ) == (
+                attempt['session_id'], attempt['owner_pid'],
+                attempt['process_identity'], attempt['hostname'],
+            )
+            for guard in guards
+        )
+        assert attempt['finished_at'] is None
+    else:
+        assert guards == []
+        assert attempt['finished_at'] is not None
+    return receipt, attempt, guards, after
 
 
 def _refuse_deletion(storage, artifact):
@@ -64,11 +145,13 @@ def test_sql_failure_restores_owned_inputs_jobs_and_selected_component(tmp_path,
     try:
         _refuse_deletion(storage, artifact)
         before = _business_rows(storage), _files(tmp_path / 'node')
-        receipts = {row['operation_id'] for row in _rows(storage)['preparation_receipts']}
+        metadata = _preparation_metadata(storage)
         with pytest.raises(sqlite3.IntegrityError, match='injected preparation deletion failure'):
             _run_preparation(tmp_path, workflow, 'reset')
         assert (_business_rows(storage), _files(tmp_path / 'node')) == before
-        new_receipt, = [row for row in _rows(storage)['preparation_receipts'] if row['operation_id'] not in receipts]
+        new_receipt, _, _, _ = _assert_new_preparation_outcome(
+            storage, metadata, receipt_state='aborted', attempt_state='aborted', guarded=False,
+        )
         assert new_receipt['state'] == 'aborted'
         assert _rows(storage)['receiver_mutation_guards'] == []
         assert not (tmp_path / '.mwf' / 'preparation-trash').exists()
@@ -82,7 +165,7 @@ def test_unknown_preparation_outcome_retains_files_receipt_and_guard_for_recover
     try:
         _refuse_deletion(storage, 'input')
         before = _business_rows(storage)
-        receipts = {row['operation_id'] for row in _rows(storage)['preparation_receipts']}
+        metadata = _preparation_metadata(storage)
 
         def unavailable(receipt):
             raise OSError('receipt outcome temporarily unreadable')
@@ -91,8 +174,10 @@ def test_unknown_preparation_outcome_retains_files_receipt_and_guard_for_recover
         with pytest.raises(sqlite3.IntegrityError, match='injected preparation deletion failure') as caught:
             _run_preparation(tmp_path, workflow, 'reset')
         assert _business_rows(storage) == before
-        receipt, = [row for row in _rows(storage)['preparation_receipts'] if row['operation_id'] not in receipts]
-        guard, = _rows(storage)['receiver_mutation_guards']
+        receipt, _, guards, interrupted = _assert_new_preparation_outcome(
+            storage, metadata, receipt_state='prepared', attempt_state='interrupted', guarded=True,
+        )
+        guard, = guards
         assert receipt['state'] == 'prepared'
         assert guard['receiver_node'] == 'B' and guard['operation_id'] == receipt['guard_id']
         saved = tmp_path / '.mwf' / 'preparation-trash' / receipt['operation_id']
@@ -104,6 +189,7 @@ def test_unknown_preparation_outcome_retains_files_receipt_and_guard_for_recover
         with pytest.raises(RuntimeError, match='unfinished preparation'):
             _run_preparation(tmp_path, workflow, 'reset')
         assert _business_rows(storage) == before
+        assert _preparation_metadata(storage) == interrupted
     finally:
         _close(storage)
 
@@ -123,15 +209,22 @@ def test_postcommit_cleanup_interrupt_preserves_original_notification_error(tmp_
             raise original
         return notify()
 
-    def fail_cleanup(path, *args, **kwargs):
-        raise cleanup_error
+    cleanup_calls = []
+    remove_recorded = PreparationStaging._remove_recorded_tree
+
+    def fail_cleanup(files, relative, expected):
+        if not cleanup_calls and (files.root / relative).exists():
+            assert relative.startswith(files.relative + '/')
+            cleanup_calls.append(relative)
+            raise cleanup_error
+        return remove_recorded(files, relative, expected)
 
     monkeypatch.setattr(storage, 'notify_state_change', fail_notification)
-    monkeypatch.setattr(preparation_files.shutil, 'rmtree', fail_cleanup)
+    monkeypatch.setattr(PreparationStaging, '_remove_recorded_tree', fail_cleanup)
     try:
         with pytest.raises((OSError, KeyboardInterrupt)) as caught:
             _run_preparation(tmp_path, workflow, 'reset')
-        assert caught.value is original and injected == [True]
+        assert caught.value is original and injected == [True] and len(cleanup_calls) == 1
         assert any(str(cleanup_error) in note for note in original.__notes__)
         assert storage.get_component_state(('A',)) == dict(
             before_a, lifecycle='queued', stability=None, instability_origin=None,
@@ -154,6 +247,7 @@ def test_repeated_interrupts_drain_exact_preparation_decision_before_file_resolu
     submit = storage.submit_db_mutation
     waits = []
     before = _business_rows(storage), _files(tmp_path / 'node')
+    metadata = _preparation_metadata(storage)
     before_a = storage.get_component_state(('A',))
 
     class InterruptedWait:
@@ -193,6 +287,10 @@ def test_repeated_interrupts_drain_exact_preparation_decision_before_file_resolu
             _run_preparation(tmp_path, workflow, 'reset')
         assert caught.value is original and len(waits) >= 2
         assert _rows(storage)['receiver_mutation_guards'] == []
+        expected = 'committed' if outcome == 'commit' else 'aborted'
+        _assert_new_preparation_outcome(
+            storage, metadata, receipt_state=expected, attempt_state=expected, guarded=False,
+        )
         if outcome == 'rollback':
             assert (_business_rows(storage), _files(tmp_path / 'node')) == before
         else:

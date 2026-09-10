@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from .models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, WAITING
-from .api_limits import allocate_api_capacity
+from .node_observation import node_observation
 
 STATUSES = [QUEUED, RUNNING, DONE, FAILED, SKIPPED, CANCELLED]
 TERMINAL = {DONE, FAILED, SKIPPED, CANCELLED}
@@ -53,24 +53,20 @@ def _duration(row: dict[str, Any]) -> float | None:
         return float(value)
     return None
 
-def _max_parallel_jobs(workflow, node_name: str) -> int:
-    node = workflow.nodes.get(node_name)
-    if node is None:
-        return 1
-    return workflow.effective_max_threads(node_name)
-
 def node_stats(
     workflow,
     node_name: str,
     *,
     summary: dict[str, Any] | None = None,
     max_parallel_jobs: int | None = None,
+    observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Fast path: use FileStorage's per-node job index. This makes monitor
     # snapshots O(number of nodes + running jobs), not O(all job folders/status
     # files). On large cyclic autostart runs, the old monitor could itself
     # compete with the runner by rereading 10k+ status files every refresh.
     summary = summary or workflow.storage.node_job_summary(node_name)
+    observation = observation or node_observation(workflow, node_name)
     counts = {status: 0 for status in STATUSES}
     counts.update(summary.get("counts") or {})
 
@@ -92,7 +88,7 @@ def node_stats(
     failed = counts.get(FAILED, 0)
     avg_duration = summary.get("avg_duration_seconds")
     max_parallel = (
-        _max_parallel_jobs(workflow, node_name)
+        observation["requested_max_threads"]
         if max_parallel_jobs is None
         else max(1, int(max_parallel_jobs))
     )
@@ -104,31 +100,9 @@ def node_stats(
 
     progress = (completed / total * 100.0) if total else 0.0
 
-    stored_status = workflow.storage.get_node_status(node_name) or "missing"
-    waiting_on = sorted(workflow.waiting_blockers(node_name))
-    # Node-state files describe component lifecycle and can briefly be broader
-    # than the work actually executing in this node. For monitor display, job
-    # counts are the source of truth: queued work must not look running merely
-    # because a sibling pump is active, and a real running job must not be shown
-    # queued because of a concurrent component refresh.
-    if failed > 0 or stored_status == FAILED:
-        display_status = FAILED
-    elif counts.get(RUNNING, 0) > 0:
-        display_status = RUNNING
-    elif counts.get(QUEUED, 0) > 0:
-        display_status = WAITING if waiting_on else QUEUED
-    elif total > 0 and counts.get(CANCELLED, 0) > 0:
-        display_status = CANCELLED
-    elif total > 0 and completed == total:
-        display_status = DONE
-    elif total == 0 and stored_status == RUNNING:
-        display_status = QUEUED
-    else:
-        display_status = stored_status
-
     return {
+        **observation,
         "node": node_name,
-        "status": display_status,
         "total": total,
         "queued": counts.get(QUEUED, 0),
         "running": counts.get(RUNNING, 0),
@@ -143,47 +117,48 @@ def node_stats(
         "completed_last_60_seconds": int(summary.get("completed_last_60_seconds") or 0),
         "eta_seconds": eta_seconds,
         "max_parallel_jobs": max_parallel,
-        "declared_max_threads": getattr(workflow.nodes.get(node_name), "max_threads", 1),
-        "thread_override": workflow.thread_override(node_name),
         "running_jobs": sorted(running_jobs),
         "running_elapsed_seconds": running_elapsed,
-        "waiting_on": waiting_on,
     }
 
 def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any]:
     selected = list(nodes) if nodes is not None else list(workflow.graph_obj.nodes)
     sessions = workflow.storage.list_execution_sessions()
     summaries = workflow.storage.node_job_summaries(selected)
+    observations = {
+        node: node_observation(workflow, node) for node in workflow.graph_obj.nodes
+    }
     api_node_names = {
         node_name
-        for node_name in selected
+        for node_name in observations
         if node_name in workflow.nodes
         and (workflow.nodes[node_name].runner_override or workflow.runner) == "api"
     }
     api_total = workflow.api_total_limit_override()
     requested_api_limits = {
-        node_name: workflow.requested_max_threads(node_name)
+        node_name: observations[node_name]["requested_max_threads"]
         for node_name in api_node_names
     }
     active_api_nodes = {
         node_name
         for node_name in api_node_names
-        if int(((summaries.get(node_name) or {}).get("counts") or {}).get(RUNNING, 0)) > 0
-        or workflow.storage.get_node_status(node_name) == RUNNING
+        if observations[node_name]["state"] == RUNNING
     }
-    active_api_limits = allocate_api_capacity(
-        {name: requested_api_limits[name] for name in active_api_nodes},
-        api_total,
+    active_requested_capacity = sum(
+        requested_api_limits[name] for name in active_api_nodes
+    )
+    active_capacity = (
+        active_requested_capacity if api_total is None
+        else min(active_requested_capacity, api_total)
     )
     node_rows = [
         node_stats(
             workflow,
             node,
             summary=summaries.get(node),
+            observation=observations[node],
             max_parallel_jobs=(
-                active_api_limits.get(node, requested_api_limits[node])
-                if node in api_node_names
-                else None
+                requested_api_limits[node] if node in api_node_names else None
             ),
         )
         for node in selected
@@ -216,8 +191,8 @@ def workflow_snapshot(workflow, nodes: list[str] | None = None) -> dict[str, Any
     api_runtime = {
         "mode": "cooperative",
         "aggregate_limit": api_total,
-        "declared_capacity": sum(requested_api_limits.values()),
-        "active_capacity": sum(active_api_limits.values()),
+        "requested_capacity": sum(requested_api_limits.values()),
+        "active_capacity": active_capacity,
         "running": sum(row["running"] for row in api_rows),
         "queued": sum(row["queued"] for row in api_rows),
         "completed_last_60_seconds": sum(

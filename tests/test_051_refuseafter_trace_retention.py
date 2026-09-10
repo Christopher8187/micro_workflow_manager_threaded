@@ -556,13 +556,51 @@ def test_preserved_recreated_job_records_and_renders_origin_changed(
     events = storage.read_job_events("T", 1)
     changed = [event for event in events if event.get("event") == "origin_changed"]
     assert len(changed) == 1
-    assert changed[0]["previous_parent"] == {"from_node": "P", "from_job_id": 4}
-    assert changed[0]["current_parent"] == {"from_node": "Q", "from_job_id": 9}
-    assert changed[0]["previous_origin"]["producer_component"] == ["P"]
-    assert changed[0]["current_origin"]["producer_component"] == ["Q"]
+    assert {key: value for key, value in changed[0].items() if key != "time"} == {
+        "event": "origin_changed",
+        "previous_origin": {
+            "parent": {"from_node": "P", "from_job_id": 4},
+            "producer_component": ["P"],
+            "job_kind": "component",
+        },
+        "current_origin": {
+            "parent": {"from_node": "Q", "from_job_id": 9},
+            "producer_component": ["Q"],
+            "job_kind": "component",
+        },
+    }
 
     assert trace_command(workflow, "T", 1) == 0
     output = capsys.readouterr().out
     assert "ORIGIN CHANGED" in output
     assert "Previous: P job 4" in output
     assert "Current: Q job 9" in output
+    assert "Previous producer component: {P}" in output
+    assert "Current producer component: {Q}" in output
+    assert "Previous job kind: component" in output
+    assert "Current job kind: component" in output
+
+
+def test_malformed_current_origin_is_rendered_without_parent_only_reconstruction(
+    tmp_path,
+    capsys,
+):
+    workflow = MicroWorkflow(tmp_path, runner="direct")
+    workflow.graph([("A", "B")])
+    storage = workflow.storage
+    try:
+        storage.create_job(Job(job_id=1, node_name="A", params={}))
+        storage.append_job_event(
+            "A",
+            1,
+            "origin_changed",
+            previous_origin="damaged origin",
+            current_origin=None,
+        )
+
+        assert trace_command(workflow, "A", 1) == 0
+        output = capsys.readouterr().out
+        assert 'Previous: "damaged origin"' in output
+        assert "Current: null" in output
+    finally:
+        storage.close_database_connections()

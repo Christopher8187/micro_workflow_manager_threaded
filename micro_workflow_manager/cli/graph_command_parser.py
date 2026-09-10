@@ -4,7 +4,12 @@ import argparse
 
 from .constants import RUNNER_CHOICES
 from .descriptions import COMMAND_HELP_DESCRIPTIONS
-from .parser_options import add_destructive_arguments, add_keeptrace_argument, add_stats_arguments
+from .parser_options import (
+    add_destructive_arguments,
+    add_interrupt_arguments,
+    add_keeptrace_argument,
+    add_stats_arguments,
+)
 
 
 def add_between_commands(commands):
@@ -23,3 +28,4 @@ def add_between_commands(commands):
             command.add_argument('--plan', action='store_true', help='Show the interval without changing project state.')
             add_keeptrace_argument(command)
             add_stats_arguments(command)
+            add_interrupt_arguments(command)

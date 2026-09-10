@@ -1,5 +1,10 @@
 # MWF 0.6.2 architectural decisions
 
+The later [workflow and clipboard decisions approved on 2026-09-08](approved-clarifications-20260908.md)
+use identifiers MQ20260908-1 through MQ20260908-7. They resolve sampled interrupt
+resume, later fence authority, ordinary stopping, and native clipboard behavior
+without reusing this document's AQ1 through AQ6 or Q7 through Q10 identifiers.
+
 Christopher approved the recommendations for AQ1 through AQ6 on 2026-09-05
 with “Use all six recommendations.” The exact supplemental approval is Parent
 Repo `testing_ground/issue-45/approved-architecture-decisions-20260905.md`.

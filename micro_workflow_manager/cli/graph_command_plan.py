@@ -27,8 +27,9 @@ def _state_text(state):
     return result
 
 
-def render_graph_command_plan(observation, *, command_line=None) -> str:
+def render_graph_command_plan(observation, *, command_line=None, blocked_components=()) -> str:
     selection = observation.selection
+    blocked_components = frozenset(blocked_components)
     disposition = "requested" if selection.operation == "reset" else "planned"
     lines = [
         f"Plan for: mwf {command_line or selection.command}",
@@ -36,6 +37,9 @@ def render_graph_command_plan(observation, *, command_line=None) -> str:
         + ", ".join(_component(component) for component in selection.components),
         "  selected nodes: " + ", ".join(selection.nodes),
     ]
+    if observation.interrupt_start_component is not None:
+        lines.append('  explicit interrupt start component ' + _component(observation.interrupt_start_component))
+        lines.append('  predecessor readiness may be overridden for this start; descendants use normal readiness')
     if selection.excluded_end_component is not None:
         lines.append("  excluded end component: " + _component(selection.excluded_end_component))
     lines.extend((
@@ -50,7 +54,9 @@ def render_graph_command_plan(observation, *, command_line=None) -> str:
         lines.append('  ' + line)
     for state in observation.selected_states:
         lines.append(f"    {_component(state.component)}: {_state_text(state)}")
-        if selection.operation in {"run", "reset"} and state.lifecycle is not None:
+        if state.component in blocked_components:
+            lines.append(f"      preparation stopped before component {_component(state.component)}")
+        elif selection.operation in {"run", "reset"} and state.lifecycle is not None:
             lines.append(
                 "      fresh preparation would queue alignment generation "
                 + str(max(state.alignment_generation, floors.get(state.component) or 0) + 1)

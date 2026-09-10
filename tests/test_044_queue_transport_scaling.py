@@ -215,13 +215,15 @@ def test_supervised_completion_wave_releases_file_fence_before_group_commit(
     release: Future[None] = Future()
     all_entered = threading.Event()
     entered = 0
+    entered_lock = threading.Lock()
 
-    @workflow.task("A", runner="api", max_threads=count, timeout=30)
+    @workflow.task("A", runner="api", max_threads=count, timeout=90)
     def run_a(ctx, value):
         nonlocal entered
-        entered += 1
-        if entered == count:
-            all_entered.set()
+        with entered_lock:
+            entered += 1
+            if entered == count:
+                all_entered.set()
         release.result()
         return value
 
@@ -234,6 +236,7 @@ def test_supervised_completion_wave_releases_file_fence_before_group_commit(
 
     active_fences = 0
     peak_fences = 0
+    fence_count_lock = threading.Lock()
     original = workflow.storage.filesystem_interprocess_lock
 
     @contextmanager
@@ -241,13 +244,15 @@ def test_supervised_completion_wave_releases_file_fence_before_group_commit(
         nonlocal active_fences, peak_fences
         with original(namespace, name):
             if namespace == "execution-fences":
-                active_fences += 1
-                peak_fences = max(peak_fences, active_fences)
+                with fence_count_lock:
+                    active_fences += 1
+                    peak_fences = max(peak_fences, active_fences)
             try:
                 yield
             finally:
                 if namespace == "execution-fences":
-                    active_fences -= 1
+                    with fence_count_lock:
+                        active_fences -= 1
 
     monkeypatch.setattr(
         workflow.storage,
@@ -255,17 +260,63 @@ def test_supervised_completion_wave_releases_file_fence_before_group_commit(
         counted_fence,
     )
 
-    worker = threading.Thread(
-        target=lambda: workflow.run_node("A", ignore_readiness=True)
-    )
-    worker.start()
-    assert all_entered.wait(10)
-    release.set_result(None)
-    worker.join(timeout=20)
+    worker_errors = []
 
-    assert not worker.is_alive()
-    assert workflow.storage.job_status_counts("A")["done"] == count
-    assert peak_fences < 10
+    def run_worker():
+        try:
+            workflow.run_node("A", ignore_readiness=True)
+        except BaseException as error:
+            worker_errors.append(error)
+
+    worker = threading.Thread(target=run_worker)
+    worker.start()
+    body_error = None
+    try:
+        # This allowance includes native session admission, fresh preparation,
+        # claims, permits, attempt setup, and physical handler entry. The task's
+        # separate 90-second timeout begins at each handler entry.
+        entered_in_time = all_entered.wait(60)
+        with entered_lock:
+            observed_entered = entered
+        assert entered_in_time, f"only {observed_entered}/{count} jobs reached their handlers"
+        release.set_result(None)
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+        assert worker_errors == []
+        assert workflow.storage.job_status_counts("A")["done"] == count
+        with fence_count_lock:
+            observed_peak_fences = peak_fences
+        assert observed_peak_fences < 10
+    except BaseException as error:
+        body_error = error
+        raise
+    finally:
+        cleanup_errors = []
+        try:
+            if not release.done():
+                release.set_result(None)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            if worker.is_alive():
+                worker.join(timeout=60)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if worker.is_alive():
+            cleanup_errors.append(
+                AssertionError("Supervised completion-wave worker did not finish during cleanup")
+            )
+        else:
+            cleanup_errors.extend(worker_errors)
+            try:
+                workflow.storage.close_database_connections()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            if body_error is None:
+                raise cleanup_errors[0]
+            for error in cleanup_errors:
+                body_error.add_note(f"Cleanup also failed: {error!r}")
 
 
 def test_api_admission_and_terminal_commits_share_highest_runtime_priority(tmp_path, monkeypatch):
@@ -374,24 +425,62 @@ def test_asymmetric_hoeflein_wave_admits_large_nodes_and_drains_cleanly(tmp_path
             [{"value": value} for value in range(count)],
         )
 
-    worker = threading.Thread(
-        target=lambda: workflow.run_node("hub", ignore_readiness=True)
-    )
+    worker_errors = []
+
+    def run_worker():
+        try:
+            workflow.run_node("hub", ignore_readiness=True)
+        except BaseException as error:
+            worker_errors.append(error)
+
+    worker = threading.Thread(target=run_worker)
     worker.start()
+    body_error = None
     try:
-        assert all_entered.wait(10), (
+        # This is a setup allowance for native preparation and physical entry;
+        # every component job must still enter before the shared release.
+        assert all_entered.wait(60), (
             f"only {entered}/{total} component jobs reached their handlers"
         )
-    finally:
         release.set_result(None)
-        worker.join(timeout=20)
-
-    assert not worker.is_alive()
-    for node_name, count in distribution.items():
-        summary = workflow.storage.node_job_summary(node_name)["counts"]
-        assert summary["done"] == count
-        assert summary["queued"] == 0
-        assert summary["running"] == 0
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+        assert worker_errors == []
+        for node_name, count in distribution.items():
+            summary = workflow.storage.node_job_summary(node_name)["counts"]
+            assert summary["done"] == count
+            assert summary["queued"] == 0
+            assert summary["running"] == 0
+    except BaseException as error:
+        body_error = error
+        raise
+    finally:
+        cleanup_errors = []
+        try:
+            if not release.done():
+                release.set_result(None)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            if worker.is_alive():
+                worker.join(timeout=60)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if worker.is_alive():
+            cleanup_errors.append(
+                AssertionError("Asymmetric component-wave worker did not finish during cleanup")
+            )
+        else:
+            cleanup_errors.extend(worker_errors)
+            try:
+                workflow.storage.close_database_connections()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            if body_error is None:
+                raise cleanup_errors[0]
+            for error in cleanup_errors:
+                body_error.add_note(f"Cleanup also failed: {error!r}")
 
 
 def test_dense_api_source_uses_bounded_admission_slices_and_sparse_source_resets():

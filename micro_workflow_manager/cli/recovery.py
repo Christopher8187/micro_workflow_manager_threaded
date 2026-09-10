@@ -1,116 +1,109 @@
+"""Recover native sessions before loading any user graph or node module."""
+
 from __future__ import annotations
 
-import socket
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+import sys
 
-from micro_workflow_manager.models import QUEUED, RUNNING
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.storage.native_recovery import recover_observed_sessions, recover_observed_cleanup
+from micro_workflow_manager.storage.native_cleanup_observation import observe_native_cleanup
+from micro_workflow_manager.storage.native_recovery_observation import observe_native_recovery
+from micro_workflow_manager.storage.native_recovery_replay import observe_recovery_receipts, recover_receipts
+from micro_workflow_manager.storage.sqlite.preview_snapshot import open_preview_snapshot
+from micro_workflow_manager.storage.clipboard_recovery import (
+    observe_clipboard_cleanup,
+    recover_clipboard_cleanup,
+)
 
-from .active_run import process_is_alive, run_state_liveness
 
-
-def recover_stale_jobs(
-    root: Path,
-    workflow=None,
-    *,
-    quiet: bool = False,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    """Recover jobs left running by a dead CLI sequence.
-
-    This never touches done, skipped, failed, cancelled, or already queued jobs.
-    Each recovered running job receives a new execution generation before being
-    requeued, fencing any late process that might still hold stale state.
-    """
-    storage = workflow.storage if workflow is not None else FileStorage(root)
-    state = storage.get_run_state()
-    liveness = run_state_liveness(state)
-
-    if liveness["live"]:
-        raise RuntimeError(
-            f"The recorded {state.get('command', 'workflow')} sequence is still active "
-            f"(process {state.get('pid', '?')}). Recovery would compete with it."
-        )
-
-    candidate_nodes: list[str] = []
-    if isinstance(state.get("nodes"), list):
-        candidate_nodes.extend(str(item) for item in state["nodes"] if isinstance(item, str))
-    if workflow is not None:
-        candidate_nodes.extend(str(item) for item in workflow.graph_obj.nodes)
-
-    node_root = root / "node"
-    if node_root.exists():
-        candidate_nodes.extend(path.name for path in node_root.iterdir() if path.is_dir())
-
-    recovered: list[dict[str, Any]] = []
-    for node in sorted(set(candidate_nodes)):
-        for job_id in storage.list_job_ids(node):
-            if storage.get_job_status(node, job_id) != RUNNING:
-                continue
-
-            status_data = storage.read_job_status_data(node, job_id)
-            pid = status_data.get("pid") if isinstance(status_data, dict) else None
-            control = storage.read_job_control(node, job_id)
-            active_pid = control.get("active_pid") or pid
-            if type(active_pid) is int and process_is_alive(active_pid):
-                continue
-
-            if dry_run:
-                recovered.append({
-                    "node": node,
-                    "job_id": job_id,
-                    "previous_generation": int(control.get("generation", 0)),
-                    "generation": int(control.get("generation", 0)) + 1,
-                })
-            else:
-                item = storage.request_job_restart(
-                    node,
-                    job_id,
-                    reason="recover stale running job",
-                )
-                recovered.append(item)
-                runtime = storage.read_job_runtime(node, job_id)
-                if runtime:
-                    storage.write_job_runtime(
-                        node,
-                        job_id,
-                        {
-                            **runtime,
-                            "state": "recovered",
-                            "recovered_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-                            "recovery_reason": liveness["reason"],
-                        },
-                    )
-                storage.set_node_status(node, QUEUED)
-
-    if not dry_run and state.get("status") == "running" and not liveness["live"]:
-        storage.update_run_state(
-            status="recovered",
-            recovered_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-            recovered_by_host=socket.gethostname(),
-            recovered_jobs=[f"{item['node']}/{item['job_id']}" for item in recovered],
-            recovery_reason=liveness["reason"],
-        )
-
+def recover_native_project(root, *, quiet=False):
+    clipboard_connection = open_preview_snapshot(root / '.mwf' / 'state.sqlite3')
+    try:
+        clipboard_observation = observe_clipboard_cleanup(clipboard_connection, root)
+    finally:
+        clipboard_connection.close()
+    clipboard = {'cleanup': [], 'errors': list(clipboard_observation.errors),
+                 'live_operations': ()}
+    if clipboard_observation.plans:
+        storage = FileStorage(root)
+        try:
+            clipboard = recover_clipboard_cleanup(storage, clipboard_observation)
+        finally:
+            storage.db_mutation_barrier()
+            storage._connection_finalizer()
+    cleanup_connection = open_preview_snapshot(root / '.mwf' / 'state.sqlite3')
+    try:
+        cleanup_observation = observe_native_cleanup(cleanup_connection, root)
+    finally:
+        cleanup_connection.close()
+    cleanup = {'cleanup': [], 'errors': list(cleanup_observation.errors),
+               'live_operations': cleanup_observation.live_operations}
+    if cleanup_observation.plans:
+        storage = FileStorage(root)
+        try:
+            cleanup = recover_observed_cleanup(storage, cleanup_observation)
+        finally:
+            storage.db_mutation_barrier()
+            storage._connection_finalizer()
+    receipt_connection = open_preview_snapshot(root / '.mwf' / 'state.sqlite3')
+    try:
+        receipts = observe_recovery_receipts(receipt_connection, root)
+    finally:
+        receipt_connection.close()
+    replay = {'cleanup': [], 'errors': list(receipts['errors'])}
+    if receipts['rows']:
+        storage = FileStorage(root)
+        try:
+            replay = recover_receipts(storage, receipts)
+        finally:
+            storage.db_mutation_barrier()
+            storage._connection_finalizer()
+    cleanup['cleanup'][:0] = clipboard['cleanup']
+    cleanup['cleanup'].extend(replay['cleanup'])
+    cleanup['errors'][:0] = clipboard['errors']
+    cleanup['errors'].extend(replay['errors'])
+    cleanup['live_operations'] = tuple(sorted(set(
+        cleanup['live_operations'] + clipboard['live_operations']
+    )))
+    for operation in cleanup['cleanup']:
+        print(f"Recovered file operation {operation['operation_id']}: {operation['state']}.")
+    connection = open_preview_snapshot(root / '.mwf' / 'state.sqlite3')
+    try:
+        observation = observe_native_recovery(connection, root)
+    finally:
+        connection.close()
     result = {
-        "recovered": recovered,
-        "previous_run": state,
-        "liveness": liveness,
+        'recovered': [], 'live_sessions': observation.live_sessions,
+        'errors': [*observation.errors, *(session_id + ': ' + '; '.join(errors)
+                   for session_id, errors in observation.refusals)],
     }
+    if observation.sessions:
+        storage = FileStorage(root)
+        try:
+            result = recover_observed_sessions(storage, observation)
+        finally:
+            storage.db_mutation_barrier()
+            storage._connection_finalizer()
+    result['errors'] = [*cleanup['errors'], *result['errors']]
+    result['cleanup'] = cleanup['cleanup']
+    for recovered in result['recovered']:
+        print(f"Recovered session {recovered['session_id']}: "
+              f"{recovered['requeued']} requeued, {recovered['terminal']} terminal outputs retained.")
     if not quiet:
-        if recovered:
-            print("Would recover running jobs:" if dry_run else "Recovered running jobs:")
-            for item in recovered:
-                print(f"  {item['node']}/{item['job_id']} -> generation {item['generation']}")
-        else:
-            print("No stale running jobs needed recovery.")
-        if state.get("status") == "running":
-            print(f"Recorded run state: {liveness['reason']}")
+        for path in cleanup_observation.retained_material:
+            print('Unrecorded private material retained: ' + path)
+        for path in clipboard_observation.retained_material:
+            print('Unrecorded private material retained: ' + path)
+        for operation_id in cleanup['live_operations']:
+            print('Live file operation retained: ' + operation_id)
+        for session_id in result['live_sessions']:
+            print('Live session retained: ' + session_id)
+        if not result['recovered'] and not result['cleanup'] and not result['errors']:
+            print('No stale native sessions needed recovery.')
+    for error in result['errors']:
+        print('Recovery refused: ' + error, file=sys.stderr)
     return result
 
 
-def recover_command(root: Path, workflow, *, dry_run: bool = False) -> int:
-    recover_stale_jobs(root, workflow, dry_run=dry_run)
-    return 0
+def recover_command(root):
+    return int(bool(recover_native_project(root)['errors']))

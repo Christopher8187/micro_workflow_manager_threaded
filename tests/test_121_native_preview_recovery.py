@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import os
-import socket
-
 import pytest
 
 from micro_workflow_manager import cli
 from micro_workflow_manager.models import Job, now
-from micro_workflow_manager.processes import process_identity
 from tests.test_064_read_only_previews import (
-    _close, _initialize_native_project, _install_import_sentinels, _snapshot, _wait_writer,
+    _close, _initialize_native_project, _install_import_sentinels,
+    _live_execution_session_identity, _mark_execution_session_stale,
+    _snapshot, _wait_writer,
 )
 
 
@@ -43,9 +41,7 @@ def test_recovery_preview_lists_all_abandoned_sessions_and_preserves_live_owner(
         storage.create_execution_session(
             session_id, session_kind='main' if node == 'A' else 'interrupt', command='run',
             start_component=(node,), selected_components=[(node,)],
-            started_at=now() if live else '2020-01-01T00:00:00+00:00',
-            hostname=socket.gethostname(), pid=os.getpid() if live else 99999999,
-            process_identity=process_identity(os.getpid()) if live else 'retired-process',
+            **_live_execution_session_identity(),
             expected_shape=shape,
         )
         storage.reserve_execution_components(session_id, expected_shape=shape)
@@ -63,6 +59,8 @@ def test_recovery_preview_lists_all_abandoned_sessions_and_preserves_live_owner(
         'status': 'done', 'generation': generation, 'execution_id': execution_id,
         'result_type': 'str', 'result_repr': "'retained terminal result'",
     })
+    _mark_execution_session_stale(storage, 'abandoned-A')
+    _mark_execution_session_stale(storage, 'abandoned-B')
     storage.db_mutation_barrier()
     _wait_writer(storage)
     if damage is not None:

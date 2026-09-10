@@ -1,6 +1,9 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from threading import Event
+from time import sleep
+
+from ..storage.interrupt_execution import InterruptAdmissionPaused
 from typing import Callable
 
 from ..errors import InvalidGraphError
@@ -57,6 +60,7 @@ class DagSchedulerMixin(NodeSchedulerMixin):
         _components=None,
         _task_parent=None,
         _sequential=False,
+        interrupt_blocked_components=frozenset(),
         refuse_after_component: tuple[str, ...] | None = None,
         refuse_before_component: tuple[str, ...] | None = None,
         refusal_event: Event | None = None,
@@ -85,6 +89,7 @@ class DagSchedulerMixin(NodeSchedulerMixin):
         if _operation is None:
             operation = DagExecutionOperation(self, units, execution_context, ready_check, {
                 '_sequential': _sequential,
+                'interrupt_blocked_components': frozenset(interrupt_blocked_components),
                 'refuse_after_component': refuse_after_component,
                 'refuse_before_component': refuse_before_component,
                 'refusal_event': refusal_event,
@@ -113,10 +118,19 @@ class DagSchedulerMixin(NodeSchedulerMixin):
             return state[component]['lifecycle'] in {'done', 'failed'}
 
         def unit_ready(unit: tuple[str, ...]) -> bool:
+            if unit in interrupt_blocked_components:
+                return False
+            if self.storage.read_interrupt_execution_fences(execution_context[0], unit):
+                return False
+            if self.storage.interrupt_component_admission_blockers(execution_context[0], unit):
+                return False
             if _operation is not None:
                 if _operation.is_resuming(unit):
                     return True
                 if _operation.stop_admission:
+                    return False
+                completed = _operation.operations.get(unit)
+                if completed is not None and completed.completed:
                     return False
             state = self.storage.get_component_state(unit)
             if state is None:
@@ -133,6 +147,23 @@ class DagSchedulerMixin(NodeSchedulerMixin):
             )
             return (needs_execution and self.component_ready(set(unit))
                     and (ready_check is None or all(ready_check(node_name) for node_name in unit)))
+
+        def waiting_on_interrupt():
+            if admission_stopped or (_operation is not None and _operation.stop_admission):
+                return False
+            return any(
+                unit not in interrupt_blocked_components
+                and not self.storage.read_interrupt_execution_fences(execution_context[0], unit)
+                and self.storage.interrupt_component_admission_blockers(execution_context[0], unit)
+                for unit in units
+            )
+
+        def discard_unstarted_operation(unit):
+            operation = None if _operation is None else _operation.operations.get(unit)
+            if operation is not None:
+                if operation.started:
+                    raise RuntimeError('Interrupt pause escaped from a begun component')
+                _operation.operations.pop(unit)
 
         max_workers = max(1, len(units))
         ran: list[str] = [] if _operation is None else _operation.ran
@@ -270,6 +301,9 @@ class DagSchedulerMixin(NodeSchedulerMixin):
                             else:
                                 _operation.component_operation(unit, unit_api_pumps).run()
                                 _operation.record_outcome(unit)
+                        except InterruptAdmissionPaused:
+                            discard_unstarted_operation(unit)
+                            continue
                         except BaseException as error:
                             if _operation is not None:
                                 _operation.record_outcome(unit, error=error)
@@ -295,9 +329,15 @@ class DagSchedulerMixin(NodeSchedulerMixin):
 
                 if _sequential:
                     if not launch:
+                        if waiting_on_interrupt():
+                            sleep(0.05)
+                            continue
                         break
                     continue
                 if not futures:
+                    if waiting_on_interrupt():
+                        sleep(0.05)
+                        continue
                     break
 
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
@@ -329,6 +369,9 @@ class DagSchedulerMixin(NodeSchedulerMixin):
                                 if refusal_event is not None:
                                     refusal_event.set()
                         futures.pop(future)
+                    except InterruptAdmissionPaused:
+                        futures.pop(future)
+                        discard_unstarted_operation(unit)
                     except BaseException as error:
                         if _operation is not None:
                             _operation.record_outcome(unit, error=error)

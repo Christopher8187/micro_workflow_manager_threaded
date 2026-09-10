@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,8 @@ import networkx as nx
 import pytest
 
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.models import now
+from micro_workflow_manager.session_liveness import process_identity
 from micro_workflow_manager.topology import ComponentTopology
 
 
@@ -32,8 +35,9 @@ def owned_component(tmp_path, request):
     storage.create_execution_session(
         'ordinary-start', session_kind='main', command='run',
         start_component=('A', 'B'), selected_components=[('A', 'B')],
-        started_at='2026-09-06T08:00:00+00:00', hostname='test-worker',
-        pid=os.getpid(), process_identity='ordinary-start', expected_shape=topology.shape_json,
+        started_at=now(), hostname=socket.gethostname(),
+        pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=topology.shape_json,
     )
     storage.reserve_execution_components('ordinary-start', expected_shape=topology.shape_json)
     return storage, topology
@@ -122,7 +126,7 @@ def test_component_start_refuses_ineligible_state_without_partial_changes(owned_
         session_id = 'missing'
     elif case == 'terminal-session':
         storage.finish_execution_session(
-            'ordinary-start', outcome='done', finished_at='2026-09-06T08:01:00+00:00',
+            'ordinary-start', outcome='done', finished_at=now(),
         )
     elif case == 'missing-reservation':
         storage.release_execution_components('ordinary-start')
@@ -130,8 +134,9 @@ def test_component_start_refuses_ineligible_state_without_partial_changes(owned_
         storage.create_execution_session(
             'other', session_kind='interrupt', command='run',
             start_component=('A', 'B'), selected_components=[('A', 'B')],
-            started_at='2026-09-06T08:00:00+00:00', hostname='test-worker',
-            pid=os.getpid(), process_identity='other', expected_shape=topology.shape_json,
+            started_at=now(), hostname=socket.gethostname(),
+            pid=os.getpid(), process_identity=process_identity(os.getpid()),
+            expected_shape=topology.shape_json,
         )
         storage.submit_db_mutation(lambda connection: connection.execute(
             "UPDATE component_reservations SET session_id='other' WHERE component_key=?", (key,),
@@ -270,8 +275,9 @@ def test_component_start_rechecks_state_when_its_mutation_is_submitted(owned_com
     other.create_execution_session(
         'next-owner', session_kind='interrupt', command='run',
         start_component=('A', 'B'), selected_components=[('A', 'B')],
-        started_at='2026-09-06T08:00:00+00:00', hostname='test-worker',
-        pid=os.getpid(), process_identity='next-owner', expected_shape=topology.shape_json,
+        started_at=now(), hostname=socket.gethostname(),
+        pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        expected_shape=topology.shape_json,
     )
     awaiting_write, proceed = Event(), Event()
     submit = storage.submit_db_mutation

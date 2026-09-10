@@ -11,6 +11,7 @@ from micro_workflow_manager.graph import normalize_edges
 from micro_workflow_manager.models import QUEUED
 from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.storage.recovery_errors import add_recovery_note
 from micro_workflow_manager.system import MicroWorkflow, normalize_workflow_runner
 
 from micro_workflow_manager.paths import config_file, mwf_dir
@@ -39,26 +40,29 @@ def init_project(archive_path: str | None = None) -> int:
         print("  deployment archive: none detected")
 
     storage = FileStorage(root)
-    path = config_file(root)
-    ensure_project_sidecars(root)
+    try:
+        path = config_file(root)
+        ensure_project_sidecars(root)
 
-    if existing:
-        print(f"  project configuration already exists: {path}")
-    else:
-        print(f"  created project configuration: {path}")
+        if existing:
+            print(f"  project configuration already exists: {path}")
+        else:
+            print(f"  created project configuration: {path}")
 
-    database_path = storage.state_database_path()
-    print(f"  initialized SQLite state database: {database_path}")
+        database_path = storage.state_database_path()
+        print(f"  initialized SQLite state database: {database_path}")
 
-    print(f"  runtime directory: {mwf_dir(root)}")
-    print(f"  node directory: {root / 'node'}")
-    print(f"  deployment ignore file: {root / '.mwfignore'}")
-    print("Initialization complete")
-    if archive is not None:
-        print("  deployment contents are unpacked and ready for graph setup or normal commands")
-    else:
-        print("  next: run 'mwf graph src/graph.py' or pass a deployment.zip to 'mwf init'")
-    return 0
+        print(f"  runtime directory: {mwf_dir(root)}")
+        print(f"  node directory: {root / 'node'}")
+        print(f"  deployment ignore file: {root / '.mwfignore'}")
+        print("Initialization complete")
+        if archive is not None:
+            print("  deployment contents are unpacked and ready for graph setup or normal commands")
+        else:
+            print("  next: run 'mwf graph src/graph.py' or pass a deployment.zip to 'mwf init'")
+        return 0
+    finally:
+        storage.close_database_connections()
 
 
 def _resolve_init_archive(root: Path, archive_path: str | None) -> Path | None:
@@ -132,66 +136,76 @@ def setup_graph(
 
     config = read_config(root)
     storage = None if dry_run else FileStorage(root)
-    previous_nodes = _nodes_from_edges(_stored_edges(config))
-    path = _resolve_graph_path(root, config, graph_path, update=update)
-    module = import_file(path)
-    edges = read_edges(module)
-    expected_nodes = _nodes_from_edges(edges)
+    workflow = None
+    try:
+        previous_nodes = _nodes_from_edges(_stored_edges(config))
+        path = _resolve_graph_path(root, config, graph_path, update=update)
+        module = import_file(path)
+        edges = read_edges(module)
+        expected_nodes = _nodes_from_edges(edges)
 
-    old_nodes = _disk_node_names(root)
-    stale_nodes = sorted(old_nodes - expected_nodes)
-    new_nodes = sorted(expected_nodes - old_nodes)
+        old_nodes = _disk_node_names(root)
+        stale_nodes = sorted(old_nodes - expected_nodes)
+        new_nodes = sorted(expected_nodes - old_nodes)
 
-    if dry_run:
-        stored_edges = _stored_edges(config)
-        target_runner = normalize_workflow_runner(runner or config.get("runner", "threaded"))
-        print("Graph synchronization dry run")
-        print(f"  graph path: {path.relative_to(root).as_posix()}")
-        print(f"  runner: {target_runner}")
-        print(f"  edges: {len(stored_edges)} stored -> {len(edges)} defined")
-        print("  nodes to add: " + (", ".join(new_nodes) if new_nodes else "(none)"))
-        print("  nodes to delete: " + (", ".join(stale_nodes) if stale_nodes else "(none)"))
-        print("  edge list changed: " + ("yes" if stored_edges != edges else "no"))
-        print("  graph synchronization was not applied")
+        if dry_run:
+            stored_edges = _stored_edges(config)
+            target_runner = normalize_workflow_runner(runner or config.get("runner", "threaded"))
+            print("Graph synchronization dry run")
+            print(f"  graph path: {path.relative_to(root).as_posix()}")
+            print(f"  runner: {target_runner}")
+            print(f"  edges: {len(stored_edges)} stored -> {len(edges)} defined")
+            print("  nodes to add: " + (", ".join(new_nodes) if new_nodes else "(none)"))
+            print("  nodes to delete: " + (", ".join(stale_nodes) if stale_nodes else "(none)"))
+            print("  edge list changed: " + ("yes" if stored_edges != edges else "no"))
+            print("  graph synchronization was not applied")
+            return 0
+
+        config["schema_version"] = CURRENT_STATE_SCHEMA_VERSION
+        config["graph_path"] = path.relative_to(root).as_posix()
+        config["edges"] = edges
+
+        if runner is not None:
+            config["runner"] = normalize_workflow_runner(runner)
+        else:
+            config["runner"] = normalize_workflow_runner(config.get("runner", "threaded"))
+
+        # Store the new graph state before mounting routers. Router mounting may
+        # materialize schemas/default jobs, and those writes must only target nodes
+        # that have already passed the explicit synchronization step.
+        assert storage is not None
+        storage.atomic_write_json(config_file(root), config)
+        _synchronize_node_folders(root, expected_nodes, stale_nodes, storage)
+        ensure_vscode_settings(
+            root,
+            node_names=expected_nodes,
+            previous_node_names=previous_nodes,
+        )
+
+        workflow = load_workflow(root, runner, require_synced=True)
+
+        action = "Graph updated" if update or graph_path is None else "Graph set"
+        print(f"{action}: {config['graph_path']}")
+        print(f"Node folder: {root / 'node'}")
+        if stale_nodes:
+            print(f"Removed stale nodes: {', '.join(stale_nodes)}")
+        if new_nodes:
+            print(f"Added nodes: {', '.join(new_nodes)}")
+        if not stale_nodes and not new_nodes:
+            print("Node folders already matched the graph.")
+        print("Nodes:")
+
+        for node in workflow.graph_obj.nodes:
+            print(f"  {node}")
+
         return 0
-
-    config["schema_version"] = CURRENT_STATE_SCHEMA_VERSION
-    config["graph_path"] = path.relative_to(root).as_posix()
-    config["edges"] = edges
-
-    if runner is not None:
-        config["runner"] = normalize_workflow_runner(runner)
-    else:
-        config["runner"] = normalize_workflow_runner(config.get("runner", "threaded"))
-
-    # Store the new graph state before mounting routers. Router mounting may
-    # materialize schemas/default jobs, and those writes must only target nodes
-    # that have already passed the explicit synchronization step.
-    storage.atomic_write_json(config_file(root), config)
-    _synchronize_node_folders(root, expected_nodes, stale_nodes, storage)
-    ensure_vscode_settings(
-        root,
-        node_names=expected_nodes,
-        previous_node_names=previous_nodes,
-    )
-
-    workflow = load_workflow(root, runner, require_synced=True)
-
-    action = "Graph updated" if update or graph_path is None else "Graph set"
-    print(f"{action}: {config['graph_path']}")
-    print(f"Node folder: {root / 'node'}")
-    if stale_nodes:
-        print(f"Removed stale nodes: {', '.join(stale_nodes)}")
-    if new_nodes:
-        print(f"Added nodes: {', '.join(new_nodes)}")
-    if not stale_nodes and not new_nodes:
-        print("Node folders already matched the graph.")
-    print("Nodes:")
-
-    for node in workflow.graph_obj.nodes:
-        print(f"  {node}")
-
-    return 0
+    finally:
+        try:
+            if workflow is not None:
+                workflow.storage.close_database_connections()
+        finally:
+            if storage is not None:
+                storage.close_database_connections()
 
 
 def load_workflow(
@@ -220,30 +234,40 @@ def load_workflow(
         persist_graph=False,
         initialize_node_folders=False,
     )
-    module = import_file(graph_file)
-    edges = read_edges(module)
+    try:
+        module = import_file(graph_file)
+        edges = read_edges(module)
 
-    if require_synced:
-        require_graph_synced(root, config, edges)
+        if require_synced:
+            require_graph_synced(root, config, edges)
 
-    graph_nodes = _nodes_from_edges(edges)
-    workflow.graph(edges)
-    # Static autostart declarations define the reverse reachability arcs used
-    # to construct Hoeflein components before any job begins.
-    from .autostart_scan import scan_autostarts
-    scanned_autostarts = scan_autostarts(graph_file.parent / "node_behavior")
-    workflow.set_autostart_edges(
-        (start, end)
-        for start, targets in scanned_autostarts.items()
-        for end in targets
-    )
-    workflow.include_node_dir(
-        graph_file.parent / "node_behavior",
-        allowed_node_names=graph_nodes,
-    )
-    for notice in workflow.configuration_notices:
-        print(f"Warning: {notice}", file=sys.stderr)
-    return workflow
+        graph_nodes = _nodes_from_edges(edges)
+        workflow.graph(edges)
+        # Static autostart declarations define the reverse reachability arcs used
+        # to construct Hoeflein components before any job begins.
+        from .autostart_scan import scan_autostarts
+        scanned_autostarts = scan_autostarts(graph_file.parent / "node_behavior")
+        workflow.set_autostart_edges(
+            (start, end)
+            for start, targets in scanned_autostarts.items()
+            for end in targets
+        )
+        workflow.include_node_dir(
+            graph_file.parent / "node_behavior",
+            allowed_node_names=graph_nodes,
+        )
+        for notice in workflow.configuration_notices:
+            print(f"Warning: {notice}", file=sys.stderr)
+        return workflow
+    except BaseException as error:
+        try:
+            workflow.storage.close_database_connections()
+        except BaseException as cleanup_error:
+            add_recovery_note(
+                error,
+                f"Closing the failed workflow storage also failed: {cleanup_error}",
+            )
+        raise
 
 
 def require_graph_synced(root: Path, config: dict, edges: list[tuple[str, str]]):

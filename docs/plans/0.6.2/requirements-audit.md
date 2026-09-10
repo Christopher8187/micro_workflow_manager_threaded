@@ -16,6 +16,12 @@ programmatic autostart redesign is deferred to approximately 0.6.4. Existing
 between-run membership-change rules and historical producing identity remain
 required. This scope decision does not itself earn implementation credit.
 
+The [current native workflow-management batch](native-workflow-management-progress.md)
+adds interrupt execution, applied recovery, thread ownership, project-wide API
+capacity, clipboard recovery, component observation, and compact lineage.
+Broader checks and review corrections remain active. This update records scope;
+it grants no whole-requirement or final acceptance credit.
+
 Status: implementation in progress. Local commit `9fd92a276608c94c5d6c4c85feb4a653ec33b7a1`
 preserves the [verified native integration boundary](native-foundation-progress.md).
 The separate [restart continuation boundary](native-restart-progress.md) passed
@@ -1076,11 +1082,9 @@ component-state work, release, the whole issue, or final Astra review.
 
 ## Current audit state
 
-S1a records the accepted interval calculation and its checks. The combined
-298-file selection records the bounded functional acceptance described above.
-Rows 44-SES-054, 44-SES-055, and 44-SES-057 are complete within that boundary;
-44-SES-056 and all dependent multi-session sharing remain pending. The private
-component-state stage separately accepts fresh version 5 creation and reading
-within its recorded boundary. Private and pure modules still need public
-integration. This record does not accept the whole issue, release, or final
-Astra review.
+Earlier stage records retain their bounded acceptance and historical failures.
+The [current integration record](native-workflow-management-progress.md) owns
+the latest batch's implementation, checks, and unresolved findings. Detailed
+requirement rows still need reconciliation against that resulting code and its
+completed reviews. This record does not accept the whole issue, release, or
+final Astra review.

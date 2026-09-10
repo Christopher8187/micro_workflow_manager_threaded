@@ -159,7 +159,7 @@ their exact limits.
 
 When a test stalls or times out, inspect:
 
-- active run and Hoeflein-component state;
+- exact main and interrupt sessions, reservations, and Hoeflein-component state;
 - queued, running, done, and failed job counts;
 - job events and checkpoint deadlines;
 - provider or external waits;

@@ -1,1 +1,1 @@
-"""Internal SQLite connection, schema, locking, and transfer helpers."""
+"""Internal SQLite connection, schema, locking, and snapshot helpers."""

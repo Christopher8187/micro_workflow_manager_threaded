@@ -4,7 +4,6 @@ import json
 import os
 from contextlib import ExitStack
 from datetime import datetime
-from uuid import uuid4
 
 from ..component_identity import encode_component_key
 from .job_preparation import NodeJobPreparation, _read_jobs
@@ -12,6 +11,7 @@ from .execution_terminal import TerminalUpdate
 from .preparation_files import stage_preparation_files
 from .preparation_guards import refuse_receiver_mutation
 from .preparation_receipts import PreparationReceipt, submit_preparation_decision
+from .preparation_attempts import hold_preparation_attempt
 from .preparation_footprint import _SnapshotPreparationStorage
 from .unproduced_membership import read_execution_component_states, read_unproduced_component_states
 from .component_result_identity import (
@@ -186,6 +186,28 @@ def _read_finished_outputs(storage, captured):
     return recovered
 
 
+def _require_resume_component_available(connection, key, session_id):
+    if connection.execute(
+        'SELECT 1 FROM pending_component_executions WHERE component_key=?', (key,),
+    ).fetchone():
+        raise RuntimeError('Resume requires recovery of a pending component: ' + key)
+    holds = connection.execute(
+        'SELECT session_id, hold_count FROM component_holds WHERE component_key=?', (key,),
+    ).fetchall()
+    if not holds:
+        return
+    frozen = connection.execute(
+        'SELECT 1 FROM interrupt_admissions AS admission JOIN execution_sessions AS session '
+        'ON session.session_id=admission.session_id WHERE admission.session_id=? '
+        "AND admission.target_component_key=? AND admission.state='frozen' "
+        "AND session.status='running' AND session.command IN ('resume','resumefrom','resumebetween')",
+        (session_id, key),
+    ).fetchone()
+    if (frozen is None or len(holds) != 1
+            or holds[0]['session_id'] != session_id or holds[0]['hold_count'] != 1):
+        raise RuntimeError('Resume requires recovery of a held component: ' + key)
+
+
 def prepare_resume_components(
     storage, session_id, expected_states, *, expected_parents=None,
     expected_successful_results=None, expected_admitted_shape, clear_trace_nodes=(),
@@ -234,11 +256,7 @@ def prepare_resume_components(
                 if component in observed_results and observed_results[component] != retained:
                     raise RuntimeError('Retained component result changed before resume preparation')
                 observed_results.setdefault(component, retained)
-            if connection.execute(
-                'SELECT 1 FROM pending_component_executions WHERE component_key=? UNION ALL '
-                'SELECT 1 FROM component_holds WHERE component_key=? LIMIT 1', (key, key),
-            ).fetchone():
-                raise RuntimeError('Resume requires recovery of a held or pending component: ' + key)
+            _require_resume_component_available(connection, key, session_id)
         for component, state in parents.items():
             if storage._read_component_state(connection, component) != state:
                 raise RuntimeError('Component parent changed before resume preparation: ' + repr(component))
@@ -271,6 +289,7 @@ def prepare_resume_components(
         return status in ('failed', 'cancelled', 'running')
 
     def commit(connection):
+        receipt.require_prepared(connection)
         validate(connection)
         connection.executemany('DELETE FROM job_events WHERE node_name=?', [(node,) for node in trace_nodes])
         for succeeded, error in storage._apply_terminal_updates(connection, list(recovered.values())):
@@ -357,9 +376,12 @@ def prepare_resume_components(
             node, captured[node], (), (), tuple(job.job_id for job in captured[node]
                                                if needs_restart(node, job)), (), False, False,
         ) for node in nodes)
-        receipt = PreparationReceipt(storage, uuid4().hex, 'resume', next(iter(expected)), session_id,
-                                     lambda connection: validate(connection, initial=True), [])
-        with stage_preparation_files(storage.project_dir, plans, receipt=receipt):
-            changed = submit_preparation_decision(storage, commit)
+        intended = [{'operation': 'resume', 'component_key': encode_component_key(next(iter(expected)))}]
+        with hold_preparation_attempt(storage, session_id, (), nodes, intended,
+                                      lambda connection: validate(connection, initial=True)) as operation_id:
+            receipt = PreparationReceipt(storage, operation_id, 'resume', next(iter(expected)), session_id,
+                                         lambda connection: validate(connection, initial=True), [])
+            with stage_preparation_files(storage.project_dir, plans, receipt=receipt):
+                changed = submit_preparation_decision(storage, commit)
     storage.notify_queue_changes(nodes)
     return changed

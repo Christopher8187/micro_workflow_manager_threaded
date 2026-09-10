@@ -10,10 +10,16 @@ import pytest
 from pathlib import Path
 
 from micro_workflow_manager import MicroWorkflow, NodeRouter, cli
-from micro_workflow_manager.models import DONE
+from micro_workflow_manager.cli.project import load_workflow
+from micro_workflow_manager.models import DONE, now
 from micro_workflow_manager.storage import FileStorage
-from micro_workflow_manager.cli.migration import migrate_command
 from micro_workflow_manager.workflow.runner_config import normalize_workflow_runner
+from tests.test_064_read_only_previews import (
+    _live_execution_session_identity,
+    _snapshot,
+    _wait_writer,
+)
+from tests.test_090_component_session_settlement import _rows
 
 
 def _write_cli_project(root: Path, *, runner: str = "direct", max_threads: int = 1) -> None:
@@ -160,19 +166,6 @@ def test_init_removes_old_top_level_node_icon_association(tmp_path, monkeypatch)
     assert folders["custom"] == "tools"
 
 
-def test_migrate_dry_run_does_not_initialize_sqlite(tmp_path, capsys):
-    mwf_dir = tmp_path / ".mwf"
-    mwf_dir.mkdir()
-    (mwf_dir / "project.json").write_text(
-        json.dumps({"version": 3, "graph_path": None, "runner": "threaded", "edges": []}),
-        encoding="utf-8",
-    )
-
-    assert migrate_command(tmp_path, dry_run=True) == 0
-    assert "Would initialize SQLite state database" in capsys.readouterr().out
-    assert not (mwf_dir / "state.sqlite3").exists()
-
-
 def test_api_runner_aliases_normalize_to_api():
     assert normalize_workflow_runner("api") == "api"
     assert normalize_workflow_runner("io") == "api"
@@ -266,19 +259,46 @@ def test_paste_refuses_missing_native_snapshot_without_rebuilding_payload_jobs(t
     storage.close_database_connections()
 
 
-def test_paste_requeues_running_snapshot_immediately(tmp_path, monkeypatch):
+def test_copy_refuses_a_live_owned_component_without_mutation(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     _write_cli_project(tmp_path, runner="direct")
     assert cli.main(["init"]) == 0
     assert cli.main(["graph", "src/graph.py", "--runner", "direct"]) == 0
-    storage = FileStorage(tmp_path)
-    storage.set_job_status("A", 1, "running")
-    storage.close_database_connections()
-    assert cli.main(["copy", "A"]) == 0
-    assert cli.main(["paste", "A"]) == 0
-    storage = FileStorage(tmp_path)
-    assert storage.get_job_status("A", 1) == "queued"
-    assert storage.get_node_status("A") == "queued"
+    workflow = load_workflow(tmp_path, "direct")
+    storage = workflow.storage
+    snapshot = workflow.topology.snapshot()
+    storage.register_component_topology(snapshot)
+    component = ("A",)
+    storage.create_execution_session(
+        "clipboard-live", session_kind="main", command="run",
+        start_component=component, selected_components=[component],
+        expected_shape=snapshot.shape_json, **_live_execution_session_identity(),
+    )
+    storage.reserve_execution_components(
+        "clipboard-live", expected_shape=snapshot.shape_json,
+    )
+    state = storage.get_component_state(component)
+    storage.begin_queued_component_execution(
+        "clipboard-live", component, expected_shape=snapshot.shape_json,
+        expected_alignment_generation=state["alignment_generation"],
+        successful_lineage=("stable", None), expected_parent_states={},
+    )
+    generation, execution_id = storage.claim_job_execution(
+        "A", 1, started_at=now(), session_id="clipboard-live", component=component,
+    )
+    assert generation == 0
+    assert storage.get_job_execution_owner(execution_id)["session_id"] == "clipboard-live"
+    storage.db_mutation_barrier()
+    _wait_writer(storage)
+    before_rows = _rows(storage)
+    before_files = _snapshot(tmp_path, mutable_existing_shm=True)
+    capsys.readouterr()
+
+    assert cli.main(["copy", "A"]) == 1
+    assert "finish or stop first" in capsys.readouterr().err
+    assert _rows(storage) == before_rows
+    assert _snapshot(tmp_path, mutable_existing_shm=True) == before_files
+    assert not (tmp_path / "clipboard" / "A").exists()
     storage.close_database_connections()
 
 

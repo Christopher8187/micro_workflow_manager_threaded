@@ -215,16 +215,17 @@ def test_component_failure_joins_started_jobs_without_recovery_scan(tmp_path, mo
 
     worker = threading.Thread(target=run_component)
     worker.start()
-    assert b_failed.wait(3)
+    try:
+        assert b_failed.wait(3)
 
-    # The first failure has stopped admission, but the already-started A job is
-    # still owned by the active component and must be allowed to finish.
-    time.sleep(0.05)
-    assert worker.is_alive()
-    assert workflow.storage.get_job_status("A", 1) == "running"
-
-    release_a.set_result(None)
-    worker.join(timeout=5)
+        # The first failure has stopped admission, but the already-started A job is
+        # still owned by the active component and must be allowed to finish.
+        time.sleep(0.05)
+        assert worker.is_alive()
+        assert workflow.storage.get_job_status("A", 1) == "running"
+    finally:
+        release_a.set_result(None)
+        worker.join(timeout=5)
     assert not worker.is_alive()
     assert error
     assert "stop the component" in workflow.storage.read_json(workflow.storage.output_file("B", 1))["error"]

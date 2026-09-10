@@ -1,9 +1,13 @@
 ---
 name: mwf-analyze-architecture
-description: Analyze an existing MWF project's graph, node, and task architecture and recommend improvements. Use for assessment, diagnosis, or a broad request to improve a workflow.
+description: Assess an existing MWF project's graph, node, and task architecture and recommend improvements. Use for design assessment or a broad request to improve a workflow.
 ---
 
 # Analyze MWF architecture
+
+For a concrete execution failure, input problem, lineage question, or component
+and session state investigation, use `mwf-debug-workflow`. Use this procedure
+when the question concerns the architecture across workflow paths.
 
 1. Read the framework `README.md`, relevant glossary and architecture pages,
    project and node READMEs, source, tests, and available run evidence. Finish

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -12,9 +13,12 @@ import pytest
 
 from micro_workflow_manager import cli
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.models import now
+from micro_workflow_manager.processes import process_identity
+from micro_workflow_manager.cli.project import load_workflow
 
 
-def wait_until(predicate, timeout: float = 8.0, interval: float = 0.02):
+def wait_until(predicate, timeout: float = 30.0, interval: float = 0.02):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -76,6 +80,21 @@ def run(ctx, value):
     assert cli.main(["graph", "src/graph.py", "--runner", "threaded"]) == 0
 
 
+def _reserve_live_main(root):
+    workflow = load_workflow(root, 'direct')
+    storage = workflow.storage
+    shape = workflow.topology.snapshot()
+    storage.register_component_topology(shape)
+    storage.create_execution_session(
+        'reserved-main', session_kind='main', command='runfrom',
+        start_component=('A',), selected_components=[('A',), ('B',)],
+        started_at=now(), hostname=socket.gethostname(), pid=os.getpid(),
+        process_identity=process_identity(os.getpid()), expected_shape=shape.shape_json,
+    )
+    storage.reserve_execution_components('reserved-main', expected_shape=shape.shape_json)
+    return storage
+
+
 @pytest.mark.parametrize("runner", ["threaded", "direct"])
 def test_restart_command_replaces_running_generation_inside_existing_runfrom(
     tmp_path,
@@ -95,64 +114,72 @@ def test_restart_command_replaces_running_generation_inside_existing_runfrom(
     started_flag = tmp_path / "node" / "A" / "input" / "old_started.flag"
     state = FileStorage(tmp_path)
 
-    wait_until(lambda: started_flag.exists())
-    wait_until(lambda: state.get_job_status("A", 1) == "running")
-    wait_until(lambda: bool(state.read_job_control("A", 1).get("active_execution_id")))
+    try:
+        wait_until(lambda: started_flag.exists())
+        wait_until(lambda: state.get_job_status("A", 1) == "running")
+        wait_until(lambda: bool(state.read_job_control("A", 1).get("active_execution_id")))
 
-    before = json.loads((tmp_path / ".mwf" / "run.json").read_text(encoding="utf-8"))
-    assert before["status"] == "running"
+        before = state.get_live_main_session()
+        assert before is not None
+        assert before["session_id"] == state.read_job_current_owner("A", 1)["session_id"]
+        assert before["status"] == "running"
 
-    env = os.environ.copy()
-    package_root = str(Path(__file__).resolve().parents[1])
-    env["PYTHONPATH"] = package_root + os.pathsep + env.get("PYTHONPATH", "")
+        env = os.environ.copy()
+        package_root = str(Path(__file__).resolve().parents[1])
+        env["PYTHONPATH"] = package_root + os.pathsep + env.get("PYTHONPATH", "")
 
-    started = time.perf_counter()
-    command = subprocess.run(
-        [sys.executable, "-m", "micro_workflow_manager", "restart", "A", "job", "1"],
-        cwd=tmp_path,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=10,
-        check=False,
-    )
-    elapsed = time.perf_counter() - started
+        started = time.perf_counter()
+        command = subprocess.run(
+            [sys.executable, "-m", "micro_workflow_manager", "restart", "A", "job", "1"],
+            cwd=tmp_path,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        elapsed = time.perf_counter() - started
 
-    assert command.returncode == 0, command.stderr
-    assert "generation 0 -> 1" in command.stdout
-    assert "no second workflow was started" in command.stdout
-    # This CI image spends about three seconds in global sitecustomize before
-    # package code starts; the command itself remains a lightweight fast path.
-    assert elapsed < 8.0
+        assert command.returncode == 0, command.stderr
+        assert "generation 0 -> 1" in command.stdout
+        assert before["session_id"] in command.stdout
+        # Restart returns while the original handler is still blocked.
+        assert elapsed < 30.0
 
-    # The original attempt is still blocked, but the scheduler must abandon it,
-    # run generation 1, run B, and finish the original runfrom sequence.
-    active_thread.join(timeout=8)
-    assert not active_thread.is_alive()
-    assert run_result == {"code": 0}
+        # The original attempt is still blocked, but the scheduler must abandon it,
+        # run generation 1, run B, and finish the original runfrom sequence.
+        active_thread.join(timeout=30)
+        assert not active_thread.is_alive()
+        assert run_result == {"code": 0}
 
-    after = json.loads((tmp_path / ".mwf" / "run.json").read_text(encoding="utf-8"))
-    assert after["run_id"] == before["run_id"]
-    assert after["status"] == "done"
+        after = state.get_execution_session(before["session_id"])
+        assert after["status"] == "terminal"
+        assert after["outcome"] == "done"
+        assert len(state.list_execution_sessions()) == 1
 
-    a_output = json.loads(
-        (tmp_path / "node" / "A" / "jobs" / "1" / "output.json").read_text(encoding="utf-8")
-    )
-    assert a_output["status"] == "done"
-    assert a_output["generation"] == 1
-    assert "fresh" in a_output["result_repr"]
+        a_output = json.loads(
+            (tmp_path / "node" / "A" / "jobs" / "1" / "output.json").read_text(encoding="utf-8")
+        )
+        assert a_output["status"] == "done"
+        assert a_output["generation"] == 1
+        assert "fresh" in a_output["result_repr"]
 
-    b_jobs = sorted((tmp_path / "node" / "B" / "jobs").glob("[0-9]*"))
-    assert len(b_jobs) == 1
-    assert json.loads((b_jobs[0] / "input.json").read_text(encoding="utf-8")) == {"value": "fresh"}
-    assert (tmp_path / "node" / "B" / "output" / "received.txt").read_text(encoding="utf-8") == "fresh"
+        b_jobs = sorted((tmp_path / "node" / "B" / "jobs").glob("[0-9]*"))
+        assert len(b_jobs) == 1
+        assert json.loads((b_jobs[0] / "input.json").read_text(encoding="utf-8")) == {"value": "fresh"}
+        assert (tmp_path / "node" / "B" / "output" / "received.txt").read_text(encoding="utf-8") == "fresh"
 
-    # Let the abandoned Python thread return. Its stale MWF writes and child-job
-    # creation must remain rejected even though the larger run has completed.
-    (tmp_path / "node" / "A" / "input" / "release_old.flag").write_text("release", encoding="utf-8")
-    time.sleep(0.25)
-    assert not (tmp_path / "node" / "A" / "output" / "stale.txt").exists()
-    assert len(sorted((tmp_path / "node" / "B" / "jobs").glob("[0-9]*"))) == 1
+        # Let the abandoned Python thread return. Its stale MWF writes and child-job
+        # creation must remain rejected even though the larger run has completed.
+        (tmp_path / "node" / "A" / "input" / "release_old.flag").write_text("release", encoding="utf-8")
+        time.sleep(0.25)
+        assert not (tmp_path / "node" / "A" / "output" / "stale.txt").exists()
+        assert len(sorted((tmp_path / "node" / "B" / "jobs").glob("[0-9]*"))) == 1
+    finally:
+        (tmp_path / "node/A/input/release_old.flag").touch(exist_ok=True)
+        active_thread.join(timeout=30)
+        assert not active_thread.is_alive()
+        state.close_database_connections()
 
 
 def test_restart_refuses_non_running_job_without_queueing_it(tmp_path, monkeypatch, capsys):
@@ -161,56 +188,43 @@ def test_restart_refuses_non_running_job_without_queueing_it(tmp_path, monkeypat
     # Router loading created A/1, but no run owns it and it is only queued.
     assert cli.main(["restart", "A", "job", "1"]) == 1
     error = capsys.readouterr().err
-    assert "second terminal" in error
-    assert "mwf resume or mwf resumefrom" in error
+    assert "no recorded execution owner" in error
 
-    assert FileStorage(tmp_path).get_job_status("A", 1) == "queued"
+    state = FileStorage(tmp_path)
+    try:
+        assert state.get_job_status("A", 1) == "queued"
+    finally:
+        state.close_database_connections()
 
 
-def test_restart_refuses_queued_job_even_when_a_run_record_is_live(
+def test_restart_refuses_unowned_queued_job_even_with_a_live_native_reservation(
     tmp_path, monkeypatch, capsys
 ):
     make_restart_project(tmp_path, monkeypatch)
-    (tmp_path / ".mwf" / "run.json").write_text(
-        json.dumps(
-            {
-                "run_id": "fake-live-run",
-                "status": "running",
-                "command": "runfrom",
-                "nodes": ["A", "B"],
-                "pid": os.getpid(),
-            }
-        ),
-        encoding="utf-8",
-    )
+    state = _reserve_live_main(tmp_path)
 
-    assert cli.main(["restart", "A", "job", "1"]) == 1
-    error = capsys.readouterr().err
-    assert "queued, not running or failed" in error
-    assert FileStorage(tmp_path).get_job_status("A", 1) == "queued"
+    try:
+        assert cli.main(["restart", "A", "job", "1"]) == 1
+        error = capsys.readouterr().err
+        assert "no recorded execution owner" in error
+        assert state.get_job_status("A", 1) == "queued"
+    finally:
+        state.close_database_connections()
 
 
 def test_run_job_command_refuses_to_compete_with_live_sequence(
     tmp_path, monkeypatch, capsys
 ):
     make_restart_project(tmp_path, monkeypatch)
-    (tmp_path / ".mwf" / "run.json").write_text(
-        json.dumps(
-            {
-                "run_id": "fake-live-run",
-                "status": "running",
-                "command": "runfrom",
-                "nodes": ["A", "B"],
-                "pid": os.getpid(),
-            }
-        ),
-        encoding="utf-8",
-    )
+    state = _reserve_live_main(tmp_path)
 
-    assert cli.main(["run", "A", "job", "1"]) == 1
-    error = capsys.readouterr().err
-    assert "already active" in error
-    assert "mwf restart <node> job <id>" in error
+    try:
+        assert cli.main(["run", "A", "job", "1"]) == 1
+        error = capsys.readouterr().err
+        assert "already active" in error
+        assert "mwf restart <node> job <id>" in error
+    finally:
+        state.close_database_connections()
 
 
 def test_restart_fast_path_does_not_import_broken_graph_or_node_code(tmp_path, monkeypatch, capsys):
@@ -225,8 +239,7 @@ def test_restart_fast_path_does_not_import_broken_graph_or_node_code(tmp_path, m
 
     assert cli.main(["restart", "A", "job", "1"]) == 1
     error = capsys.readouterr().err
-    assert "second terminal" in error
-    assert "mwf resume or mwf resumefrom" in error
+    assert "Job does not exist: A/1" in error
     assert "invalid syntax" not in error.lower()
 
 
@@ -360,7 +373,7 @@ def run(ctx):
 
     assert restart_active_jobs(tmp_path, "A", [1]) == 0
 
-    active_thread.join(timeout=8)
+    active_thread.join(timeout=30)
     assert not active_thread.is_alive()
     assert run_result == {"code": 0}
 

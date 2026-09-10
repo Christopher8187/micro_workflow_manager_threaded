@@ -131,7 +131,7 @@ class ApiRunner(BaseRunner):
     def startup_lanes(self, items=None) -> int:
         limit = self.effective_limit()
         strategy = self.startup_strategy
-        if strategy in {"event", "single", "serial", "legacy", "latency"}:
+        if strategy in {"event", "single", "latency"}:
             return 1
         if strategy == "balanced":
             hint = getattr(items, "remaining_hint", None)

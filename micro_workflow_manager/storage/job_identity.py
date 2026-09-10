@@ -109,13 +109,18 @@ class JobIdentityStorageMixin(JobProducerStorageMixin):
         ).fetchone()
         return int(row["next_id"])
 
-    def reserve_job_ids(self, node_name: str, count: int) -> list[int]:
+    def reserve_job_ids(
+        self, node_name: str, count: int, *, producer_execution_id: str | None = None,
+    ) -> list[int]:
         if type(count) is not int or count < 1:
             raise ValueError("count must be a positive integer")
         node_name = self.validate_node_name(node_name)
 
         def reserve(connection):
             refuse_receiver_mutation(connection, node_name)
+            self._refuse_interrupt_held_publication(
+                connection, node_name, producer_execution_id,
+            )
             row = connection.execute(
                 "SELECT next_job_id FROM job_sequences WHERE node_name=?",
                 (node_name,),

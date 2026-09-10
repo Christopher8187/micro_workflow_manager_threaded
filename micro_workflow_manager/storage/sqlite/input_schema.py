@@ -34,6 +34,9 @@ def create_input_tables(connection):
             execution_id TEXT NOT NULL REFERENCES job_execution_owners(execution_id),
             receiver_node TEXT NOT NULL,
             state TEXT NOT NULL CHECK(state IN ('prepared','committed','aborted')),
-            changes_json TEXT NOT NULL
+            changes_json TEXT NOT NULL,
+            intent_digest TEXT NOT NULL,
+            decision_json TEXT,
+            decision_digest TEXT
         )
     ''')

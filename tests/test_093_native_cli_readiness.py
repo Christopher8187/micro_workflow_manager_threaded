@@ -77,7 +77,10 @@ def test_ordinary_cli_start_uses_native_parent_readiness(
                        if session['session_id'] not in {row['session_id'] for row in before['execution_sessions']})
         assert current['selected_components'] == selected
         assert (current['status'], current['outcome']) == ('terminal', 'done')
-        assert storage.get_node_status('P') == raw_status
+        assert storage.get_node_status('P') == parent_state['lifecycle']
+        assert storage.db_connection().execute(
+            'SELECT status FROM nodes WHERE node_name=?', ('P',),
+        ).fetchone()['status'] == raw_status
         for node in ('A', 'B'):
             ran = (node,) in selected
             assert storage.get_component_state((node,))['lifecycle'] == ('done' if ran else 'queued')
@@ -261,7 +264,10 @@ def test_runfrom_distant_merge_preserves_unselected_native_parent(tmp_path, monk
         assert cli.main(['runfrom', 'A']) == (0 if parent_done else 1)
 
         assert storage.get_component_state(('X',)) == parent
-        assert storage.get_node_status('X') == raw_status
+        assert storage.get_node_status('X') == parent['lifecycle']
+        assert storage.db_connection().execute(
+            'SELECT status FROM nodes WHERE node_name=?', ('X',),
+        ).fetchone()['status'] == raw_status
         assert storage.get_job_status('X', 1) == ('done' if parent_done else 'queued')
         assert storage.read_job_current_owner('X', 1) == owner
         assert storage.read_job_events('X', 1) == events

@@ -16,30 +16,6 @@ def _init(tmp_path: Path, monkeypatch) -> None:
     assert cli.main(["init"]) == 0
 
 
-def test_legacy_root_state_is_consolidated_into_mwf_directory(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".mwf").write_text(
-        json.dumps({"version": 2, "schema_version": 1, "graph_path": None, "runner": "threaded", "edges": []}),
-        encoding="utf-8",
-    )
-    (tmp_path / ".mwf_run.json").write_text('{"status":"done"}', encoding="utf-8")
-    (tmp_path / ".mwf_threads.json").write_text('{"overrides":{"A":2}}', encoding="utf-8")
-    (tmp_path / ".mwf_locks").mkdir()
-    (tmp_path / ".mwf_locks" / "A.lock").write_text("0", encoding="utf-8")
-
-    assert cli.main(["init"]) == 0
-    out = capsys.readouterr().out
-    assert "Migrated legacy runtime state" in out
-    assert (tmp_path / ".mwf" / "project.json").is_file()
-    assert (tmp_path / ".mwf" / "run.json").is_file()
-    assert (tmp_path / ".mwf" / "threads.json").is_file()
-    assert (tmp_path / ".mwf" / "state.sqlite3").is_file()
-    assert not (tmp_path / ".mwf" / "locks").exists()
-    assert not (tmp_path / ".mwf_run.json").exists()
-    assert not (tmp_path / ".mwf_threads.json").exists()
-    assert not (tmp_path / ".mwf_locks").exists()
-
-
 def test_deploy_setup_creates_ignore_and_stores_no_password(tmp_path, monkeypatch, capsys):
     _init(tmp_path, monkeypatch)
     capsys.readouterr()

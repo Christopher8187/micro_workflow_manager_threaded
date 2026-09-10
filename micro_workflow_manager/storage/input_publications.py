@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.file_helpers import _relative_file_parts
+from micro_workflow_manager.processes import process_identity
 from .input_publication_files import StagedInputFiles, checked_input_path, input_relative_path
 from .events import JobEventAppend
+from .file_operation_receipts import (
+    prepared_receipt, insert_file_receipt, read_file_receipt, require_prepared_file_receipt,
+    finish_file_receipt, input_decision, validate_file_receipt,
+)
+from .operation_lock import operation_lock
+from .recovery_errors import add_recovery_note
 from .preparation_guards import refuse_receiver_mutation, refuse_unfinished_preparation
 
 
@@ -42,9 +50,10 @@ class InputPublicationStorageMixin:
 
     @staticmethod
     def _require_settled_input_publications(connection, receiver):
-        if connection.execute("SELECT 1 FROM input_publications WHERE receiver_node=? AND state='prepared'",
-                              (receiver,)).fetchone():
-            raise RuntimeError('Managed input receiver has an unfinished publication requiring recovery')
+        for row in connection.execute('SELECT * FROM input_publications WHERE receiver_node=?', (receiver,)):
+            validate_file_receipt('input_publications', row)
+            if row['state'] == 'prepared':
+                raise RuntimeError('Managed input receiver has an unfinished publication requiring recovery')
 
     def _read_input_ownership(self, connection, receiver, relative):
         row = connection.execute(
@@ -127,16 +136,30 @@ class InputPublicationStorageMixin:
                 finally:
                     connection.close()
                 operation_id = uuid4().hex
-                files = StagedInputFiles(self, node, receiver, operation_id, changes)
-                return self._publish_input_files(
-                    node, job_id, generation, execution_id, receiver, operation_id, files, event_data,
-                )
+                identity = process_identity(os.getpid())
+                if identity is None:
+                    raise RuntimeError('Managed input publication cannot identify this process instance')
+                owner = {
+                    'owner_pid': os.getpid(),
+                    'process_identity': identity,
+                    'hostname': socket.gethostname(),
+                    'heartbeat_at': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+                }
+                with operation_lock(self, 'input-publication-operations', operation_id):
+                    files = StagedInputFiles(self, node, receiver, operation_id, changes, owner)
+                    return self._publish_input_files(
+                        node, job_id, generation, execution_id, receiver, operation_id, files, event_data,
+                    )
 
     def _publish_input_files(self, node, job_id, generation, execution_id, receiver, operation_id, files, event_data):
         arrival_identity = None
+        expected_receipt = None
 
         def validate(connection):
             refuse_receiver_mutation(connection, receiver)
+            self._refuse_interrupt_held_publication(
+                connection, receiver, execution_id,
+            )
             owner = self._validate_input_producer(connection, node, job_id, generation, execution_id, receiver)
             first_changed_path = None
             for entry in files.entries:
@@ -147,15 +170,19 @@ class InputPublicationStorageMixin:
             return owner, first_changed_path
 
         def prepare(connection):
+            nonlocal expected_receipt
             validate(connection)
             self._require_settled_input_publications(connection, receiver)
-            connection.execute(
-                'INSERT INTO input_publications VALUES(?,?,?,\'prepared\',?)',
-                (operation_id, execution_id, receiver, json.dumps(files.manifest(), separators=(',', ':'))),
+            expected_receipt = prepared_receipt(
+                'input_publications', operation_id=operation_id, execution_id=execution_id, receiver_node=receiver,
+                changes_json=json.dumps(files.manifest, separators=(',', ':')),
             )
+            insert_file_receipt(connection, 'input_publications', expected_receipt)
 
         def commit(connection):
             nonlocal arrival_identity
+            require_prepared_file_receipt(connection, 'input_publications', expected_receipt)
+            files.cleanup_files().require_published()
             owner, first_changed_path = validate(connection)
             for entry in files.entries:
                 relative = entry['relative']
@@ -178,20 +205,13 @@ class InputPublicationStorageMixin:
             for succeeded, error in self._apply_job_event_appends(connection, appends):
                 if not succeeded:
                     raise error
-            changed = connection.execute(
-                "UPDATE input_publications SET state='committed' WHERE operation_id=? AND state='prepared'",
-                (operation_id,),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError('Managed input publication lost its prepared receipt')
+            finish_file_receipt(connection, 'input_publications', expected_receipt, 'committed',
+                                input_decision(connection, expected_receipt, [entry['relative'] for entry in files.entries]))
 
         def abort(connection):
-            changed = connection.execute(
-                "UPDATE input_publications SET state='aborted' WHERE operation_id=? AND state='prepared'",
-                (operation_id,),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError('Managed input restoration lost its prepared receipt')
+            require_prepared_file_receipt(connection, 'input_publications', expected_receipt)
+            files.require_restored()
+            finish_file_receipt(connection, 'input_publications', expected_receipt, 'aborted', {'restored': True})
 
         try:
             files.stage()
@@ -212,6 +232,8 @@ class InputPublicationStorageMixin:
             if arrival_identity is not None:
                 self._component_arrival_latches[receiver] = arrival_identity
         except BaseException as error:
+            if files.manifest is None:
+                raise
             # A durable receipt distinguishes a failed transaction from a
             # notification error after COMMIT. If receipt reads fail, retain
             # the backups and intent instead of guessing the committed state.
@@ -235,8 +257,7 @@ class InputPublicationStorageMixin:
     def _input_publication_state(self, operation_id):
         connection = self._new_db_connection()
         try:
-            row = connection.execute('SELECT state FROM input_publications WHERE operation_id=?',
-                                     (operation_id,)).fetchone()
+            row = read_file_receipt(connection, 'input_publications', operation_id)
             return None if row is None else row['state']
         finally:
             connection.close()
@@ -253,7 +274,12 @@ class InputPublicationStorageMixin:
                     future.result()
                 except BaseException:
                     pass
-            if self._input_publication_state(operation_id) != expected:
+            try:
+                state = self._input_publication_state(operation_id)
+            except BaseException as observation_error:
+                add_recovery_note(error, 'Input publication decision could not be read: ' + str(observation_error))
+                raise error
+            if state != expected:
                 raise
             if not isinstance(error, Exception):
                 raise

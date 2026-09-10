@@ -76,9 +76,9 @@ def test_programmatic_hoeflein_component_waits_for_external_predecessor():
         workflow.storage.close_database_connections()
 
 
-def test_cancelled_jobs_do_not_count_as_successful_completion():
-    with tempfile.TemporaryDirectory() as project_dir:
-        workflow = MicroWorkflow(project_dir=project_dir, runner="direct")
+def test_cancelled_jobs_do_not_count_as_successful_completion(tmp_path):
+    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
+    try:
         workflow.graph([("A", "B")])
 
         @workflow.task("A")
@@ -94,6 +94,7 @@ def test_cancelled_jobs_do_not_count_as_successful_completion():
 
         assert not workflow.node_complete("A")
         assert not workflow.node_ready("B")
+    finally:
         workflow.storage.close_database_connections()
 
 
@@ -476,7 +477,7 @@ def test_dynamic_spawn_does_not_touch_legacy_job_index(monkeypatch):
         def flaky_write_job_index(node_name, index):
             if node_name == "B" and not failed_once["B"]:
                 failed_once["B"] = True
-                raise PermissionError(13, "Permission denied", str(workflow.storage.job_index_file(node_name)))
+                raise PermissionError(13, "Permission denied", str(workflow.storage.project_dir / "node" / node_name / "job_index.json"))
             return original_write_job_index(node_name, index)
 
         monkeypatch.setattr(workflow.storage, "write_job_index", flaky_write_job_index)
@@ -516,7 +517,7 @@ def test_threaded_high_fan_in_to_one_node_avoids_legacy_index_contention(monkeyp
         def flaky_write_job_index(node_name, index):
             if node_name == "Z" and failures_left["Z"] > 0:
                 failures_left["Z"] -= 1
-                raise PermissionError(13, "Permission denied", str(workflow.storage.job_index_file(node_name)))
+                raise PermissionError(13, "Permission denied", str(workflow.storage.project_dir / "node" / node_name / "job_index.json"))
             return original_write_job_index(node_name, index)
 
         monkeypatch.setattr(workflow.storage, "write_job_index", flaky_write_job_index)

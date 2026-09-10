@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import socket
 import sys
-import time
 from contextlib import contextmanager
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -15,6 +14,10 @@ from micro_workflow_manager.monitor import InlineMonitorReporter, InlineStatsRep
 from micro_workflow_manager.processes import process_identity
 from .admission_wait import resolve_admission_future
 from .execution_session_driver import ExecutionSessionDriver
+from .interrupt_execution import (
+    admit_interrupt_session, explicit_interrupt_component, freeze_interrupt_session,
+    frozen_sample_admission, interrupt_request,
+)
 from .sample_admission import SampleRequest, admit_sample_execution_session
 if TYPE_CHECKING:
     from micro_workflow_manager.system import MicroWorkflow
@@ -92,6 +95,8 @@ def _execution_session(
     selected_jobs: list[int] | None = None,
     sample_request: SampleRequest | None = None,
     fresh_preparation: bool = False,
+    interrupt_preflight=None,
+    execution_session_id: str | None = None,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
     stats: bool = False,
@@ -126,9 +131,12 @@ def _execution_session(
             raise ValueError('Sample admission cannot also specify selected jobs')
         if selected_components != [components_by_node[start_node]]:
             raise ValueError('Sample admission requires exactly its starting component')
-    run_id = f"{int(time.time())}-{os.getpid()}-{uuid4().hex[:8]}"
+    interrupt_component = explicit_interrupt_component(interrupt_preflight)
+    if interrupt_component is not None and interrupt_component != components_by_node[start_node]:
+        raise RuntimeError('Explicit interrupt start changed before admission')
+    run_id = execution_session_id if execution_session_id is not None else uuid4().hex
     api_startup_strategy = os.environ.get("MWF_API_STARTUP_STRATEGY", "adaptive").strip().lower()
-    if api_startup_strategy in {"single", "event", "latency", "serial", "legacy"}:
+    if api_startup_strategy in {"single", "event", "latency"}:
         api_startup_windows = "1"
     elif api_startup_strategy == "balanced":
         api_startup_windows = "auto:1-2"
@@ -160,6 +168,11 @@ def _execution_session(
         "api_claim_transaction_rows": os.environ.get("MWF_SQLITE_CLAIM_TRANSACTION_ROWS", "192"),
         "api_prefetch": os.environ.get("MWF_API_PREFETCH", "0"),
     }
+
+    if interrupt_preflight is not None:
+        if not set(interrupt_preflight.blocked_components) <= set(selected_components):
+            raise ValueError('Interrupt boundaries lie outside the execution selection')
+        data['interrupt_preflight'] = interrupt_preflight.record()
 
     admitted_context = None
     created = False
@@ -227,22 +240,12 @@ def _execution_session(
             raise
 
         reporter_cleanup_error = stop_local_reporting()
-        override_cleanup_error: Exception | None = None
         with workflow.storage.interprocess_lock("active-run-state"):
-            try:
-                released = decision['released']
-                if reserved and released != len(selected_components):
-                    raise RuntimeError(
-                        f'Execution session {run_id} reservation cleanup released {released}, '
-                        f'expected {len(selected_components)}'
-                    )
-            finally:
-                try:
-                    workflow.storage.clear_thread_overrides_for_run(run_id)
-                except Exception as cleanup_error:
-                    override_cleanup_error = cleanup_error
-                finally:
-                    workflow.invalidate_thread_override_cache()
+            remaining = workflow.storage.db_connection().execute(
+                'SELECT 1 FROM component_reservations WHERE session_id=? LIMIT 1', (run_id,),
+            ).fetchone()
+            if reserved and remaining is not None:
+                raise RuntimeError(f'Execution session {run_id} retained component reservations')
 
         if reporter_cleanup_error is not None:
             if body_error is not None:
@@ -251,16 +254,10 @@ def _execution_session(
         for reporter in (stats_reporter, monitor_reporter):
             if reporter is not None:
                 reporter.print_final()
-        if override_cleanup_error is not None:
-            print(
-                "Warning: the run completed, but its temporary thread override "
-                f"could not be removed: {override_cleanup_error}",
-                file=sys.stderr,
-            )
-
     try:
         with workflow.storage.interprocess_lock("active-run-state"):
-            refuse_competing_run(workflow)
+            if interrupt_component is None:
+                refuse_competing_run(workflow)
             if sample_request is None:
                 # Preserve exact-job refusal before topology registration.
                 selected_jobs = validate_selected_jobs(workflow, start_node, selected_jobs)
@@ -286,7 +283,20 @@ def _execution_session(
             hostname = socket.gethostname()
             pid = os.getpid()
             identity = process_identity(pid)
-            if sample_request is None:
+            if sample_request is None and interrupt_component is not None:
+                arguments = dict(
+                    command=command, start_component=interrupt_component,
+                    selected_components=selected_components,
+                    selected_jobs=[(start_node, job_id) for job_id in (selected_jobs or [])],
+                    started_at=started_at, hostname=hostname, pid=pid,
+                    process_identity=identity, details=data, expected_shape=snapshot.shape_json,
+                    **interrupt_request(workflow, interrupt_component, expected_shape=snapshot.shape_json),
+                )
+                admission = admit_interrupt_session(workflow.storage, run_id, arguments)
+                created = reserved = True
+                if admission.interruption is not None:
+                    raise admission.interruption
+            elif sample_request is None:
                 pending_creation = workflow.storage.create_execution_session(
                     run_id, session_kind='main', command=command,
                     start_component=components_by_node[start_node],
@@ -330,17 +340,27 @@ def _execution_session(
                     snapshot=snapshot, selected_components=selected_components,
                     started_at=started_at, hostname=hostname, pid=pid,
                     process_identity=identity, details=data, request=sample_request,
+                    interrupt_arguments=(None if interrupt_component is None else interrupt_request(
+                        workflow, interrupt_component, expected_shape=snapshot.shape_json,
+                    )),
                 )
                 # Session, reservation, roots, and selection committed together.
                 created = reserved = True
                 if sample_admission.interruption is not None:
                     raise sample_admission.interruption
-            workflow.storage.bind_thread_overrides_to_run(run_id)
             admitted_context = (run_id, ownership, snapshot.shape_json)
             workflow.execution_session_context = admitted_context
-            workflow.invalidate_thread_override_cache()
 
         workflow.scheduler_supervisor.start_run_heartbeat(run_id, interval=2.0)
+        if interrupt_component is not None:
+            freeze_interrupt_session(
+                workflow, run_id, interrupt_component, expected_shape=snapshot.shape_json,
+                sample_request=sample_request, sample_admission=sample_admission,
+            )
+            if sample_request is not None:
+                sample_admission = frozen_sample_admission(
+                    workflow, run_id, interrupt_component, expected_shape=snapshot.shape_json,
+                )
         stats_reporter = InlineStatsReporter(
             workflow, nodes=nodes, enabled=stats, interval=stats_interval,
         ).start()

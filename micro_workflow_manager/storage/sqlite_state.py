@@ -3,11 +3,13 @@ from __future__ import annotations
 from .sqlite.advisory import SQLiteAdvisoryLockMixin
 from .sqlite.connection import SQLiteConnectionMixin
 from .sqlite.schema import DATABASE_SCHEMA_VERSION, SQLiteSchemaMixin
-from .sqlite.transfer import SQLiteStateTransferMixin
+from .clipboard_operation import ClipboardOperationStorageMixin
+from .node_state_deletion import NodeStateDeletionStorageMixin
 
 
 class SQLiteStateMixin(
-    SQLiteStateTransferMixin,
+    ClipboardOperationStorageMixin,
+    NodeStateDeletionStorageMixin,
     SQLiteAdvisoryLockMixin,
     SQLiteSchemaMixin,
     SQLiteConnectionMixin,

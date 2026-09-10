@@ -14,7 +14,8 @@ from typing import Any
 from micro_workflow_manager.models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED
 from micro_workflow_manager.processes import process_is_alive
 from micro_workflow_manager.session_liveness import execution_session_liveness
-from micro_workflow_manager.monitor_render import render_session_lines
+from micro_workflow_manager.monitor_render import render_component_lines, render_session_lines
+from micro_workflow_manager.node_observation import node_observation
 
 
 TERMINAL_EVENTS = {"done", "failed", "cancelled", "skipped"}
@@ -246,12 +247,14 @@ def top_snapshot(
         item = metrics[node]
         all_terminal_lags.extend(item["terminal_lag_seconds"])
         runner = mounted.runner_override or workflow.runner
+        observation = node_observation(workflow, node)
         row = {
+            **observation,
             "node": node,
-            "node_status": storage.get_node_status(node) or "missing",
+            "node_status": observation["status"],
             "runner": runner,
             "declared_limit": mounted.max_threads,
-            "effective_limit": workflow.effective_max_threads(node),
+            "requested_limit": observation["requested_max_threads"],
             "queued": node_counts.get(QUEUED, 0),
             "running": node_counts.get(RUNNING, 0),
             "done": node_counts.get(DONE, 0),
@@ -282,6 +285,7 @@ def top_snapshot(
         "generated_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "window_seconds": window_seconds,
         "event_driven": True,
+        "api_total_limit": workflow.api_total_limit_override(),
         "sessions": sessions,
         "session_diagnostics": {
             session["session_id"]: _session_diagnostics(storage, session) for session in sessions
@@ -340,6 +344,11 @@ def render_top(snapshot: dict[str, Any]) -> str:
             f"db={_bytes(db['bytes'])} wal={_bytes(db['wal_bytes'])}"
         ),
         (
+            "project API limit="
+            + (str(snapshot["api_total_limit"])
+               if snapshot["api_total_limit"] is not None else "none")
+        ),
+        (
             f"writer source={writer.get('source', '?')} scope=observer-process age={_seconds(writer.get('age_seconds'))} "
             f"queued={writer.get('queued', 0)} urgent={writer.get('urgent', 0)} "
             f"durability-backlog={writer.get('durability_backlog', 0)} "
@@ -368,9 +377,10 @@ def render_top(snapshot: dict[str, Any]) -> str:
             f"rounds={settings.get('api_admission_target_rounds', '-')} "
             f"claim-tx={settings.get('api_claim_transaction_rows', '-')}"
         )
+    lines.extend(render_component_lines(snapshot["nodes"]))
     lines.append("")
     header = (
-        f"{'NODE':<24} {'STATE':<9} {'RUNNER':<8} {'LIMIT':>7} {'QUEUE':>7} "
+        f"{'NODE':<24} {'STATE':<9} {'RUNNER':<8} {'REQUEST':>7} {'QUEUE':>7} "
         f"{'RUN':>6} {'DONE':>7} {'FAIL':>6} {'START/s':>8} {'FIN/s':>8} "
         f"{'Q95':>7} {'TERM95':>7} {'OLDEST-Q':>9}"
     )
@@ -379,7 +389,7 @@ def render_top(snapshot: dict[str, Any]) -> str:
     for row in snapshot["nodes"]:
         line = (
             f"{row['node']:<24.24} {row['node_status']:<9.9} {row['runner']:<8.8} "
-            f"{row['effective_limit']:>7} {row['queued']:>7} {row['running']:>6} "
+            f"{row['requested_limit']:>7} {row['queued']:>7} {row['running']:>6} "
             f"{row['done']:>7} {row['failed']:>6} {row['starts_per_second']:>8.1f} "
             f"{row['finishes_per_second']:>8.1f} {_seconds(row['queue_wait_p95_seconds']):>7} "
             f"{_seconds(row['terminal_lag_p95_seconds']):>7} {_seconds(row['oldest_queued_seconds']):>9}"

@@ -33,7 +33,7 @@ def _session(storage, session_id, kind, component, expected_shape, parent=None, 
         session_id, session_kind=kind, command='run' if kind == 'main' else 'interrupt',
         start_component=component, selected_components=[component],
         selected_jobs=[('A', 1)] if kind == 'main' else [],
-        parent_session_id=parent, started_at=now(), hostname=hostname or socket.gethostname(),
+        parent_session_ids=() if parent is None else (parent,), started_at=now(), hostname=hostname or socket.gethostname(),
         pid=os.getpid(), process_identity=process_identity(os.getpid()),
         details={'start_node': component[0]},
         expected_shape=expected_shape,
@@ -58,10 +58,6 @@ def test_monitoring_lists_exact_native_main_interrupts_and_history(tmp_path, mon
     before_sessions = storage.list_execution_sessions()
     before_events = storage.read_job_events('A', 1)
 
-    def obsolete_reader():
-        raise AssertionError('Monitoring still reads the removed singleton run model')
-
-    monkeypatch.setattr(storage, 'get_run_state', obsolete_reader)
     try:
         snapshot = workflow_snapshot(workflow) if view == 'monitor' else top_snapshot(workflow, list(workflow.nodes))
         assert snapshot['sessions'] == before_sessions
@@ -70,7 +66,7 @@ def test_monitoring_lists_exact_native_main_interrupts_and_history(tmp_path, mon
         text = render_snapshot(snapshot) if view == 'monitor' else render_top(snapshot)
         for session in before_sessions:
             assert session['session_id'] in text
-        assert 'first-interrupt' in text and 'parent=current-main' in text
+        assert 'first-interrupt' in text and 'parents=current-main' in text
         assert 'done' in text
         if view == 'top':
             for session_id in ('current-main', 'first-interrupt', 'second-interrupt'):

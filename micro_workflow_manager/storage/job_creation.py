@@ -121,6 +121,9 @@ class JobCreationStorageMixin(AutoJobCreationStorageMixin):
                 raise ValueError(f"Job {job.node_name}/{job_id} already exists")
 
             refuse_receiver_mutation(connection, job.node_name)
+            self._refuse_interrupt_held_publication(
+                connection, job.node_name, producer_execution_id,
+            )
             if input_text is not None:
                 input_directory = self.job_base_dir(job.node_name, job_id)
                 input_directory.mkdir(exist_ok=False)

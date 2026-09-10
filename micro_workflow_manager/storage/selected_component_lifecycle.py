@@ -69,6 +69,7 @@ class SelectedComponentLifecycleStorageMixin:
         )])
 
         def begin(connection):
+            self._require_interrupt_component_admission(connection, session_id, component)
             observed_identity = ComponentGenerationIdentity(*expected_identity)
             admitted = read_admitted_component_shape(connection, session_id, component, shape)
             read_selected_execution_jobs(self, context, roots, expected_identity, connection=connection)
@@ -80,6 +81,9 @@ class SelectedComponentLifecycleStorageMixin:
                 'SELECT 1 FROM pending_component_executions WHERE component_key=?', (key,),
             ).fetchone():
                 raise RuntimeError('Selected component already has a pending execution')
+            self._validate_interrupt_component_start(
+                connection, session_id, component, successful_lineage,
+            )
             for parent, observed in parents.items():
                 if self._read_component_state(connection, parent) != observed:
                     raise RuntimeError('Selected component parent changed before start')

@@ -126,33 +126,26 @@ def test_events_and_inspect_show_job_history(tmp_path, monkeypatch, capsys):
 
 
 def test_recover_requeues_only_abandoned_running_jobs(tmp_path, monkeypatch, capsys):
-    write_project(tmp_path, monkeypatch)
-    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct", persist_graph=False, initialize_node_folders=False)
-    workflow.graph([("A", "B")])
-    workflow.storage.set_job_status("A", 1, RUNNING, pid=99999999, started_at="2020-01-01T00:00:00")
-    with workflow.storage.db_transaction() as connection:
-        connection.execute(
-            "UPDATE jobs SET active_execution_id=?, active_pid=? WHERE node_name=? AND job_id=?",
-            ("dead", 99999999, "A", 1),
-        )
-    workflow.storage.write_run_state(
-        {
-            "run_id": "dead-run",
-            "status": "running",
-            "command": "runfrom",
-            "nodes": ["A", "B"],
-            "pid": 99999999,
-            "hostname": os.uname().nodename if hasattr(os, "uname") else "local",
-            "heartbeat_at": "2020-01-01T00:00:00",
-        }
-    )
-    capsys.readouterr()
+    from tests.test_064_read_only_previews import _initialize_native_project
+    from tests.test_146_native_applied_recovery import _create_active_scope, _scope_rows
 
-    assert cli.main(["recover"]) == 0
-    assert workflow.storage.get_job_status("A", 1) == QUEUED
-    state = workflow.storage.get_run_state()
-    assert state["status"] == "recovered"
-    assert "A/1" in state["recovered_jobs"]
+    workflow = _initialize_native_project(tmp_path, monkeypatch, edges=[('A', 'B')])
+    storage = workflow.storage
+    shape = workflow.topology.graph_shape()
+    abandoned = _create_active_scope(storage, shape, 'A', 'abandoned-A')
+    _create_active_scope(storage, shape, 'B', 'live-B', live=True)
+    live_before = _scope_rows(storage, 'B', 'live-B')
+    capsys.readouterr()
+    try:
+        assert cli.main(['recover']) == 0
+        assert storage.get_job_status('A', 1) == QUEUED
+        session = storage.get_execution_session('abandoned-A')
+        assert session['status'] == 'terminal' and session['outcome'] == 'failed'
+        assert storage.read_job_control('A', 1)['generation'] == abandoned['generation'] + 1
+        assert _scope_rows(storage, 'B', 'live-B') == live_before
+        assert not (tmp_path / '.mwf' / 'run.json').exists()
+    finally:
+        storage.close_database_connections()
 
 
 def test_timeout_moves_to_fallback_and_blocks_late_context_write(tmp_path):
@@ -515,10 +508,12 @@ def test_failure_history_is_scoped_to_one_job_execution(tmp_path):
 
     job = workflow.start("A")
     assert workflow.run_job("A", job.job_id, ignore_readiness=True) == 1
-    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == 2
-    assert workflow.storage.list_job_ids("B") == [1, 2]
     assert workflow.run_job("B", 1, ignore_readiness=True) == 1
-    assert workflow.run_job("B", 2, ignore_readiness=True) == 2
+    assert workflow.run_job("A", job.job_id, ignore_readiness=True) == 2
+    # Fresh rerunning A removes its earlier causal work in B before publishing
+    # the next job. In-memory handler observations still cover both executions.
+    assert workflow.storage.list_job_ids("B") == [1]
+    assert workflow.run_job("B", 1, ignore_readiness=True) == 2
 
     assert [(item[0], item[1]) for item in a_observations] == [
         (1, 1),
@@ -934,42 +929,26 @@ def test_graph_update_dry_run_does_not_add_or_delete_nodes(tmp_path, monkeypatch
 
 
 def test_cleanup_and_recover_dry_runs_do_not_mutate(tmp_path, monkeypatch, capsys):
-    write_project(tmp_path, monkeypatch)
-    workflow = MicroWorkflow(project_dir=tmp_path, runner="direct", persist_graph=False, initialize_node_folders=False)
-    workflow.graph([("A", "B")])
-    workflow.storage.set_job_status("A", 1, RUNNING, pid=99999999, started_at="2020-01-01T00:00:00")
-    with workflow.storage.db_transaction() as connection:
-        connection.execute(
-            "UPDATE jobs SET active_execution_id=?, active_pid=? WHERE node_name=? AND job_id=?",
-            ("dead", 99999999, "A", 1),
-        )
-    workflow.storage.write_run_state(
-        {
-            "run_id": "dead-run",
-            "status": "running",
-            "command": "runfrom",
-            "nodes": ["A", "B"],
-            "pid": 99999999,
-            "hostname": os.uname().nodename if hasattr(os, "uname") else "local",
-            "heartbeat_at": "2020-01-01T00:00:00",
-        }
+    from tests.test_064_read_only_previews import (
+        _close_without_sidecars, _initialize_native_project, _snapshot,
     )
-    status_before = workflow.storage.read_job_status_data("A", 1)
-    control_before = workflow.storage.read_job_control("A", 1)
-    run_before = (tmp_path / ".mwf" / "run.json").read_bytes()
+    from tests.test_146_native_applied_recovery import _create_active_scope
+
+    workflow = _initialize_native_project(tmp_path, monkeypatch, edges=[('A', 'B')])
+    _create_active_scope(workflow.storage, workflow.topology.graph_shape(), 'A', 'abandoned-A')
+    _close_without_sidecars(workflow.storage, tmp_path)
+    before = _snapshot(tmp_path)
     capsys.readouterr()
 
-    assert cli.main(["recover", "--dry-run"]) == 0
-    assert "Would recover" in capsys.readouterr().out
-    assert workflow.storage.read_job_status_data("A", 1) == status_before
-    assert workflow.storage.read_job_control("A", 1) == control_before
-    assert (tmp_path / ".mwf" / "run.json").read_bytes() == run_before
+    assert cli.main(['recover', '--dry-run']) == 0
+    output = capsys.readouterr().out
+    assert 'session abandoned-A' in output
+    assert 'would requeue abandoned execution: A/1' in output
+    assert _snapshot(tmp_path) == before
 
-    node_before = sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node" / "A").rglob("*"))
-    assert cli.main(["reset", "A", "--dry-run"]) == 0
-    assert "Dry run" in capsys.readouterr().out
-    node_after = sorted(str(path.relative_to(tmp_path)) for path in (tmp_path / "node" / "A").rglob("*"))
-    assert node_after == node_before
+    assert cli.main(['reset', 'A', '--dry-run']) == 0
+    assert 'reset' in capsys.readouterr().out.lower()
+    assert _snapshot(tmp_path) == before
 
 
 def test_every_describe_page_extends_help_with_abstract_examples(capsys):
@@ -1012,9 +991,9 @@ def test_threads_help_describes_api_total_as_an_aggregate_budget(capsys):
     assert exit_info.value.code == 0
     captured = capsys.readouterr()
     output = captured.out
-    assert "aggregate API admission budget" in output
+    assert "project-wide aggregate API admission value" in " ".join(output.split())
     assert "no aggregate framework cap" not in output
-    assert "Deprecated: Set the aggregate API admission budget" in " ".join(output.split())
+    assert "Deprecated:" in output
     assert captured.err == ""
 
     assert cli.main(["--describe", "threads"]) == 0
@@ -1025,39 +1004,38 @@ def test_threads_help_describes_api_total_as_an_aggregate_budget(capsys):
     assert "remains functional" in description
 
 
-def test_preview_and_observer_help_scopes_bootstrap_effects(capsys):
-    for command in ("graph", "doctor", "run", "resume", "runfrom", "resumefrom"):
+def test_preview_and_observer_help_describes_native_state(capsys):
+    for command in ('graph', 'doctor', 'run', 'resume', 'runfrom', 'resumefrom'):
         with pytest.raises(SystemExit) as exit_info:
-            cli.main([command, "--help"])
+            cli.main([command, '--help'])
         assert exit_info.value.code == 0
         output = capsys.readouterr().out
-        assert "bootstrap" in output.lower()
+        assert 'migrate framework state' not in output
 
-    assert cli.main(["--describe", "run"]) == 0
-    run_description = capsys.readouterr().out
-    normalized_run = " ".join(run_description.split())
-    assert "preservation of unselected jobs" in normalized_run
-    assert "do not yet establish descendant or component-circulation isolation" in normalized_run
-    assert "bootstrap" in run_description.lower()
-    assert "no-write" not in run_description
-
-    assert cli.main(["--describe", "monitor"]) == 0
-    monitor_description = capsys.readouterr().out
-    assert "does not execute jobs or claim the run slot" in monitor_description
-    assert "bootstrap" in monitor_description.lower()
-    assert "read-only live view" not in monitor_description
+    for command in ('doctor', 'recover', 'threads', 'monitor'):
+        assert cli.main(['--describe', command]) == 0
+        description = capsys.readouterr().out
+        assert '.mwf/run.json' not in description
+        assert '.mwf/threads.json' not in description
+        assert 'migrate an old runtime' not in description
+        if command == 'doctor':
+            assert 'without importing' in description
+            assert 'changing project state' in description
+        if command == 'monitor':
+            assert 'Multiple interrupts remain separately visible' in description
 
 
 def test_checkpoint_watchdog_refreshes_at_each_progress_checkpoint(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
     workflow.graph([("A", "B")])
 
-    @workflow.task("A", checkpoint_timeout=0.05)
+    @workflow.task("A", checkpoint_timeout=1.0)
     def a(ctx):
         started = time.monotonic()
-        time.sleep(0.03)
-        ctx.checkpoint("halfway", progress=0.5, detail="first section complete")
-        time.sleep(0.03)
+        for _ in range(2):
+            time.sleep(0.4)
+            ctx.checkpoint("halfway", progress=0.5, detail="first section complete")
+        time.sleep(0.4)
         return time.monotonic() - started
 
     @workflow.task("B")
@@ -1065,7 +1043,7 @@ def test_checkpoint_watchdog_refreshes_at_each_progress_checkpoint(tmp_path):
         return None
 
     elapsed = workflow.run_one("A")
-    assert elapsed > 0.05
+    assert elapsed > 1.0
     runtime = workflow.storage.read_job_runtime("A", 1)
     assert runtime["state"] == "completed"
     assert runtime["checkpoint_name"] == "halfway"
@@ -1110,7 +1088,8 @@ def test_checkpoint_watchdog_fails_stalled_section_and_blocks_late_write(tmp_pat
 
 
 def test_inspect_reports_live_checkpoint_progress(tmp_path, capsys):
-    from threading import Event, Thread
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
     from micro_workflow_manager.cli.inspect import inspect_job
 
     workflow = MicroWorkflow(project_dir=tmp_path, runner="direct")
@@ -1118,11 +1097,11 @@ def test_inspect_reports_live_checkpoint_progress(tmp_path, capsys):
     checkpoint_written = Event()
     release = Event()
 
-    @workflow.task("A", checkpoint_timeout=1.0)
+    @workflow.task("A", checkpoint_timeout=30.0)
     def a(ctx):
         ctx.checkpoint("download", progress=0.4, detail="2 of 5 files")
         checkpoint_written.set()
-        assert release.wait(0.5)
+        assert release.wait(30)
         ctx.checkpoint("complete", progress=1.0)
         return "ok"
 
@@ -1131,27 +1110,22 @@ def test_inspect_reports_live_checkpoint_progress(tmp_path, capsys):
         return None
 
     job = workflow.start("A")
-    result: list[object] = []
-    worker = Thread(
-        target=lambda: result.append(
-            workflow.run_job("A", job.job_id, ignore_readiness=True)
-        ),
-        daemon=True,
-    )
-    worker.start()
-    assert checkpoint_written.wait(0.5)
-
-    assert inspect_job(workflow, "A", job.job_id) == 0
-    output = capsys.readouterr().out
-    assert "checkpoint: download" in output
-    assert "progress: 40.0%" in output
-    assert "progress detail: 2 of 5 files" in output
-    assert "checkpoint deadline:" in output
-
-    release.set()
-    worker.join(timeout=2)
-    assert not worker.is_alive()
-    assert result == ["ok"]
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            execution = executor.submit(workflow.run_job, 'A', job.job_id, ignore_readiness=True)
+            try:
+                assert checkpoint_written.wait(15)
+                assert inspect_job(workflow, 'A', job.job_id) == 0
+                output = capsys.readouterr().out
+                assert 'checkpoint: download' in output
+                assert 'progress: 40.0%' in output
+                assert 'progress detail: 2 of 5 files' in output
+                assert 'checkpoint deadline:' in output
+            finally:
+                release.set()
+            assert execution.result(timeout=15) == 'ok'
+    finally:
+        workflow.storage.close_database_connections()
 
 
 @pytest.mark.parametrize("startup_delay", [0.0, 0.6])

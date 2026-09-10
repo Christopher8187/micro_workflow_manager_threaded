@@ -16,6 +16,7 @@ from .node import (
     validate_positive_int,
     validate_positive_float,
     normalize_wait_for,
+    validate_interrupt,
 )
 
 
@@ -67,6 +68,7 @@ class NodeRouter:
         checkpoint_timeout: float | None = None,
         waiting: bool = False,
         wait_for: str | Iterable[str] | None = None,
+        interrupt: bool = False,
     ):
         self.name = name
         self.max_threads = validate_positive_int("max_threads", max_threads)
@@ -74,6 +76,7 @@ class NodeRouter:
         self.checkpoint_timeout = validate_positive_float("checkpoint_timeout", checkpoint_timeout)
         self.waiting = bool(waiting or wait_for is not None)
         self.wait_for = normalize_wait_for(wait_for)
+        self.interrupt = validate_interrupt(interrupt)
         self.runner_override = sequential_runner_value(
             runner=runner,
             sequential=sequential,
@@ -96,6 +99,7 @@ class NodeRouter:
         checkpoint_timeout: float | None = None,
         waiting: bool = False,
         wait_for: str | Iterable[str] | None = None,
+        interrupt: bool = False,
     ) -> "NodeRouter":
         """Create a router whose node name is the Python file stem."""
         return cls(
@@ -107,6 +111,7 @@ class NodeRouter:
             checkpoint_timeout=checkpoint_timeout,
             waiting=waiting,
             wait_for=wait_for,
+            interrupt=interrupt,
         )
 
     def wait_for_nodes(self, *node_names: str) -> "NodeRouter":
@@ -280,6 +285,7 @@ class NodeRouter:
             runner=self.runner_override,
             waiting=self.waiting,
             wait_for=self.wait_for,
+            interrupt=self.interrupt,
         )(self.main_task.handler)
 
         for fallback in self.fallbacks:

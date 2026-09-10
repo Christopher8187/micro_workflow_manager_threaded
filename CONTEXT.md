@@ -142,8 +142,7 @@ need not be numeric or monotonic.
 
 An earlier error or unsuitable result persists through job transfers and causes
 erroneous jobs or durable results downstream. A chain reaction needs neither a
-cycle nor a component vortex. Tracing and recovery for chain reactions belong
-to the MWF 0.6.2 workflow-management discussion.
+cycle nor a component vortex.
 
 ### Semantic oasis
 
@@ -299,17 +298,159 @@ state-transparency problem, not backlog work.
 
 ### MWF run session
 
-One framework-owned execution record or sequence.
+An earlier name for an execution session. A session owns a selected region of
+work and may coexist with other sessions in disjoint or explicitly transferred
+regions.
 
 ### Full workflow run
 
-Execution of the complete intended end-to-end workflow region. Not every MWF
-run session is a full workflow run.
+Execution of the complete intended end-to-end workflow region. An execution
+session may instead cover only a selected part of that region.
 
 ### Node clipboard snapshot and restore
 
 The operations exposed as `mwf copy` and `mwf paste`. They copy stored node
 state, not Python behavior or graph edges, so they are not full node duplication.
+
+## Workflow management
+
+### Workflow management
+
+The selection, execution, continuation, recovery, and inspection of MWF work by
+an actor. The actor may be a person or an automated agent.
+
+### Subgraph management
+
+Management of an isolated quotient-DAG selection together with its corresponding
+raw nodes, inputs, jobs, and traces.
+
+### Quotient interval
+
+The union of components on directed quotient-DAG paths between two components.
+The half-open interval includes its start component and excludes its end.
+
+### Execution sampling
+
+Execution of a reproducibly selected subset of framework-visible jobs and the
+causal work those jobs create within the selected component.
+
+### Inspection sampling
+
+A review practice that reproducibly selects framework-visible work for closer
+inspection, emphasizing failures, unusually dirty filters, and expensive late
+fallbacks. It is distinct from executing a sample.
+
+### Sampled
+
+A component lifecycle in which selected work has completed successfully while
+the full component remains incomplete. Its retained work has one compatible
+stability lineage.
+
+### Tracing
+
+Inspection of the recorded relationships and execution history that explain a
+job's origin, progress, and result.
+
+### Full job trace
+
+The ordered history of one job, including its context observations, task and
+fallback attempts, publications, failures, and terminal result.
+
+### Lineage trace
+
+A compact view of one job's identity, component state, producing session,
+creating job, and directly created jobs. Traversal to another job is a separate
+inspection.
+
+### Producer-qualified input
+
+Managed receiver input whose identity includes the producing raw node and the
+producer-relative path. Equal relative paths from different producers remain
+distinct inputs.
+
+### Execution session
+
+One framework-owned execution sequence with an exact selected scope, ownership,
+and outcome. Its identity is distinct from a component's successful result or
+instability origin.
+
+### Main session
+
+The ordinary execution session in a project. At most one main session is live
+at a time.
+
+### Interrupt session
+
+An explicitly requested execution session that can pause live direct predecessors
+and execute its selected target region. Several interrupt sessions may coexist
+when their ownership and mutation requirements permit it.
+
+### Interrupt component
+
+A Hoeflein component declared as an ordinary execution boundary that an actor
+may explicitly interrupt. The declaration applies to the complete component.
+
+### Interrupt barricade
+
+An interrupt component at which ordinary execution requires a run-or-stop
+decision before proceeding.
+
+### Post-interrupt fence
+
+A boundary that prevents earlier admitted work from automatically continuing
+through an interrupt's partial or readiness-overridden result. It is separate
+from the temporary pause of the target's direct predecessors.
+
+### Waiting configuration
+
+A raw node's declared internal admission condition within its Hoeflein component.
+It is distinct from component lifecycle and graph routing.
+
+### Active waiting display
+
+The displayed waiting condition of a configured raw node whose internal wait
+is active while its component is running.
+
+### Autostart routing
+
+A declared routing relationship through which work can activate another member
+of its Hoeflein component. It is distinct from waiting and lifecycle state.
+
+### Stability
+
+The stable or unstable character of a successful component result or retained
+sampled work. An unstable result carries one exact instability origin.
+
+### Instability origin
+
+The interrupt session that established the unstable lineage of a result.
+Later execution can retain that origin while using a different session identity.
+
+### Instability conflict
+
+An incompatibility between incoming successful results that would require one
+component to carry several instability origins.
+
+### Misaligned
+
+A component condition in which its current managed input or job set no longer
+agrees with its retained done, sampled, or failed work. It is separate from
+lifecycle and stability.
+
+### Misalignment conflict
+
+A refusal to reuse retained work whose managed input or job set has changed.
+
+### Alignment generation
+
+The identity of one established component input-and-job alignment. Misalignment
+causes belong to that generation.
+
+### Report interrupt architecture
+
+A workflow design in which a report interrupt component shares the direct
+predecessors of a semantic oasis and has a descendant branch disjoint from the
+oasis branch.
 
 ## Task architecture
 
@@ -348,19 +489,3 @@ Filesystem correctness between connected tasks. Outbound routing places or
 references data at the path expected by the receiving task's function.
 Connected tasks may use different relative paths as long as their task
 interfaces agree.
-
-## Release boundaries
-
-MWF 0.6.1 owns this documentation hierarchy, AFSR instructions, isolated
-testing model, failure lineage, durable per-attempt failure events, trace error
-views, removal of per-job file storage and `ctx.transaction()`, narrow CLI and
-benchmark corrections, and their approved regression coverage.
-
-Issue 44 owns the contested MWF 0.6.2 workflow-management changes. Proper
-example implementation, including correction of the mistaken output-history
-framing in examples, remains MWF 0.6.3 work.
-
-The provisional future items currently collected as 0.6.4 still need a later
-grilling session to settle the exact 0.6.3 versus 0.6.4 boundary and Wayfinder
-shape. The long-term compatibility boundary for the public Python API remains
-undecided.

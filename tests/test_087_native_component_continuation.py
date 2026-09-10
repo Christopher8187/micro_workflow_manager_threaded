@@ -1246,7 +1246,11 @@ def test_partial_component_restart_runs_only_accepted_successor_before_remaining
                 {'event': 'queued', 'previous_status': 'queued', 'status': 'queued'},
             ]
             assert not storage.output_file(node, 2).exists()
-            assert storage.get_node_status(node) == ('queued' if entry == 'run' and node == 'A' else 'failed')
+            assert storage.get_node_status(node) == 'failed'
+            state = storage.get_component_state(('A', 'B') if entry == 'run_component' else (node,))
+            assert (state['lifecycle'], state['stability'], state['instability_origin']) == (
+                'failed', None, None,
+            )
         assert storage.read_job_current_owner('A', 1)['session_id'] == owner['session_id']
         for component in workflow.execution_components():
             assert storage.get_component_reservation(component) is None

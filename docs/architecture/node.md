@@ -134,6 +134,17 @@ constructing one client for every job or retry.
 Waiting declarations are intra-component admission gates. A target outside the
 node's Hoeflein component is invalid. A waiting singleton adds no DAG behavior.
 
+`waiting` and `wait_for` configure one raw node. Interrupt classification has
+component scope: one member's `interrupt=True` declaration classifies the whole
+component. Neither declaration changes job status. A configured waiting node
+displays active waiting only while its component is running and its internal
+condition currently blocks admission. Queued components display queued members.
+
+Managed input uses the producing raw node as the visible prefix under the
+receiving raw node's input directory. Members of one component keep distinct
+producer and receiver identities. Component membership determines scheduling
+and preparation; it does not replace raw-node names in input paths.
+
 ## State, restart, and recovery
 
 SQLite is authoritative for scheduler state. User payloads and output
@@ -142,7 +153,7 @@ timed-out, restarted, or stale handler from publishing MWF-managed files, state,
 or child jobs.
 
 Resume preserves successful work and continues eligible unfinished work.
-Restart operates inside an active run session and advances the execution fence
+Restart operates inside the job's owning execution session and advances the execution fence
 before replacement work publishes. Recovery is for work abandoned by a dead CLI
 owner. None of these operations should be treated as synonyms for a fresh run.
 

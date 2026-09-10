@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
-import os
-import socket
-from contextlib import contextmanager
-from uuid import uuid4
 
-from micro_workflow_manager.component_identity import decode_component_key
-from micro_workflow_manager.processes import process_identity
+from contextlib import contextmanager
+
+from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
 from .preparation_footprint import validate_preparation_footprint
-from .preparation_receipts import submit_preparation_decision
+from .preparation_attempts import hold_preparation_attempt
+from .file_operation_receipts import validate_file_receipt
 
 
 def refuse_unfinished_preparation(connection, receiver):
-    row = connection.execute(
-        "SELECT operation_id FROM preparation_receipts WHERE state='prepared' AND EXISTS "
-        "(SELECT 1 FROM json_each(manifest_json, '$.receivers') WHERE value=?) LIMIT 1", (receiver,),
-    ).fetchone()
-    if row is not None:
-        raise RuntimeError(f'Receiver {receiver} has unfinished preparation {row["operation_id"]} requiring recovery')
+    rows = connection.execute(
+        "SELECT * FROM preparation_receipts WHERE EXISTS "
+        "(SELECT 1 FROM json_each(manifest_json, '$.receivers') WHERE value=?)", (receiver,),
+    )
+    for row in rows:
+        validate_file_receipt('preparation_receipts', row)
+        if row['state'] == 'prepared':
+            raise RuntimeError(f'Receiver {receiver} has unfinished preparation {row["operation_id"]} requiring recovery')
 
 
 def refuse_receiver_mutation(connection, receiver):
@@ -39,9 +39,10 @@ def validate_held_guards(connection, receivers, operation_id):
 
 
 @contextmanager
-def hold_preparation_guards(storage, footprint, session_id, observations, *, membership_preparation=None):
-    operation_id = uuid4().hex
+def hold_preparation_guards(storage, footprint, session_id, observations, *, operation, membership_preparation=None):
     receivers = footprint.excluded_nodes
+    nodes = {plan.node for unit in footprint.units for plan in unit.jobs}
+    nodes.update(item.receiver for unit in footprint.units for item in unit.inputs)
 
     def acquire(connection):
         if membership_preparation is not None:
@@ -56,8 +57,6 @@ def hold_preparation_guards(storage, footprint, session_id, observations, *, mem
                 if observed != expected:
                     raise RuntimeError('Component changed during complete preparation preflight: ' + repr(unit.component))
             validate_preparation_footprint(storage, connection, footprint)
-        nodes = {plan.node for unit in footprint.units for plan in unit.jobs}
-        nodes.update(item.receiver for unit in footprint.units for item in unit.inputs)
         for node in sorted(nodes):
             refuse_receiver_mutation(connection, node)
         reservations = connection.execute('SELECT component_key, session_id FROM component_reservations').fetchall()
@@ -79,37 +78,16 @@ def hold_preparation_guards(storage, footprint, session_id, observations, *, mem
                                        f'execution {active["active_execution_id"]}')
             if observed is not None and observed[1]['lifecycle'] == 'running':
                 raise RuntimeError(f'Receiver {receiver} has running component {members}')
-        identity = process_identity(os.getpid())
-        if receivers and not identity:
-            raise RuntimeError('Receiver preparation requires the current process identity')
-        connection.executemany('INSERT INTO receiver_mutation_guards VALUES(?,?,?,?,?,?)',
-                               [(node, operation_id, session_id, os.getpid(), identity, socket.gethostname())
-                                for node in receivers])
+
+    def after_acquire(connection, operation_id):
         if membership_preparation is not None:
-            # Recheck the complete footprint in the transaction that now owns
-            # every temporary receiver guard.
             membership_preparation.validate_initial(connection)
             validate_held_guards(connection, receivers, operation_id)
+            membership_preparation.bind_attempt(connection, operation_id)
 
-    def release():
-        def release(connection):
-            unfinished = connection.execute(
-                "SELECT operation_id FROM preparation_receipts WHERE guard_id=? AND state='prepared' LIMIT 1",
-                (operation_id,),
-            ).fetchone()
-            if unfinished is not None:
-                raise RuntimeError('Preparation guards retained for recovery: ' + unfinished['operation_id'])
-            connection.execute('DELETE FROM receiver_mutation_guards WHERE operation_id=?', (operation_id,))
-        submit_preparation_decision(storage, release)
-
-    try:
-        submit_preparation_decision(storage, acquire)
+    intended = [{'operation': operation, 'component_key': encode_component_key(unit.component)}
+                for unit in footprint.units]
+    with hold_preparation_attempt(storage, session_id, receivers, nodes, intended, acquire,
+                                  after_acquire=after_acquire, membership_revision=(
+                                      None if membership_preparation is None else membership_preparation.revision)) as operation_id:
         yield operation_id
-    except BaseException as error:
-        try:
-            release()
-        except BaseException as release_error:
-            error.__notes__ = [*getattr(error, '__notes__', ()), f'Receiver guard release failed: {release_error}']
-        raise
-    else:
-        release()

@@ -94,10 +94,6 @@ class JobEventStorageMixin:
                             {
                                 "previous_origin": previous_origin,
                                 "current_origin": current_origin,
-                                # Retain the parent-only keys for compatibility
-                                # with any 0.5.0 prerelease trace readers.
-                                "previous_parent": previous_origin.get("parent"),
-                                "current_parent": current_origin.get("parent"),
                             },
                             ensure_ascii=False,
                             separators=(",", ":"),

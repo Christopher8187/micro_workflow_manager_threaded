@@ -9,6 +9,7 @@ from ..node import (
     validate_non_negative_int,
     validate_positive_int,
     validate_positive_float,
+    validate_interrupt,
 )
 from ..router import NodeRouter, import_modules_from_dir, routers_from_module
 
@@ -95,10 +96,12 @@ class WorkflowRegistrationMixin:
         sequential: bool = False,
         waiting: bool | None = None,
         wait_for: str | Iterable[str] | None = None,
+        interrupt: bool = False,
     ) -> JobNode:
         name = self.storage.validate_node_name(name)
         max_threads = validate_positive_int("max_threads", max_threads)
         runner_override = sequential_runner_value(runner=runner, sequential=sequential)
+        interrupt_checked = validate_interrupt(interrupt)
 
         if runner_override == "direct":
             max_threads = 1
@@ -111,6 +114,7 @@ class WorkflowRegistrationMixin:
                     runner=runner_override,
                     waiting=bool(waiting),
                     wait_for=wait_for,
+                    interrupt=interrupt_checked,
                 )
                 self.graph_obj.add_node(name)
 
@@ -125,6 +129,7 @@ class WorkflowRegistrationMixin:
                     node.set_runner(runner=runner_override)
                 if waiting is not None:
                     node.configure_waiting(waiting=waiting, wait_for=wait_for)
+                node.declare_interrupt(interrupt_checked)
 
             if waiting is not None:
                 self.validate_waiting_configuration(name)
@@ -142,6 +147,7 @@ class WorkflowRegistrationMixin:
         checkpoint_timeout: float | None = None,
         waiting: bool = False,
         wait_for: str | Iterable[str] | None = None,
+        interrupt: bool = False,
     ):
         max_threads_checked = validate_positive_int("max_threads", max_threads)
         retries_checked = validate_non_negative_int("retries", retries)
@@ -149,6 +155,7 @@ class WorkflowRegistrationMixin:
         timeout_checked = validate_positive_float("timeout", timeout)
         checkpoint_timeout_checked = validate_positive_float("checkpoint_timeout", checkpoint_timeout)
         runner_override = sequential_runner_value(runner=runner, sequential=sequential)
+        interrupt_checked = validate_interrupt(interrupt)
 
         if runner_override == "direct":
             max_threads_checked = 1
@@ -160,6 +167,7 @@ class WorkflowRegistrationMixin:
                 runner=runner_override,
                 waiting=waiting or wait_for is not None,
                 wait_for=wait_for,
+                interrupt=interrupt_checked,
             )
             node.max_threads = max_threads_checked
             if runner_override is not None:
@@ -188,6 +196,7 @@ class WorkflowRegistrationMixin:
                 waiting=node.waiting,
                 wait_for=node.wait_for,
                 resolved_wait_for=sorted(self.waiting_dependencies(node_name)),
+                interrupt=node.interrupt,
             )
 
             return fn
@@ -234,6 +243,7 @@ class WorkflowRegistrationMixin:
                     waiting=node.waiting,
                     wait_for=node.wait_for,
                     resolved_wait_for=sorted(self.waiting_dependencies(node_name)),
+                    interrupt=node.interrupt,
                 )
 
             return fn

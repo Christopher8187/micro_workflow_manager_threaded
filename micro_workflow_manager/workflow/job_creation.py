@@ -388,7 +388,9 @@ class JobCreationMixin:
         if missing_indexes:
             self.storage.validate_job_receiver_shape(to_node, expected_shape=expected_shape)
         reserved_ids = (
-            self.storage.reserve_job_ids(to_node, len(missing_indexes))
+            self.storage.reserve_job_ids(
+                to_node, len(missing_indexes), producer_execution_id=_parent_execution_id,
+            )
             if missing_indexes
             else []
         )

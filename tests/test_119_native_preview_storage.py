@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import socket
 from hashlib import sha256
 from pathlib import Path
 
@@ -12,7 +11,11 @@ from micro_workflow_manager.cli.project import load_workflow
 from micro_workflow_manager.models import Job
 from tests.test_036_hoeflein_scheduling import make_project
 from tests.test_086_native_owned_restart import _close
-from tests.test_064_read_only_previews import _wait_restart_listener_retired
+from tests.test_064_read_only_previews import (
+    _live_execution_session_identity,
+    _mark_execution_session_stale,
+    _wait_restart_listener_retired,
+)
 
 
 def _files(root, *, allow_existing_shm=False):
@@ -153,10 +156,7 @@ def test_native_preview_reports_abandoned_session_and_recovery_without_mutation(
         start_component=component,
         selected_components=[component],
         selected_jobs=[('A', 1)],
-        started_at='2020-01-01T00:00:00+00:00',
-        hostname=socket.gethostname(),
-        pid=99999999,
-        process_identity='dead-preview-process',
+        **_live_execution_session_identity(),
         details={'start_node': 'A'},
         expected_shape=workflow.topology.snapshot().shape_json,
     )
@@ -177,6 +177,7 @@ def test_native_preview_reports_abandoned_session_and_recovery_without_mutation(
     )
     assert generation == 0
     assert storage.read_job_control('A', 1)['active_execution_id'] == execution_id
+    _mark_execution_session_stale(storage, session_id)
     storage.db_mutation_barrier()
     external = _install_import_sentinels(tmp_path)
     database = tmp_path / '.mwf' / 'state.sqlite3'

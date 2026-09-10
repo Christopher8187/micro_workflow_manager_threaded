@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from uuid import uuid4
 
 from .input_schema import INPUT_TABLES, create_input_tables
 from .membership_schema import MEMBERSHIP_TABLES, create_membership_tables
 from .component_schema import create_component_tables
 from .misalignment_schema import MISALIGNMENT_TABLES, create_misalignment_tables
 from .preparation_schema import PREPARATION_TABLES, create_preparation_tables
+from .recovery_schema import RECOVERY_TABLES, create_recovery_tables
+from .restart_schema import RESTART_TABLES, create_restart_tables
+from .api_admission_schema import API_ADMISSION_TABLES, create_api_admission_tables
+from .thread_schema import THREAD_TABLES, create_thread_tables
+from .interrupt_schema import INTERRUPT_TABLES, create_interrupt_tables
+from .clipboard_schema import CLIPBOARD_TABLES, create_clipboard_tables
 
 
-DATABASE_SCHEMA_VERSION = 6
+DATABASE_SCHEMA_VERSION = 9
 SESSION_TABLES = frozenset({
     "execution_sessions", "session_components", "session_jobs",
     "graph_shapes", "component_definitions", "component_reservations", "component_holds",
@@ -23,7 +30,8 @@ CORE_TABLES = frozenset({
     "default_job_specs", "advisory_locks", "job_sequences", "network_state",
 })
 NATIVE_TABLES = (CORE_TABLES | SESSION_TABLES | INPUT_TABLES | MISALIGNMENT_TABLES
-                 | PREPARATION_TABLES | MEMBERSHIP_TABLES)
+                 | PREPARATION_TABLES | MEMBERSHIP_TABLES | RECOVERY_TABLES | RESTART_TABLES
+                 | THREAD_TABLES | INTERRUPT_TABLES | API_ADMISSION_TABLES | CLIPBOARD_TABLES)
 
 
 class SQLiteSchemaMixin:
@@ -55,6 +63,10 @@ class SQLiteSchemaMixin:
                     "INSERT INTO metadata(key, value) VALUES('database_schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (str(DATABASE_SCHEMA_VERSION),),
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES('project_id', ?)",
+                    (uuid4().hex,),
                 )
             else:
                 self.validate_native_database(connection)
@@ -107,6 +119,12 @@ class SQLiteSchemaMixin:
             raise RuntimeError("Unsupported MWF project format. Use migration.md to prepare a separate fresh project.")
         if not NATIVE_TABLES.issubset(existing_tables):
             raise RuntimeError("Incomplete SQLite execution-session schema")
+        project = connection.execute(
+            "SELECT value FROM metadata WHERE key='project_id'"
+        ).fetchone()
+        if (project is None or type(project[0]) is not str or len(project[0]) != 32
+                or any(character not in '0123456789abcdef' for character in project[0])):
+            raise RuntimeError("Incomplete SQLite execution-session schema: invalid project identity")
         SQLiteSchemaMixin._validate_execution_session_schema(connection)
 
     @staticmethod
@@ -299,9 +317,6 @@ class SQLiteSchemaMixin:
             CREATE TABLE execution_sessions (
                 session_id TEXT PRIMARY KEY,
                 session_kind TEXT NOT NULL CHECK(session_kind IN ('main', 'interrupt')),
-                parent_session_id TEXT REFERENCES execution_sessions(session_id)
-                    CHECK(parent_session_id IS NULL OR
-                          (session_kind='interrupt' AND parent_session_id<>session_id)),
                 command TEXT NOT NULL,
                 selection_kind TEXT NOT NULL CHECK(selection_kind IN ('components', 'jobs')),
                 start_component TEXT NOT NULL,
@@ -317,7 +332,9 @@ class SQLiteSchemaMixin:
                 details_json TEXT NOT NULL DEFAULT '{}',
                 admitted_shape_id INTEGER NOT NULL REFERENCES graph_shapes(shape_id),
                 partition_revision INTEGER NOT NULL
-                    CHECK(typeof(partition_revision)='integer' AND partition_revision>=0)
+                    CHECK(typeof(partition_revision)='integer' AND partition_revision>=0),
+                scope_admitted INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(scope_admitted)='integer' AND scope_admitted IN (0,1))
             )
         """)
         connection.execute("""
@@ -353,7 +370,13 @@ class SQLiteSchemaMixin:
 
         create_input_tables(connection)
         create_preparation_tables(connection)
+        create_recovery_tables(connection)
+        create_restart_tables(connection)
         create_misalignment_tables(connection)
+        create_interrupt_tables(connection)
+        create_thread_tables(connection)
+        create_api_admission_tables(connection)
+        create_clipboard_tables(connection)
 
     def database_integrity_check(self) -> str:
         row = self.db_connection().execute("PRAGMA quick_check").fetchone()

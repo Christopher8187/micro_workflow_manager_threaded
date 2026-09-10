@@ -73,7 +73,7 @@ def test_queued_component_is_not_reported_running_before_execution(tmp_path):
     workflow.include_router(explode)
     workflow.include_router(handler)
     # Simulate the stale component-wide RUNNING state observed after an earlier
-    # refresh. Monitor must derive per-node display state from actual job counts.
+    # refresh. Monitor must derive lifecycle from the current native component.
     workflow.storage.set_node_status("explode", "running")
     workflow.storage.set_node_status("handler", "running")
 
@@ -88,6 +88,9 @@ def test_queued_component_is_not_reported_running_before_execution(tmp_path):
 def test_monitor_prefers_actual_running_job_over_stale_queued_node_state(tmp_path):
     workflow = MicroWorkflow(tmp_path, runner="threaded")
     workflow.graph([("explode", "handler"), ("handler", "explode")])
+    entered = threading.Event()
+    release = threading.Event()
+    errors = []
 
     explode = NodeRouter("explode")
     handler = NodeRouter("handler")
@@ -99,21 +102,60 @@ def test_monitor_prefers_actual_running_job_over_stale_queued_node_state(tmp_pat
 
     @handler.task
     def refine(ctx, value):
+        entered.set()
+        release.wait()
         return value
 
     workflow.include_router(explode)
     workflow.include_router(handler)
-    workflow.storage.set_node_status("handler", "queued")
-    workflow.storage.set_job_status("handler", 1, "running")
 
-    snapshot = workflow_snapshot(workflow)
-    rows = {row["node"]: row for row in snapshot["nodes"]}
-    assert rows["handler"]["status"] == "running"
-    assert rows["handler"]["running"] == 1
-    assert "handler" in snapshot["running_nodes"]
+    def run_workflow():
+        try:
+            workflow.run_node("handler", ignore_readiness=True)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            workflow.storage.close_thread_connection()
+
+    worker = threading.Thread(target=run_workflow)
+    worker.start()
+    try:
+        assert entered.wait(10), "The native handler did not start"
+        assert workflow.storage.read_job_current_owner("handler", 1) is not None
+        assert workflow.storage.get_component_state(("explode", "handler"))["lifecycle"] == "running"
+        workflow.storage.set_node_status("handler", "queued")
+        workflow.storage.db_mutation_barrier()
+        assert workflow.storage.db_connection().execute(
+            "SELECT status FROM nodes WHERE node_name='handler'"
+        ).fetchone()[0] == "queued"
+
+        snapshot = workflow_snapshot(workflow)
+        rows = {row["node"]: row for row in snapshot["nodes"]}
+        assert rows["handler"]["status"] == "running"
+        assert rows["handler"]["running"] == 1
+        assert "handler" in snapshot["running_nodes"]
+    finally:
+        release.set()
+        worker.join(timeout=20)
+    assert not worker.is_alive(), "The native handler did not finish"
+    assert errors == []
+    assert workflow.storage.job_status_counts("handler")["done"] == 1
+
 
 def test_threaded_lazy_source_failure_terminates_run_and_monitor(tmp_path, monkeypatch, capsys):
+    import sys
+    from types import ModuleType
+
     monkeypatch.chdir(tmp_path)
+    phase_module_name = "_mwf_test041_lazy_source_failure_phase"
+    failure_started: list[float] = []
+    phase_module = ModuleType(phase_module_name)
+
+    def mark_failure() -> None:
+        failure_started.append(time.monotonic())
+
+    phase_module.mark_failure = mark_failure
+    monkeypatch.setitem(sys.modules, phase_module_name, phase_module)
     behavior = tmp_path / "src" / "node_behavior"
     behavior.mkdir(parents=True)
     (tmp_path / "src" / "graph.py").write_text(
@@ -124,6 +166,7 @@ def test_threaded_lazy_source_failure_terminates_run_and_monitor(tmp_path, monke
         textwrap.dedent(
             """
             from micro_workflow_manager import NodeRouter
+            from _mwf_test041_lazy_source_failure_phase import mark_failure
 
             router = NodeRouter("explode", max_threads=8, runner="threaded")
             router.create_job(number=200)
@@ -131,6 +174,7 @@ def test_threaded_lazy_source_failure_terminates_run_and_monitor(tmp_path, monke
             @router.task
             def run(ctx):
                 if ctx.job_id == 1:
+                    mark_failure()
                     raise RuntimeError("synthetic route failure")
                 ctx.sleep(0.01)
                 return ctx.job_id
@@ -157,7 +201,7 @@ def test_threaded_lazy_source_failure_terminates_run_and_monitor(tmp_path, monke
     assert cli.main(["graph", "src/graph.py", "--runner", "threaded"]) == 0
     capsys.readouterr()
 
-    started = time.monotonic()
+    command_started = time.monotonic()
     assert cli.main(
         [
             "run",
@@ -169,10 +213,10 @@ def test_threaded_lazy_source_failure_terminates_run_and_monitor(tmp_path, monke
             "0.02",
         ]
     ) == 1
-    elapsed = time.monotonic() - started
+    command_finished = time.monotonic()
+    whole_command_elapsed = command_finished - command_started
     captured = capsys.readouterr()
 
-    assert elapsed < 5.0
     storage = FileStorage(tmp_path)
     sessions = storage.list_execution_sessions()
     assert len(sessions) == 1
@@ -186,6 +230,12 @@ def test_threaded_lazy_source_failure_terminates_run_and_monitor(tmp_path, monke
     final = captured.err.rsplit("--- mwf final monitor snapshot ---", 1)[1]
     assert f"session={session['session_id']} kind=main command=run status=terminal" in final
     assert 'outcome=failed' in final
+    assert len(failure_started) == 1
+    shutdown_elapsed = command_finished - failure_started[0]
+    assert shutdown_elapsed < 5.0, (
+        f"failure shutdown took {shutdown_elapsed:.3f}s; "
+        f"whole command took {whole_command_elapsed:.3f}s"
+    )
 
 
 def test_windows_extended_length_descendant_is_safe():
@@ -303,10 +353,22 @@ def test_cli_monitor_shows_api_handler_scaling_during_live_routing(
     capsys,
 ):
     import re
+    import sys
+    from types import ModuleType
 
     monkeypatch.chdir(tmp_path)
     release_path = tmp_path / "release-handler-jobs"
+    handler_started = threading.Event()
+    phase_module_name = "_mwf_test041_monitor_scaling_phase"
+    phase_module = ModuleType(phase_module_name)
+
+    def mark_handler_started() -> None:
+        handler_started.set()
+
+    phase_module.mark_handler_started = mark_handler_started
+    monkeypatch.setitem(sys.modules, phase_module_name, phase_module)
     monitor_saw_scaling = threading.Event()
+    guard_finished = threading.Event()
     original_workflow_snapshot = monitor_module.workflow_snapshot
 
     def observed_workflow_snapshot(workflow, nodes=None):
@@ -318,6 +380,7 @@ def test_cli_monitor_shows_api_handler_scaling_during_live_routing(
         if handler_row is not None and handler_row["running"] >= 2:
             monitor_saw_scaling.set()
             release_path.touch()
+            guard_finished.set()
         return snapshot
 
     monkeypatch.setattr(
@@ -353,11 +416,13 @@ def test_cli_monitor_shows_api_handler_scaling_during_live_routing(
             from pathlib import Path
 
             from micro_workflow_manager import NodeRouter
+            from _mwf_test041_monitor_scaling_phase import mark_handler_started
 
             router = NodeRouter("handler", max_threads=4, runner="api")
 
             @router.task
             def run(ctx, source):
+                mark_handler_started()
                 while not Path("release-handler-jobs").is_file():
                     ctx.sleep(0.01)
                 return source
@@ -371,7 +436,10 @@ def test_cli_monitor_shows_api_handler_scaling_during_live_routing(
     capsys.readouterr()
 
     def release_on_guard_timeout() -> None:
-        if not monitor_saw_scaling.wait(10):
+        handler_started.wait()
+        if release_path.is_file():
+            return
+        if not guard_finished.wait(10):
             release_path.touch()
 
     guard = threading.Thread(target=release_on_guard_timeout)
@@ -390,7 +458,9 @@ def test_cli_monitor_shows_api_handler_scaling_during_live_routing(
         ) == 0
     finally:
         release_path.touch()
-    guard.join(timeout=1)
+        guard_finished.set()
+        handler_started.set()
+        guard.join(timeout=1)
     captured = capsys.readouterr()
     output = captured.out + captured.err
     running_counts = [

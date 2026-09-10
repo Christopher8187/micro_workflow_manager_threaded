@@ -1,9 +1,10 @@
 """Observe an entire resume selection before it changes preserved work."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from shlex import join
 
 from ..component_readiness import calculate_component_readiness, calculate_sampled_resume_lineage
+from ..component_readiness import calculate_interrupt_sampled_resume_readiness
 from ..errors import InvalidGraphError
 from ..storage.resume_preparation import prepare_resume_components, validate_resume_job_owners
 from ..storage.unproduced_membership import read_execution_component_states
@@ -20,9 +21,13 @@ class ResumeSelection:
     command: str
     start_node: str
     end_node: str | None = None
+    interrupt_start_origin: str | None = None
 
 
-def predict_resume_lineages(components, all_parents, observations, successful_results):
+def predict_resume_lineages(
+    components, all_parents, observations, successful_results, *,
+    interrupt_component=None, interrupt_start_origin=None,
+):
     predicted = {}
     for component in components:
         state = observations[component]
@@ -40,7 +45,13 @@ def predict_resume_lineages(components, all_parents, observations, successful_re
                     ))
             else:
                 raise RuntimeError('Resume components are not in quotient-DAG order')
-        readiness = None if any(item is None for item in inputs) else calculate_component_readiness(inputs)
+        if component == interrupt_component:
+            readiness = calculate_component_readiness(
+                (('queued', None, None) if item is None else item for item in inputs),
+                interrupt_start_origin=interrupt_start_origin,
+            )
+        else:
+            readiness = None if any(item is None for item in inputs) else calculate_component_readiness(inputs)
         if readiness is None:
             raise InvalidGraphError(
                 f'Cannot resume component {list(component)}: incomplete or incompatible parent '
@@ -54,7 +65,14 @@ def predict_resume_lineages(components, all_parents, observations, successful_re
               and successful_results[component].lifecycle == 'sampled'):
             retained = successful_results[component].lineage
         if retained is not None:
-            lineage = calculate_sampled_resume_lineage(*retained, readiness)
+            if component == interrupt_component:
+                retained_readiness = calculate_interrupt_sampled_resume_readiness(
+                    retained, (('queued', None, None) if item is None else item for item in inputs),
+                    interrupt_start_origin=interrupt_start_origin,
+                )
+                lineage = None if retained_readiness is None else retained_readiness[:2]
+            else:
+                lineage = calculate_sampled_resume_lineage(*retained, readiness)
             if lineage is None:
                 raise InvalidGraphError(
                     f'Cannot resume component {list(component)}: retained sampled result is '
@@ -70,6 +88,7 @@ def predict_resume_lineages(components, all_parents, observations, successful_re
 
 def observe_resume_selection(
     workflow, nodes, *, command='resume', start_node=None, end_node=None,
+    interrupt_start_origin=None,
 ):
     start_node = nodes[0] if start_node is None else start_node
     with workflow.lock:
@@ -116,24 +135,52 @@ def observe_resume_selection(
             raise RuntimeError(f'Resume requires recovery of running component {component}')
     states = {key: observations[key] for key in components}
     successful_results = validate_resume_job_owners(workflow.storage, states, expected_shape=shape)
-    predict_resume_lineages(components, all_parents, observations, successful_results)
+    predict_resume_lineages(
+        components, all_parents, observations, successful_results,
+        interrupt_component=selection.start_component if interrupt_start_origin is not None else None,
+        interrupt_start_origin=interrupt_start_origin,
+    )
     return ResumeSelection(shape, components, states,
                            {key: observations[key] for key in external}, successful_results,
-                           command, start_node, end_node)
+                           command, start_node, end_node, interrupt_start_origin)
 
 
-def prepare_admitted_resume(workflow, nodes, selection, *, clear_trace_nodes=()):
+def prepare_admitted_resume(workflow, nodes, selection, *, clear_trace_nodes=(), blocked_components=()):
     context = workflow.execution_session_context
     if (context is None or context[2] != selection.shape
-            or tuple(dict.fromkeys(context[1].values())) != selection.components
-            or observe_resume_selection(workflow, nodes, command=selection.command,
-                                        start_node=selection.start_node,
-                                        end_node=selection.end_node) != selection):
+            or tuple(dict.fromkeys(context[1].values())) != selection.components):
         raise RuntimeError('Resume selection changed during admission')
+    current = observe_resume_selection(
+        workflow, nodes, command=selection.command, start_node=selection.start_node,
+        end_node=selection.end_node, interrupt_start_origin=selection.interrupt_start_origin,
+    )
+    if selection.interrupt_start_origin is not None:
+        admission = workflow.storage.get_interrupt_execution_admission(context[0])
+        if (context[0] != selection.interrupt_start_origin or admission is None
+                or admission['state'] != 'frozen'
+                or selection.start_node not in admission['target_component']):
+            raise RuntimeError('Interrupt resume lost its exact frozen admission')
+        parents = dict(selection.parents)
+        for parent, frozen in admission['frozen_parent_states'].items():
+            if parent not in parents or current.parents[parent] != frozen:
+                raise RuntimeError('Interrupt resume parent changed after its frozen observation')
+            parents[parent] = frozen
+        selection = replace(selection, parents=parents)
+    if current != selection:
+        raise RuntimeError('Resume selection changed during admission')
+    blocked = frozenset(blocked_components)
+    if not blocked <= set(selection.components):
+        raise ValueError('Stopped resume components lie outside the admitted selection')
+    states = {component: state for component, state in selection.states.items() if component not in blocked}
+    if not states:
+        return 0
+    prepared_nodes = {node for component in states for node in component}
     return prepare_resume_components(
-        workflow.storage, context[0], selection.states,
+        workflow.storage, context[0], states,
         expected_admitted_shape=selection.shape,
-        expected_parents=selection.parents,
-        expected_successful_results=selection.successful_results,
-        clear_trace_nodes=clear_trace_nodes,
+        expected_parents={**selection.parents, **{
+            component: selection.states[component] for component in blocked
+        }},
+        expected_successful_results={component: selection.successful_results[component] for component in states},
+        clear_trace_nodes=tuple(node for node in clear_trace_nodes if node in prepared_nodes),
     )

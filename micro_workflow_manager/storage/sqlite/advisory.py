@@ -43,17 +43,6 @@ class SQLiteAdvisoryLockMixin:
             if type(pid) is int and pid > 0 and isinstance(hostname, str):
                 return {"pid": pid, "hostname": hostname}
 
-        # MWF 0.3.4-0.3.6 stored ``pid:thread_id:uuid``. Those databases are
-        # local project state, so an owner without a hostname is treated as a
-        # local legacy owner for immediate dead-process recovery.
-        parts = owner.split(":", 2)
-        if len(parts) == 3:
-            try:
-                pid = int(parts[0])
-            except ValueError:
-                return None
-            if pid > 0:
-                return {"pid": pid, "hostname": None}
         return None
 
     def _register_advisory_owner(cls, owner: str) -> None:
@@ -74,7 +63,7 @@ class SQLiteAdvisoryLockMixin:
             return None
 
         hostname = parsed["hostname"]
-        if hostname not in {None, "", socket.gethostname()}:
+        if hostname not in {"", socket.gethostname()}:
             # A shared project directory may be visible from another host. We
             # cannot query that process locally, so its lease remains the
             # fallback authority.

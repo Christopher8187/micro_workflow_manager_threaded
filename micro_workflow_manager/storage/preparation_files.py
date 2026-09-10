@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+from .recovery_errors import add_recovery_note
+
 import logging
-import os
-import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
 from micro_workflow_manager.project_format import is_link_or_reparse_point
+from .preparation_staging import allocate_preparation_staging
 
 
 def _contains_link(root, path):
@@ -35,31 +36,14 @@ def stage_preparation_files(root: Path, preparations, *, inputs=(), receipt=None
         if _contains_link(root, path) or not path.resolve().is_relative_to(root / 'node'):
             raise ValueError(f'Unsafe preparation path: {path}')
     paths = [path for path in sorted(targets) if not any(parent in targets for parent in path.parents)]
-    staging_parent = root / '.mwf' / 'preparation-trash'
-    if _contains_link(root, staging_parent) or not staging_parent.resolve().is_relative_to(root):
-        raise ValueError(f'Unsafe preparation staging directory: {staging_parent}')
-    staging = staging_parent / (uuid4().hex if receipt is None else receipt.operation_id)
-    moved, created = [], []
+    receivers = {plan.node for plan in preparations} | {item.receiver for item in inputs}
+    operation_id = uuid4().hex if receipt is None else receipt.operation_id
+    files = allocate_preparation_staging(root, operation_id, paths, directories, receivers)
     try:
         if receipt is not None:
-            manifest = {
-                'receivers': sorted({plan.node for plan in preparations} | {item.receiver for item in inputs}),
-                'paths': [{'path': path.relative_to(root).as_posix(), 'saved': str(position),
-                           'existed': path.exists()} for position, path in enumerate(paths)],
-                'directories': [path.relative_to(root).as_posix() for path in sorted(directories)],
-            }
-            receipt.prepare(manifest)
-        for position, path in enumerate(paths):
-            if path.exists():
-                if not moved:
-                    staging.mkdir(parents=True, exist_ok=False)
-                saved = staging / str(position)
-                path.rename(saved)
-                moved.append((path, saved))
-        for path in sorted(directories):
-            if not path.exists():
-                path.mkdir()
-                created.append(path)
+            receipt.files = files
+            receipt.prepare(files.manifest)
+        files.stage()
         yield
     except BaseException as error:
         state = None
@@ -67,59 +51,33 @@ def stage_preparation_files(root: Path, preparations, *, inputs=(), receipt=None
             try:
                 state = receipt.state()
             except BaseException as observation_error:
-                error.__notes__ = [*getattr(error, '__notes__', ()),
-                                   f'Preparation {receipt.operation_id} requires recovery at {staging}: '
-                                   f'{observation_error}']
+                add_recovery_note(error, f'Preparation files require recovery at {files.directory}: {observation_error}')
                 raise error
-            if state == 'committed':
-                _discard_preparation_files(staging, original_error=error)
-                raise
-        restoration_errors = []
-        for path in reversed(created):
+        if state != 'committed':
             try:
-                path.rmdir()
-            except OSError as restore_error:
-                restoration_errors.append(restore_error)
-        for path, saved in reversed(moved):
-            try:
-                if os.path.lexists(path):
-                    raise OSError(f'Preparation restoration target changed: {path}')
-                saved.rename(path)
-            except OSError as restore_error:
-                restoration_errors.append(restore_error)
-        if restoration_errors:
-            note = f'Preparation files require recovery at {staging}: {restoration_errors!r}'
-            error.__notes__ = [*getattr(error, '__notes__', ()), note]
-            raise
-        if state == 'prepared':
-            try:
-                receipt.abort()
-            except BaseException as abort_error:
-                error.__notes__ = [*getattr(error, '__notes__', ()),
-                                   f'Preparation {receipt.operation_id} retains a recovery receipt: {abort_error}']
+                files.restore()
+                if state == 'prepared':
+                    receipt.abort()
+            except BaseException as restoration_error:
+                add_recovery_note(error, f'Preparation files require recovery at {files.directory}: {restoration_error}')
                 raise error
-        if staging.exists():
-            staging.rmdir()
+        _discard_preparation_files(files, original_error=error)
         raise
     else:
-        _discard_preparation_files(staging)
+        _discard_preparation_files(files)
     finally:
         try:
-            staging_parent.rmdir()
+            files.directory.parent.rmdir()
         except OSError:
             pass
 
 
-def _discard_preparation_files(staging, *, original_error=None):
-    if staging.exists():
-        try:
-            shutil.rmtree(staging)
-        except BaseException as error:
-            if original_error is not None:
-                original_error.__notes__ = [*getattr(original_error, '__notes__', ()),
-                                           f'Committed preparation retained temporary files at {staging}: {error}']
-            elif not isinstance(error, OSError):
-                raise
-            logging.getLogger(__name__).warning(
-                'Prepared work committed; temporary files remain at %s: %s', staging, error,
-            )
+def _discard_preparation_files(files, *, original_error=None):
+    try:
+        files.discard()
+    except BaseException as error:
+        if original_error is not None:
+            add_recovery_note(original_error, f'Preparation files remain at {files.directory}: {error}')
+        elif not isinstance(error, (OSError, RuntimeError)):
+            raise
+        logging.getLogger(__name__).warning('Preparation temporary files remain at %s: %s', files.directory, error)

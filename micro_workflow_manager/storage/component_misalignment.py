@@ -8,6 +8,7 @@ from micro_workflow_manager.file_helpers import _relative_file_parts
 from .component_definitions import component_snapshot_from_shape
 from .component_membership import read_active_component_for_node
 from .membership_receipts import validate_membership_receipt_producer
+from .file_operation_receipts import read_file_receipt
 
 
 class ComponentMisalignmentStorageMixin:
@@ -101,8 +102,7 @@ class ComponentMisalignmentStorageMixin:
 
     def _decode_component_preparation_cause(self, connection, row, state):
         owner = self._read_execution_owner(connection, row['producer_execution_id'])
-        receipt = connection.execute('SELECT * FROM preparation_receipts WHERE operation_id=?',
-                                     (row['preparation_id'],)).fetchone()
+        receipt = read_file_receipt(connection, 'preparation_receipts', row['preparation_id'])
         if (row['arrival_kind'] is not None or row['preparation_kind'] != 'preparation-removal'
                 or row['action'] != 'delete' or row['affected_kind'] not in ('managed-input', 'managed-job')
                 or owner is None or receipt is None or receipt['state'] != 'committed'

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
 from .preparation_guards import refuse_receiver_mutation
+from .session_scope import require_admitted_reservation_scope
 
 
 class ComponentReservationConflict(RuntimeError):
@@ -27,7 +28,8 @@ class ComponentReservationStorageMixin:
 
     def _reserve_execution_components(self, connection, session_id, expected_shape):
         session = connection.execute(
-            'SELECT status, admitted_shape_id, partition_revision FROM execution_sessions WHERE session_id=?', (session_id,),
+            'SELECT status, admitted_shape_id, partition_revision, scope_admitted '
+            'FROM execution_sessions WHERE session_id=?', (session_id,),
         ).fetchone()
         if session is None or session['status'] != 'running':
             raise RuntimeError('Component reservations require an existing running session: ' + session_id)
@@ -58,16 +60,32 @@ class ComponentReservationStorageMixin:
         if conflicts:
             raise ComponentReservationConflict(conflicts)
         owned_keys = {row['component_key'] for row in reservations if row['session_id'] == session_id}
-        if owned_keys == {row['component_key'] for row in rows}:
+        expected_keys = {row['component_key'] for row in rows}
+        if owned_keys == expected_keys:
+            if session['scope_admitted'] != 1:
+                raise RuntimeError('Session reservation admission marker is missing: ' + session_id)
+            self._bind_pending_thread_overrides(connection, session_id, selected_nodes)
+            require_admitted_reservation_scope(connection, session_id)
             return False
         if owned_keys:
             raise RuntimeError('Session has a damaged partial reservation: ' + session_id)
+        if session['scope_admitted'] != 0:
+            raise RuntimeError('Admitted session lost its component reservations: ' + session_id)
         inserted = connection.executemany(
             'INSERT INTO component_reservations(component_key, session_id) VALUES(?, ?)',
             [(row['component_key'], session_id) for row in rows],
         ).rowcount
         if inserted != len(rows):
             raise RuntimeError('Component reservation was not recorded completely')
+        self._bind_pending_thread_overrides(connection, session_id, selected_nodes)
+        if connection.execute(
+            "UPDATE execution_sessions SET scope_admitted=1 "
+            "WHERE session_id=? AND status='running' AND scope_admitted=0",
+            (session_id,),
+        ).rowcount != 1:
+            raise RuntimeError('Session reservation admission was not retained')
+        if not require_admitted_reservation_scope(connection, session_id):
+            raise RuntimeError('Session reservation admission marker changed')
         return True
 
     def get_component_reservation(self, component) -> dict | None:

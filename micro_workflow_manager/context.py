@@ -89,6 +89,7 @@ class NodeHandle(_ExecutionChecks):
         attempt: int | None = None,
         repeat_index: int | None = None,
         pending_event_recorder: Callable[[Any], None] | None = None,
+        execution_checker: Callable[[], None] | None = None,
     ):
         super().__init__(cancellation_event=cancellation_event)
         self.system = system
@@ -102,6 +103,7 @@ class NodeHandle(_ExecutionChecks):
         self.attempt = attempt
         self.repeat_index = repeat_index
         self._pending_event_recorder = pending_event_recorder
+        self._execution_checker = execution_checker
 
     def _guarded(self, action: Callable[[], T]) -> T:
         self.checkpoint()
@@ -141,6 +143,9 @@ class NodeHandle(_ExecutionChecks):
 
     def checkpoint(self):
         """Raise if the parent job was restarted or this task timed out."""
+        if self._execution_checker is not None:
+            self._execution_checker()
+            return
         self._check_local_execution()
         if self.execution_id is not None and self._cancellation_event is None:
             self.system.check_job_execution(
@@ -339,25 +344,10 @@ class JobContext(_ExecutionChecks):
         return list(self._errors)
 
     def _check_execution(self):
-        """Validate cancellation/restart without reporting progress."""
-        if self._attempt_watch is not None:
-            restart_error = self.system.scheduler_supervisor.execution_cancel_error(self._attempt_watch)
-            if restart_error is not None:
-                raise restart_error
-            timeout_error = self.system.scheduler_supervisor.timeout_error(self._attempt_watch)
-            if timeout_error is not None:
-                raise timeout_error
-        self._check_local_execution()
-        # Active attempts are polled in one batch by SchedulerSupervisor. A
-        # guarded mutation still verifies its exact lease under the per-job
-        # filesystem fence, so omitting a per-checkpoint SELECT is race-safe.
-        if self.execution_id is not None and self._attempt_watch is None:
-            self.system.check_job_execution(
-                self.current_node,
-                self.job_id,
-                self.execution_generation,
-                self.execution_id,
-            )
+        from .interrupt_cooperation import check_execution_without_pause, wait_for_interrupt_pauses
+
+        check_execution_without_pause(self)
+        wait_for_interrupt_pauses(self)
 
     def _guarded(self, action: Callable[[], T]) -> T:
         self._check_execution()
@@ -605,4 +595,5 @@ class JobContext(_ExecutionChecks):
             attempt=self.attempt,
             repeat_index=self.repeat_index,
             pending_event_recorder=self._pending_event_futures.append,
+            execution_checker=self._check_execution,
         )

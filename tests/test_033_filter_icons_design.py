@@ -142,8 +142,6 @@ def test_init_gitignore_and_material_icons_cover_runtime_structure(
     gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
     assert ".mwf/" in gitignore
     assert "node/*/jobs/**" in gitignore
-    assert "node/*/idempotency/**" in gitignore
-    assert "clipboard/*/idempotency/**" in gitignore
     assert "clipboard/*/.mwf-node-state.sqlite3" in gitignore
     assert (tmp_path / ".mwf" / "state.sqlite3").is_file()
 

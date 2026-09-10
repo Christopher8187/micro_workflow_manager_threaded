@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import socket
 from concurrent.futures import Future
 
 import pytest
 
 from micro_workflow_manager import cli
 from micro_workflow_manager.cli.project import load_workflow
-from micro_workflow_manager.models import Job
+from micro_workflow_manager.models import Job, now
 from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.storage import FileStorage
 from tests.test_036_hoeflein_scheduling import make_project
@@ -17,6 +16,8 @@ from tests.test_064_read_only_previews import (
     _close_without_sidecars,
     _initialize_native_project,
     _install_import_sentinels,
+    _live_execution_session_identity,
+    _mark_execution_session_stale,
     _snapshot,
 )
 from tests.test_090_component_session_settlement import _close, _rows
@@ -56,8 +57,9 @@ def _prepared_selection_snapshot(storage, root, nodes):
     ['resetfrom', 'A', '--yes'],
     ['resetbetween', 'A', 'B', '--yes'],
 ])
-def test_applied_reset_refuses_abandoned_native_session_before_import_or_mutation(
-    tmp_path, monkeypatch, capsys, session_kind, arguments,
+@pytest.mark.parametrize('damaged', [False, True], ids=['safe', 'damaged'])
+def test_applied_reset_recovers_safe_abandoned_session_and_refuses_damaged_ownership(
+    tmp_path, monkeypatch, capsys, session_kind, arguments, damaged,
 ):
     edges = [('A', 'B')]
     workflow = _initialize_native_project(tmp_path, monkeypatch, edges=edges)
@@ -72,31 +74,57 @@ def test_applied_reset_refuses_abandoned_native_session_before_import_or_mutatio
         command='run',
         start_component=('B',),
         selected_components=[('B',)],
-        started_at='2020-01-01T00:00:00+00:00',
-        hostname=socket.gethostname(),
-        pid=99999999,
-        process_identity='retired-process',
+        **_live_execution_session_identity(),
         details={'start_node': 'B'},
         expected_shape=shape,
     )
-    storage.reserve_execution_components(session_id, expected_shape=shape)
+    assert storage.reserve_execution_components(session_id, expected_shape=shape) is True
+    if damaged:
+        storage.claim_job_execution(
+            'B', 1, started_at=now(), session_id=session_id, component=('B',),
+        )
+        assert storage.submit_db_mutation(lambda connection: connection.execute(
+            "UPDATE job_instances SET last_execution_id=NULL WHERE node_name='B' AND job_id=1",
+        ).rowcount) == 1
+    _mark_execution_session_stale(storage, session_id)
     before_rows = _tuple_rows(storage)
+    before_components = {node: storage.get_component_state((node,)) for node in ('A', 'B')}
     _close_without_sidecars(storage, tmp_path)
     sentinel = _install_import_sentinels(tmp_path, edges)
     before_files = _snapshot(tmp_path)
     capsys.readouterr()
 
-    assert cli.main(arguments) == 1
+    assert cli.main(arguments) == (1 if damaged else 0)
 
     captured = capsys.readouterr()
-    assert _closed_database_rows(tmp_path) == before_rows
-    assert _snapshot(tmp_path) == before_files
-    assert not sentinel.exists()
+    if damaged:
+        assert not sentinel.exists()
+        assert _closed_database_rows(tmp_path) == before_rows
+        assert _snapshot(tmp_path) == before_files
+        output = (captured.out + captured.err).lower()
+        assert session_id in output
+        assert 'running' in output or 'recovery' in output
+    else:
+        assert sentinel.exists()
+        reopened = FileStorage(tmp_path)
+        try:
+            session, = reopened.list_execution_sessions()
+            assert session['session_id'] == session_id
+            assert (session['status'], session['outcome']) == ('terminal', 'failed')
+            selected = {'A', 'B'} if arguments[0] == 'resetfrom' else {'A'}
+            for node in ('A', 'B'):
+                assert reopened.list_job_ids(node) == [1]
+                assert reopened.load_job(node, 1).params == {'kept': node}
+                assert reopened.get_job_status(node, 1) == 'queued'
+                assert reopened.read_job_current_owner(node, 1) is None
+                expected = dict(before_components[node])
+                expected['alignment_generation'] += int(node in selected)
+                assert reopened.get_component_state((node,)) == expected
+                assert reopened.get_component_reservation((node,)) is None
+        finally:
+            _close_without_sidecars(reopened, tmp_path)
     assert not (tmp_path / '.mwf' / 'state.sqlite3-wal').exists()
     assert not (tmp_path / '.mwf' / 'state.sqlite3-shm').exists()
-    output = (captured.out + captured.err).lower()
-    assert session_id in output
-    assert 'running' in output or 'recovery' in output
 
 
 @pytest.mark.parametrize('command,arguments,selected_nodes', [

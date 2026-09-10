@@ -102,14 +102,19 @@ def _component(value) -> tuple[str, ...]:
     return normalized
 
 
-def _lineage_is_valid(stability, origin, origin_kind):
+def _lineage_is_valid(stability, origin, origin_kind, origin_scope_admitted):
     return (
-        stability == 'stable' and origin is None
+        stability == 'stable'
+        and origin is None
+        and origin_kind is None
+        and origin_scope_admitted is None
     ) or (
         stability == 'unstable'
         and isinstance(origin, str)
         and bool(origin.strip())
         and origin_kind == 'interrupt'
+        and type(origin_scope_admitted) is int
+        and origin_scope_admitted == 1
     )
 
 
@@ -119,7 +124,7 @@ def read_successful_result(connection, component, identity):
         identity = ComponentGenerationIdentity(*identity)
     row = connection.execute(
         'SELECT result.*, definition.component_key AS definition_key, shape.shape_json, '
-        'origin.session_kind AS origin_kind '
+        'origin.session_kind AS origin_kind, origin.scope_admitted AS origin_scope_admitted '
         'FROM component_successful_results AS result '
         'LEFT JOIN component_definitions AS definition '
         'ON definition.component_key=result.component_key AND definition.shape_id=result.shape_id '
@@ -139,7 +144,7 @@ def read_successful_result(connection, component, identity):
     if members not in producing.components:
         raise RuntimeError('Retained successful result differs from its historical component')
     if row['lifecycle'] not in ('sampled', 'done') or not _lineage_is_valid(
-        row['stability'], row['instability_origin'], row['origin_kind'],
+        row['stability'], row['instability_origin'], row['origin_kind'], row['origin_scope_admitted'],
     ):
         raise RuntimeError('Invalid retained successful component result')
     return SuccessfulResultObservation(
@@ -160,7 +165,7 @@ def read_component_state_record(connection, component, *, require_active=True):
     key = encode_component_key(members)
     row = connection.execute(
         'SELECT state.*, definition.component_key AS definition_key, shape.shape_json, '
-        'origin.session_kind AS origin_kind '
+        'origin.session_kind AS origin_kind, origin.scope_admitted AS origin_scope_admitted '
         'FROM component_states AS state '
         'LEFT JOIN component_definitions AS definition '
         'ON definition.component_key=state.component_key AND definition.shape_id=state.shape_id '
@@ -202,7 +207,7 @@ def read_component_state_record(connection, component, *, require_active=True):
         raise RuntimeError('Component lost its retained successful result: ' + key)
     no_lineage = row['stability'] is None and row['instability_origin'] is None
     result_lineage = _lineage_is_valid(
-        row['stability'], row['instability_origin'], row['origin_kind'],
+        row['stability'], row['instability_origin'], row['origin_kind'], row['origin_scope_admitted'],
     )
     lifecycle = row['lifecycle']
     valid_lifecycle = (

@@ -34,7 +34,11 @@ def test_graph_command_previews_display_native_external_prerequisites(
         )
     storage.set_node_status('P', raw_status)
     assert storage.get_component_state(('P',))['lifecycle'] == native_status
-    assert storage.get_node_status('P') == raw_status
+    assert storage.get_node_status('P') == native_status
+    storage.db_mutation_barrier()
+    assert storage.db_connection().execute(
+        'SELECT status FROM nodes WHERE node_name=?', ('P',),
+    ).fetchone()['status'] == raw_status
     _close_without_sidecars(storage, tmp_path)
     sentinel = _install_import_sentinels(tmp_path, edges)
     before = _snapshot(tmp_path)

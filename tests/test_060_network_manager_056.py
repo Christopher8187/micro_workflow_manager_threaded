@@ -973,12 +973,12 @@ def test_network_manager_snapshot_is_batched_into_sqlite(tmp_path):
     assert fresh["updated_at"] == 456.0
 
 
-def test_network_state_schema_migrates_to_v4(tmp_path):
+def test_fresh_native_schema_contains_network_state(tmp_path):
     workflow = MicroWorkflow(tmp_path, runner="direct")
     row = workflow.storage.db_connection().execute(
         "SELECT value FROM metadata WHERE key='database_schema_version'"
     ).fetchone()
-    assert int(row["value"]) == 4
+    assert int(row["value"]) == 9
     tables = {
         str(row[0])
         for row in workflow.storage.db_connection().execute(

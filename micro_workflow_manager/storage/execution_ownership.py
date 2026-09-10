@@ -4,6 +4,41 @@ import json
 
 from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
 from .component_definitions import component_snapshot_from_shape
+from .interrupt_common import (
+    InterruptAdmissionPaused,
+    read_interrupt_claim_blockers,
+    read_session_parent_ids,
+)
+
+
+_JOB_OWNER_SELECT = (
+    'SELECT j.job_id AS observed_job_id, j.generation AS job_generation, '
+    'j.status AS job_status, j.active_execution_id, j.active_pid, '
+    'j.active_thread_id, j.active_started_at, '
+    'i.instance_id, i.last_execution_id, i.created_by_execution_id AS instance_creator, '
+    'instance_creator.execution_id AS instance_creator_execution_id, '
+    'o.*, s.session_id AS owner_session, creator.execution_id AS creator_execution_id, '
+    'shape.shape_json AS producing_shape, '
+    's.admitted_shape_id AS owner_admitted_shape, definition.shape_id AS definition_shape_id, '
+    'selected.session_id AS selected_session, '
+    's.session_kind AS owner_session_kind, s.status AS owner_session_status, '
+    's.outcome AS owner_session_outcome, '
+    's.hostname AS owner_hostname, s.pid AS owner_pid, '
+    's.process_identity AS owner_process_identity, s.heartbeat_at AS owner_heartbeat, '
+    's.started_at AS owner_started_at, s.finished_at AS owner_finished_at '
+    'FROM jobs AS j LEFT JOIN job_instances AS i USING(node_name, job_id) '
+    'LEFT JOIN job_execution_owners AS o '
+    'ON o.execution_id=COALESCE(j.active_execution_id, i.last_execution_id) '
+    'LEFT JOIN graph_shapes AS shape ON shape.shape_id=o.shape_id '
+    'LEFT JOIN component_definitions AS definition '
+    'ON definition.component_key=o.component_key AND definition.shape_id=o.shape_id '
+    'LEFT JOIN job_execution_owners AS creator ON creator.execution_id=o.created_by_execution_id '
+    'LEFT JOIN job_execution_owners AS instance_creator '
+    'ON instance_creator.execution_id=i.created_by_execution_id '
+    'LEFT JOIN execution_sessions AS s ON s.session_id=o.session_id '
+    'LEFT JOIN session_components AS selected '
+    'ON selected.session_id=o.session_id AND selected.component_key=o.component_key '
+)
 
 
 class JobExecutionOwnerStorageMixin:
@@ -15,7 +50,18 @@ class JobExecutionOwnerStorageMixin:
             return RuntimeError('Job claims require explicit session_id and component')
         if batch.node_name not in batch.component:
             return RuntimeError(f'Claimed node {batch.node_name} is not a member of component {batch.component!r}')
+        blockers = read_interrupt_claim_blockers(
+            connection, batch.session_id, batch.component,
+        )
+        if blockers:
+            return InterruptAdmissionPaused(blockers)
         key = (batch.session_id, encode_component_key(batch.component))
+        from .interrupt_coordination import InterruptCoordinationStorageMixin
+        fences = InterruptCoordinationStorageMixin._read_interrupt_execution_fences(
+            connection, batch.session_id, key[1],
+        )
+        if fences:
+            return RuntimeError('Post-interrupt fence refuses component claim: ' + key[1])
         if key not in checked:
             checked[key] = connection.execute(
                 'SELECT session.status, reservation.session_id AS owner, selected.component_key AS selected_key '
@@ -33,6 +79,12 @@ class JobExecutionOwnerStorageMixin:
                                 f'not claiming session {batch.session_id}')
         if row['selected_key'] is None:
             return RuntimeError(f'Component {batch.component!r} is outside session {batch.session_id} selected scope')
+        try:
+            # Imported lazily because this reader validates execution owners.
+            from .thread_overrides import validate_thread_override_claim
+            validate_thread_override_claim(connection, batch.session_id, batch.component)
+        except Exception as error:
+            return error
         return None
 
     def get_job_execution_owner(self, execution_id: str) -> dict | None:
@@ -174,33 +226,25 @@ class JobExecutionOwnerStorageMixin:
     @staticmethod
     def _read_job_owner_observation(connection, node_name: str, job_id: int) -> dict | None:
         row = connection.execute(
-            'SELECT j.generation AS job_generation, j.status AS job_status, '
-            'j.active_execution_id, j.active_pid, j.active_started_at, '
-            'i.instance_id, i.last_execution_id, i.created_by_execution_id AS instance_creator, '
-            'instance_creator.execution_id AS instance_creator_execution_id, '
-            'o.*, s.session_id AS owner_session, creator.execution_id AS creator_execution_id, '
-            'shape.shape_json AS producing_shape, '
-            's.admitted_shape_id AS owner_admitted_shape, definition.shape_id AS definition_shape_id, '
-            'selected.session_id AS selected_session, '
-            's.session_kind AS owner_session_kind, s.status AS owner_session_status, '
-            's.parent_session_id AS owner_parent_session, s.outcome AS owner_session_outcome, '
-            's.hostname AS owner_hostname, s.pid AS owner_pid, '
-            's.process_identity AS owner_process_identity, s.heartbeat_at AS owner_heartbeat, '
-            's.started_at AS owner_started_at, s.finished_at AS owner_finished_at '
-            'FROM jobs AS j LEFT JOIN job_instances AS i USING(node_name, job_id) '
-            'LEFT JOIN job_execution_owners AS o '
-            'ON o.execution_id=COALESCE(j.active_execution_id, i.last_execution_id) '
-            'LEFT JOIN graph_shapes AS shape ON shape.shape_id=o.shape_id '
-            'LEFT JOIN component_definitions AS definition '
-            'ON definition.component_key=o.component_key AND definition.shape_id=o.shape_id '
-            'LEFT JOIN job_execution_owners AS creator ON creator.execution_id=o.created_by_execution_id '
-            'LEFT JOIN job_execution_owners AS instance_creator '
-            'ON instance_creator.execution_id=i.created_by_execution_id '
-            'LEFT JOIN execution_sessions AS s ON s.session_id=o.session_id '
-            'LEFT JOIN session_components AS selected '
-            'ON selected.session_id=o.session_id AND selected.component_key=o.component_key '
+            _JOB_OWNER_SELECT +
             'WHERE j.node_name=? AND j.job_id=?', (node_name, job_id),
         ).fetchone()
+        return JobExecutionOwnerStorageMixin._job_owner_observation_from_row(
+            connection, node_name, job_id, row,
+        )
+
+    @staticmethod
+    def _read_active_job_owner_rows(connection, node_name):
+        return connection.execute(
+            _JOB_OWNER_SELECT +
+            "WHERE j.node_name=? AND (j.status='running' "
+            "OR j.active_execution_id IS NOT NULL OR j.active_pid IS NOT NULL "
+            "OR j.active_thread_id IS NOT NULL OR j.active_started_at IS NOT NULL) "
+            "ORDER BY j.job_id", (node_name,),
+        )
+
+    @staticmethod
+    def _job_owner_observation_from_row(connection, node_name, job_id, row, *, parent_sessions=None):
         if row is None:
             return None
         instance = row['instance_id']
@@ -236,9 +280,16 @@ class JobExecutionOwnerStorageMixin:
             raise RuntimeError(f'Damaged current execution component for {node_name}/{job_id}')
         observation['owner'] = JobExecutionOwnerStorageMixin._execution_owner_from_row(row)
         observation['state'] = 'active' if active is not None else 'last'
+        if parent_sessions is None:
+            parents = read_session_parent_ids(connection, row['owner_session'])
+        else:
+            if row['owner_session'] not in parent_sessions:
+                parent_sessions[row['owner_session']] = read_session_parent_ids(connection, row['owner_session'])
+            parents = list(parent_sessions[row['owner_session']])
         observation['session'] = {
             'session_id': row['owner_session'], 'session_kind': row['owner_session_kind'],
-            'status': row['owner_session_status'], 'parent_session_id': row['owner_parent_session'],
+            'status': row['owner_session_status'],
+            'parent_session_ids': parents,
             'outcome': row['owner_session_outcome'],
             'hostname': row['owner_hostname'], 'pid': row['owner_pid'],
             'process_identity': row['owner_process_identity'], 'heartbeat_at': row['owner_heartbeat'],

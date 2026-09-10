@@ -6,6 +6,7 @@ from pathlib import Path
 
 from micro_workflow_manager import MicroWorkflow
 from micro_workflow_manager.errors import InvalidGraphError
+from micro_workflow_manager.storage import preparation_staging
 from micro_workflow_manager.workflow.preparation import prepare_fresh_components
 from tests.test_090_component_session_settlement import _rows
 from tests.test_093_native_cli_readiness import _node_files
@@ -99,22 +100,28 @@ def test_failed_independent_preparation_restores_files_and_releases_session(tmp_
     old = tmp_path / 'node' / 'A' / 'output' / 'retained.txt'
     old.write_text('retained', encoding='utf-8')
     primary = RuntimeError('preparation injection')
-    mkdir = Path.mkdir
+    move = preparation_staging.move_without_replacement
+    reached = []
 
-    def fail_output_recreation(path, *args, **kwargs):
-        if path == old.parent and not path.exists():
+    def fail_output_publication(source, target):
+        result = move(source, target)
+        if Path(target) == old.parent and Path(source).name.startswith('created_') and not reached:
             assert storage.get_live_main_session() is not None
             assert storage.get_component_reservation(('A',)) is not None
             saved, = (tmp_path / '.mwf' / 'preparation-trash').glob('*/*/retained.txt')
             assert saved.read_text(encoding='utf-8') == 'retained'
+            assert Path(source).parent.parent.name == 'preparation-trash'
+            assert old.parent.is_dir() and not any(old.parent.iterdir())
+            reached.append((Path(source), Path(target)))
             raise primary
-        return mkdir(path, *args, **kwargs)
+        return result
 
-    monkeypatch.setattr(Path, 'mkdir', fail_output_recreation)
+    monkeypatch.setattr(preparation_staging, 'move_without_replacement', fail_output_publication)
     try:
         with pytest.raises(RuntimeError) as raised:
             workflow.run_node('A')
         assert raised.value is primary
+        assert len(reached) == 1 and reached[0][1] == old.parent
         assert calls == []
         assert old.read_text(encoding='utf-8') == 'retained'
         assert storage.get_component_state(('A',))['alignment_generation'] == 0

@@ -25,13 +25,15 @@ class FreshComponentSelection:
     components: tuple[tuple[str, ...], ...]
 
 
-def observe_programmatic_fresh_preparation(workflow, nodes):
+def observe_programmatic_fresh_preparation(workflow, nodes, *, interrupt_component=None):
     """Refuse blocked external parents before an independent run changes state."""
     with workflow.lock:
         snapshot = workflow.topology.snapshot()
         components = tuple(workflow.topology.execution_components(nodes))
         if not components or set(nodes) - set(workflow.graph_obj):
             raise ValueError('Fresh preparation requires a nonempty current selection')
+        if interrupt_component is not None and interrupt_component not in components:
+            raise ValueError('Interrupt preparation override must belong to the selection')
         selected = set(components)
         parents = {
             component: workflow.component_predecessor_components(set(component)) - selected
@@ -42,6 +44,8 @@ def observe_programmatic_fresh_preparation(workflow, nodes):
         external, expected_shape=snapshot.shape_json, allow_missing=True,
     )
     for component, predecessors in parents.items():
+        if component == interrupt_component:
+            continue
         observed = [states[parent] for parent in predecessors]
         if any(state is None for state in observed) or calculate_component_readiness(
             (state['lifecycle'], state['stability'], state['instability_origin'])
@@ -71,6 +75,8 @@ def prepare_fresh_components(
     *,
     keep_trace: bool = False,
     operation: str = 'run',
+    admitted_components=None,
+    interrupt_preflight=None,
 ) -> dict[str, int]:
     """Prepare a full CLI or independent programmatic component selection.
 
@@ -86,6 +92,19 @@ def prepare_fresh_components(
         with workflow.lock:
             snapshot = workflow.topology.snapshot()
             selected = [workflow.component_id(component) for component in components]
+            admitted = tuple(
+                selected if admitted_components is None else
+                (workflow.component_id(component) for component in admitted_components)
+            )
+        blocked = frozenset(
+            () if interrupt_preflight is None else interrupt_preflight.blocked_components
+        )
+        if len(admitted) != len(set(admitted)) or not blocked <= set(admitted):
+            raise RuntimeError('Fresh preparation has an invalid admitted interrupt scope')
+        expected_execution = tuple(component for component in admitted if component not in blocked)
+        if tuple(selected) != expected_execution:
+            raise RuntimeError('Fresh preparation differs from its admitted interrupt scope')
+        interrupt_record = None if interrupt_preflight is None else interrupt_preflight.record()
         storage = workflow.storage
         if context is None:
             storage.refuse_live_sessions_for_reset()
@@ -101,11 +120,15 @@ def prepare_fresh_components(
                 storage, change, start_component=selected[0], keep_trace=keep_trace,
             )
             session_id = None if context is None else context[0]
-            preparation = MembershipPreparation(storage, change, footprint, session_id, operation)
+            preparation = MembershipPreparation(
+                storage, change, footprint, session_id, operation,
+                admitted_components=admitted,
+                interrupt_preflight_record=interrupt_record,
+            )
             observations = {unit.component: storage.get_component_state(unit.component) for unit in footprint.units}
             removed = {}
             with hold_preparation_guards(
-                storage, footprint, session_id, observations, membership_preparation=preparation,
+                storage, footprint, session_id, observations, operation=operation, membership_preparation=preparation,
             ) as guard_id:
                 for unit in footprint.units:
                     changed = prepare_component_unit(
@@ -135,7 +158,7 @@ def _prepare_observed_components(root, workflow, components, observations, conte
     footprint = read_preparation_footprint(storage, components, keep_trace=keep_trace)
     session_id = None if context is None else context[0]
     removed = {}
-    with hold_preparation_guards(storage, footprint, session_id, observations) as guard_id:
+    with hold_preparation_guards(storage, footprint, session_id, observations, operation=operation) as guard_id:
         for unit in footprint.units:
             changed = prepare_component_unit(storage, root, unit, observations[unit.component], session_id,
                                              guard_id, operation, keep_trace=keep_trace, target_shape=target_shape)

@@ -4,7 +4,7 @@ import json
 import time
 
 from micro_workflow_manager.cli import top
-from micro_workflow_manager.cli import active_run
+from micro_workflow_manager.session_liveness import execution_session_liveness
 from micro_workflow_manager.storage.filesystem import FileStorage
 from micro_workflow_manager.storage import state_events
 
@@ -72,13 +72,7 @@ def test_top_pid_snapshot_uses_platform_safe_helper(monkeypatch):
     assert top._pid_snapshot(1000)["alive"] is False
 
 
-def test_active_run_rejects_recycled_pid_even_when_it_exists(monkeypatch):
-    monkeypatch.setattr(active_run, "process_is_alive", lambda _pid: True)
-    monkeypatch.setattr(
-        active_run,
-        "process_identity",
-        lambda _pid: "windows-filetime:new-process",
-    )
+def test_native_session_rejects_recycled_pid_even_when_it_exists():
     state = {
         "status": "running",
         "pid": 33248,
@@ -86,24 +80,24 @@ def test_active_run_rejects_recycled_pid_even_when_it_exists(monkeypatch):
         "heartbeat_at": "2020-01-01T00:00:00",
     }
 
-    liveness = active_run.run_state_liveness(state)
+    liveness = execution_session_liveness(
+        state, pid_probe=lambda _pid: True,
+        identity_probe=lambda _pid: "windows-filetime:new-process",
+    )
 
     assert liveness["live"] is False
     assert liveness["process_identity_matches"] is False
     assert "different process instance" in liveness["reason"]
 
 
-def test_legacy_active_run_does_not_trust_recycled_pid_after_stale_heartbeat(
-    monkeypatch,
-):
-    monkeypatch.setattr(active_run, "process_is_alive", lambda _pid: True)
+def test_native_session_without_process_identity_refuses_stale_heartbeat():
     state = {
         "status": "running",
         "pid": 33248,
         "heartbeat_at": "2020-01-01T00:00:00",
     }
 
-    liveness = active_run.run_state_liveness(state)
+    liveness = execution_session_liveness(state, pid_probe=lambda _pid: True)
 
     assert liveness["live"] is False
     assert "PID existence alone is ambiguous" in liveness["reason"]

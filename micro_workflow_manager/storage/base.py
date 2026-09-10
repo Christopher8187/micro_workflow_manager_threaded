@@ -16,8 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from micro_workflow_manager.models import JOB_VALID_STATUSES, NODE_VALID_STATUSES
-from micro_workflow_manager.schema import CURRENT_STATE_SCHEMA_VERSION
-from micro_workflow_manager.paths import config_file, locks_dir, run_file
+from micro_workflow_manager.paths import config_file, locks_dir
 
 
 _HELD_FILESYSTEM_LOCKS: ContextVar[frozenset[str]] = ContextVar(
@@ -236,24 +235,6 @@ class FileStorageBase:
 
     def workflow_file(self) -> Path:
         return config_file(self.project_dir)
-
-    def run_state_file(self) -> Path:
-        return run_file(self.project_dir)
-
-    def write_run_state(self, data: dict):
-        self.atomic_write_json(
-            self.run_state_file(),
-            {**data, "schema_version": CURRENT_STATE_SCHEMA_VERSION},
-        )
-
-    def get_run_state(self) -> dict:
-        data = self.read_json(self.run_state_file(), default={})
-        return data if isinstance(data, dict) else {}
-
-    def update_run_state(self, **updates):
-        data = self.get_run_state()
-        data.update(updates)
-        self.write_run_state(data)
 
     def lock_dir(self) -> Path:
         path = locks_dir(self.project_dir)

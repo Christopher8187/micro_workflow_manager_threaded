@@ -2,7 +2,7 @@ from micro_workflow_manager import InputFileSystem, NodeRouter, OutputFileSystem
 from src.utils.provenance import record_provenance
 router=NodeRouter("render_frame")
 router.create_job()
-INPUT=InputFileSystem("final game state")
+INPUT=InputFileSystem("final game state",base="apply_game_event")
 OUTPUT=OutputFileSystem("rendered frame descriptions")
 @router.task
 def render_frame(ctx):

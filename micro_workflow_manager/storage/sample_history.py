@@ -88,11 +88,12 @@ def _decode_plan(selection):
     ), selection['sample_id'], selection['full_starting_coverage']
 
 
-def read_sample_admission_history(storage, connection, session_id, *, component, expected_shape):
+def read_sample_admission_history(
+    storage, connection, session_id, *, component, expected_shape, require_active=True,
+):
     """Return one validated sample history bound to its exact selected session."""
     row = connection.execute(
-        'SELECT command, selection_kind, start_component, details_json '
-        'FROM execution_sessions WHERE session_id=?',
+        'SELECT * FROM execution_sessions WHERE session_id=?',
         (session_id,),
     ).fetchone()
     if row is None or row['command'] != 'run sample' or row['selection_kind'] != 'jobs':
@@ -101,7 +102,16 @@ def read_sample_admission_history(storage, connection, session_id, *, component,
     component = tuple(component)
     if components != [component] or storage._stored_session_component(row['start_component']) != component:
         raise RuntimeError('Persisted sample scope differs from its lifecycle component')
-    read_admitted_component_shape(connection, session_id, component, expected_shape)
+    if require_active:
+        read_admitted_component_shape(connection, session_id, component, expected_shape)
+    else:
+        from .execution_sessions import execution_session_from_row_snapshot, validate_execution_session_snapshot
+        from .session_shapes import validate_session_shape_snapshot
+
+        session = execution_session_from_row_snapshot(connection, row)
+        validate_execution_session_snapshot(session)
+        if validate_session_shape_snapshot(connection, session) != expected_shape:
+            raise RuntimeError('Sample history differs from its admitted graph shape')
     try:
         details = json.loads(row['details_json'])
     except (TypeError, json.JSONDecodeError) as error:

@@ -5,18 +5,41 @@ Later releases may supersede behavior described in an earlier entry. Use the
 [current README](../README.md) and linked architecture and operations guides for
 current behavior.
 
-The 0.6.2 development branch removes `clean`, `cleanfrom`, `wipe`, and `wipefrom`.
-Older entries below describe the releases in which those commands existed.
-Use `reset` or `resetfrom` to prepare retained work for execution; these commands
-preserve input and retained job definitions.
+## In development for 0.6.2
 
-The 0.6.2 development branch also deprecates `mwf threads --api-total VALUE`.
-Help labels the option deprecated, and use prints a warning. The existing
-set/reset behavior remains functional with no removal date or session-specific
-form.
+This source branch is under verification. The
+[integration record](plans/0.6.2/native-workflow-management-progress.md) records
+current checks and unresolved findings; this entry does not announce a release.
 
-The 0.6.2 development branch removes `MicroWorkflow.skip_node()`. Skipped
-jobs remain supported; the removed operation cannot skip an entire component.
+- Execution uses native main and interrupt sessions with exact component and
+  job ownership. Recovery, restart, and per-node thread overrides follow those
+  owners. The deprecated `mwf threads --api-total VALUE` remains functional as
+  one project-wide limit across active API sessions and clears after the final
+  session ends.
+- The uneven 600-job visibility regression now requires every output,
+  immutable execution-owner row, terminal event, and final job row to identify
+  the same generation and execution. Its bounded completion guard continues to
+  detect a stalled run; measured output-to-terminal delay remains in the
+  benchmark programs.
+- The nine graph commands share component selections, read-only plans,
+  producer-aware preparation, and readiness rules. Sampling retains its selected
+  jobs and replay identity. Aligned sampled resume preserves completed work and
+  its established instability origin.
+- Interrupt components support explicit predecessor pauses and nested scope
+  transfers. Partial or readiness-overriding results establish progression
+  fences. Later input does not automatically rerun the interrupt component.
+- Monitor, inspect, and top show component state, stability, origin, and
+  misalignment separately from job counts. Compact text and JSON lineage trace
+  direct job creation and retain separate sample and interrupt identities.
+- Node clipboard operations require idle component ownership and restore within
+  the originating project. Saved native history supports completed jobs, while
+  node-scoped paste preserves compatible peer work. Interrupted file operations
+  use recorded recovery decisions.
+- The branch supports one native project model and refuses unsupported older
+  project state. It removes `clean`, `cleanfrom`, `wipe`, `wipefrom`, and
+  `MicroWorkflow.skip_node()`. Use reset commands to prepare retained work;
+  skipped jobs remain supported. Two management skills join the five existing
+  architecture, documentation, and testing skills.
 
 ## What changed in 0.6.1
 

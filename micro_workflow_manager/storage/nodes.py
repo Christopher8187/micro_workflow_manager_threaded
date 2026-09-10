@@ -55,48 +55,15 @@ class NodeFileStorageMixin:
     def debug_file(self, node_name: str) -> Path:
         return self.node_output_dir(node_name) / "debug.txt"
 
-    def node_state_file(self, node_name: str) -> Path:
-        return self.node_dir(node_name) / "node_state.json"
-
     def node_schema_file(self, node_name: str) -> Path:
         return self.node_dir(node_name) / "schema.json"
-
-    def default_jobs_file(self, node_name: str) -> Path:
-        return self.node_dir(node_name) / "default_jobs.json"
-
-    def job_index_file(self, node_name: str) -> Path:
-        return self.node_dir(node_name) / "job_index.json"
-
-    def queued_dir(self, node_name: str) -> Path:
-        """Legacy compatibility path; queue membership now lives in SQLite."""
-        return self.node_dir(node_name) / "queued"
-
-    def queued_marker_file(self, node_name: str, job_id: int) -> Path:
-        job_id = self.validate_job_id(job_id)
-        return self.queued_dir(node_name) / f"{job_id}.queued"
-
-    def job_index_dirty_file(self, node_name: str) -> Path:
-        return self.node_dir(node_name) / "job_index.dirty"
-
-    def idempotency_dir(self, node_name: str) -> Path:
-        """Legacy compatibility path; idempotency keys now live in SQLite."""
-        return self.node_dir(node_name) / "idempotency"
-
-    def idempotency_file(self, node_name: str, key_hash: str) -> Path:
-        return self.idempotency_dir(node_name) / f"{key_hash}.json"
 
     def job_base_dir(self, node_name: str, job_id: int) -> Path:
         job_id = self.validate_job_id(job_id)
         return self.jobs_dir(node_name) / str(job_id)
 
-    def job_file(self, node_name: str, job_id: int) -> Path:
-        return self.job_base_dir(node_name, job_id) / "job.json"
-
     def input_file(self, node_name: str, job_id: int) -> Path:
         return self.job_base_dir(node_name, job_id) / "input.json"
-
-    def status_file(self, node_name: str, job_id: int) -> Path:
-        return self.job_base_dir(node_name, job_id) / "status.json"
 
     def output_file(self, node_name: str, job_id: int) -> Path:
         return self.job_base_dir(node_name, job_id) / "output.json"
@@ -315,7 +282,10 @@ class NodeFileStorageMixin:
         waiting: bool = False,
         wait_for: tuple[str, ...] | list[str] | None = None,
         resolved_wait_for: list[str] | tuple[str, ...] | None = None,
+        interrupt: bool = False,
     ):
+        if type(interrupt) is not bool:
+            raise ValueError("interrupt must be a Boolean")
         self.atomic_write_json(
             self.node_schema_file(node_name),
             {
@@ -334,6 +304,7 @@ class NodeFileStorageMixin:
                 "waiting": bool(waiting),
                 "wait_for": None if wait_for is None else list(wait_for),
                 "resolved_wait_for": list(resolved_wait_for or ()),
+                "interrupt": interrupt,
                 "input_dir": str(self.node_input_dir(node_name)),
                 "output_dir": str(self.node_output_dir(node_name)),
                 "jobs_dir": str(self.jobs_dir(node_name)),
@@ -379,28 +350,13 @@ class NodeFileStorageMixin:
         self.submit_db_mutation(update, priority=5)
 
     def get_node_status(self, node_name: str) -> str | None:
-        row = self.db_connection().execute(
-            "SELECT status FROM nodes WHERE node_name=?",
-            (self.validate_node_name(node_name),),
-        ).fetchone()
-        return None if row is None else row["status"]
+        return self.get_node_statuses((node_name,)).get(node_name)
 
     def get_node_statuses(self, node_names) -> dict[str, str]:
-        """Read many node lifecycle states with one bounded SQLite query set."""
-        normalized = sorted({self.validate_node_name(name) for name in node_names})
-        if not normalized:
-            return {}
-        result: dict[str, str] = {}
-        connection = self.db_connection()
-        for offset in range(0, len(normalized), 500):
-            chunk = normalized[offset:offset + 500]
-            placeholders = ",".join("?" for _ in chunk)
-            rows = connection.execute(
-                f"SELECT node_name, status FROM nodes WHERE node_name IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            result.update({str(row["node_name"]): str(row["status"]) for row in rows})
-        return result
+        """Read component lifecycle once per current membership, ignoring pump caches."""
+        from .node_lifecycle_observation import read_node_lifecycles
+
+        return read_node_lifecycles(self.db_connection(), node_names)
 
     def write_debug(self, node_name: str, message: str):
         from datetime import datetime

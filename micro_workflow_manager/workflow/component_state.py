@@ -4,6 +4,7 @@ import networkx as nx
 
 from ..component_readiness import calculate_component_readiness, calculate_sampled_resume_lineage
 from ..errors import InvalidGraphError
+from .interrupt_execution import execution_component_readiness
 from ..storage.component_states import ComponentTerminalOutcome
 from ..topology import ComponentTopology
 from ..models import (
@@ -54,9 +55,8 @@ class ComponentStateMixin:
         observations = self.storage.read_component_states(parents, expected_shape=expected_shape)
         if set(observations) != set(parents):
             raise RuntimeError('Component admission requires every direct parent observation')
-        readiness = calculate_component_readiness(
-            (state['lifecycle'], state['stability'], state['instability_origin'])
-            for state in observations.values()
+        readiness = execution_component_readiness(
+            self, component, observations, execution_context,
         )
         if readiness is None:
             raise InvalidGraphError(f'Hoeflein component {list(component)} is not ready yet')
@@ -101,9 +101,8 @@ class ComponentStateMixin:
         observations = self.storage.read_component_states(parents, expected_shape=expected_shape)
         if set(observations) != set(parents):
             raise RuntimeError('Selected execution requires every direct parent observation')
-        readiness = calculate_component_readiness(
-            (state['lifecycle'], state['stability'], state['instability_origin'])
-            for state in observations.values()
+        readiness = execution_component_readiness(
+            self, component, observations, execution_context,
         )
         if readiness is None:
             raise InvalidGraphError(f'Hoeflein component {list(component)} is not ready yet')
@@ -226,11 +225,12 @@ class ComponentStateMixin:
         with self.lock:
             expected_shape = self.topology.graph_shape()
             parents = sorted(self.component_predecessor_components(component))
-        observations = self.storage.read_component_states(parents, expected_shape=expected_shape)
-        return calculate_component_readiness(
-            (state['lifecycle'], state['stability'], state['instability_origin'])
-            for state in observations.values()
-        ) is not None
+        observations = self.storage.read_component_states(
+            parents, expected_shape=expected_shape, allow_missing=True,
+        )
+        if any(state is None for state in observations.values()):
+            return False
+        return execution_component_readiness(self, component, observations) is not None
 
     def component_has_any_jobs(self, component: set[str]) -> bool:
         return any(self.storage.list_jobs(node_name) for node_name in component)

@@ -570,21 +570,29 @@ def test_component_result_batch_cannot_leave_an_owned_component_running(running_
 def test_component_result_batch_preserves_work_transferred_to_another_session(running_component):
     storage, topology, generation, execution_id = running_component
     storage.finalize_job_execution('A', 1, generation, execution_id, 'done')
-    storage.begin_queued_component_execution(
-        'ordinary-result', ('C',), expected_shape=topology.shape_json,
-        expected_alignment_generation=0, successful_lineage=('stable', None),
-    )
-    storage.create_execution_session(
-        'next-owner', session_kind='interrupt', command='run',
-        start_component=('C',), selected_components=[('C',)], started_at=now(),
+    storage.create_job(Job(node_name='C', job_id=1, params={}))
+    admitted = storage.admit_interrupt_execution(
+        'next-owner', command='run C --interrupt',
+        start_component=('C',), selected_components=[('C',)], selected_jobs=(),
+        direct_predecessors=[('A', 'B')], readiness_overridden=True, started_at=now(),
         hostname=socket.gethostname(), pid=os.getpid(), process_identity=process_identity(os.getpid()),
+        details={'fixture': 'transferred-result'},
         expected_shape=topology.shape_json,
     )
-    storage.submit_db_mutation(lambda connection: connection.execute(
-        'UPDATE component_reservations SET session_id=? WHERE component_key=?',
-        ('next-owner', json.dumps(['C'])),
-    ))
-    storage.create_job(Job(node_name='C', job_id=1, params={}))
+    assert admitted['session_id'] == 'next-owner'
+    parent_states = {('A', 'B'): storage.get_component_state(('A', 'B'))}
+    frozen = storage.freeze_interrupt_target(
+        'next-owner', expected_shape=topology.shape_json,
+        expected_parent_states=parent_states,
+        successful_lineage=('unstable', 'next-owner'), readiness_overridden=True,
+        frozen_at=now(),
+    )
+    assert frozen['state'] == 'frozen'
+    assert storage.begin_queued_component_execution(
+        'next-owner', ('C',), expected_shape=topology.shape_json,
+        expected_alignment_generation=0, successful_lineage=('unstable', 'next-owner'),
+        expected_parent_states=parent_states,
+    ) is True
     _, other_execution = storage.claim_job_execution(
         'C', 1, started_at=now(), session_id='next-owner', component=('C',),
     )
@@ -617,6 +625,17 @@ def test_component_settlement_preserves_or_clears_successful_lineage(running_com
         process_identity=process_identity(os.getpid()),
         expected_shape=topology.shape_json,
     )
+    assert storage.reserve_execution_components(
+        'interrupt-origin', expected_shape=topology.shape_json,
+    ) is True
+    assert storage.finish_execution_session(
+        'interrupt-origin', outcome='done', finished_at=now(),
+    ) is True
+    origin = storage.get_execution_session('interrupt-origin')
+    assert origin['status'] == 'terminal'
+    assert origin['outcome'] == 'done'
+    assert storage.release_execution_components('interrupt-origin') == 1
+    assert storage.get_component_reservation(('C',)) is None
     lifecycle = 'failed' if mode == 'failed' else 'done'
     if mode in ('new-unstable', 'retained-unstable'):
         storage.submit_db_mutation(lambda connection: connection.execute(

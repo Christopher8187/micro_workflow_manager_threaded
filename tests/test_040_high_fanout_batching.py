@@ -316,7 +316,7 @@ def test_native_reopen_preserves_sequence_and_incomplete_schema_refuses_mutation
         connection.close()
 
     files = {path.relative_to(tmp_path): path.read_bytes() for path in (tmp_path / 'node').rglob('*') if path.is_file()}
-    with pytest.raises(RuntimeError, match='Incomplete SQLite execution-session schema'):
+    with pytest.raises(RuntimeError, match='Unsupported MWF project format'):
         MicroWorkflow(project_dir=tmp_path)
 
     connection = sqlite3.connect(database)

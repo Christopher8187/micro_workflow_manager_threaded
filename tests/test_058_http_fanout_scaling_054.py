@@ -14,20 +14,50 @@ from micro_workflow_manager.runners.api import ApiRunner, _LaneCoordinator
 from micro_workflow_manager.workflow.component_scheduler import allocate_api_pumps
 
 
-def test_preclaimed_api_burst_records_first_task_started_in_claim_batch(tmp_path):
+def test_preclaimed_api_burst_records_first_task_started_in_claim_batch(tmp_path, monkeypatch):
     workflow = MicroWorkflow(tmp_path, runner="api")
     workflow.active_job_restart_enabled = True
     workflow.graph([])
     router = NodeRouter("A", runner="api", max_threads=16)
 
     @router.task
-    def work(ctx, value):
+    def work(ctx, value, errors):
+        assert errors == []
         return value
 
     workflow.include_router(router)
     workflow.add_jobs(None, "A", [{"value": value} for value in range(16)])
+
+    appended_task_starts = []
+    claim_observations = []
+    append_job_event = workflow.storage.append_job_event
+    claim_job_executions_batch = workflow.storage.claim_job_executions_batch
+
+    def reject_separate_task_start(node_name, job_id, event, **data):
+        if event == "task_started":
+            appended_task_starts.append((node_name, job_id, data))
+            raise AssertionError("first main task start must share its execution-claim writer")
+        return append_job_event(node_name, job_id, event, **data)
+
+    def observe_claim(node_name, job_ids, **options):
+        result = claim_job_executions_batch(node_name, job_ids, **options)
+        observed = {
+            job_id: [
+                event["event"]
+                for event in workflow.storage.read_job_events(node_name, job_id)
+            ]
+            for job_id in job_ids
+        }
+        assert all(events.count("task_started") == 1 for events in observed.values())
+        claim_observations.append((tuple(job_ids), observed))
+        return result
+
+    monkeypatch.setattr(workflow.storage, "append_job_event", reject_separate_task_start)
+    monkeypatch.setattr(workflow.storage, "claim_job_executions_batch", observe_claim)
     workflow.run_node("A")
 
+    assert appended_task_starts == []
+    assert sorted(job_id for job_ids, _ in claim_observations for job_id in job_ids) == list(range(1, 17))
     for job_id in range(1, 17):
         names = [event["event"] for event in workflow.storage.read_job_events("A", job_id)]
         assert names.count("task_started") == 1

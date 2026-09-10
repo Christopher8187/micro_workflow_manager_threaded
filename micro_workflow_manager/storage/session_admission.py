@@ -23,7 +23,7 @@ class SessionAdmissionStorageMixin:
         start_component,
         selected_components,
         selected_jobs=(),
-        parent_session_id: str | None = None,
+        parent_session_ids=(),
         started_at: str,
         hostname: str,
         pid: int,
@@ -46,10 +46,18 @@ class SessionAdmissionStorageMixin:
             raise ValueError("pid must be a positive integer")
         if process_identity is not None:
             self._session_text(process_identity, "process_identity")
-        if parent_session_id is not None:
-            self._session_text(parent_session_id, "parent_session_id")
-            if session_kind != "interrupt" or parent_session_id == session_id:
-                raise ValueError("An interrupt session must have a distinct parent")
+        if (not isinstance(parent_session_ids, Sequence)
+                or isinstance(parent_session_ids, (str, bytes))):
+            raise ValueError("Session parents must be an ordered sequence")
+        parent_session_ids = tuple(sorted(
+            self._session_text(parent, "parent_session_id") for parent in parent_session_ids
+        ))
+        if len(set(parent_session_ids)) != len(parent_session_ids):
+            raise ValueError("Session parents must be distinct")
+        if parent_session_ids and (
+            session_kind != "interrupt" or session_id in parent_session_ids
+        ):
+            raise ValueError("Only an interrupt session may have distinct parent sessions")
         if details is not None and not isinstance(details, dict):
             raise ValueError("Session details must be an object")
         if not isinstance(selected_components, Sequence) or isinstance(selected_components, (str, bytes)):
@@ -87,6 +95,12 @@ class SessionAdmissionStorageMixin:
 
         def create(connection):
             shape_id, revision = read_admission_shape(connection, expected_shape, component_keys)
+            for parent in parent_session_ids:
+                row = connection.execute(
+                    "SELECT status FROM execution_sessions WHERE session_id=?", (parent,),
+                ).fetchone()
+                if row is None or row['status'] != 'running':
+                    raise RuntimeError("Session parent must be an existing running session: " + parent)
             job_roots = []
             for position, (node, job_id) in enumerate(jobs):
                 observed = self._read_job_owner_observation(connection, node, job_id)
@@ -96,11 +110,11 @@ class SessionAdmissionStorageMixin:
             selection_kind = 'jobs' if job_roots else 'components'
             connection.execute(
                 "INSERT INTO execution_sessions("
-                "session_id, session_kind, parent_session_id, command, selection_kind, start_component, "
+                "session_id, session_kind, command, selection_kind, start_component, "
                 "status, started_at, heartbeat_at, hostname, pid, process_identity, details_json, "
                 "admitted_shape_id, partition_revision) "
-                "VALUES(?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
-                (session_id, session_kind, parent_session_id, command, selection_kind,
+                "VALUES(?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, session_kind, command, selection_kind,
                  encode_component_key(start_component), started_at, started_at,
                  hostname, pid, process_identity, json.dumps(details or {}), shape_id, revision),
             )
@@ -108,6 +122,14 @@ class SessionAdmissionStorageMixin:
                 "INSERT INTO session_components(session_id, position, component_key) VALUES(?, ?, ?)",
                 [(session_id, position, component) for position, component in enumerate(components)],
             )
+            if parent_session_ids:
+                inserted = connection.executemany(
+                    "INSERT INTO execution_session_parents("
+                    "child_session_id, parent_session_id, created_at) VALUES(?, ?, ?)",
+                    [(session_id, parent, started_at) for parent in parent_session_ids],
+                ).rowcount
+                if inserted != len(parent_session_ids):
+                    raise RuntimeError("Session parents were not recorded completely")
             if _reserved_sample_builder is not None:
                 # Internal use only: the caller holds every component input/jobs
                 # advisory lock. This callback may read only through this
@@ -149,6 +171,9 @@ class SessionAdmissionStorageMixin:
             ).rowcount
             if recorded != len(job_roots):
                 raise RuntimeError('Session admission did not record every selected job instance')
+            self._authorize_interrupt_fences(
+                connection, session_id, component_keys, started_at,
+            )
             row = connection.execute(
                 'SELECT * FROM execution_sessions WHERE session_id=?', (session_id,),
             ).fetchone()
@@ -197,12 +222,15 @@ class SessionAdmissionStorageMixin:
                         'SELECT COUNT(*) FROM session_components WHERE session_id=?',
                         'SELECT COUNT(*) FROM session_jobs WHERE session_id=?',
                         'SELECT COUNT(*) FROM component_reservations WHERE session_id=?',
+                        'SELECT COUNT(*) FROM execution_session_parents WHERE child_session_id=?',
+                        'SELECT COUNT(*) FROM session_fence_authorizations WHERE session_id=?',
                     )
                 )
                 if orphaned:
                     raise RuntimeError('Admission rollback left rows without its execution session')
                 return None
             session = self._execution_session_from_row(connection, row)
+            scope_admitted = row['scope_admitted']
             if validate_session_shape_snapshot(connection, session) != expected_shape:
                 raise RuntimeError("Committed admission has a different graph shape")
             roots = tuple(self._read_session_job_roots(
@@ -211,7 +239,7 @@ class SessionAdmissionStorageMixin:
             expected_selection_kind = 'jobs' if selected_jobs else 'components'
             if (
                 session['session_kind'] != session_kind
-                or session['parent_session_id'] is not None
+                or session['parent_session_ids']
                 or session['command'] != command
                 or session['selection_kind'] != expected_selection_kind
                 or session['start_component'] != start_component
@@ -242,9 +270,17 @@ class SessionAdmissionStorageMixin:
             if reserved and not reserved_keys:
                 # Ordinary reservation is a second writer decision. Its
                 # rollback leaves the already committed session intact.
+                if scope_admitted != 0:
+                    raise RuntimeError(
+                        'Committed execution-session reservation lost its admitted scope'
+                    )
                 return None
-            if reserved_keys != expected_keys:
+            if scope_admitted != int(reserved) or reserved_keys != expected_keys:
                 raise RuntimeError('Committed execution-session reservation differs from its request')
+            if reserved:
+                from .session_scope import require_admitted_reservation_scope
+                if not require_admitted_reservation_scope(connection, session_id):
+                    raise RuntimeError('Committed execution-session reservation lost its admission marker')
             return session
         finally:
             connection.close()

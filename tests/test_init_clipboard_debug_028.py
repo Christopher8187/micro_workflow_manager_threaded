@@ -31,6 +31,7 @@ def test_copy_paste_and_debug(tmp_path, monkeypatch, capsys):
     (tmp_path / 'src' / 'node_behavior' / 'A.py').write_text("from micro_workflow_manager import NodeRouter\nrouter=NodeRouter('A')\n@router.task\ndef run(ctx): return None\n", encoding='utf-8')
     (tmp_path / 'src' / 'node_behavior' / 'B.py').write_text("from micro_workflow_manager import NodeRouter\nrouter=NodeRouter('B')\n@router.task\ndef run(ctx): return None\n", encoding='utf-8')
     assert cli.main(['graph','src/graph.py']) == 0
+    assert cli.main(['run', 'A', '--runner', 'direct']) == 0
     debug = tmp_path / 'node' / 'A' / 'output' / 'debug.txt'
     debug.write_text('first\n', encoding='utf-8')
     assert cli.main(['copy','A']) == 0

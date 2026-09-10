@@ -69,11 +69,13 @@ def read_membership_history(connection):
                 raise RuntimeError('Stable historical result has an instability origin')
         else:
             origin = connection.execute(
-                "SELECT session_id FROM execution_sessions WHERE session_id=? AND session_kind='interrupt'",
+                "SELECT session_id FROM execution_sessions WHERE session_id=? "
+                "AND session_kind='interrupt' AND scope_admitted=1 "
+                "AND typeof(scope_admitted)='integer'",
                 (row['instability_origin'],),
             ).fetchone()
             if origin is None:
-                raise RuntimeError('Unstable historical result has no interrupt origin')
+                raise RuntimeError('Unstable historical result has no admitted interrupt origin')
         results[key] = row
     for row in connection.execute('SELECT * FROM component_states WHERE retained_result_shape_id IS NOT NULL'):
         key = decode_component_key(row['component_key']), row['retained_result_shape_id'], row['retained_result_alignment_generation']

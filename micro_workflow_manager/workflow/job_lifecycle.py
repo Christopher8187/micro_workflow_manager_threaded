@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Callable, TypeVar
 
 from ..context import JobContext
+from ..interrupt_cooperation import claim_with_interrupt_retry
 from ..errors import (
     InvalidGraphError,
     InvalidJobError,
@@ -18,6 +19,7 @@ from ..fibers import cancellation_scope, in_fiber_runtime
 from ..networking import network_attempt_context
 from ..storage.priorities import ADMISSION_PRIORITY
 from .execution_scope import programmatic_execution
+from .api_admission import ApiPermitStateError, api_execution_permit
 from .selected_execution_operation import run_selected_execution
 
 
@@ -120,14 +122,12 @@ class JobLifecycleMixin:
                 started_at = now()
                 started_perf = perf_counter()
                 session_id, component = self.execution_claim_context(node_name, context=execution_context)
-                generation, execution_id = self.storage.claim_job_execution(
-                    node_name,
-                    job_id,
-                    started_at=started_at,
-                    priority=claim_priority,
-                    session_id=session_id,
-                    component=component,
-                    expected_restart=_expected_restart,
+                generation, execution_id = claim_with_interrupt_retry(
+                    lambda: self.storage.claim_job_execution(
+                        node_name, job_id, started_at=started_at, priority=claim_priority,
+                        session_id=session_id, component=component,
+                        expected_restart=_expected_restart,
+                    ),
                 )
                 _expected_restart = None
             else:
@@ -140,13 +140,21 @@ class JobLifecycleMixin:
                 preclaimed_execution = None
 
             try:
-                result = self.execute_with_fallbacks(
-                    job,
-                    execution_generation=generation,
-                    execution_id=execution_id,
-                    first_task_started_pre_recorded=task_started_pre_recorded,
-                )
+                with api_execution_permit(
+                    self, node_name, job_id, generation, execution_id,
+                ):
+                    result = self.execute_with_fallbacks(
+                        job,
+                        execution_generation=generation,
+                        execution_id=execution_id,
+                        first_task_started_pre_recorded=task_started_pre_recorded,
+                    )
                 outcome_kind, payload = "result", result
+            except ApiPermitStateError:
+                # Permit integrity is part of the active execution lease. Do
+                # not publish a task failure or terminal job while capacity
+                # ownership is unresolved; native recovery must observe it.
+                raise
             except JobRestartedError as error:
                 task_started_pre_recorded = False
                 self.scheduler_supervisor.cancel_execution(

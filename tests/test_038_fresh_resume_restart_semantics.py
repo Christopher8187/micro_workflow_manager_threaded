@@ -43,7 +43,7 @@ def _terminal_session(storage, command, start_component, selected_components, ou
     assert len(matches) == 1
     session = matches[0]
     assert session["session_kind"] == "main"
-    assert session["parent_session_id"] is None
+    assert session["parent_session_ids"] == []
     assert session["status"] == "terminal"
     assert session["outcome"] == outcome
     assert session["selected_components"] == selected_components
@@ -96,11 +96,11 @@ def test_run_resets_parent_created_jobs_before_running_with_monitor(
     session = _terminal_session(storage, "run", ("B",), [("B",)], "done")
     assert (
         f"session={session['session_id']} kind=main command=run status=running "
-        "parent=- components=[B]"
+        "parents=- components=[B]"
     ) in captured.err
     assert (
         f"session={session['session_id']} kind=main command=run status=terminal "
-        "parent=- components=[B] outcome=done"
+        "parents=- components=[B] outcome=done"
     ) in captured.err
     assert "No queued jobs for B" not in captured.out
 
@@ -183,11 +183,11 @@ def test_runfrom_freshens_start_component_and_preserves_other_merge_branch(
     session = _terminal_session(storage, "runfrom", ("A",), [("A",), ("C",)], "done")
     assert (
         f"session={session['session_id']} kind=main command=runfrom status=running "
-        "parent=- components=[A; C]"
+        "parents=- components=[A; C]"
     ) in captured.err
     assert (
         f"session={session['session_id']} kind=main command=runfrom status=terminal "
-        "parent=- components=[A; C] outcome=done"
+        "parents=- components=[A; C] outcome=done"
     ) in captured.err
     c_jobs = [storage.load_job("C", job_id) for job_id in storage.list_job_ids("C")]
     assert sorted(job.params["label"] for job in c_jobs) == ["A", "Q"]
@@ -243,7 +243,7 @@ def test_resumefrom_requeues_failed_descendant_without_prior_restart_and_monitor
     )
     assert (
         f"session={failed_session['session_id']} kind=main command=runfrom status=terminal "
-        "parent=- components=[A; B] outcome=failed"
+        "parents=- components=[A; B] outcome=failed"
     ) in first.err
     assert any(
         "Job B/2 failed" in failure["error"]
@@ -272,11 +272,11 @@ def test_resumefrom_requeues_failed_descendant_without_prior_restart_and_monitor
     )
     assert (
         f"session={resumed_session['session_id']} kind=main command=resumefrom status=running "
-        "parent=- components=[A; B]"
+        "parents=- components=[A; B]"
     ) in resumed.err
     assert (
         f"session={resumed_session['session_id']} kind=main command=resumefrom status=terminal "
-        "parent=- components=[A; B] outcome=done"
+        "parents=- components=[A; B] outcome=done"
     ) in resumed.err
 
 

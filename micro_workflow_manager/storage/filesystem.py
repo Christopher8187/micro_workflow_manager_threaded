@@ -11,6 +11,7 @@ from micro_workflow_manager.project_format import (
     require_unchanged_path,
 )
 from .base import FileStorageBase
+from .api_admission import ApiExecutionAdmissionStorageMixin
 from .component_definitions import ComponentDefinitionStorageMixin
 from .component_holds import ComponentHoldStorageMixin
 from .component_misalignment import ComponentMisalignmentStorageMixin
@@ -20,17 +21,20 @@ from .execution import JobExecutionStorageMixin
 from .execution_sessions import ExecutionSessionStorageMixin
 from .events import JobEventStorageMixin
 from .input_publications import InputPublicationStorageMixin
+from .interrupt_execution import InterruptExecutionStorageMixin
 from .job_index import JobIndexStorageMixin
 from .jobs import JobFileStorageMixin
 from .nodes import NodeFileStorageMixin
 from .network_state import NetworkStateStorageMixin
-from .runtime_config import RuntimeConfigStorageMixin
+from .thread_overrides import ThreadOverrideStorageMixin
 from .sqlite_state import SQLiteStateMixin
 from .state_events import StateEventStorageMixin
 
 
 class FileStorage(
+    ApiExecutionAdmissionStorageMixin,
     InputPublicationStorageMixin,
+    InterruptExecutionStorageMixin,
     ComponentMisalignmentStorageMixin,
     ComponentDefinitionStorageMixin,
     ComponentHoldStorageMixin,
@@ -39,7 +43,7 @@ class FileStorage(
     ExecutionSessionStorageMixin,
     NetworkStateStorageMixin,
     StateEventStorageMixin,
-    RuntimeConfigStorageMixin,
+    ThreadOverrideStorageMixin,
     JobEventStorageMixin,
     JobExecutionStorageMixin,
     JobFileStorageMixin,

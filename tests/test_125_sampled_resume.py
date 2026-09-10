@@ -12,6 +12,10 @@ from micro_workflow_manager.models import now
 from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.storage import FileStorage
 from tests.test_036_hoeflein_scheduling import make_project
+from tests.test_064_read_only_previews import (
+    _live_execution_session_identity,
+    _mark_execution_session_stale,
+)
 from tests.test_090_component_session_settlement import _close, _rows
 from tests.test_093_native_cli_readiness import _node_files
 from tests.test_117_execution_sampling import _component_result, _job_snapshot
@@ -102,7 +106,15 @@ def _seed_unstable_parent(storage, origin):
         process_identity=process_identity(os.getpid()),
         expected_shape=storage.get_component_definition(("P",))["shape_json"],
     )
+    assert storage.reserve_execution_components(
+        origin, expected_shape=storage.get_component_definition(("P",))["shape_json"],
+    ) is True
+    assert storage.db_connection().execute(
+        "SELECT scope_admitted FROM execution_sessions WHERE session_id=?", (origin,),
+    ).fetchone()[0] == 1
     assert storage.finish_execution_session(origin, outcome="done", finished_at=now()) is True
+    assert storage.release_execution_components(origin) == 1
+    assert storage.get_component_reservation(("P",)) is None
     assert _set_done_result(storage, ("P",), "unstable", origin) == 1
     storage.set_node_status("P", "done")
 
@@ -423,10 +435,7 @@ def test_recovery_preview_accepts_rootless_sampled_resume_pending_kind(
             command="resume",
             start_component=("A",),
             selected_components=[("A",)],
-            started_at="2020-01-01T00:00:00+00:00",
-            hostname=socket.gethostname(),
-            pid=99999999,
-            process_identity="retired-resume",
+            **_live_execution_session_identity(),
             expected_shape=state["shape_json"],
         )
         assert storage.reserve_execution_components(
@@ -444,6 +453,7 @@ def test_recovery_preview_accepts_rootless_sampled_resume_pending_kind(
             storage.current_job_generation("A", remaining[0]),
             storage.read_job_current_owner("A", remaining[0])["execution_id"],
         )
+        _mark_execution_session_stale(storage, "abandoned-resume")
         storage.db_mutation_barrier()
         before_rows = _rows(storage)
         before_files = _node_files(tmp_path)

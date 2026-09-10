@@ -81,7 +81,8 @@ def test_raise_open_file_limit_never_lowers_and_targets_65536(monkeypatch):
             self.limit = value
 
     fake = FakeResource()
-    monkeypatch.setattr(resource_limits.os, "name", "posix")
+    from types import SimpleNamespace
+    monkeypatch.setattr(resource_limits, "os", SimpleNamespace(name="posix"))
     import sys
     monkeypatch.setitem(sys.modules, "resource", fake)
     assert resource_limits.raise_open_file_limit() == 65536

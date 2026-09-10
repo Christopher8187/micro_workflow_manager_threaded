@@ -171,6 +171,9 @@ class JobBatchStorageMixin:
             for job in jobs:
                 self._validate_job_producer(connection, job, producer_execution_id)
             refuse_receiver_mutation(connection, node_name)
+            self._refuse_interrupt_held_publication(
+                connection, node_name, producer_execution_id,
+            )
             connection.executemany(
                 "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
                 "VALUES(?, ?, ?, ?, ?, '{}')",
@@ -316,6 +319,10 @@ class JobBatchStorageMixin:
 
             if job_rows:
                 refuse_receiver_mutation(connection, node_name)
+                for job in commit_jobs:
+                    self._refuse_interrupt_held_publication(
+                        connection, node_name, producer_execution_id,
+                    )
                 connection.executemany(
                     "INSERT INTO jobs(node_name, job_id, parent_json, created_at, status, status_json) "
                     "VALUES(?, ?, ?, ?, ?, '{}')",

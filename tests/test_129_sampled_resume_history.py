@@ -1,7 +1,4 @@
-"""Sensitive public refusal for conflicting retained sampled history.
-
-External draft only. Root may copy this into Direct after review.
-"""
+"""Sensitive public refusal for conflicting retained sampled history."""
 
 import os
 import socket
@@ -123,6 +120,7 @@ def _set_done_result(storage, component, stability, origin):
 
 
 def _set_unstable_result(storage, component, origin):
+    shape = storage.get_component_definition(component)["shape_json"]
     storage.create_execution_session(
         origin,
         session_kind="interrupt",
@@ -133,9 +131,15 @@ def _set_unstable_result(storage, component, origin):
         hostname=socket.gethostname(),
         pid=os.getpid(),
         process_identity=process_identity(os.getpid()),
-        expected_shape=storage.get_component_definition(component)["shape_json"],
+        expected_shape=shape,
     )
+    assert storage.reserve_execution_components(origin, expected_shape=shape) is True
+    assert storage.db_connection().execute(
+        "SELECT scope_admitted FROM execution_sessions WHERE session_id=?", (origin,),
+    ).fetchone()[0] == 1
     assert storage.finish_execution_session(origin, outcome="done", finished_at=now()) is True
+    assert storage.release_execution_components(origin) == 1
+    assert storage.get_component_reservation(component) is None
     key = encode_component_key(component)
     assert _set_done_result(storage, component, "unstable", origin) == 1
     for node in component:

@@ -19,6 +19,26 @@ def add_destructive_arguments(command) -> None:
     add_keeptrace_argument(command)
 
 
+def add_interrupt_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--interrupt",
+        action="store_true",
+        help="Run the explicitly named starting component as an interrupt session.",
+    )
+    command.add_argument(
+        "--interrupt-policy",
+        choices=("run-all", "stop-all", "individual"),
+        help="Resolve reachable ordinary interrupt components before mutation.",
+    )
+    command.add_argument(
+        "--interrupt-choice",
+        action="append",
+        default=[],
+        metavar="RAW_NODE=run|stop",
+        help="Choose one interrupt component action under the individual policy; repeat as needed.",
+    )
+
+
 def add_stats_arguments(command: argparse.ArgumentParser):
     command.add_argument(
         "--stats",

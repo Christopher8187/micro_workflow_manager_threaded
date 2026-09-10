@@ -4,7 +4,10 @@ import sqlite3
 import threading
 import time
 
+import pytest
+
 from micro_workflow_manager import MicroWorkflow, NodeRouter
+from micro_workflow_manager.storage.component_states import ComponentExecutionIncomplete
 
 
 def test_component_consumes_publication_between_coordinator_observations(tmp_path, monkeypatch):
@@ -30,7 +33,7 @@ def test_component_consumes_publication_between_coordinator_observations(tmp_pat
 
     workflow.include_routers(producer, consumer)
     workflow.add_job(None, "A")
-    original_connection = workflow.storage.db_connection
+    original_observation = workflow.storage.nodes_by_job_status
     observer = sqlite3.connect(workflow.storage.state_database_path().as_uri() + "?mode=ro", uri=True)
 
     def after_observation():
@@ -44,36 +47,15 @@ def test_component_consumes_publication_between_coordinator_observations(tmp_pat
             assert time.monotonic() < deadline, "Producer did not finish its real publication"
             time.sleep(0.001)
 
-    class Cursor:
-        def __init__(self, cursor):
-            self.cursor = cursor
-
-        def fetchall(self):
-            rows = self.cursor.fetchall()
-            # Delay delivery of an actual SQLite observation. A producer may
-            # publish and finish at this boundary under ordinary concurrency.
-            # SQL, rows, and task execution remain real and unchanged.
+    def observe(*args, **kwargs):
+        observed = original_observation(*args, **kwargs)
+        # Delay delivery of the real coordinator snapshot without wrapping
+        # unrelated native ownership and session queries.
+        if threading.get_ident() == coordinator:
             after_observation()
-            return rows
+        return observed
 
-        def __getattr__(self, name):
-            return getattr(self.cursor, name)
-
-    class Connection:
-        def __init__(self, connection):
-            self.connection = connection
-
-        def execute(self, *args, **kwargs):
-            return Cursor(self.connection.execute(*args, **kwargs))
-
-        def __getattr__(self, name):
-            return getattr(self.connection, name)
-
-    def connection():
-        raw = original_connection()
-        return Connection(raw) if threading.get_ident() == coordinator else raw
-
-    monkeypatch.setattr(workflow.storage, "db_connection", connection)
+    monkeypatch.setattr(workflow.storage, "nodes_by_job_status", observe)
     try:
         workflow.run_component({"A", "B"}, ignore_readiness=True)
     finally:
@@ -109,14 +91,14 @@ def test_admitted_waiting_pump_finishes_between_claims_before_deadlock_decision(
 
     workflow.include_routers(producer, consumer)
     workflow.add_jobs(None, "A", [{}, {}])
-    original_status = workflow.storage.set_job_status
+    original_claim = workflow.storage.claim_job_execution
     original_observation = workflow.storage.nodes_by_job_status
 
-    def mark_status(node_name, job_id, status, *args, **kwargs):
-        if node_name == "A" and job_id == 2 and status == "running":
+    def claim(node_name, job_id, *args, **kwargs):
+        if node_name == "A" and job_id == 2:
             second_claim_ready.set()
             assert allow_second_claim.wait(10), "Coordinator did not observe the gap between claims"
-        return original_status(node_name, job_id, status, *args, **kwargs)
+        return original_claim(node_name, job_id, *args, **kwargs)
 
     def observe(*args, **kwargs):
         nonlocal saw_between_claims
@@ -126,7 +108,7 @@ def test_admitted_waiting_pump_finishes_between_claims_before_deadlock_decision(
             allow_second_claim.set()
         return observed
 
-    monkeypatch.setattr(workflow.storage, "set_job_status", mark_status)
+    monkeypatch.setattr(workflow.storage, "claim_job_execution", claim)
     monkeypatch.setattr(workflow.storage, "nodes_by_job_status", observe)
     try:
         workflow.run_component({"A", "B"}, ignore_readiness=True)
@@ -163,8 +145,13 @@ def test_idle_resident_member_does_not_hide_a_real_waiting_deadlock(tmp_path, mo
         return original_observation(*args, **kwargs)
 
     monkeypatch.setattr(workflow.storage, "nodes_by_job_status", observe)
-    workflow.run_component({"A", "B", "C"}, ignore_readiness=True)
+    with pytest.raises(ComponentExecutionIncomplete, match="Component completion has unfinished job"):
+        workflow.run_component({"A", "B", "C"}, ignore_readiness=True)
     for node in ("A", "B"):
         counts = workflow.storage.job_status_counts(node)
         assert counts["queued"] == 1
         assert all(counts[state] == 0 for state in ("running", "done", "failed"))
+    state = workflow.storage.get_component_state(("A", "B", "C"))
+    assert state["lifecycle"] == "failed"
+    assert state["stability"] is None and state["instability_origin"] is None
+    assert workflow.storage.get_live_main_session() is None

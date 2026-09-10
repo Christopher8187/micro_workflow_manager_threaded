@@ -78,7 +78,12 @@ def test_selected_child_restart_survives_root_exit(tmp_path, catch_child_failure
         assert successor['generation'] == 1
         assert successor['created_by_execution_id'] == root_owner['execution_id']
         assert storage.get_job_status('B', 1) == 'done'
-        assert storage.get_node_status('B') == ('queued' if catch_child_failure else 'failed')
+        expected_lifecycle = 'sampled' if catch_child_failure else 'failed'
+        assert storage.get_node_status('A') == storage.get_node_status('B') == expected_lifecycle
+        state = storage.get_component_state(('A', 'B'))
+        assert state['lifecycle'] == expected_lifecycle
+        assert state['stability'] == ('stable' if catch_child_failure else None)
+        assert state['instability_origin'] is None
         assert storage.get_job_status('A', 2) == 'queued'
         assert storage.read_job_current_owner('A', 2) is None
         assert storage.read_job_current_owner('A', 1) == root_owner

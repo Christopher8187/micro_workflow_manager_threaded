@@ -13,17 +13,33 @@ from .membership_footprint import selected_membership_owners
 from .membership_history import read_membership_history
 from .preparation_guards import validate_held_guards
 from .preparation_receipts import submit_preparation_decision
+from .membership_completion import MembershipCompletion
 from .job_preparation import validate_job_preparation
 from .preparation_footprint import validate_prepared_inputs
 
 
 class MembershipPreparation:
-    def __init__(self, storage, change, footprint, session_id, operation):
+    def __init__(
+        self, storage, change, footprint, session_id, operation, *,
+        admitted_components=None, interrupt_preflight_record=None,
+    ):
         self.storage = storage
         self.change = change
         self.footprint = footprint
         self.session_id = session_id
         self.operation = operation
+        self.admitted_components = tuple(
+            change.requested_components if admitted_components is None else admitted_components
+        )
+        self.interrupt_preflight_record = interrupt_preflight_record
+        try:
+            self.interrupt_preflight_identity = None if interrupt_preflight_record is None else json.dumps(
+                interrupt_preflight_record, sort_keys=True, separators=(',', ':'),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError('Interrupt preflight record must be JSON data') from error
+        self.revision = change.source.revision + int(set(change.source_components) != set(change.target_components))
+        self.completion = None
         self.positions = {unit.component: position for position, unit in enumerate(footprint.units)}
         connection = storage.db_connection()
         component_membership.validate_membership_change(connection, change)
@@ -68,6 +84,9 @@ class MembershipPreparation:
                            for item in change.source.components],
         }
 
+    def bind_attempt(self, connection, operation_id):
+        self.completion = MembershipCompletion(connection, operation_id, self.revision, self.session_id)
+
     def _validate_session(self, connection):
         sessions = connection.execute("SELECT * FROM execution_sessions WHERE status='running'").fetchall()
         if self.session_id is None:
@@ -78,7 +97,20 @@ class MembershipPreparation:
             if session is None:
                 raise RuntimeError('Membership preparation requires its admitted running session')
             selected = tuple(self.storage._read_session_components(connection, self.session_id))
-            if (selected != self.change.requested_components
+            try:
+                details = json.loads(session['details_json'])
+                if not isinstance(details, dict):
+                    raise ValueError('Session details must be an object')
+                if self.interrupt_preflight_identity is None:
+                    matching_preflight = 'interrupt_preflight' not in details
+                else:
+                    matching_preflight = self.interrupt_preflight_identity == json.dumps(
+                        details['interrupt_preflight'], sort_keys=True, separators=(',', ':'),
+                    )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise RuntimeError('Membership preparation has damaged admitted interrupt scope') from error
+            if (selected != self.admitted_components
+                    or not matching_preflight
                     or session['start_component'] != encode_component_key(self.footprint.start_component)
                     or session['admitted_shape_id'] != self.shape_id
                     or session['partition_revision'] != self.change.source.revision):
@@ -238,14 +270,21 @@ class MembershipPreparation:
                 raise RuntimeError('Prepared jobs changed before membership replacement: ' + node)
 
     def finish(self, guard_id):
+        if self.completion is None or self.completion.expected['operation_id'] != guard_id:
+            raise RuntimeError('Membership preparation lacks its bound attempt')
+
         def finish(connection):
+            self.completion.require_prepared(connection)
             self._validate_source(connection)
             completed = self._committed_units(connection, guard_id)
             self._validate_states(connection, completed)
             validate_held_guards(connection, self.footprint.excluded_nodes, guard_id)
             self._validate_final_effects(connection)
             active = component_membership._replace_active_component_closure(connection, self.change)
+            session = None
             if self.session_id is not None:
+                session = dict(connection.execute('SELECT * FROM execution_sessions WHERE session_id=?',
+                                                  (self.session_id,)).fetchone())
                 changed = connection.execute(
                     'UPDATE execution_sessions SET partition_revision=? WHERE session_id=? '
                     "AND status='running' AND admitted_shape_id=? AND partition_revision=?",
@@ -253,4 +292,14 @@ class MembershipPreparation:
                 ).rowcount
                 if changed != 1:
                     raise RuntimeError('Membership repair lost its admitted session')
+            self.completion.commit(connection, active.revision)
+            if component_membership.read_active_component_partition(connection) != active:
+                raise RuntimeError('Active membership changed during completion')
+            self._validate_states(connection, completed)
+            self._validate_final_effects(connection)
+            if session is not None:
+                current = connection.execute('SELECT * FROM execution_sessions WHERE session_id=?',
+                                             (self.session_id,)).fetchone()
+                if current is None or dict(current) != dict(session, partition_revision=active.revision):
+                    raise RuntimeError('Admitted session changed during membership completion')
         submit_preparation_decision(self.storage, finish)

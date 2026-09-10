@@ -9,6 +9,12 @@ from .models import MountedTask
 NODE_RUNNER_CHOICES = {"direct", "threaded", "api", "process"}
 
 
+def validate_interrupt(value: bool) -> bool:
+    if type(value) is not bool:
+        raise ValueError("interrupt must be a Boolean")
+    return value
+
+
 def validate_non_negative_int(name: str, value: int) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be an integer >= 0")
@@ -101,12 +107,14 @@ class JobNode:
         *,
         waiting: bool = False,
         wait_for: str | Iterable[str] | None = None,
+        interrupt: bool = False,
     ):
         self.name = name
         self.max_threads = validate_positive_int("max_threads", max_threads)
         self.runner_override = validate_node_runner(runner)
         self.waiting = bool(waiting or wait_for is not None)
         self.wait_for = normalize_wait_for(wait_for)
+        self.interrupt = validate_interrupt(interrupt)
         self.main_task: MountedTask | None = None
         self.fallbacks: dict[str, MountedTask] = {}
         self.fallback_order: list[str] = []
@@ -121,6 +129,10 @@ class JobNode:
     ) -> None:
         self.waiting = bool(waiting or wait_for is not None)
         self.wait_for = normalize_wait_for(wait_for)
+
+    def declare_interrupt(self, interrupt: bool) -> None:
+        checked = validate_interrupt(interrupt)
+        self.interrupt = self.interrupt or checked
 
     @property
     def sequential(self) -> bool:

@@ -85,26 +85,35 @@ def test_monitor_reports_waiting_instead_of_queued(tmp_path):
 
     workflow.include_routers(a, b)
     result: dict[str, object] = {}
-    thread = threading.Thread(
-        target=lambda: result.setdefault(
-            "ran",
-            workflow.run_component({"A", "B"}, ignore_readiness=True),
-        )
-    )
+    errors: list[BaseException] = []
+
+    def run_component():
+        try:
+            result.setdefault(
+                "ran",
+                workflow.run_component({"A", "B"}, ignore_readiness=True),
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run_component)
     thread.start()
-    assert first_a_started.wait(3)
+    try:
+        # Fresh preparation precedes entry; this only guards against a stuck run.
+        assert first_a_started.wait(30)
 
-    _wait_for(lambda: workflow.storage.has_queued_jobs("A"))
-    snapshot = workflow_snapshot(workflow)
-    b_row = next(row for row in snapshot["nodes"] if row["node"] == "B")
-    assert b_row["status"] == "waiting"
-    assert b_row["queued"] == 1
-    assert b_row["waiting_on"] == ["A"]
-    assert "B" in snapshot["waiting_nodes"]
-
-    release_a.set()
-    thread.join(8)
+        _wait_for(lambda: workflow.storage.has_queued_jobs("A"))
+        snapshot = workflow_snapshot(workflow)
+        b_row = next(row for row in snapshot["nodes"] if row["node"] == "B")
+        assert b_row["status"] == "waiting"
+        assert b_row["queued"] == 1
+        assert b_row["waiting_on"] == ["A"]
+        assert "B" in snapshot["waiting_nodes"]
+    finally:
+        release_a.set()
+        thread.join(8)
     assert not thread.is_alive()
+    assert not errors, errors
     assert "ran" in result
 
 

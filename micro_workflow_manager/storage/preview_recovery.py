@@ -2,41 +2,24 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
+import json
 
 from micro_workflow_manager.component_identity import decode_component_key, encode_component_key
 from micro_workflow_manager.session_liveness import execution_session_liveness
 
 from .component_states import ComponentStateStorageMixin, ComponentTerminalOutcome
 from .execution_ownership import JobExecutionOwnerStorageMixin
-from .execution_sessions import ExecutionSessionStorageMixin
-from .input_publication_files import check_local_path
+from .execution_sessions import ExecutionSessionStorageMixin, validate_execution_session_snapshot
+from .component_result_identity import read_component_state_record
+from .recovery_output import observe_recovery_file, recovery_terminal_output
+from .session_scope import require_admitted_reservation_scope
 
 
 def _terminal_output(root, node, job_id, observed):
-    path = root / 'node' / node / 'jobs' / str(job_id) / 'output.json'
-    check_local_path(root, path)
-    try:
-        before = path.stat()
-        content = path.read_bytes()
-        after = path.stat()
-    except FileNotFoundError:
-        return None
-    check_local_path(root, path)
-    marker = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
-    if marker(before) != marker(after):
-        raise RuntimeError(f'Terminal output changed during preview: {node}/{job_id}')
-    try:
-        output = json.loads(content)
-    except (ValueError, UnicodeError):
-        return None
-    if (not isinstance(output, dict)
-            or output.get('generation') != observed['generation']
-            or output.get('execution_id') != observed['active_execution_id']):
-        return None
-    status = output.get('status')
-    return status if status in ('done', 'skipped', 'failed', 'cancelled') else None
+    captured = observe_recovery_file(root, f'node/{node}/jobs/{job_id}/output.json')
+    output = recovery_terminal_output(captured, observed['generation'], observed['active_execution_id'])
+    return None if output is None else output['status']
 
 
 def _validate_recovery_component(connection, session_id, component):
@@ -119,6 +102,38 @@ def _validate_session_identity(row):
         reader._session_text(row['process_identity'], 'process_identity')
 
 
+def _refuse_unfinished_file_operations(connection, session_id, members, root):
+    from .native_recovery_records import require_resolved_recovery_receipts
+    from .file_operation_receipts import validate_file_receipt
+    require_resolved_recovery_receipts(connection, session_id, root)
+    for row in connection.execute('SELECT * FROM preparation_receipts'):
+        affected = set(decode_component_key(row['component_key']))
+        affected.update(item[0] for item in connection.execute(
+            'SELECT receiver_node FROM receiver_mutation_guards WHERE operation_id=?', (row['guard_id'],),
+        ))
+        try:
+            manifest = json.loads(row['manifest_json'])
+            receivers = manifest['receivers']
+            if not isinstance(receivers, list) or any(not isinstance(node, str) for node in receivers):
+                raise ValueError('Invalid preparation receivers')
+            affected.update(receivers)
+        except (ValueError, TypeError, KeyError):
+            if row['session_id'] == session_id or members.intersection(affected):
+                raise RuntimeError('Damaged unfinished preparation requires recovery: ' + row['operation_id'])
+        if row['session_id'] == session_id or members.intersection(affected):
+            validate_file_receipt('preparation_receipts', row)
+            if row['state'] == 'prepared':
+                raise RuntimeError('Unfinished preparation requires recovery: ' + row['operation_id'])
+    for row in connection.execute(
+        "SELECT publication.*, owner.session_id FROM input_publications AS publication "
+        "LEFT JOIN job_execution_owners AS owner USING(execution_id)",
+    ):
+        if row['session_id'] == session_id or row['receiver_node'] in members:
+            validate_file_receipt('input_publications', row)
+            if row['state'] == 'prepared':
+                raise RuntimeError('Unfinished managed input publication requires recovery: ' + row['operation_id'])
+
+
 def observe_abandoned_sessions(connection, root: Path) -> dict:
     """Report all stale sessions and damaged active claims from a fixed read view."""
     sessions, errors, live = [], [], []
@@ -148,6 +163,8 @@ def observe_abandoned_sessions(connection, root: Path) -> dict:
         by_session[session_id] = observation
         try:
             observation['session'] = ExecutionSessionStorageMixin._execution_session_from_row(connection, row)
+            validate_execution_session_snapshot(observation['session'])
+            require_admitted_reservation_scope(connection, session_id)
             observation['reservations'] = [
                 decode_component_key(item[0]) for item in connection.execute(
                     'SELECT component_key FROM component_reservations WHERE session_id=? ORDER BY component_key',
@@ -159,6 +176,13 @@ def observe_abandoned_sessions(connection, root: Path) -> dict:
                     reserved_sessions.setdefault(node, set()).add(session_id)
                 if component not in observation['session']['selected_components']:
                     raise RuntimeError('Recovery reservation is outside its session selection')
+                state = read_component_state_record(connection, component)
+                if state is None:
+                    raise RuntimeError('Recovery reservation has no component state')
+                if state.lifecycle == 'running':
+                    _validate_recovery_component(connection, session_id, component)
+            _refuse_unfinished_file_operations(connection, session_id,
+                                               {node for component in observation['reservations'] for node in component}, root)
             observation['holds'] = [
                 {'component': decode_component_key(item[0]), 'count': item[1]}
                 for item in connection.execute(
@@ -178,7 +202,8 @@ def observe_abandoned_sessions(connection, root: Path) -> dict:
         'FROM jobs AS job LEFT JOIN job_instances AS instance USING(node_name, job_id) '
         'LEFT JOIN job_execution_owners AS owner '
         'ON owner.execution_id=COALESCE(job.active_execution_id, instance.last_execution_id) '
-        "WHERE job.status='running' OR job.active_execution_id IS NOT NULL ORDER BY job.node_name, job.job_id",
+        "WHERE job.status='running' OR job.active_execution_id IS NOT NULL OR job.active_pid IS NOT NULL "
+        'OR job.active_thread_id IS NOT NULL OR job.active_started_at IS NOT NULL ORDER BY job.node_name, job.job_id',
     ).fetchall()
     for row in jobs:
         node, job_id = row['node_name'], row['job_id']

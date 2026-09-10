@@ -13,8 +13,10 @@ from .engine import engine_command
 from .filter import inspect_filter
 from .inspect import inspect_command
 from .trace import trace_command
+from .lineage import lineage_command
 from .layout import ensure_runtime_layout
 from .recovery import recover_command
+from .startup_recovery import command_needs_recovery, recover_before_mutation
 from .recovery_preview import print_recovery_preview
 from .graph_utils import component_topological_nodes
 from .jobs import selected_job_ids_from_args
@@ -27,19 +29,22 @@ from .graph_command_dispatch import graph_preview_requested, print_graph_preview
 from .parser import build_parser
 from .project import init_project, load_workflow, setup_graph
 from .restart import restart_active_jobs, restart_active_scope
-from .threads import threads_command, update_declared_threads
+from .threads import api_total_command, threads_command, update_declared_threads
 from .deploy import deploy_command
 from .run import resume_from, resume_node, run_from, run_node, run_selected_jobs, run_between, resume_between
 from .sampling import sample_command
 from .validation import require_node
-from .node_clipboard import copy_node_to_clipboard, paste_node_from_clipboard
+from .node_clipboard import copy_node_to_clipboard, paste_node_from_clipboard, validate_clipboard_request
 from .resource_limits import raise_open_file_limit
+from .interrupt_command import EXECUTING_GRAPH_COMMANDS, prepare_interrupt_command
+from .interrupt_preflight import require_interrupt_preflight_unchanged, validate_loaded_interrupt_declarations
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     workflow = None
+    interrupt_observation = None
 
     try:
         if args.describe is not None:
@@ -57,12 +62,47 @@ def main(argv: list[str] | None = None) -> int:
 
         root = find_root()
         read_native_project_config(root)
+        if args.command == "trace":
+            if args.json and not args.lineage:
+                raise RuntimeError("--json requires: mwf trace <node> job <id> --lineage")
+            if args.lineage:
+                if args.job_id < 1:
+                    raise RuntimeError("Use: mwf trace <node> job <id> --lineage")
+                return lineage_command(
+                    root, safe_node_name(args.node), args.job_id, json_output=args.json,
+                )
+        if args.command == "threads":
+            if args.api_total is not None:
+                print(
+                    "Deprecation warning: mwf threads --api-total is deprecated and remains functional.",
+                    file=sys.stderr,
+                )
+            if args.update and (
+                args.node is not None or args.value is not None or args.api_total is not None
+            ):
+                raise RuntimeError("mwf threads --update does not accept a node or runtime value")
+            if args.api_total is not None and (
+                args.node is not None or args.value is not None
+            ):
+                raise RuntimeError("mwf threads --api-total does not accept a node or node value")
+            if args.api_total is not None:
+                recover_before_mutation(root)
+                return api_total_command(root, args.api_total)
+            if args.update:
+                recover_before_mutation(root)
+                return update_declared_threads(root)
+            # Per-node mutation performs a read-only exact-owner observation
+            # before startup recovery, then rechecks that observation in its
+            # SQLite writer. Inspection is read-only throughout.
+            return threads_command(root, args.node, args.value)
+        if args.command in EXECUTING_GRAPH_COMMANDS:
+            interrupt_observation = prepare_interrupt_command(root, args)
         # Engine is a strictly read-only visualization path. Dispatch it before
         # layout migration, SQLite initialization, or user graph imports.
         if args.command == "engine":
             return engine_command(root)
         if args.command == "run" and args.job_mode == "sample":
-            return sample_command(root, args)
+            return sample_command(root, args, interrupt_observation=interrupt_observation)
         if args.command == "run" and any(value is not None for value in (args.seed, args.sample_status, args.expect_population)):
             raise RuntimeError("--seed, --status, and --expect-population require: mwf run <node> sample <count>")
         read_only_plan = (
@@ -71,6 +111,14 @@ def main(argv: list[str] | None = None) -> int:
         ) or (
             args.command in {"reset", "resetfrom", "resetbetween", "recover"} and args.dry_run
         )
+        if args.command == 'recover' and not read_only_plan:
+            return recover_command(root)
+        if interrupt_observation is not None:
+            require_interrupt_preflight_unchanged(root, interrupt_observation)
+        if args.command in {"copy", "paste"}:
+            validate_clipboard_request(root, args.command, safe_node_name(args.node))
+        if command_needs_recovery(args):
+            recover_before_mutation(root)
         if args.command in {"reset", "resetfrom", "resetbetween"} and not read_only_plan:
             refuse_reset_running_sessions(root)
         if not read_only_plan:
@@ -88,13 +136,6 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "graph":
             return setup_graph(root, args.path, args.runner, update=args.update, dry_run=args.dry_run)
-
-        if args.command == "threads":
-            if args.update:
-                if args.node is not None or args.value is not None:
-                    raise RuntimeError("mwf threads --update does not accept a node or runtime value")
-                return update_declared_threads(root)
-            return threads_command(root, args.node, args.value)
 
         # Restart is intentionally handled before graph/router loading. The
         # generation fence reaches the running job as early as possible and the
@@ -121,16 +162,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return doctor_command(root)
 
+        if interrupt_observation is not None:
+            require_interrupt_preflight_unchanged(root, interrupt_observation)
         workflow = load_preview(root) if read_only_plan else load_workflow(root, args.runner)
+        if interrupt_observation is not None and not read_only_plan:
+            validate_loaded_interrupt_declarations(workflow, interrupt_observation)
         if read_only_plan:
             recovery_result = print_recovery_preview(workflow, quiet_if_empty=args.command != "recover")
             if args.command == "recover":
                 return recovery_result
             if graph_preview_requested(args):
-                return print_graph_preview(root, workflow, args)
-
-        if args.command == "recover":
-            return recover_command(root, workflow, dry_run=args.dry_run)
+                return print_graph_preview(
+                    root, workflow, args,
+                    interrupt_preflight=None if interrupt_observation is None else interrupt_observation.preflight,
+                )
 
         if args.command == "inspect":
             node = safe_node_name(args.node)
@@ -215,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 root, workflow, node, end_node, stats=args.stats,
                 stats_interval=args.stats_interval, monitor=args.monitor,
                 monitor_interval=args.monitor_interval, keep_trace=args.keeptrace,
+                interrupt_preflight=interrupt_observation.preflight,
             )
 
         if args.command == "run":
@@ -227,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
                     node=node,
                     selected_jobs=job_ids,
                     keep_trace=args.keeptrace,
+                    interrupt_preflight=interrupt_observation.preflight,
                 )
             if job_ids is not None:
                 return run_selected_jobs(
@@ -239,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                     monitor=args.monitor,
                     monitor_interval=args.monitor_interval,
                     keep_trace=args.keeptrace,
+                    interrupt_preflight=interrupt_observation.preflight,
                 )
             return run_node(
                 root,
@@ -249,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
                 monitor=args.monitor,
                 monitor_interval=args.monitor_interval,
                 keep_trace=args.keeptrace,
+                interrupt_preflight=interrupt_observation.preflight,
             )
 
         if args.command == "resume":
@@ -261,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
                 monitor=args.monitor,
                 monitor_interval=args.monitor_interval,
                 keep_trace=args.keeptrace,
+                interrupt_preflight=interrupt_observation.preflight,
             )
 
         if args.command == "runfrom":
@@ -288,6 +338,7 @@ def main(argv: list[str] | None = None) -> int:
                 keep_trace=args.keeptrace,
                 refuse_after_node=refuse_after_node,
                 refuse_before_node=refuse_before_node,
+                interrupt_preflight=interrupt_observation.preflight,
             )
 
         if args.command == "resumefrom":
@@ -315,14 +366,18 @@ def main(argv: list[str] | None = None) -> int:
                 keep_trace=args.keeptrace,
                 refuse_after_node=refuse_after_node,
                 refuse_before_node=refuse_before_node,
+                interrupt_preflight=interrupt_observation.preflight,
             )
 
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
     finally:
-        if getattr(workflow, "read_only", False):
-            workflow.storage.close()
+        if workflow is not None:
+            if getattr(workflow, "read_only", False):
+                workflow.storage.close()
+            else:
+                workflow.storage.close_database_connections()
 
     return 0
 

@@ -59,7 +59,7 @@ def test_ordinary_reopen_keeps_native_schema_and_payloads(tmp_path):
     with sqlite3.connect(tmp_path / '.mwf' / 'state.sqlite3') as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone() == ('6',)
+        ).fetchone() == ('9',)
         assert connection.execute('SELECT COUNT(*) FROM execution_sessions').fetchone() == (0,)
     reopened.close_database_connections()
 
@@ -67,7 +67,7 @@ def test_ordinary_reopen_keeps_native_schema_and_payloads(tmp_path):
 def test_terminal_session_keeps_exact_outcome_when_old_heartbeat_or_finish_arrives(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
     _session(storage)
-    _session(storage, "child-1", kind="interrupt", parent_session_id="main-1")
+    _session(storage, "child-1", kind="interrupt", parent_session_ids=("main-1",))
     assert storage.heartbeat_execution_session("main-1", "2026-09-05T12:01:00+00:00")
     assert storage.get_execution_session("main-1")["heartbeat_at"] == "2026-09-05T12:01:00+00:00"
     failures = [{"node": "A", "job_id": 3, "error": "lost input"}, {"node": "A", "error": "cleanup"}]
@@ -90,7 +90,7 @@ def test_terminal_session_keeps_exact_outcome_when_old_heartbeat_or_finish_arriv
     assert main["finished_at"] == "2026-09-05T12:02:00+00:00"
     child = reopened.get_execution_session("child-1")
     assert child["status"] == "running"
-    assert child["parent_session_id"] == "main-1"
+    assert child["parent_session_ids"] == ["main-1"]
     assert child["heartbeat_at"] == "2026-09-05T12:00:00+00:00"
     assert not (tmp_path / ".mwf" / "run.json").exists()
     assert not (tmp_path / ".mwf_run.json").exists()
@@ -116,7 +116,7 @@ def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_
             start_component=("A", "B"),
             selected_components=[("A", "B"), ("C",)],
             selected_jobs=[("B", 9), ("A", 3)],
-            parent_session_id=parent,
+            parent_session_ids=() if parent is None else (parent,),
             started_at="2026-09-05T12:00:00+00:00",
             hostname="worker.example",
             pid=123,
@@ -136,7 +136,7 @@ def test_fresh_store_retains_exact_main_and_interrupt_sessions_after_reopen(tmp_
         expected = {
             "session_id": session_id,
             "session_kind": kind,
-            "parent_session_id": parent,
+            "parent_session_ids": [] if parent is None else [parent],
             "command": "run" if kind == "main" else "interrupt",
             "start_component": ("A", "B"),
             "selected_components": [("A", "B"), ("C",)],
@@ -253,10 +253,9 @@ def test_fresh_session_storage_refuses_existing_runtime_without_changing_files(t
     assert after == before
 
 
-def test_named_live_readers_use_main_then_single_interrupt_and_report_ambiguity(tmp_path):
+def test_native_readers_keep_exact_main_and_all_live_interrupt_sessions(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
     assert storage.get_live_main_session() is None
-    assert storage.get_live_execution_session() is None
     assert storage.list_live_execution_sessions() == []
     current = {
         "hostname": socket.gethostname(), "pid": os.getpid(),
@@ -268,20 +267,18 @@ def test_named_live_readers_use_main_then_single_interrupt_and_report_ambiguity(
     _session(storage, "terminal", kind="interrupt", **current)
     storage.finish_execution_session("terminal", outcome="stopped", finished_at=current["started_at"])
     _session(storage, "recycled", kind="interrupt", **dict(current, process_identity="old-instance"))
-    assert storage.get_live_execution_session() is None
+    assert storage.list_live_execution_sessions() == []
     assert storage.get_execution_session("stale")["status"] == "running"
     assert storage.get_execution_session("terminal")["outcome"] == "stopped"
     assert storage.get_execution_session("recycled")["status"] == "running"
 
     _session(storage, "interrupt-z", kind="interrupt", **current)
     assert storage.get_live_main_session() is None
-    assert storage.get_live_execution_session()["session_id"] == "interrupt-z"
+    assert [item["session_id"] for item in storage.list_live_execution_sessions()] == ["interrupt-z"]
     _session(storage, "interrupt-a", kind="interrupt", **current)
-    with pytest.raises(RuntimeError, match="interrupt-a.*interrupt-z"):
-        storage.get_live_execution_session()
+    assert [item["session_id"] for item in storage.list_live_execution_sessions()] == ["interrupt-a", "interrupt-z"]
     _session(storage, "main-1", **current)
     assert storage.get_live_main_session()["session_id"] == "main-1"
-    assert storage.get_live_execution_session()["session_id"] == "main-1"
     assert [session["session_id"] for session in storage.list_live_execution_sessions()] == [
         "interrupt-a", "interrupt-z", "main-1",
     ]
@@ -289,10 +286,9 @@ def test_named_live_readers_use_main_then_single_interrupt_and_report_ambiguity(
         "interrupt-a", "interrupt-z", "main-1", "recycled", "stale", "terminal",
     ]
     storage.finish_execution_session("main-1", outcome="done", finished_at=current["started_at"])
-    with pytest.raises(RuntimeError, match="interrupt-a.*interrupt-z"):
-        storage.get_live_execution_session()
+    assert [item["session_id"] for item in storage.list_live_execution_sessions()] == ["interrupt-a", "interrupt-z"]
     storage.finish_execution_session("interrupt-z", outcome="done", finished_at=current["started_at"])
-    assert storage.get_live_execution_session()["session_id"] == "interrupt-a"
+    assert [item["session_id"] for item in storage.list_live_execution_sessions()] == ["interrupt-a"]
     storage.close_database_connections()
 
 
@@ -348,12 +344,12 @@ def test_session_mutations_share_the_writer_and_rollback_partial_children(tmp_pa
 
 def test_session_creation_requires_an_actual_parent_and_keeps_failed_request_atomic(tmp_path):
     storage = FileStorage._create_new_project_state(tmp_path)
-    with pytest.raises(sqlite3.IntegrityError):
-        _session(storage, "child-1", kind="interrupt", parent_session_id="absent")
+    with pytest.raises(RuntimeError, match="existing running session"):
+        _session(storage, "child-1", kind="interrupt", parent_session_ids=("absent",))
     assert storage.list_execution_sessions() == []
     _session(storage)
-    _session(storage, "child-1", kind="interrupt", parent_session_id="main-1")
-    assert storage.get_execution_session("child-1")["parent_session_id"] == "main-1"
+    _session(storage, "child-1", kind="interrupt", parent_session_ids=("main-1",))
+    assert storage.get_execution_session("child-1")["parent_session_ids"] == ["main-1"]
     storage.close_database_connections()
 
 
@@ -376,7 +372,7 @@ def test_failed_schema_creation_does_not_publish_a_partial_version(tmp_path, mon
     with sqlite3.connect(tmp_path / ".mwf" / "state.sqlite3") as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'"
-        ).fetchone() == ("6",)
+        ).fetchone() == ("9",)
     _session(storage)
     assert storage.get_execution_session("main-1")["status"] == "running"
     assert storage.database_integrity_check() == "ok"
@@ -538,7 +534,7 @@ def test_session_parent_must_be_a_distinct_actual_parent_of_an_interrupt(tmp_pat
     _session(storage, "parent-1")
     storage.finish_execution_session("parent-1", outcome="done", finished_at="2026-09-05T12:01:00+00:00")
     with pytest.raises(ValueError, match="parent"):
-        _session(storage, "child-1", kind=kind, parent_session_id=parent)
+        _session(storage, "child-1", kind=kind, parent_session_ids=() if parent is None else (parent,))
     assert storage.get_execution_session("child-1") is None
     storage.close_database_connections()
 
@@ -579,7 +575,7 @@ def test_fresh_creator_preserves_a_native_store_that_initialized_first(tmp_path,
         assert storage.database_integrity_check() == 'ok'
         assert storage.db_connection().execute(
             "SELECT value FROM metadata WHERE key='database_schema_version'",
-        ).fetchone()[0] == '6'
+        ).fetchone()[0] == '9'
     finally:
         storage.close_database_connections()
 

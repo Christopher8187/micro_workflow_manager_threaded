@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
+import os
 import socket
 import textwrap
 import time
@@ -12,7 +13,58 @@ import pytest
 
 from micro_workflow_manager import cli
 from micro_workflow_manager.cli.project import load_workflow
-from micro_workflow_manager.models import Job
+from micro_workflow_manager.models import Job, now
+from micro_workflow_manager.processes import process_identity
+
+
+def _live_execution_session_identity():
+    started_at = now()
+    return {
+        'started_at': started_at,
+        'hostname': socket.gethostname(),
+        'pid': os.getpid(),
+        'process_identity': process_identity(os.getpid()),
+    }
+
+
+def _mark_execution_session_stale(storage, session_id):
+    stale_time = '2020-01-01T00:00:00+00:00'
+
+    def mark(connection):
+        row = connection.execute(
+            'SELECT * FROM execution_sessions WHERE session_id=?', (session_id,),
+        ).fetchone()
+        if row is None or row['status'] != 'running':
+            raise RuntimeError('Expected one running execution session before stale transition')
+        before = dict(row)
+        changed = connection.execute(
+            'UPDATE execution_sessions SET started_at=?, heartbeat_at=?, pid=?, '
+            'process_identity=? WHERE session_id=? AND status=? AND started_at IS ? '
+            'AND heartbeat_at IS ? AND hostname IS ? AND pid IS ? '
+            'AND process_identity IS ?',
+            (
+                stale_time, stale_time, 99999999, 'retired-process',
+                session_id, 'running', before['started_at'], before['heartbeat_at'],
+                before['hostname'], before['pid'], before['process_identity'],
+            ),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError('Execution session changed before stale transition')
+        expected = dict(before)
+        expected.update({
+            'started_at': stale_time,
+            'heartbeat_at': stale_time,
+            'pid': 99999999,
+            'process_identity': 'retired-process',
+        })
+        recorded = connection.execute(
+            'SELECT * FROM execution_sessions WHERE session_id=?', (session_id,),
+        ).fetchone()
+        if recorded is None or dict(recorded) != expected:
+            raise RuntimeError('Execution session stale transition readback failed')
+        return expected
+
+    return storage.submit_db_mutation(mark, wait=True, priority=0)
 
 
 def _wait_writer(storage):
@@ -295,10 +347,7 @@ def test_native_preview_reports_abandoned_session_and_owned_job_without_mutation
         command='run',
         start_component=component,
         selected_components=[component],
-        started_at='2020-01-01T00:00:00+00:00',
-        hostname=socket.gethostname(),
-        pid=99999999,
-        process_identity='retired-preview-process',
+        **_live_execution_session_identity(),
         details={'start_node': 'A'},
         expected_shape=snapshot.shape_json,
     )
@@ -328,6 +377,7 @@ def test_native_preview_reports_abandoned_session_and_owned_job_without_mutation
     )
     assert generation == 0
     assert storage.read_job_control('A', 1)['active_execution_id'] == execution_id
+    _mark_execution_session_stale(storage, session_id)
     storage.db_mutation_barrier()
     _wait_writer(storage)
     database = tmp_path / '.mwf' / 'state.sqlite3'

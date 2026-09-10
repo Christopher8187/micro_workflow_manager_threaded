@@ -34,6 +34,8 @@ class ComponentTransitionStorageMixin:
             connection.execute('RELEASE SAVEPOINT mwf_component_preparation')
 
     def _read_component_preparation(self, connection, session_id, members, expected_shape, *, selected_roots=None):
+        if session_id is not None:
+            self._require_interrupt_component_admission(connection, session_id, members)
         if selected_roots is not None:
             self._require_selected_preparation_roots(connection, session_id, members, selected_roots)
         key = encode_component_key(members)
@@ -57,9 +59,22 @@ class ComponentTransitionStorageMixin:
                 raise RuntimeError('Full preparation requires the exact component reservation: ' + key)
             if selected_roots is None and self._read_session_job_roots(connection, session_id):
                 raise RuntimeError('Selected-job preparation cannot realign a full component')
-        if connection.execute(
-            'SELECT 1 FROM component_holds WHERE component_key=? LIMIT 1', (key,),
-        ).fetchone() or connection.execute(
+            self._require_interrupt_fence_authority(connection, session_id, key)
+        holds = connection.execute(
+            'SELECT session_id, hold_count FROM component_holds WHERE component_key=?', (key,),
+        ).fetchall()
+        authorized_interrupt_hold = False
+        if session_id is not None and len(holds) == 1:
+            admission = connection.execute(
+                "SELECT state, target_component_key FROM interrupt_admissions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            authorized_interrupt_hold = (
+                holds[0]['session_id'] == session_id and holds[0]['hold_count'] == 1
+                and admission is not None and admission['state'] == 'frozen'
+                and admission['target_component_key'] == key
+            )
+        if (holds and not authorized_interrupt_hold) or connection.execute(
             'SELECT 1 FROM pending_component_executions WHERE component_key=? LIMIT 1', (key,),
         ).fetchone():
             raise RuntimeError('Full preparation cannot change a held or pending component: ' + key)
@@ -168,7 +183,7 @@ class ComponentTransitionStorageMixin:
             state = connection.execute(
                 'SELECT d.component_key, g.shape_json, s.component_key AS state_key, '
                 's.lifecycle, s.stability, s.instability_origin, s.misaligned, s.alignment_generation, '
-                'origin.session_kind AS origin_kind '
+                'origin.session_kind AS origin_kind, origin.scope_admitted AS origin_scope_admitted '
                 'FROM component_states s '
                 'LEFT JOIN component_definitions d ON d.component_key=s.component_key AND d.shape_id=s.shape_id '
                 'LEFT JOIN graph_shapes g ON g.shape_id=s.shape_id '

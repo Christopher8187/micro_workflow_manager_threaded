@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import os
-import socket
-
 import pytest
 
 from micro_workflow_manager import cli
 from micro_workflow_manager.models import Job, now
-from micro_workflow_manager.processes import process_identity
 from tests.test_064_read_only_previews import (
-    _close, _initialize_native_project, _install_import_sentinels, _snapshot, _wait_writer,
+    _close, _initialize_native_project, _install_import_sentinels,
+    _live_execution_session_identity, _mark_execution_session_stale,
+    _snapshot, _wait_writer,
 )
 from tests.test_121_native_preview_recovery import _rows
 
@@ -27,15 +25,12 @@ def test_damaged_session_identity_is_refused_before_liveness_classification(
     shape = workflow.topology.snapshot().shape_json
     session_ids = {'A': 'damaged-A', 'B': 'abandoned-B', 'C': 'live-C'}
     for node in ('A', 'B', 'C'):
-        live = node != 'B'
         session_id = session_ids[node]
         storage.create_job(Job(node_name=node, job_id=1, params={}))
         storage.create_execution_session(
             session_id, session_kind='main' if node == 'A' else 'interrupt', command='run',
             start_component=(node,), selected_components=[(node,)],
-            started_at=now() if live else '2020-01-01T00:00:00+00:00',
-            hostname=socket.gethostname(), pid=os.getpid() if live else 99999999,
-            process_identity=process_identity(os.getpid()) if live else 'retired-process',
+            **_live_execution_session_identity(),
             expected_shape=shape,
         )
         storage.reserve_execution_components(session_id, expected_shape=shape)
@@ -44,6 +39,7 @@ def test_damaged_session_identity_is_refused_before_liveness_classification(
             successful_lineage=('stable', None),
         )
         storage.claim_job_execution(node, 1, started_at=now(), session_id=session_id, component=(node,))
+    _mark_execution_session_stale(storage, 'abandoned-B')
     storage.submit_db_mutation(lambda connection: connection.execute(
         f"UPDATE execution_sessions SET {field}=? WHERE session_id='damaged-A'", (value,),
     ))

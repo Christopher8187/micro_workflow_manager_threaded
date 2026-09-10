@@ -359,7 +359,15 @@ def _seed_unstable_parent(storage, component, origin):
         process_identity=process_identity(os.getpid()),
         expected_shape=storage.get_component_definition(component)["shape_json"],
     )
+    assert storage.reserve_execution_components(
+        origin, expected_shape=storage.get_component_definition(component)["shape_json"],
+    ) is True
+    assert storage.db_connection().execute(
+        "SELECT scope_admitted FROM execution_sessions WHERE session_id=?", (origin,),
+    ).fetchone()[0] == 1
     assert storage.finish_execution_session(origin, outcome="done", finished_at=now()) is True
+    assert storage.release_execution_components(origin) == 1
+    assert storage.get_component_reservation(component) is None
     assert _set_done_result(storage, component, "unstable", origin) == 1
     storage.set_node_status(component[0], "done")
 

@@ -12,7 +12,10 @@ description: Apply a known architecture change to an existing MWF project. Use w
 2. If the desired change is still broad or unknown, stop modification and use
    `mwf-analyze-architecture`. Otherwise trace affected Job Scope, routes,
    components, task parameters and files, fallbacks, validation, output provenance,
-   replay, and recovery.
+   replay, and recovery. Account for native session ownership, retained result
+   history, and every affected receiver outside the proposed selection. Use
+   command plans to establish producer-aware preparation and membership repair
+   scope before changing durable work.
 3. Handle every documentation and source disagreement through `AGENTS.md`.
    Await review before executable work that depends on an unresolved point.
 4. Match the user's requested action. A design or documentation request does not

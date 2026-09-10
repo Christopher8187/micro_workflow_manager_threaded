@@ -10,6 +10,23 @@ from micro_workflow_manager.cli.project import load_workflow
 from micro_workflow_manager.cli.run import active_workflow_run
 from micro_workflow_manager.cli.threads import threads_command
 from micro_workflow_manager.runners.threaded import ThreadedRunner
+from micro_workflow_manager.storage import FileStorage
+
+
+def _thread_rows(storage):
+    connection = storage.db_connection()
+    return {
+        "pending": [tuple(row) for row in connection.execute(
+            "SELECT node_name, value FROM pending_node_thread_overrides ORDER BY node_name"
+        )],
+        "owned": [tuple(row) for row in connection.execute(
+            "SELECT node_name, session_id, value FROM node_thread_overrides "
+            "ORDER BY node_name, session_id"
+        )],
+        "api_total": [tuple(row) for row in connection.execute(
+            "SELECT singleton, value FROM api_thread_limit ORDER BY singleton"
+        )],
+    }
 
 
 def _wait_for(predicate, timeout: float = 3.0) -> None:
@@ -64,16 +81,22 @@ def test_threads_command_supports_absolute_relative_list_and_reset(
     assert "declared max_threads: 3" in capsys.readouterr().out
 
     assert cli.main(["threads", "A", "5"]) == 0
-    assert "3 -> 5" in capsys.readouterr().out
+    assert "Requested max_threads: 3 -> 5" in capsys.readouterr().out
 
     assert cli.main(["threads", "A", "+2"]) == 0
-    assert "5 -> 7" in capsys.readouterr().out
+    assert "Requested max_threads: 5 -> 7" in capsys.readouterr().out
 
     assert cli.main(["threads", "A", "-3"]) == 0
-    assert "7 -> 4" in capsys.readouterr().out
+    assert "Requested max_threads: 7 -> 4" in capsys.readouterr().out
 
-    data = json.loads((tmp_path / ".mwf" / "threads.json").read_text(encoding="utf-8"))
-    assert data["overrides"] == {"A": 4}
+    storage = FileStorage(tmp_path)
+    assert storage.read_thread_override_observation("A") == {
+        "node": "A", "value": 4, "session_id": None,
+    }
+    assert _thread_rows(storage) == {
+        "pending": [("A", 4)], "owned": [], "api_total": [],
+    }
+    assert not (tmp_path / ".mwf" / "threads.json").exists()
 
     assert cli.main(["threads"]) == 0
     listing = capsys.readouterr().out
@@ -84,7 +107,7 @@ def test_threads_command_supports_absolute_relative_list_and_reset(
     inspected = capsys.readouterr().out
     assert "declared max_threads: 3" in inspected
     assert "runtime max_threads override: 4" in inspected
-    assert "effective max_threads: 4" in inspected
+    assert "requested max_threads: 4" in inspected
 
     assert cli.main(["monitor", "--once", "--json"]) == 0
     snapshot = json.loads(capsys.readouterr().out)
@@ -94,8 +117,15 @@ def test_threads_command_supports_absolute_relative_list_and_reset(
     assert a_row["max_parallel_jobs"] == 4
 
     assert cli.main(["threads", "A", "reset"]) == 0
-    assert "4 -> 3" in capsys.readouterr().out
+    assert "Requested max_threads: 4 -> 3" in capsys.readouterr().out
+    assert storage.read_thread_override_observation("A") == {
+        "node": "A", "value": None, "session_id": None,
+    }
+    assert _thread_rows(storage) == {
+        "pending": [], "owned": [], "api_total": [],
+    }
     assert not (tmp_path / ".mwf" / "threads.json").exists()
+    storage.close_database_connections()
 
 
 def test_adaptive_threaded_runner_scales_up_and_down_without_cancelling_running_jobs():
@@ -161,7 +191,7 @@ def test_adaptive_threaded_runner_scales_up_and_down_without_cancelling_running_
     assert result_holder["result"] == list(range(6))
 
 
-def test_workflow_refreshes_override_from_atomic_runtime_file(tmp_path):
+def test_workflow_refreshes_native_override_owned_by_active_session(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path, runner="threaded")
     workflow.graph([("A", "B")])
 
@@ -174,15 +204,31 @@ def test_workflow_refreshes_override_from_atomic_runtime_file(tmp_path):
         return None
 
     assert workflow.effective_max_threads("A") == 2
-    workflow.storage.set_thread_override("A", 6)
-    assert workflow.effective_max_threads("A") == 6
-    workflow.storage.set_thread_override("A", 3)
-    assert workflow.effective_max_threads("A") == 3
-    workflow.storage.clear_thread_override("A")
+    pending = workflow.storage.read_thread_override_observation("A")
+    workflow.storage.set_thread_override("A", 6, expected=pending)
     assert workflow.effective_max_threads("A") == 2
+    with active_workflow_run(
+        workflow, command="run", start_node="A", nodes=["A"],
+    ) as finish:
+        owned = workflow.storage.read_thread_override_observation("A")
+        assert owned["session_id"] is not None
+        assert owned["value"] == 6
+        assert workflow.effective_max_threads("A") == 6
+        workflow.storage.set_thread_override("A", 3, expected=owned)
+        owned = workflow.storage.read_thread_override_observation("A")
+        assert owned["value"] == 3
+        assert workflow.effective_max_threads("A") == 3
+        workflow.storage.clear_thread_override("A", expected=owned)
+        assert workflow.effective_max_threads("A") == 2
+        finish("done")
+    assert workflow.storage.read_thread_override_observation("A") == {
+        "node": "A", "value": None, "session_id": None,
+    }
+    assert workflow.effective_max_threads("A") == 2
+    workflow.storage.close_database_connections()
 
 
-def test_api_total_budget_is_proportional_refreshable_and_run_scoped(tmp_path):
+def test_api_total_budget_is_proportional_refreshable_and_project_wide(tmp_path):
     workflow = MicroWorkflow(project_dir=tmp_path, runner="api")
     workflow.graph([("A", "B"), ("B", "C")])
 
@@ -203,14 +249,24 @@ def test_api_total_budget_is_proportional_refreshable_and_run_scoped(tmp_path):
     assert [workflow.effective_max_threads(name) for name in ("A", "B", "C")] == [10, 20, 70]
     assert workflow.effective_api_total_limit() == 100
 
-    workflow.storage.set_thread_override("B", 200)
-    limits = [workflow.effective_max_threads(name) for name in ("A", "B", "C")]
-    assert limits == [11, 11, 78]
-    assert sum(limits) == 100
-
-    workflow.storage.clear_api_total_limit()
-    assert workflow.api_total_limit_override() is None
-    assert workflow.effective_max_threads("A") == 200
+    pending = workflow.storage.read_thread_override_observation("B")
+    workflow.storage.set_thread_override("B", 200, expected=pending)
+    with active_workflow_run(
+        workflow, command="run", start_node="A", nodes=["A", "B", "C"],
+    ) as finish:
+        owned = workflow.storage.read_thread_override_observation("B")
+        assert owned["session_id"] is not None and owned["value"] == 200
+        limits = [workflow.effective_max_threads(name) for name in ("A", "B", "C")]
+        assert limits == [11, 11, 78]
+        assert sum(limits) == 100
+        workflow.storage.clear_api_total_limit()
+        assert workflow.api_total_limit_override() is None
+        assert workflow.effective_max_threads("A") == 200
+        finish("done")
+    assert workflow.storage.read_thread_override_observation("B") == {
+        "node": "B", "value": None, "session_id": None,
+    }
+    workflow.storage.close_database_connections()
 
 
 def test_api_total_budget_reallocates_over_only_live_api_nodes(tmp_path):
@@ -259,7 +315,7 @@ def test_api_total_smaller_than_live_node_count_preserves_one_slot_each(tmp_path
     assert [workflow.effective_max_threads(name) for name in ("A", "B", "C")] == [1, 1, 1]
 
 
-def test_threads_cli_sets_and_clears_pending_api_total_budget(
+def test_threads_cli_sets_and_clears_native_project_api_total_budget(
     tmp_path,
     monkeypatch,
     capsys,
@@ -270,17 +326,25 @@ def test_threads_cli_sets_and_clears_pending_api_total_budget(
     assert cli.main(["threads", "--api-total", "64"]) == 0
     captured = capsys.readouterr()
     assert "aggregate API admission budget: 64" in captured.out
-    data = json.loads((tmp_path / ".mwf" / "threads.json").read_text(encoding="utf-8"))
-    assert data["api_total_limit"] == 64
-    assert data["run_id"] is None
+    storage = FileStorage(tmp_path)
+    assert storage.read_api_total_limit() == 64
+    assert _thread_rows(storage) == {
+        "pending": [], "owned": [], "api_total": [(1, 64)],
+    }
+    assert not (tmp_path / ".mwf" / "threads.json").exists()
     warning = "Deprecation warning: mwf threads --api-total is deprecated and remains functional.\n"
     assert captured.err == warning
 
     assert cli.main(["threads", "--api-total", "reset"]) == 0
     captured = capsys.readouterr()
     assert "Cleared aggregate API admission budget" in captured.out
+    assert storage.read_api_total_limit() is None
+    assert _thread_rows(storage) == {
+        "pending": [], "owned": [], "api_total": [],
+    }
     assert not (tmp_path / ".mwf" / "threads.json").exists()
     assert captured.err == warning
+    storage.close_database_connections()
 
 
 def test_api_total_warning_precedes_invalid_value_without_changing_overrides(
@@ -290,17 +354,19 @@ def test_api_total_warning_precedes_invalid_value_without_changing_overrides(
     capsys.readouterr()
     assert cli.main(["threads", "A", "4"]) == 0
     assert capsys.readouterr().err == ""
-    override_path = tmp_path / ".mwf" / "threads.json"
-    before = override_path.read_bytes()
+    storage = FileStorage(tmp_path)
+    before = _thread_rows(storage)
 
     assert cli.main(["threads", "--api-total", "nope"]) == 1
 
     captured = capsys.readouterr()
     warning = "Deprecation warning: mwf threads --api-total is deprecated and remains functional.\n"
-    assert override_path.read_bytes() == before
+    assert _thread_rows(storage) == before
+    assert not (tmp_path / ".mwf" / "threads.json").exists()
     assert captured.out == ""
     assert captured.err.startswith(warning + "Error: ")
     assert captured.err.count("Deprecation warning:") == 1
+    storage.close_database_connections()
 
 
 def test_threads_unknown_node_does_not_recreate_folder(tmp_path, monkeypatch, capsys):
@@ -358,14 +424,14 @@ def test_threads_command_scopes_override_to_run_that_starts_concurrently(
     finish_run = threading.Event()
     command_done = threading.Event()
     command_result: dict[str, object] = {}
-    original_bind = workflow.storage.bind_thread_overrides_to_run
+    original_bind = workflow.storage._bind_pending_thread_overrides
 
-    def delayed_bind(run_id: str):
+    def delayed_bind(connection, session_id, nodes):
         bind_entered.set()
         assert release_bind.wait(3)
-        return original_bind(run_id)
+        return original_bind(connection, session_id, nodes)
 
-    monkeypatch.setattr(workflow.storage, "bind_thread_overrides_to_run", delayed_bind)
+    monkeypatch.setattr(workflow.storage, "_bind_pending_thread_overrides", delayed_bind)
 
     def run_sequence():
         with active_workflow_run(
@@ -395,15 +461,26 @@ def test_threads_command_scopes_override_to_run_that_starts_concurrently(
     assert run_ready.wait(3)
     assert command_done.wait(3)
 
-    active = workflow.storage.get_run_state()
-    override_state = workflow.storage.read_thread_override_state()
+    active = workflow.storage.get_live_main_session()
+    observation = workflow.storage.read_thread_override_observation("A")
     assert command_result["code"] == 0
     assert active["status"] == "running"
-    assert override_state["run_id"] == active["run_id"]
-    assert override_state["overrides"] == {"A": 9}
+    assert observation == {
+        "node": "A", "value": 9, "session_id": active["session_id"],
+    }
+    assert _thread_rows(workflow.storage)["owned"] == [
+        ("A", active["session_id"], 9),
+    ]
 
     finish_run.set()
     run_thread.join(3)
     command_thread.join(3)
     assert not run_thread.is_alive()
     assert not command_thread.is_alive()
+    assert workflow.storage.read_thread_override_observation("A") == {
+        "node": "A", "value": None, "session_id": None,
+    }
+    assert _thread_rows(workflow.storage) == {
+        "pending": [], "owned": [], "api_total": [],
+    }
+    workflow.storage.close_database_connections()

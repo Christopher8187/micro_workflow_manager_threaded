@@ -86,11 +86,13 @@ def print_sample_selection(selection, *, executing=False):
         print('  Read-only plan; user code was not loaded and no work was started.')
 
 
-def sample_command(root, args):
+def sample_command(root, args, *, interrupt_observation=None):
     from .files import safe_node_name
     from .layout import ensure_runtime_layout
+    from .startup_recovery import recover_before_mutation
     from .project import load_workflow
     from .run_selected import run_sampled_jobs
+    from .interrupt_preflight import require_interrupt_preflight_unchanged, validate_loaded_interrupt_declarations
 
     node = safe_node_name(args.node)
     statuses = parse_sample_statuses(args.sample_status)
@@ -98,19 +100,40 @@ def sample_command(root, args):
     selectors = tuple(args.job_specs)
     plan = read_sample_plan(
         root, node, selectors, seed=seed, statuses=statuses,
-        expected_population=args.expect_population, require_ready=not args.plan,
-        report_recovery=True,
+        expected_population=args.expect_population, require_ready=False,
+        report_recovery=args.plan,
     )
     if args.plan or not plan.selected_jobs:
         print_sample_selection(plan.manifest(None))
         if not plan.selected_jobs:
             print('No jobs selected; no work was started.')
         return 0
-    ensure_runtime_layout(root)
-    workflow = load_workflow(root, args.runner)
-    return run_sampled_jobs(
-        root, workflow, node, selectors, seed=seed, statuses=statuses,
-        expected_population=args.expect_population, stats=args.stats,
-        stats_interval=args.stats_interval, monitor=args.monitor,
-        monitor_interval=args.monitor_interval, keep_trace=args.keeptrace,
+    if interrupt_observation is not None:
+        require_interrupt_preflight_unchanged(root, interrupt_observation)
+    recover_before_mutation(root)
+    plan = read_sample_plan(
+        root, node, selectors, seed=seed, statuses=statuses,
+        expected_population=args.expect_population,
+        require_ready=(interrupt_observation is None
+                       or interrupt_observation.preflight.explicit_start_component is None),
     )
+    if not plan.selected_jobs:
+        print_sample_selection(plan.manifest(None))
+        print('No jobs selected; no work was started.')
+        return 0
+    ensure_runtime_layout(root)
+    if interrupt_observation is not None:
+        require_interrupt_preflight_unchanged(root, interrupt_observation)
+    workflow = load_workflow(root, args.runner)
+    try:
+        if interrupt_observation is not None:
+            validate_loaded_interrupt_declarations(workflow, interrupt_observation)
+        return run_sampled_jobs(
+            root, workflow, node, selectors, seed=seed, statuses=statuses,
+            expected_population=args.expect_population, stats=args.stats,
+            stats_interval=args.stats_interval, monitor=args.monitor,
+            monitor_interval=args.monitor_interval, keep_trace=args.keeptrace,
+            interrupt_preflight=None if interrupt_observation is None else interrupt_observation.preflight,
+        )
+    finally:
+        workflow.storage.close_database_connections()

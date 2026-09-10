@@ -45,27 +45,49 @@ class SQLiteConnectionMixin:
             raise RuntimeError("Native MWF project state is missing; initialize a separate fresh project")
         self._state_database_path_cached = raw_path.resolve()
         self._mutation_writer = SQLiteMutationWriter(self)
+        self._storage_owner_guard = threading.Lock()
+        self._storage_close_guard = threading.Lock()
+        self._acquire_storage_owner()
         path = self._state_database_path_cached
-        pid = os.getpid()
-        with self._connection_registry_guard:
-            ref_key = (path, pid)
-            self._storage_path_refcounts[ref_key] = (
-                self._storage_path_refcounts.get(ref_key, 0) + 1
+        try:
+            with self._db_init_locks_guard:
+                lock = self._db_init_locks.setdefault(path, threading.Lock())
+            with lock:
+                initialized_key = (path, os.getpid())
+                # A path previously opened in this process may now contain damaged
+                # or replaced state. Every new storage owner validates its schema.
+                self.initialize_state_database(create=create)
+                self._initialized_databases.add(initialized_key)
+        except BaseException:
+            # The constructor cannot return this owner to a caller that could
+            # close it. Release its exact refcount immediately. No mutation can
+            # have been accepted through an object that has not finished
+            # construction, so the writer has nothing to drain here.
+            with self._storage_owner_guard:
+                finalizer = getattr(self, "_connection_finalizer", None)
+                if finalizer is not None and finalizer.alive:
+                    finalizer()
+            raise
+
+    def _acquire_storage_owner(self) -> None:
+        """Register or re-register this reusable storage instance."""
+        with self._storage_owner_guard:
+            current = getattr(self, "_connection_finalizer", None)
+            if current is not None and current.alive:
+                return
+            path = self.state_database_path()
+            pid = os.getpid()
+            with self._connection_registry_guard:
+                ref_key = (path, pid)
+                self._storage_path_refcounts[ref_key] = (
+                    self._storage_path_refcounts.get(ref_key, 0) + 1
+                )
+            self._connection_finalizer = weakref.finalize(
+                self,
+                type(self)._release_storage_path,
+                path,
+                pid,
             )
-        self._connection_finalizer = weakref.finalize(
-            self,
-            type(self)._release_storage_path,
-            path,
-            pid,
-        )
-        with self._db_init_locks_guard:
-            lock = self._db_init_locks.setdefault(path, threading.Lock())
-        with lock:
-            initialized_key = (path, os.getpid())
-            # A path previously opened in this process may now contain damaged
-            # or replaced state. Every new storage owner validates its schema.
-            self.initialize_state_database(create=create)
-            self._initialized_databases.add(initialized_key)
 
     def submit_db_mutation(
         self,
@@ -75,11 +97,19 @@ class SQLiteConnectionMixin:
         priority: int = 10,
     ) -> T | Future[T]:
         """Run one mutation through the project-local priority writer."""
-        return self._mutation_writer.submit(
-            operation,
-            wait=wait,
-            priority=priority,
-        )
+        # Admission and explicit close share one small gate. Always enqueue a
+        # Future while holding it, then wait outside it so the writer can open
+        # its own connection. A mutation admitted before close is included in
+        # close's barrier; a mutation arriving later re-registers this reusable
+        # storage owner after close returns.
+        with self._storage_close_guard:
+            self._acquire_storage_owner()
+            future = self._mutation_writer.submit(
+                operation,
+                wait=False,
+                priority=priority,
+            )
+        return future.result() if wait else future
 
     def submit_grouped_db_mutation(
         self,
@@ -99,15 +129,18 @@ class SQLiteConnectionMixin:
         """
         if weight is None:
             weight = getattr(item, "mutation_weight", 1)
-        return self._mutation_writer.submit_grouped(
-            group_key,
-            item,
-            operation,
-            wait=wait,
-            priority=priority,
-            collect_seconds=collect_seconds,
-            weight=weight,
-        )
+        with self._storage_close_guard:
+            self._acquire_storage_owner()
+            future = self._mutation_writer.submit_grouped(
+                group_key,
+                item,
+                operation,
+                wait=False,
+                priority=priority,
+                collect_seconds=collect_seconds,
+                weight=weight,
+            )
+        return future.result() if wait else future
 
     def urgent_state_mutation_pending(self) -> bool:
         return self._mutation_writer.urgent_state_pending()
@@ -202,15 +235,14 @@ class SQLiteConnectionMixin:
         return (self.state_database_path(), os.getpid(), threading.get_ident())
 
     def db_connection(self) -> sqlite3.Connection:
+        # Explicit close is historically reusable. A later read therefore
+        # restores this instance's share before entering the shared registry.
+        self._acquire_storage_owner()
         key = self._connection_key()
         current_thread = threading.current_thread()
         stale_connection = None
         stale_registry_connections: list[sqlite3.Connection] = []
         with self._connection_registry_guard:
-            if len(self._connection_registry) >= 256:
-                stale_registry_connections = self._prune_stale_registered_connections_locked(
-                    os.getpid()
-                )
             connection = self._connection_registry.get(key)
             owner_thread = self._connection_threads.get(key)
             # Python may reuse a dead thread's integer identifier. Never hand
@@ -221,6 +253,18 @@ class SQLiteConnectionMixin:
                 self._connection_threads.pop(key, None)
                 connection = None
             if connection is None:
+                # A healthy existing connection is the common path and needs no
+                # process-wide filesystem sweep. Long-lived worker pools can
+                # retain connections for many still-present test or project
+                # directories; scanning all of them under the registry lock on
+                # every read makes each otherwise local query O(projects).
+                # Keep the defensive sweep on connection admission, where it
+                # can still reclaim dead-thread and deleted-project entries
+                # before allocating another handle.
+                if len(self._connection_registry) >= 256:
+                    stale_registry_connections = self._prune_stale_registered_connections_locked(
+                        os.getpid()
+                    )
                 connection = self._new_db_connection()
                 self._connection_registry[key] = connection
                 self._connection_threads[key] = current_thread
@@ -276,22 +320,18 @@ class SQLiteConnectionMixin:
         return len(stale)
 
     def close_database_connections(self) -> None:
-        path = self.state_database_path()
-        pid = os.getpid()
-        with self._connection_registry_guard:
-            matches = [
-                (key, connection)
-                for key, connection in self._connection_registry.items()
-                if key[0] == path and key[1] == pid
-            ]
-            for key, _ in matches:
-                self._connection_registry.pop(key, None)
-                self._connection_threads.pop(key, None)
-        for _, connection in matches:
-            try:
-                connection.close()
-            except sqlite3.Error:
-                pass
+        # One process may own several FileStorage instances for the same
+        # project. Their per-thread connections share this process-wide
+        # registry. Closing every path match here can close a peer instance's
+        # SQLite connection while its mutation writer is inside a transaction.
+        # Drain only this instance's accepted writer work, then release its
+        # ownership through the same refcounted finalizer used by collection.
+        with self._storage_close_guard:
+            self.db_mutation_barrier()
+            with self._storage_owner_guard:
+                finalizer = getattr(self, "_connection_finalizer", None)
+                if finalizer is not None and finalizer.alive:
+                    finalizer()
 
     def _database_write_lock(self) -> threading.RLock:
         path = self.state_database_path()

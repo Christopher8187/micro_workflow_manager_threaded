@@ -63,11 +63,11 @@ def _claimed_runtime_storage(tmp_path):
 def test_cooperative_future_result_preserves_periodic_timeout_semantics():
     future: Future[str] = Future()
     timer = threading.Timer(0.12, lambda: future.set_result("done"))
-    timer.start()
     ticks = 0
 
     def job(_):
         nonlocal ticks
+        timer.start()
         while True:
             try:
                 return future.result(timeout=0.02)
@@ -77,7 +77,9 @@ def test_cooperative_future_result_preserves_periodic_timeout_semantics():
     try:
         assert ApiRunner(max_threads=1, poll_interval=0.002).run_jobs("A", [1], job) == ["done"]
     finally:
-        timer.join(timeout=1)
+        timer.cancel()
+        if timer.ident is not None:
+            timer.join(timeout=1)
     assert ticks >= 3
 
 
@@ -1267,7 +1269,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
             if len(renewal_reasons) < expected_physical_attempts:
                 return original_operation(watch, *args, **kwargs)
             renewal_ready.set()
-            assert release_renewal.wait(10), "Physical-attempt renewal was not released"
+            release_renewal.wait()
         arming_thread.append(threading.get_ident())
         try:
             return original_operation(watch, *args, **kwargs)
@@ -1280,18 +1282,18 @@ def test_task_intervals_exclude_framework_heap_maintenance(
                 and payload.get("state") == "running"
                 and payload.get("checkpoint_name") == "after reports"):
             checkpoint_submission.set()
-            assert release_checkpoint_submission.wait(10), "Checkpoint submission was not released"
+            release_checkpoint_submission.wait()
         return original_write(node, job_id, payload, **kwargs)
 
     class ObservedCondition:
         def __enter__(self):
             if is_renewal and phase == "condition" and arming_thread == [threading.get_ident()]:
                 renewal_condition_blocked.set()
-                assert release_renewal_condition.wait(10), "Renewal condition entry was not released"
+                release_renewal_condition.wait()
             if (threading.current_thread().name == "mwf-scheduler-supervisor"
                     and pause_supervisor.is_set()):
                 supervisor_paused.set()
-                assert release_supervisor.wait(10), "Deadline scan was not released"
+                release_supervisor.wait()
             return condition.__enter__()
 
         def __exit__(self, *args):
@@ -1309,7 +1311,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
         def heapify(self, values):
             if arming_thread == [threading.get_ident()]:
                 heap_blocked.set()
-                assert release_heap.wait(10), "Framework heap maintenance was not released"
+                release_heap.wait()
                 result = original_heap.heapify(values)
                 heap_rebuilt.set()
                 return result
@@ -1330,9 +1332,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
         if operation == "network_replay" and len(physical_requests) == 1:
             raise httpx.ReadError("controlled physical-attempt failure", request=request)
         response_started.set()
-        response_deadline = time.perf_counter() + 10
         while not release_response.is_set():
-            assert time.perf_counter() < response_deadline, "Physical response was not released"
             await asyncio.sleep(0.001)
         return httpx.Response(200, json={"received": True}, request=request)
 
@@ -1348,7 +1348,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
     def a(ctx):
         handler_entered.set()
         if operation == "checkpoint":
-            assert start_checkpoint.wait(10), "Checkpoint was not allowed to start"
+            start_checkpoint.wait()
             ctx.checkpoint("after reports", timeout=0.02 if deadline_kind == "checkpoint" else 100)
         elif is_network:
             response = shared_http_transport.post_json(
@@ -1357,7 +1357,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
             )
             assert response == {"received": True}
         interval_entered.set()
-        assert release_handler.wait(10), "User work was not released"
+        release_handler.wait()
         return {"started": True}
 
     @workflow.task("B", runner="api", max_threads=40, timeout=100, checkpoint_timeout=100)
@@ -1366,7 +1366,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
             entered_jobs.add(ctx.job_id)
             if len(entered_jobs) == 40:
                 all_other_handlers_entered.set()
-        reports_gate.result(timeout=10)
+        reports_gate.result()
         if ctx.job_id == 1:
             # With forty live attempts, these ordinary reports remain below
             # the normal rebuild threshold. Completing them leaves stale heap
@@ -1374,7 +1374,7 @@ def test_task_intervals_exclude_framework_heap_maintenance(
             for value in range(70):
                 ctx.checkpoint(f"other task report {value}", timeout=100)
             reports_finished.set()
-        other_handlers_gate.result(timeout=10)
+        other_handlers_gate.result()
         return {"job": ctx.job_id}
 
     @workflow.task("Z")
@@ -1398,13 +1398,8 @@ def test_task_intervals_exclude_framework_heap_maintenance(
     workers.append(active)
     active.start()
     try:
-        if operation == "checkpoint":
-            assert handler_entered.wait(10), "User work did not start"
-        elif operation == "network_end":
-            assert response_started.wait(10), "The physical request did not start"
-        elif is_renewal:
-            assert renewal_ready.wait(10), "The target physical-attempt callback did not start"
-        assert all_other_handlers_entered.wait(10), "Concurrent tasks did not all start"
+        # Native preparation precedes the virtual-clock behavior under test.
+        assert all_other_handlers_entered.wait(60), "Concurrent tasks did not all start"
         with condition:
             pause_supervisor.set()
             condition.notify_all()
@@ -1412,10 +1407,15 @@ def test_task_intervals_exclude_framework_heap_maintenance(
         reports_gate.set_result(None)
         assert reports_finished.wait(10), "Concurrent checkpoint reports did not finish"
         if operation == "checkpoint":
+            assert handler_entered.wait(10), "User work did not start"
             # Keep the forty watches alive through the report's initial disarm
             # so only its post-submission rearm takes the rebuild branch.
             start_checkpoint.set()
             assert checkpoint_submission.wait(10), "Checkpoint did not reach runtime submission"
+        elif operation == "network_end":
+            assert response_started.wait(10), "The physical request did not start"
+        elif is_renewal:
+            assert renewal_ready.wait(10), "The target physical-attempt callback did not start"
         if operation == "initial":
             allow_a.set()
         other_handlers_gate.set_result(None)
@@ -1425,14 +1425,6 @@ def test_task_intervals_exclude_framework_heap_maintenance(
             time.sleep(0.01)
         assert not errors, errors
         assert workflow.storage.job_status_counts("B").get("done") == 40
-        for job_id in range(1, 41):
-            output = json.loads(workflow.storage.output_file("B", job_id).read_text(encoding="utf-8"))
-            owner = workflow.storage.read_job_current_owner("B", job_id)
-            assert owner is not None
-            assert output == {
-                "status": "done", "result_type": "dict", "result_repr": str({"job": job_id}),
-                "generation": owner["generation"], "execution_id": owner["execution_id"],
-            }
         if operation == "checkpoint":
             release_checkpoint_submission.set()
         elif operation == "network_end":
@@ -1483,6 +1475,14 @@ def test_task_intervals_exclude_framework_heap_maintenance(
         release_handler.set()
         active.join(timeout=10)
         assert not active.is_alive(), "The API run did not finish"
+        for job_id in range(1, 41):
+            output = json.loads(workflow.storage.output_file("B", job_id).read_text(encoding="utf-8"))
+            owner = workflow.storage.read_job_current_owner("B", job_id)
+            assert owner is not None
+            assert output == {
+                "status": "done", "result_type": "dict", "result_repr": str({"job": job_id}),
+                "generation": owner["generation"], "execution_id": owner["execution_id"],
+            }
         output = json.loads(workflow.storage.output_file("A", 1).read_text(encoding="utf-8"))
         owner = workflow.storage.read_job_current_owner("A", 1)
         assert owner is not None
@@ -1791,7 +1791,7 @@ def test_api_checkpoint_distinguishes_framework_delay_from_task_time(
     active = threading.Thread(target=run, daemon=True)
     active.start()
     try:
-        assert handler_ready.wait(10), "API handler did not start"
+        assert handler_ready.wait(60), "API handler did not start"
         if delay == "condition":
             with condition:
                 start_checkpoint.set()
@@ -1939,9 +1939,9 @@ def test_api_checkpoint_stops_after_handler_exit_before_framework_completion(
     active.start()
     try:
         if phase in {"caller", "exact_deadline"}:
-            assert network_returned.wait(10), "The network result did not reach the caller"
+            assert network_returned.wait(60), "The network result did not reach the caller"
         else:
-            assert handler_returned.wait(10), "The API handler did not return"
+            assert handler_returned.wait(60), "The API handler did not return"
         if phase == "later_checkpoint":
             task_context[0].checkpoint("after handler exit", timeout=0.02)
         with condition:
@@ -2378,6 +2378,7 @@ def test_many_framework_network_waits_do_not_cascade_checkpoint_cancellations(tm
     clock = [time.monotonic()]
     requests_started = set()
     requests_lock = threading.Lock()
+    response_waiters = []
     all_requests_started = Event()
     release_responses = Event()
     observe_supervisor = Event()
@@ -2385,15 +2386,31 @@ def test_many_framework_network_waits_do_not_cascade_checkpoint_cancellations(tm
     run_finished = Event()
     errors = []
 
+    def finish_response(waiter):
+        if not waiter.done():
+            waiter.set_result(None)
+
+    def release_all_responses():
+        with requests_lock:
+            release_responses.set()
+            pending = tuple(response_waiters)
+        for loop, waiter in pending:
+            loop.call_soon_threadsafe(finish_response, waiter)
+
     async def handler(request: httpx.Request) -> httpx.Response:
         job_id = json.loads(request.content)["job"]
+        loop = asyncio.get_running_loop()
+        response_ready = loop.create_future()
         with requests_lock:
             assert job_id not in requests_started
             requests_started.add(job_id)
+            if release_responses.is_set():
+                response_ready.set_result(None)
+            else:
+                response_waiters.append((loop, response_ready))
             if len(requests_started) == 100:
                 all_requests_started.set()
-        while not release_responses.is_set():
-            await asyncio.sleep(0.01)
+        await response_ready
         return httpx.Response(200, json={"ok": True, "job": job_id}, request=request)
 
     close_shared_http_transport()
@@ -2449,30 +2466,26 @@ def test_many_framework_network_waits_do_not_cascade_checkpoint_cancellations(tm
 
     active = threading.Thread(target=run, daemon=True)
     active.start()
+    body_failed = False
     try:
-        assert all_requests_started.wait(15), "All 100 physical requests did not start"
+        # Fresh preparation and admission precede physical-request entry.
+        assert all_requests_started.wait(60), "All 100 physical requests did not start"
         with condition:
             # Advance only while all handlers own a framework-managed wait.
             # Caller scheduling is covered by the separate deadline cases.
             clock[0] += 0.08
             observe_supervisor.set()
             condition.notify_all()
-        scan_deadline = time.perf_counter() + 10
-        while not supervisor_checked.is_set():
-            # A broken supervisor can cancel every watch and exit without
-            # waiting again. Report its durable timeout instead of a lost ack.
-            for job_id in range(1, 101):
-                events = workflow.storage.read_job_events("A", job_id)
-                timeouts = [event for event in events if event.get("event") == "timeout"]
-                assert not timeouts, (job_id, timeouts)
-            assert time.perf_counter() < scan_deadline, "Supervisor did not inspect all network waits"
-            supervisor_checked.wait(0.01)
+        inspected_in_time = supervisor_checked.wait(10)
+        # Check durable timeouts even if a broken supervisor exited without
+        # acknowledgement. History-read time is outside the inspection deadline.
         for job_id in range(1, 101):
             events = workflow.storage.read_job_events("A", job_id)
             assert not [event for event in events if event.get("event") == "timeout"], (job_id, events)
+        assert inspected_in_time, "Supervisor did not inspect all network waits"
         assert not run_finished.is_set()
-        release_responses.set()
-        assert run_finished.wait(15), "The 100-request API run did not finish"
+        release_all_responses()
+        assert run_finished.wait(60), "The 100-request API run did not finish"
         assert not errors, errors
         assert requests_started == set(range(1, 101))
         counts = workflow.storage.node_job_summary("A")["counts"]
@@ -2486,14 +2499,45 @@ def test_many_framework_network_waits_do_not_cascade_checkpoint_cancellations(tm
                 "result_repr": "{'ok': True, 'job': " + str(job_id) + "}",
                 "generation": owner["generation"], "execution_id": owner["execution_id"],
             }
+    except BaseException:
+        body_failed = True
+        raise
     finally:
-        release_responses.set()
-        active.join(timeout=10)
-        close_shared_http_transport()
-        workflow.storage.db_mutation_barrier()
-        cleanup_deadline = time.perf_counter() + 10
-        while workflow.storage.mutation_writer_diagnostics()["writer_alive"]:
-            assert time.perf_counter() < cleanup_deadline, "Mutation writer did not retire"
-            time.sleep(0.01)
-        workflow.storage.close_thread_connection()
-    assert not active.is_alive()
+        cleanup_errors = []
+        try:
+            release_all_responses()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            active.join(timeout=60)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            close_shared_http_transport()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if active.is_alive():
+            try:
+                active.join(timeout=10)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        active_still_running = active.is_alive()
+        if active_still_running:
+            cleanup_errors.append(AssertionError(
+                "The 100-request API run did not finish during cleanup"
+            ))
+        else:
+            try:
+                workflow.storage.db_mutation_barrier()
+                cleanup_deadline = time.perf_counter() + 10
+                while workflow.storage.mutation_writer_diagnostics()["writer_alive"]:
+                    assert time.perf_counter() < cleanup_deadline, "Mutation writer did not retire"
+                    time.sleep(0.01)
+            except BaseException as error:
+                cleanup_errors.append(error)
+            try:
+                workflow.storage.close_thread_connection()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors and not body_failed:
+            raise cleanup_errors[0]

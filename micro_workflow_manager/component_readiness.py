@@ -61,6 +61,22 @@ def calculate_sampled_resume_lineage(
             and bool(instability_origin))
     ):
         raise ValueError('invalid sampled component result')
-    if parent_readiness[0] == 'unstable' and retained != parent_readiness[:2]:
+    if (parent_readiness[0] == 'unstable'
+            and retained != parent_readiness[:2]):
         return None
     return retained
+
+
+def calculate_interrupt_sampled_resume_readiness(
+    retained, parent_observations, *, interrupt_start_origin,
+):
+    """Preserve sampled origin while checking every completed parent result."""
+    inputs = tuple(parent_observations)
+    readiness = calculate_component_readiness(
+        inputs, interrupt_start_origin=interrupt_start_origin,
+    )
+    completed = calculate_component_readiness(item for item in inputs if item[0] == 'done')
+    if completed is None:
+        return None
+    lineage = calculate_sampled_resume_lineage(*retained, completed)
+    return None if lineage is None else (*lineage, readiness[2])

@@ -26,7 +26,7 @@ def render_session_lines(sessions: list[dict[str, Any]]) -> list[str]:
         line = (
             f"  session={session['session_id']} kind={session['session_kind']} "
             f"command={session['command']} status={session['status']} "
-            f"parent={session['parent_session_id'] or '-'} "
+            f"parents={','.join(session['parent_session_ids']) or '-'} "
             f"components=[{components}]"
         )
         if session["status"] == "running":
@@ -38,6 +38,22 @@ def render_session_lines(sessions: list[dict[str, Any]]) -> list[str]:
         lines.append(line)
         for failure in session["failures"]:
             lines.append(f"    failure={failure}")
+    return lines
+
+
+def render_component_lines(rows: list[dict[str, Any]]) -> list[str]:
+    components, lines = {}, []
+    for row in rows:
+        components.setdefault(tuple(row["component"]), row)
+    for members, row in sorted(components.items()):
+        lines.append(
+            f"component [{', '.join(members)}]: state={row['state']} "
+            f"stability={row['stability'] or 'none'} "
+            f"instability_origin={row['instability_origin'] or 'none'} "
+            f"misaligned={'yes' if row['misaligned'] else 'no'}"
+        )
+        for cause in row["misalignment_causes"]:
+            lines.append("  first cause: " + json.dumps(cause, sort_keys=True, ensure_ascii=False))
     return lines
 
 
@@ -72,20 +88,21 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
             f"running={api.get('running', 0)} "
             f"queued={api.get('queued', 0)} "
             f"done_60s={api.get('completed_last_60_seconds', 0)} "
-            f"declared_capacity={api.get('declared_capacity', 0)} "
-            f"active_capacity={api.get('active_capacity', api.get('declared_capacity', 0))} "
+            f"requested_capacity={api.get('requested_capacity', 0)} "
+            f"active_capacity={api.get('active_capacity', api.get('requested_capacity', 0))} "
             f"aggregate_limit={api.get('aggregate_limit') or 'none'}"
         )
     lines.append(f"running nodes: {running_text}")
     waiting_nodes = snapshot.get("waiting_nodes") or []
     waiting_text = ", ".join(waiting_nodes) if waiting_nodes else "none"
     lines.append(f"waiting nodes: {waiting_text}")
+    lines.extend(render_component_lines(snapshot["nodes"]))
     lines.append("")
 
     headers = [
         ("node", 18),
         ("status", 9),
-        ("threads", 8),
+        ("request", 8),
         ("jobs", 6),
         ("Q", 5),
         ("R", 5),
@@ -128,8 +145,8 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
 
     lines.append("")
     lines.append("ETA is a rough estimate from completed job durations; it is unknown until at least one job has finished.")
-    lines.append("threads marked with * use a runtime override from 'mwf threads'.")
-    lines.append("API max_threads values are cooperative fiber counts; 'mwf threads --api-total' sets an optional run-scoped aggregate budget.")
+    lines.append("requests marked with * use a runtime override from 'mwf threads'.")
+    lines.append("API max_threads values are cooperative fiber counts; 'mwf threads --api-total' sets optional project-wide concurrency.")
     return "\n".join(lines)
 
 def print_snapshot(workflow, nodes: list[str] | None = None, *, json_output: bool = False):

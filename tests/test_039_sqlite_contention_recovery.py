@@ -15,6 +15,7 @@ from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.storage.sqlite_state import SQLiteStateMixin
 from micro_workflow_manager.system import MicroWorkflow
 from micro_workflow_manager.topology import ComponentTopology
+from tests.test_064_read_only_previews import _live_execution_session_identity
 from tests.test_090_component_session_settlement import _close
 
 
@@ -28,9 +29,8 @@ def native_claim(tmp_path):
     storage.create_execution_session(
         'checkpoint-owner', session_kind='main', command='run',
         start_component=('merge',), selected_components=[('merge',)],
-        started_at='2026-09-06T12:00:00', hostname='worker.example',
-        pid=os.getpid(), process_identity='test-process',
         expected_shape=snapshot.shape_json,
+        **_live_execution_session_identity(),
     )
     storage.reserve_execution_components('checkpoint-owner', expected_shape=snapshot.shape_json)
     storage.create_job(Job(job_id=1, node_name='merge', params={}))

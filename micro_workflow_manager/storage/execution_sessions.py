@@ -7,6 +7,7 @@ from micro_workflow_manager.session_liveness import execution_session_liveness
 from .session_selection import SessionSelectionStorageMixin
 from .session_admission import SessionAdmissionStorageMixin
 from .session_shapes import validate_session_shape_snapshot
+from .interrupt_common import read_session_parent_ids
 from .sqlite.schema import DATABASE_SCHEMA_VERSION
 from micro_workflow_manager.component_identity import component_key, decode_component_key, encode_component_key
 
@@ -34,6 +35,9 @@ def execution_session_from_row_snapshot(connection, row) -> dict:
     session_id = row['session_id']
     result = dict(row)
     try:
+        scope_admitted = result.pop('scope_admitted')
+        if type(scope_admitted) is not int or scope_admitted not in (0, 1):
+            raise ValueError('Invalid reservation admission state')
         result['start_component'] = SessionSelectionStorageMixin._stored_session_component(
             result['start_component']
         )
@@ -48,6 +52,7 @@ def execution_session_from_row_snapshot(connection, row) -> dict:
                 connection, session_id, components=result['selected_components'],
             )
         ]
+        result['parent_session_ids'] = read_session_parent_ids(connection, session_id)
     except (json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
         raise RuntimeError('Damaged execution session: ' + str(session_id)) from error
     validate_session_shape_snapshot(connection, result)
@@ -63,11 +68,12 @@ def validate_execution_session_snapshot(session: dict) -> None:
         _session_time_snapshot(session['heartbeat_at'], 'heartbeat_at')
         if session['session_kind'] not in ('main', 'interrupt'):
             raise ValueError('Invalid session kind')
-        parent = session['parent_session_id']
-        if parent is not None:
-            _session_text_snapshot(parent, 'parent_session_id')
-            if session['session_kind'] != 'interrupt' or parent == session_id:
-                raise ValueError('Invalid parent session')
+        parents = session['parent_session_ids']
+        if (not isinstance(parents, list) or parents != sorted(set(parents))
+                or any(_session_text_snapshot(parent, 'parent_session_id') == session_id
+                       for parent in parents)
+                or (parents and session['session_kind'] != 'interrupt')):
+            raise ValueError('Invalid parent sessions')
         if session['selection_kind'] not in ('components', 'jobs'):
             raise ValueError('Invalid session selection kind')
         if session['status'] not in ('running', 'terminal'):
@@ -158,6 +164,19 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
         failure_data = json.dumps(failures if failures is not None else [])
 
         def finish(connection):
+            row = connection.execute(
+                "SELECT status FROM execution_sessions WHERE session_id=?", (session_id,),
+            ).fetchone()
+            if row is None or row['status'] != 'running':
+                return False
+            if connection.execute(
+                "SELECT 1 FROM interrupt_admissions WHERE session_id=?", (session_id,),
+            ).fetchone() is not None:
+                raise RuntimeError(
+                    "Explicit interrupt sessions require atomic component and scope settlement"
+                )
+            from .session_scope import require_admitted_reservation_scope
+            require_admitted_reservation_scope(connection, session_id)
             return connection.execute(
                 "UPDATE execution_sessions SET status='terminal', outcome=?, finished_at=?, failures_json=? "
                 "WHERE session_id=? AND status='running'",
@@ -411,40 +430,13 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
                 ):
                     raise RuntimeError('Component outcome differs from its recorded start')
                 settled.setdefault(component, recorded)
-            settled_outcomes = tuple(settled.values())
-            self._validate_component_terminal_outcomes(connection, session_id, settled_outcomes)
-            supplied_keys = {encode_component_key(result.component) for result in settled_outcomes}
-            running_keys = {row[0] for row in connection.execute(
-                'SELECT state.component_key FROM component_states AS state '
-                'JOIN component_reservations AS reservation USING(component_key) '
-                "WHERE reservation.session_id=? AND state.lifecycle='running'", (session_id,),
-            )}
-            if running_keys - supplied_keys:
-                raise RuntimeError('Terminal settlement omitted an owned running component')
-            reserved_count = connection.execute(
-                'SELECT COUNT(*) FROM component_reservations WHERE session_id=?', (session_id,),
-            ).fetchone()[0]
-            self._publish_component_terminal_outcomes(connection, session_id, settled_outcomes)
-            if failed_nodes:
-                if not set(failed_nodes) <= owned_nodes:
-                    raise RuntimeError('Failed nodes are outside the session reserved scope')
-                connection.executemany(
-                    "UPDATE nodes SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE node_name=?",
-                    [(node,) for node in failed_nodes],
-                )
-            finished = connection.execute(
-                "UPDATE execution_sessions SET status='terminal', outcome=?, finished_at=?, failures_json=? "
-                "WHERE session_id=? AND status='running'",
-                (outcome, finished_at, failure_data, session_id),
-            ).rowcount
-            if finished != 1:
-                raise RuntimeError('Execution session changed before terminal settlement')
-            released = connection.execute(
-                'DELETE FROM component_reservations WHERE session_id=?', (session_id,),
-            ).rowcount
-            if released != reserved_count:
-                raise RuntimeError('Execution session reservations changed before terminal settlement')
-            return {'restarts': {}, 'released': released}
+            from .session_settlement import settle_execution_session
+
+            return settle_execution_session(
+                self, connection, session_id, outcome=outcome, finished_at=finished_at,
+                failure_data=failure_data, component_outcomes=tuple(settled.values()),
+                failed_nodes=failed_nodes,
+            )
 
         return self.submit_db_mutation(decide, wait=True, priority=0)
 
@@ -471,17 +463,6 @@ class ExecutionSessionStorageMixin(SessionSelectionStorageMixin, SessionAdmissio
     def get_live_main_session(self) -> dict | None:
         return next((session for session in self.list_live_execution_sessions()
                      if session["session_kind"] == "main"), None)
-
-    def get_live_execution_session(self) -> dict | None:
-        """Compatibility reader; several live interrupts require an exact ID."""
-        sessions = self.list_live_execution_sessions()
-        main = next((session for session in sessions if session["session_kind"] == "main"), None)
-        if main is not None:
-            return main
-        if len(sessions) > 1:
-            names = ", ".join(session["session_id"] for session in sessions)
-            raise RuntimeError(f"Several live interrupt sessions are ambiguous: {names}. Specify a session ID.")
-        return sessions[0] if sessions else None
 
     @staticmethod
     def _execution_session_from_row(connection, row) -> dict:

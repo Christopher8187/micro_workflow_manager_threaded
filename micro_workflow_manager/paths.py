@@ -7,16 +7,9 @@ from pathlib import Path, PurePath, PureWindowsPath
 
 MWF_DIR_NAME = ".mwf"
 MWF_CONFIG_NAME = "project.json"
-MWF_RUN_NAME = "run.json"
-MWF_THREADS_NAME = "threads.json"
 MWF_LOCKS_NAME = "locks"
 MWF_DEPLOY_NAME = "deploy"
 MWF_STATE_DATABASE_NAME = "state.sqlite3"
-
-LEGACY_CONFIG_NAME = ".mwf"
-LEGACY_RUN_NAME = ".mwf_run.json"
-LEGACY_THREADS_NAME = ".mwf_threads.json"
-LEGACY_LOCKS_NAME = ".mwf_locks"
 
 
 def mwf_dir(root: Path) -> Path:
@@ -25,14 +18,6 @@ def mwf_dir(root: Path) -> Path:
 
 def config_file(root: Path) -> Path:
     return mwf_dir(root) / MWF_CONFIG_NAME
-
-
-def run_file(root: Path) -> Path:
-    return mwf_dir(root) / MWF_RUN_NAME
-
-
-def threads_file(root: Path) -> Path:
-    return mwf_dir(root) / MWF_THREADS_NAME
 
 
 def locks_dir(root: Path) -> Path:

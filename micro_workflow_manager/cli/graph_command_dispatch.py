@@ -19,7 +19,7 @@ def graph_preview_requested(args):
     )
 
 
-def print_graph_preview(root, workflow, args):
+def print_graph_preview(root, workflow, args, *, interrupt_preflight=None):
     node = args.node if args.node == "*" else safe_node_name(args.node)
     end_node = getattr(args, 'end_node', None)
     if end_node is not None:
@@ -36,15 +36,20 @@ def print_graph_preview(root, workflow, args):
             raise RuntimeError(
                 f'{refuse_mode} node {refuse_node!r} is not in the {args.command} selection starting at {node!r}'
             )
+    blocked_components = () if interrupt_preflight is None else interrupt_preflight.blocked_components
     reader = NativePlanningReader(workflow.storage.connection, root, workflow.topology.graph_shape())
     observation = observe_graph_command(
         reader, workflow.topology, selection, keep_trace=bool(getattr(args, 'keeptrace', False)),
-        static_receivers_by_node=workflow.static_node_targets,
+        static_receivers_by_node=workflow.static_node_targets, blocked_components=blocked_components,
+        interrupt_start_component=(None if interrupt_preflight is None
+                                   else interrupt_preflight.explicit_start_component),
     )
     invocation = [args.command, node]
     if end_node is not None:
         invocation.append(end_node)
-    print(render_graph_command_plan(observation, command_line=join(invocation)))
+    print(render_graph_command_plan(
+        observation, command_line=join(invocation), blocked_components=blocked_components,
+    ))
     if refuse_node is not None:
         label = '{' + ', '.join(boundary) + '}'
         if selection.operation == 'reset':

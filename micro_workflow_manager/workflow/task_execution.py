@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Callable, TypeVar
 
 from ..context import JobContext
+from ..interrupt_cooperation import check_execution_without_pause
 from ..errors import (
     InvalidGraphError,
     InvalidJobError,
@@ -17,6 +18,7 @@ from ..models import CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED, Job, now
 from ..fibers import cancellation_scope, in_fiber_runtime
 from ..networking import network_attempt_context
 from ..storage.runtime_observations import RuntimeObservationSequence
+from .api_admission import ApiPermitStateError
 
 
 T = TypeVar("T")
@@ -72,7 +74,9 @@ class MountedTaskExecutionMixin:
 
         if in_fiber_runtime():
             def check_cancelled() -> None:
-                ctx.raise_if_cancelled()
+                # Fiber pumps call this outside the handler's greenlet. Never
+                # acknowledge a pause or wait while servicing other handlers.
+                check_execution_without_pause(ctx)
             try:
                 with cancellation_scope(check_cancelled), network_attempt_context(self, ctx, watch):
                     supervisor.begin_handler_execution(watch)
@@ -81,9 +85,16 @@ class MountedTaskExecutionMixin:
             except BaseException as error:
                 restart_error = supervisor.execution_cancel_error(watch)
                 timeout_error = supervisor.timeout_error(watch)
-                final_error = restart_error or timeout_error or error
+                # Durable API capacity is part of the running execution
+                # lease. Neither restart nor timeout policy may hide an
+                # unresolved permit transition at a cooperative checkpoint.
+                permit_error = (
+                    error if isinstance(error, ApiPermitStateError) else None
+                )
+                final_error = permit_error or restart_error or timeout_error or error
                 state = (
-                    "superseded" if restart_error is not None
+                    "failed" if permit_error is not None
+                    else "superseded" if restart_error is not None
                     else "timed_out" if timeout_error is not None
                     else "failed"
                 )
@@ -171,6 +182,8 @@ class MountedTaskExecutionMixin:
                 runtime_sequence=runtime_sequence,
             )
 
+        except ApiPermitStateError:
+            raise
         except JobRestartedError:
             raise
         except Exception as main_error:
@@ -214,6 +227,8 @@ class MountedTaskExecutionMixin:
                         runtime_sequence=runtime_sequence,
                     )
 
+                except ApiPermitStateError:
+                    raise
                 except JobRestartedError:
                     raise
                 except Exception as fallback_error:
@@ -347,6 +362,11 @@ class MountedTaskExecutionMixin:
                 all_results.extend(repeat_results)
                 return all_results[0] if len(all_results) == 1 else all_results
 
+            except ApiPermitStateError:
+                # Leave the native job claim active. The outer lifecycle owns
+                # recovery and must not record task failure, retry this task,
+                # or invoke a fallback while permit ownership is unresolved.
+                raise
             except JobRestartedError:
                 raise
             except Exception as error:

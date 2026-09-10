@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import json
 import re
 import shutil
 import sqlite3
+import socket
 import subprocess
 import sys
 import time
@@ -13,7 +15,8 @@ from threading import Event, Lock
 import pytest
 import networkx as nx
 
-from micro_workflow_manager.models import Job
+from micro_workflow_manager.models import Job, now
+from micro_workflow_manager.processes import process_identity
 from micro_workflow_manager.storage import FileStorage
 from micro_workflow_manager.system import MicroWorkflow
 from micro_workflow_manager.topology import ComponentTopology
@@ -364,47 +367,6 @@ def test_real_job_creation_paths_assign_distinct_identities_and_preserve_reuse(t
         _close(storage)
 
 
-def test_native_paste_reconciliation_retains_identity_and_removes_deleted_jobs(tmp_path):
-    storage = FileStorage._create_new_project_state(tmp_path)
-    try:
-        storage.create_job(Job(node_name='A', job_id=1, params={'value': 'keep'}))
-        storage.create_job(Job(node_name='A', job_id=2, params={'value': 'remove'}))
-        first = storage.read_job_instance_id('A', 1)
-        storage.set_job_status('A', 1, 'running')
-        storage.input_file('A', 2).unlink()
-        assert storage.reconcile_pasted_node_state('A') == {
-            'requeued': 1, 'removed': 1, 'jobs': 1,
-        }
-        assert storage.read_job_instance_id('A', 1) == first
-        assert storage.get_job_status('A', 1) == 'queued'
-        assert storage.read_job_instance_id('A', 2) is None
-        assert _identity_rows(storage) == {('A', 1): first}
-    finally:
-        _close(storage)
-
-
-def test_clipboard_state_import_creates_new_destination_job_identities(tmp_path):
-    source = FileStorage._create_new_project_state(tmp_path / 'source')
-    destination = FileStorage._create_new_project_state(tmp_path / 'destination')
-    try:
-        source.create_job(Job(node_name='A', job_id=1, params={'value': 'source'}))
-        destination.create_job(Job(node_name='A', job_id=1, params={'value': 'old destination'}))
-        source_identity = source.read_job_instance_id('A', 1)
-        old_destination_identity = destination.read_job_instance_id('A', 1)
-        snapshot = source.export_node_state('A', tmp_path / 'clipboard.sqlite3')
-        destination.import_node_state('A', snapshot)
-        imported = destination.read_job_instance_id('A', 1)
-        assert re.fullmatch('[0-9a-f]{32}', imported)
-        assert imported not in (source_identity, old_destination_identity)
-        assert _identity_rows(destination) == {('A', 1): imported}
-        assert source.read_job_instance_id('A', 1) == source_identity
-        # This storage API transfers database rows only; filesystem paste is a
-        # separate operation and is not claimed by this identity assertion.
-    finally:
-        _close(source)
-        _close(destination)
-
-
 @pytest.mark.parametrize('path', ['selected-batch', 'whole-batch', 'node-jobs', 'node-state'])
 def test_supported_deletion_paths_remove_only_deleted_job_identities(tmp_path, path):
     storage = FileStorage._create_new_project_state(tmp_path)
@@ -589,17 +551,19 @@ def test_identity_survives_claim_terminal_restart_reset_and_sequence_updates(tmp
         graph.add_node('A')
         snapshot = ComponentTopology(graph, []).snapshot()
         storage.register_component_topology(snapshot)
+        started_at = now()
         storage.create_execution_session(
             'owner', session_kind='main', command='run', start_component=('A',),
-            selected_components=[('A',)], started_at='2026-09-05T12:00:00',
-            hostname='worker.example', pid=123, process_identity='owner-process',
+            selected_components=[('A',)], started_at=started_at,
+            hostname=socket.gethostname(), pid=os.getpid(),
+            process_identity=process_identity(os.getpid()),
             expected_shape=snapshot.shape_json,
         )
         assert storage.reserve_execution_components('owner', expected_shape=snapshot.shape_json)
         storage.create_job(Job(node_name='A', job_id=1, params={'value': 'retained'}))
         identity = storage.read_job_instance_id('A', 1)
         generation, execution = storage.claim_job_execution(
-            'A', 1, started_at='2026-09-05T12:00:00', session_id='owner', component=('A',),
+            'A', 1, started_at=started_at, session_id='owner', component=('A',),
         )
         assert storage.get_job_status('A', 1) == 'running'
         assert storage.read_job_instance_id('A', 1) == identity
@@ -611,7 +575,7 @@ def test_identity_survives_claim_terminal_restart_reset_and_sequence_updates(tmp
         assert storage.get_job_status('A', 1) == 'queued'
         assert storage.read_job_instance_id('A', 1) == identity
         assert storage.finish_execution_session(
-            'owner', outcome='stopped', finished_at='2026-09-05T12:01:00',
+            'owner', outcome='stopped', finished_at=now(),
         )
         assert storage.release_execution_components('owner') == 1
         storage.set_job_status('A', 1, 'failed')

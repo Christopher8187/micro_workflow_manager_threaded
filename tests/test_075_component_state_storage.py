@@ -10,6 +10,8 @@ import networkx as nx
 import pytest
 
 from micro_workflow_manager.storage import FileStorage
+from micro_workflow_manager.models import now
+from tests.test_064_read_only_previews import _live_execution_session_identity
 from micro_workflow_manager.component_identity import encode_component_key
 from micro_workflow_manager.topology import ComponentTopology
 
@@ -306,15 +308,35 @@ def test_component_state_reader_preserves_valid_lineage_and_refuses_damage(
         if origin == ' int-spaced ':
             sessions.append((origin, 'interrupt'))
         for session_id, kind in sessions:
+            identity = {
+                'started_at': '2026-09-05T12:00:00+00:00',
+                'hostname': 'worker.example', 'pid': 123, 'process_identity': session_id,
+            }
+            if valid and origin == session_id:
+                identity = _live_execution_session_identity()
             storage.create_execution_session(
                 session_id, session_kind=kind, command='run', start_component=('A',),
-                selected_components=[('A',)], started_at='2026-09-05T12:00:00+00:00',
-                hostname='worker.example', pid=123, process_identity=session_id,
+                selected_components=[('A',)], **identity,
                 expected_shape=snapshot.shape_json,
             )
+        if valid and origin == 'int-done':
+            assert storage.reserve_execution_components(
+                origin, expected_shape=snapshot.shape_json,
+            ) is True
         storage.finish_execution_session(
-            'int-done', outcome='done', finished_at='2026-09-05T12:01:00+00:00',
+            'int-done', outcome='done', finished_at=now(),
         )
+        if valid and origin == ' int-spaced ':
+            assert storage.reserve_execution_components(
+                origin, expected_shape=snapshot.shape_json,
+            ) is True
+            storage.finish_execution_session(
+                origin, outcome='done', finished_at=now(),
+            )
+        if valid and origin == 'int-live':
+            assert storage.reserve_execution_components(
+                origin, expected_shape=snapshot.shape_json,
+            ) is True
         # Seed valid native history through the writer. The disposable
         # connection alone disables CHECK/FK enforcement for named damage.
         if valid:
@@ -516,4 +538,4 @@ else:
     assert result.returncode == 0, result.stdout + result.stderr
     with sqlite3.connect(database) as connection:
         assert connection.execute('SELECT type,name,sql FROM sqlite_master ORDER BY type,name').fetchall() == before
-        assert connection.execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '6'
+        assert connection.execute("SELECT value FROM metadata WHERE key='database_schema_version'").fetchone()[0] == '9'

@@ -41,8 +41,8 @@ def _abandoned_job(tmp_path, request):
     generation, execution_id = storage.claim_job_execution(
         "A", 1, started_at=started_at, session_id=session_id, component=("A",)
     )
-    storage.release_execution_components(session_id)
     storage.finish_execution_session(session_id, outcome=FAILED, finished_at=now())
+    storage.release_execution_components(session_id)
     storage.set_node_status("A", FAILED)
     return workflow, storage, calls, started_at, generation, execution_id
 
@@ -290,10 +290,10 @@ def test_resume_refuses_terminal_owner_from_prior_component_shape(tmp_path, requ
         component=("A",),
     )
     old_owner = old_storage.read_job_current_owner("A", 1)
-    old_storage.release_execution_components("old-shape-owner")
     old_storage.finish_execution_session(
         "old-shape-owner", outcome=FAILED, finished_at=now()
     )
+    old_storage.release_execution_components("old-shape-owner")
     old_storage.set_node_status("A", FAILED)
     _close(old_storage)
 
@@ -398,10 +398,10 @@ def test_real_job_output_records_execution_and_is_recovered_after_terminal_write
         "DELETE FROM pending_component_executions WHERE session_id=?",
         (owner["session_id"],),
     ).rowcount) == 1
-    storage.release_execution_components(owner["session_id"])
     storage.finish_execution_session(
         owner["session_id"], outcome=FAILED, finished_at=now()
     )
+    storage.release_execution_components(owner["session_id"])
     storage.set_node_status("A", FAILED)
     monkeypatch.setattr(storage, "finalize_job_execution", original_finalize)
     assert storage.read_json(storage.output_file("A", 1)) == output

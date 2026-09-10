@@ -57,6 +57,7 @@ def admit_sample_execution_session(
     process_identity,
     details,
     request,
+    interrupt_arguments=None,
 ):
     """Reserve, observe, select, and persist one sample as one writer decision."""
     if not isinstance(request, SampleRequest):
@@ -82,15 +83,22 @@ def admit_sample_execution_session(
         for node in sorted(component):
             locks.enter_context(storage.interprocess_lock(f'node-{node}-input'))
             locks.enter_context(storage.interprocess_lock(f'node-{node}-jobs'))
-        pending = storage.create_execution_session(
-            session_id, session_kind='main', command=command,
-            start_component=component, selected_components=components, selected_jobs=(),
-            started_at=started_at, hostname=hostname, pid=pid,
+        arguments = dict(
+            command=command, start_component=component, selected_components=components,
+            selected_jobs=(), started_at=started_at, hostname=hostname, pid=pid,
             process_identity=process_identity, details=details,
             sample_id=sample_id, expected_shape=snapshot.shape_json,
-            _reserved_sample_builder=build,
-            _wait=False,
         )
+        if interrupt_arguments is None:
+            pending = storage.create_execution_session(
+                session_id, session_kind='main', **arguments,
+                _reserved_sample_builder=build, _wait=False,
+            )
+        else:
+            pending = storage.admit_interrupt_execution(
+                session_id, **arguments, **interrupt_arguments,
+                _reserved_sample_builder=build, _wait=False,
+            )
 
         def readback():
             if len(plans) != 1:
@@ -101,14 +109,19 @@ def admit_sample_execution_session(
             roots, selection = plan.admission_record(
                 sample_id=sample_id, component=component, expected_shape=snapshot.shape_json,
             )
-            return storage._read_execution_session_admission(
-                session_id, session_kind='main', command=command,
-                start_component=component, selected_components=components,
+            observed_arguments = dict(
+                command=command, start_component=component, selected_components=components,
                 selected_jobs=[(node, job_id) for node, job_id, _ in roots],
                 expected_job_instances=roots, started_at=started_at,
                 hostname=hostname, pid=pid, process_identity=process_identity,
-                details={**details, 'selection': selection}, reserved=True,
-                expected_shape=snapshot.shape_json,
+                details={**details, 'selection': selection}, expected_shape=snapshot.shape_json,
+            )
+            if interrupt_arguments is not None:
+                return storage._read_interrupt_execution_admission(
+                    session_id, **observed_arguments, **interrupt_arguments,
+                )
+            return storage._read_execution_session_admission(
+                session_id, session_kind='main', reserved=True, **observed_arguments,
             )
 
         settled = resolve_admission_future(pending, readback)

@@ -3,13 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from micro_workflow_manager.system import MicroWorkflow
+from micro_workflow_manager.workflow.interrupt_execution import explicit_interrupt_component
 from micro_workflow_manager.workflow.preparation import observe_programmatic_fresh_preparation
 from micro_workflow_manager.workflow.selected_preparation import prepare_selected_jobs, prepare_selected_addresses
 from micro_workflow_manager.workflow.selected_execution_operation import run_selected_addresses
 from micro_workflow_manager.workflow.sample_admission import SampleRequest
 from micro_workflow_manager.storage.session_admission import NoSelectedJobs
 
-from .active_run import refuse_competing_run
+from micro_workflow_manager.workflow.execution_session import refuse_competing_run
 from .run_session import active_workflow_run
 from .sampling import print_sample_selection
 from .validation import is_ready, print_not_ready
@@ -26,6 +27,7 @@ def run_selected_jobs(
     monitor: bool = False,
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
+    interrupt_preflight=None,
 ) -> int:
     return _run_selected_jobs(
         root,
@@ -38,12 +40,14 @@ def run_selected_jobs(
         monitor=monitor,
         monitor_interval=monitor_interval,
         keep_trace=keep_trace,
+        interrupt_preflight=interrupt_preflight,
     )
 
 
 def run_sampled_jobs(
     root, workflow, node, selectors, *, seed, statuses=(), expected_population=None,
     stats=False, stats_interval=5.0, monitor=False, monitor_interval=2.0, keep_trace=False,
+    interrupt_preflight=None,
 ):
     request = SampleRequest(tuple(selectors), seed, statuses, expected_population)
     try:
@@ -51,6 +55,7 @@ def run_sampled_jobs(
             root, workflow, node, None, command='run sample', sample_request=request,
             stats=stats, stats_interval=stats_interval, monitor=monitor,
             monitor_interval=monitor_interval, keep_trace=keep_trace,
+            interrupt_preflight=interrupt_preflight,
         )
     except NoSelectedJobs:
         print('No jobs selected; no work was started.')
@@ -70,13 +75,18 @@ def _run_selected_jobs(
     monitor: bool = False,
     monitor_interval: float = 2.0,
     keep_trace: bool = False,
+    interrupt_preflight=None,
 ) -> int:
-    refuse_competing_run(workflow)
+    explicit_interrupt = explicit_interrupt_component(interrupt_preflight) is not None
+    if not explicit_interrupt:
+        refuse_competing_run(workflow)
 
-    if not is_ready(workflow, node):
+    if not explicit_interrupt and not is_ready(workflow, node):
         print_not_ready(workflow, node)
         return 1
-    preparation = observe_programmatic_fresh_preparation(workflow, [node])
+    preparation = observe_programmatic_fresh_preparation(
+        workflow, [node], interrupt_component=explicit_interrupt_component(interrupt_preflight),
+    )
 
     if sample_request is None:
         for job_id in job_ids:
@@ -95,8 +105,15 @@ def _run_selected_jobs(
         stats_interval=stats_interval,
         monitor=monitor,
         monitor_interval=monitor_interval,
+        interrupt_preflight=interrupt_preflight,
     ) as finish_run:
         execution_context = workflow.execution_session_context
+        if interrupt_preflight is not None and interrupt_preflight.stopped_components:
+            if sample_request is not None:
+                print_sample_selection(finish_run.sample_admission.selection, executing=True)
+            finish_run('stopped')
+            print('Stopped before the selected interrupt component; no selected job was prepared or claimed.')
+            return 0
         if sample_request is not None:
             admission = finish_run.sample_admission
             addresses = admission.addresses

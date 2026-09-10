@@ -58,10 +58,13 @@ def run_nodes(
     monitor_interval: float = 2.0,
     prepare: Callable[[], None] | None = None,
     fresh_preparation: bool = False,
+    interrupt_preflight=None,
+    execution_session_id: str | None = None,
     refuse_after_node: str | None = None,
     refuse_before_node: str | None = None,
 ) -> int:
     refusal_event = Event()
+    interrupt_blocked = frozenset(() if interrupt_preflight is None else interrupt_preflight.blocked_components)
     refuse_after_component = (
         workflow.component_key(workflow.component_for(refuse_after_node))
         if refuse_after_node is not None
@@ -94,6 +97,8 @@ def run_nodes(
         stats_interval=stats_interval,
         monitor=monitor,
         monitor_interval=monitor_interval,
+        interrupt_preflight=interrupt_preflight,
+        execution_session_id=execution_session_id,
     ) as finish_run:
         execution_context = workflow.execution_session_context
         if prepare is not None:
@@ -105,6 +110,7 @@ def run_nodes(
             _sequential=workflow.runner not in {'threaded', 'api', 'process'},
             nodes=nodes,
             _components=components,
+            interrupt_blocked_components=interrupt_blocked,
             refuse_after_component=refuse_after_component,
             refuse_before_component=refuse_before_component,
             refusal_event=refusal_event,
@@ -119,9 +125,15 @@ def run_nodes(
             workflow.execution_components(nodes), expected_shape=execution_context[2],
         )
 
+        fenced = frozenset(
+            component for component in states
+            if workflow.storage.read_interrupt_execution_fences(execution_context[0], component)
+        )
+        stopped = interrupt_blocked | fenced
+
         if refusal_event.is_set():
             if refuse_before_component is not None:
-                finish_run("done")
+                finish_run("stopped" if stopped else "done")
                 boundary = ", ".join(refuse_before_component)
                 print(
                     "Refused Hoeflein-component admission before "
@@ -141,7 +153,7 @@ def run_nodes(
                 return 0
 
             failed_boundary = states[refuse_after_component]['lifecycle'] == 'failed'
-            finish_run("failed" if failed_boundary else "done")
+            finish_run("failed" if failed_boundary else "stopped" if stopped else "done")
             boundary = ", ".join(refuse_after_component or ())
             print(
                 "Refused further Hoeflein-component admission after "
@@ -160,7 +172,8 @@ def run_nodes(
                     print(f"  {item}")
             return 1 if failed_boundary else 0
 
-        blocked = [component for component, state in states.items() if state['lifecycle'] == 'queued']
+        blocked = [component for component, state in states.items()
+                   if component not in stopped and state['lifecycle'] == 'queued']
 
         if blocked:
             finish_run("blocked")
@@ -169,7 +182,8 @@ def run_nodes(
                 print(f"  {{{', '.join(component)}}}: queued")
             return 1
 
-        unfinished = [component for component, state in states.items() if state['lifecycle'] != 'done']
+        unfinished = [component for component, state in states.items()
+                      if component not in stopped and state['lifecycle'] != 'done']
 
         if unfinished:
             finish_run("incomplete")
@@ -178,7 +192,11 @@ def run_nodes(
                 print(f"  {{{', '.join(component)}}}: {states[component]['lifecycle']}")
             return 1
 
-        finish_run("done")
+        finish_run("stopped" if stopped else "done")
+        if stopped:
+            print("Stopped at interrupt boundaries; remaining work is available for a later command.")
+            for component in sorted(stopped):
+                print(f"  {{{', '.join(component)}}}")
         print("Ran:")
         for node in ran:
             print(f"  {node}")

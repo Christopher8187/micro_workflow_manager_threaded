@@ -125,7 +125,7 @@ def test_cli_config_returns_the_same_value_it_validated(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, 'read_text', replace_after_read)
     config = read_config(tmp_path)
-    assert config['version'] == 6
+    assert config['version'] == 9
     assert len(reads) == 1
 
 
@@ -330,7 +330,7 @@ storage.close_database_connections()
         try:
             assert storage.database_integrity_check() == 'ok'
             assert storage.list_execution_sessions() == []
-            assert read_config(root)['version'] == 6
+            assert read_config(root)['version'] == 9
         finally:
             _close(storage)
         assert {path.name for path in (root / '.mwf').iterdir()} == {'project.json', 'state.sqlite3'}
@@ -359,8 +359,7 @@ def test_direct_clipboard_refuses_old_project_before_copying_or_replacing_files(
     assert _filesystem_state(tmp_path) == before
 
 
-@pytest.mark.parametrize('entry', ['storage', 'clipboard'])
-def test_missing_clipboard_snapshot_preserves_native_jobs_and_payloads(tmp_path, entry):
+def test_missing_clipboard_snapshot_preserves_native_jobs_and_payloads(tmp_path):
     storage = FileStorage(tmp_path)
     try:
         storage.create_job(Job(node_name='A', job_id=1, params={'value': 'original'}))
@@ -370,11 +369,8 @@ def test_missing_clipboard_snapshot_preserves_native_jobs_and_payloads(tmp_path,
         clipboard.write_text('{"value": "replacement"}', encoding='utf-8')
         node_before = _filesystem_state(tmp_path / 'node')
         clipboard_before = _filesystem_state(tmp_path / 'clipboard')
-        with pytest.raises(RuntimeError, match='Native clipboard state snapshot is missing'):
-            if entry == 'storage':
-                storage.import_node_state('A', tmp_path / 'clipboard' / 'A' / '.mwf-node-state.sqlite3')
-            else:
-                paste_node_from_clipboard(tmp_path, 'A')
+        with pytest.raises(RuntimeError, match="Clipboard does not contain an ordinary native node 'A'"):
+            paste_node_from_clipboard(tmp_path, 'A')
         assert storage.read_job_instance_id('A', 1) == identity
         assert storage.load_job('A', 1).params == {'value': 'original'}
         assert _filesystem_state(tmp_path / 'node') == node_before
@@ -383,53 +379,64 @@ def test_missing_clipboard_snapshot_preserves_native_jobs_and_payloads(tmp_path,
         _close(storage)
 
 
-def test_native_reconciliation_refuses_payload_only_jobs_before_changing_metadata(tmp_path):
+def test_native_paste_refuses_payload_only_jobs_before_changing_metadata(tmp_path):
     storage = FileStorage(tmp_path)
     try:
+        graph = nx.DiGraph()
+        graph.add_node('A')
+        storage.register_component_topology(ComponentTopology(graph, []).snapshot())
         for job_id in (1, 2):
             storage.create_job(Job(node_name='A', job_id=job_id, params={'value': job_id}))
         identities = {job_id: storage.read_job_instance_id('A', job_id) for job_id in (1, 2)}
-        storage.set_job_status('A', 1, 'running')
-        storage.input_file('A', 2).unlink()
-        orphan = tmp_path / 'node' / 'A' / 'jobs' / '99' / 'input.json'
+        assert copy_node_to_clipboard(tmp_path, 'A') == 0
+        orphan = tmp_path / 'clipboard' / 'A' / 'jobs' / '99' / 'input.json'
         orphan.parent.mkdir()
         orphan.write_text('{"value": "untracked"}', encoding='utf-8')
-        before = _filesystem_state(tmp_path / 'node')
+        node_before = _filesystem_state(tmp_path / 'node')
+        clipboard_before = _filesystem_state(tmp_path / 'clipboard')
+
         with pytest.raises(RuntimeError, match='Clipboard payloads have no native job state: A/99'):
-            storage.reconcile_pasted_node_state('A')
-        assert storage.get_job_status('A', 1) == 'running'
-        assert storage.get_job_status('A', 2) == 'queued'
+            paste_node_from_clipboard(tmp_path, 'A')
+
         assert {job_id: storage.read_job_instance_id('A', job_id) for job_id in (1, 2)} == identities
         assert storage.read_job_instance_id('A', 99) is None
-        assert _filesystem_state(tmp_path / 'node') == before
+        assert _filesystem_state(tmp_path / 'node') == node_before
+        assert _filesystem_state(tmp_path / 'clipboard') == clipboard_before
     finally:
         _close(storage)
 
 
-def test_failed_clipboard_import_preserves_destination_job_state(tmp_path):
-    source = FileStorage(tmp_path / 'source')
-    destination = FileStorage(tmp_path / 'destination')
+def test_failed_clipboard_snapshot_validation_preserves_destination_job_state(tmp_path):
+    storage = FileStorage(tmp_path)
     try:
-        source.create_job(Job(node_name='A', job_id=1, params={'value': 'source'}))
-        destination.create_job(Job(node_name='A', job_id=7, params={'value': 'retained'}))
-        identity = destination.read_job_instance_id('A', 7)
-        snapshot = source.export_node_state('A', tmp_path / 'clipboard.sqlite3')
+        graph = nx.DiGraph()
+        graph.add_node('A')
+        storage.register_component_topology(ComponentTopology(graph, []).snapshot())
+        storage.create_job(Job(node_name='A', job_id=1, params={'value': 'saved'}))
+        assert copy_node_to_clipboard(tmp_path, 'A') == 0
+        storage.create_job(Job(node_name='A', job_id=7, params={'value': 'retained'}))
+        identities = {job_id: storage.read_job_instance_id('A', job_id) for job_id in (1, 7)}
+        snapshot = tmp_path / 'clipboard' / 'A' / '.mwf-node-state.sqlite3'
         connection = sqlite3.connect(snapshot)
         try:
-            connection.execute('INSERT INTO jobs SELECT * FROM jobs')
+            connection.execute('PRAGMA foreign_keys=OFF')
+            connection.execute("DELETE FROM job_instances WHERE node_name='A'")
             connection.commit()
         finally:
             connection.close()
-        with pytest.raises(sqlite3.IntegrityError):
-            destination.import_node_state('A', snapshot)
-        assert destination.read_job_instance_id('A', 7) == identity
-        assert destination.get_job_status('A', 7) == 'queued'
-        assert destination.load_job('A', 7).params == {'value': 'retained'}
-        assert destination.read_job_instance_id('A', 1) is None
-        assert destination.database_integrity_check() == 'ok'
+        node_before = _filesystem_state(tmp_path / 'node')
+        clipboard_before = _filesystem_state(tmp_path / 'clipboard')
+
+        with pytest.raises(RuntimeError, match='invalid job identities'):
+            paste_node_from_clipboard(tmp_path, 'A')
+
+        assert {job_id: storage.read_job_instance_id('A', job_id) for job_id in (1, 7)} == identities
+        assert storage.load_job('A', 7).params == {'value': 'retained'}
+        assert _filesystem_state(tmp_path / 'node') == node_before
+        assert _filesystem_state(tmp_path / 'clipboard') == clipboard_before
+        assert storage.database_integrity_check() == 'ok'
     finally:
-        _close(source)
-        _close(destination)
+        _close(storage)
 
 
 def test_ordinary_creation_and_fresh_process_reopen_use_native_sessions(tmp_path):
