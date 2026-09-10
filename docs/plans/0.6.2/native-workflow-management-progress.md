@@ -1,14 +1,15 @@
 # Native workflow-management integration
 
-This batch continues from `f6dc5a3d0d21181a32c08756dcbb27dc500c2652` on
+This batch was committed locally as `371b834d3c3fed8c963b33973540e0a606033c31`,
+following baseline `f6dc5a3d0d21181a32c08756dcbb27dc500c2652`, on
 `codex/mwf-062-workflow-management` for
 [Implement and verify the agreed MWF 0.6.2 workflow-management changes](https://github.com/Christopher8187/product/issues/45).
-Christopher requested a coherent local commit after broader checks and reviews
-pass, followed immediately by requirement reconciliation and the remaining
-work. Pushing and publication
-are not authorized for this checkpoint.
+The required checkpoint checks and reviews passed before the commit.
+The requirement audit is integrated and its structural checks pass.
+Christopher has put the final Astra review on hold.
+Pushing and publication are not authorized for this checkpoint.
 
-## Implemented scope awaiting batch acceptance
+## Implemented scope in the local checkpoint
 
 | Area | Behavior and requirement coverage |
 | --- | --- |
@@ -26,7 +27,80 @@ sampled origin, later fence authority, ordinary stopping, and clipboard scope.
 The [one-model decision](single-model-scope.md) cancels obsolete compatibility
 machinery. Its removals do not cancel native failure and recovery checks.
 
-## Verification and reviews
+## Checkpoint verification
+
+The [completed source comparison](../../../../testing_ground/issue-45/native-workflow-management-checkpoint-source-verification-20260910-revision02.json)
+and [commit verification](../../../../testing_ground/issue-45/native-workflow-management-checkpoint-commit-verification-20260910-revision01.json)
+bind all 300 committed paths to the reviewed source and completed checks.
+The ordinary suite passed 2,876 cases with exactly the two approved deferred
+example failures. Four cyclic cases, one stress case, eight focused cases,
+43 adjacent cases, 4,320 repeated API executions, and three 1,000-job wait
+samples passed.
+
+The [final documentation check](../../../../testing_ground/issue-45/workflow-management-docs-verification-20260910-revision02.json)
+passed before this progress update. The
+[Arendt supplement](../../../../testing_ground/issue-45/native-workflow-management-final-checkpoint-staged-supplement-arendt-revision01.md)
+and [Heisenberg supplement](../../../../testing_ground/issue-45/native-workflow-management-final-checkpoint-review-heisenberg-revision02.md)
+carry the complete source reviews. They also accept removal of 11 terminal
+newline bytes from five files, with identical Python syntax trees. The original
+source freezes and execution identities remain unchanged.
+
+## Whole-issue reconciliation
+
+The [fresh-project rebuild guide](../../../../migration.md) is committed in the
+Parent Repo at `bad9f53e26902ed09d6e549404240a1f97778698`. It covers source,
+graph, tasks, inputs, documentation, and operating instructions before creating
+new native state. The [guide verification](../../../../testing_ground/issue-45/migration-guide-verification-root-revision01.json)
+and [guide commit verification](../../../../testing_ground/issue-45/migration-guide-commit-verification-root-revision01.json)
+record source review, eight local links, five Python snippet syntax checks, and
+the exact committed file. No older project was rebuilt or modified for these
+checks. The guide identifies the runtime by source commit because package
+metadata remains `0.6.1` until the downstream packaging task.
+Christopher's [guide-validation clarification](approved-guide-validation-clarification-20260910.md)
+confirms that an actual project rebuild is not required for completion or final
+review. The unexecuted walkthrough is a validation limit, not outstanding work.
+The [independent Sol guide review](../../../../testing_ground/issue-45/migration-guide-independent-source-review-heisenberg-revision01.md)
+passed against the committed runtime and guide, with no actionable finding.
+
+The [source-read record](../../../../testing_ground/issue-45/whole-issue-task-source-read-coverage-root-revision01.json)
+accounts for all nine turns of `Find objective for issue #45` and all 29 turns
+of `Review GitHub issue #44`. It records page, turn, and message identities
+without exporting either conversation. The [worked-example mapping](../../../../testing_ground/issue-45/whole-issue-worked-example-reconciliation-root-revision02.json)
+connects 32 groups of approved examples to 92 existing regression functions and
+their passing cases. The [independent review](../../../../testing_ground/issue-45/whole-issue-worked-example-and-source-read-independent-review-arendt-revision01.md)
+accepts the source-read record and corrected mapping. This mapping records
+present coverage; original stage records retain the test-first history. The
+[reviewer-model evidence](../../../../testing_ground/issue-45/reviewer-model-evidence-arendt-revision02/REVIEWER-MODEL-EVIDENCE.md)
+also resolves the sampled-resume review's abbreviated model description through
+its original configuration and artifact messages.
+
+The [initial generated audit validation](../../../../testing_ground/issue-45/whole-issue-final-reconciliation-validation-root-revision01.json)
+passed for all 694 rows. It preserved every requirement and the first five
+settled cells, matched the reviewed current statements, resolved 864 local
+links, and checked all 542 Python files against the accepted checkpoint source.
+Its scope is structural and evidence consistency. Final Astra review and
+external publication and closure remain open.
+
+The [integrated audit](requirements-audit.md) uses the reviewed successor
+statements and tooling. Its [final structural validation](../../../../testing_ground/issue-45/whole-issue-final-reconciliation-validation-root-revision02.json)
+passed with 694 requirements, 871 resolved local links, and one resolved local
+heading link. It records the completed guide review and Christopher's Astra
+hold. The [independent input review](../../../../testing_ground/issue-45/whole-issue-first-audit-procedural03-tooling11-independent-review-arendt-revision01.md)
+accepts the first render, successor requirement statements, and corrected
+historical framing. No executable source changed during this reconciliation.
+
+## Final review hold on 2026-09-10
+
+Christopher asked to hold the final exhaustive Astra review. His instruction
+was relayed from `Check issue 45 progress (2)`, task
+`01a071cf-399b-7712-8409-461f1ad4746a`. That review has not started. Audit
+integration, document validation, and local commits continue. The hold does
+not permanently waive review or authorize pushing, publication, or closure.
+
+## Earlier verification and review chronology
+
+The records below preserve the failures, corrections, and acceptance limits
+that preceded the completed checkpoint.
 
 The immutable [run history](../../../../testing_ground/issue-45/native-applied-recovery-test-history-revision149.json)
 records every completed focused and adjacent run, including failed attempts and
@@ -367,25 +441,24 @@ four runtime removals and final Test044, Test048, Test092, Test188, and Test199
 corrections. Both retain the broader execution gates, including the newly
 observed Test183 failure.
 
-The current [combined source supplement](../../../../testing_ground/issue-45/native-workflow-management-batch-independent-source-review-supplement-arendt-revision12.md)
+The earlier [combined source supplement](../../../../testing_ground/issue-45/native-workflow-management-batch-independent-source-review-supplement-arendt-revision12.md)
 and [current-source review](../../../../testing_ground/issue-45/native-workflow-management-current-batch-source-review-closure-heisenberg-revision10.md)
-accept the same 542 Python files now under ordinary-suite verification. They
+accepted the 542 Python files used by the completed ordinary suite. They
 include the Test183 baseline correction and retain every broader execution
 gate. Its focused and adjacent runs passed all 50 cases.
 
 ## Remaining work
 
-Finish the checkpoint reviews and verify staged files against the tested
-sources. The
+The
 [native-only source scan](../../../../testing_ground/issue-45/native-only-final-source-scan-heisenberg-revision01.md)
 and [bounded removal plan](../../../../testing_ground/issue-45/native-only-residual-removal-plan-heisenberg-revision01.md)
 record three required removals. The
 unused single-node reset wrapper, obsolete API startup-strategy spellings,
 and obsolete network-mode translations are now removed and pass the current
-checks. These removals belong to this batch. Commit the coherent implementation
-locally after the remaining acceptance checks pass.
+checks. These removals are included in the local checkpoint.
 
-Then reconcile the complete requirement record and remaining documentation,
-write the external project-revamping guide
-from the finished APIs, and obtain the final Astra review only after whole-issue
-readiness. Packaging and publication belong to the downstream task.
+The 694-row reconciliation is integrated and structurally validated. The final
+Astra review remains on hold at Christopher's request. The external
+project-revamping guide is complete within its recorded validation limits.
+Push, issue publication, and closure remain open. Packaging and package
+publication belong to the downstream task.
